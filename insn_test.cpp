@@ -1,0 +1,590 @@
+#include "insn.h"
+#include <iostream>
+#include <cassert>
+#include <cstring> // For memcpy
+#include <sys/mman.h>
+#include <unistd.h>
+
+// Helper function to print test results
+void print_test_result(const std::string& test_name, bool success) {
+    std::cout << "Test: " << test_name << " - " << (success ? "PASSED" : "FAILED") << std::endl;
+}
+
+struct vmOptions option = {
+    .entry = 0x1000,
+    .verbose = true,
+    .breakpoint = 0,
+    .step_run = false,
+};
+
+// Helper function to load BPF program code into the VM's memory
+// Allocates memory for the code, copies it, and adds it to the VM.
+// Sets PF_W flag in memmap to ensure free() is called by memmap's destructor,
+// as per current memmap destructor logic for malloc'd data.
+bool load_program_to_vm(vm& ebpf_vm, const bpf_insn* instructions, size_t num_instructions, uint64_t paddr = 0x1000) {
+    if (instructions == nullptr || num_instructions == 0) {
+        std::cerr << "Error: No instructions provided to load_program_to_vm." << std::endl;
+        return false;
+    }
+
+    size_t code_size = num_instructions * sizeof(bpf_insn);
+    // Align code_size to a reasonable boundary if necessary, e.g., page size for mmap later if used directly
+    // For now, simple malloc is used as in the original code.
+
+    unsigned char* prog_data = (unsigned char*)mmap(nullptr, sysconf(_SC_PAGESIZE), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!prog_data) {
+        std::cerr << "Error: Failed to allocate memory for program code in load_program_to_vm. Size: " << code_size << std::endl;
+        perror("malloc failed");
+        return false;
+    }
+    memcpy(prog_data, instructions, code_size);
+
+    memmap prog_mem;
+    prog_mem.paddr = paddr; // Use a non-zero base address for program memory to avoid conflict with nullptr or other special addresses
+    prog_mem.size = code_size;
+    prog_mem.data = prog_data;
+    prog_mem.flags = PF_R | PF_X | PF_W; // PF_W for free() by memmap destructor, PF_R | PF_X for execution
+    ebpf_vm.addmem(std::move(prog_mem));
+    return true;
+}
+
+// --- ALU64 Tests ---
+void test_alu64_add_imm() {
+    std::cout << "--- Running Test: test_alu64_add_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 50 },  // add r1, 50
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1 (for exit value)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }             // exit
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option); // Program loaded at 0x1000
+    bool success = (ebpf_vm.r(1) == 150 && ret == 150);
+    print_test_result("test_alu64_add_imm", success);
+    assert(success);
+}
+
+void test_alu64_sub_reg() {
+    std::cout << "--- Running Test: test_alu64_sub_reg ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 200 }, // mov r1, 200
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 75 },  // mov r2, 75
+        { BPF_ALU64 | BPF_SUB | BPF_X, 1, 2, 0, 0 },   // sub r1, r2
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 125 && ret == 125);
+    print_test_result("test_alu64_sub_reg", success);
+    assert(success);
+}
+
+void test_alu64_mul_imm() {
+    std::cout << "--- Running Test: test_alu64_mul_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 12 },  // mov r1, 12
+        { BPF_ALU64 | BPF_MUL | BPF_K, 1, 0, 0, 10 },  // mul r1, 10
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 120 && ret == 120);
+    print_test_result("test_alu64_mul_imm", success);
+    assert(success);
+}
+
+void test_alu64_div_imm() {
+    std::cout << "--- Running Test: test_alu64_div_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, 5 },   // div r1, 5
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 20 && ret == 20);
+    print_test_result("test_alu64_div_imm", success);
+    assert(success);
+}
+
+void test_alu64_div_by_zero_imm() {
+    std::cout << "--- Running Test: test_alu64_div_by_zero_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, 0 },   // div r1, 0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    // According to BPF spec, division by zero result is 0.
+    bool success = (ebpf_vm.r(1) == 0 && ret == 0);
+    print_test_result("test_alu64_div_by_zero_imm", success);
+    assert(success);
+}
+
+
+void test_alu64_mod_imm() {
+    std::cout << "--- Running Test: test_alu64_mod_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, 7 },   // mod r1, 7
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 2 && ret == 2); // 100 % 7 = 2
+    print_test_result("test_alu64_mod_imm", success);
+    assert(success);
+}
+
+void test_alu64_mod_by_zero_imm() {
+    std::cout << "--- Running Test: test_alu64_mod_by_zero_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, 0 },   // mod r1, 0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    // According to BPF spec, modulo by zero result is dst.
+    bool success = (ebpf_vm.r(1) == 100 && ret == 100);
+    print_test_result("test_alu64_mod_by_zero_imm", success);
+    assert(success);
+}
+
+void test_alu64_and_imm() {
+    std::cout << "--- Running Test: test_alu64_and_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0xF0F0 },  // mov r1, 0xF0F0
+        { BPF_ALU64 | BPF_AND | BPF_K, 1, 0, 0, 0x0FF0 },  // and r1, 0x0FF0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 0x00F0 && ret == 0x00F0);
+    print_test_result("test_alu64_and_imm", success);
+    assert(success);
+}
+
+void test_alu64_or_reg() {
+    std::cout << "--- Running Test: test_alu64_or_reg ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0xF0F0 }, // mov r1, 0xF0F0
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0x0FF0 }, // mov r2, 0x0FF0
+        { BPF_ALU64 | BPF_OR  | BPF_X, 1, 2, 0, 0 },      // or r1, r2
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 0xFFF0 && ret == 0xFFF0);
+    print_test_result("test_alu64_or_reg", success);
+    assert(success);
+}
+
+
+void test_alu64_lsh_imm() {
+    std::cout << "--- Running Test: test_alu64_lsh_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x123 },// mov r1, 0x123
+        { BPF_ALU64 | BPF_LSH | BPF_K, 1, 0, 0, 4 },    // lsh r1, 4
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == (0x123ULL << 4) && ret == (0x123ULL << 4));
+    print_test_result("test_alu64_lsh_imm", success);
+    assert(success);
+}
+
+void test_alu64_rsh_imm() {
+    std::cout << "--- Running Test: test_alu64_rsh_imm ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x1230 }, // mov r1, 0x1230
+        { BPF_ALU64 | BPF_RSH | BPF_K, 1, 0, 0, 4 },      // rsh r1, 4 (logical)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == (0x1230ULL >> 4) && ret == (0x1230ULL >> 4));
+    print_test_result("test_alu64_rsh_imm", success);
+    assert(success);
+}
+
+void test_alu64_arsh_imm() {
+    std::cout << "--- Running Test: test_alu64_arsh_imm ---" << std::endl;
+    vm ebpf_vm;
+    uint64_t val = 0xF000000000000000; // Negative number if treated as signed
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) }, // mov r1, val (lower 32 bits)
+        { 0, 0, 0, 0, (int32_t)(val >> 32) },                                // (upper 32 bits)
+        { BPF_ALU64 | BPF_ARSH | BPF_K, 1, 0, 0, 4 },                        // arsh r1, 4 (arithmetic)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == ((int64_t)val >> 4) && ret == ((int64_t)val >> 4));
+    print_test_result("test_alu64_arsh_imm", success);
+    assert(success);
+}
+
+void test_alu64_neg() {
+    std::cout << "--- Running Test: test_alu64_neg ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_NEG, 1, 0, 0, 0 },           // neg r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == (uint64_t)(-(int64_t)100) && ret == (uint64_t)(-(int64_t)100));
+    print_test_result("test_alu64_neg", success);
+    assert(success);
+}
+
+// --- ALU32 Tests ---
+void test_alu32_add_imm() {
+    std::cout << "--- Running Test: test_alu32_add_imm ---" << std::endl;
+    vm ebpf_vm;
+    ebpf_vm.r(1) = 0xFFFFFFFF000000AA; // Set r1 with high bits set
+    bpf_insn instructions[] = {
+        // r1 is pre-set
+        { BPF_ALU | BPF_ADD | BPF_K, 1, 0, 0, 0x55 },  // add r1, 0x55 (32-bit) ; r1 = 0xAA + 0x55 = 0xFF
+                                                       // High bits of r1 should be cleared
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 0xFF && ret == 0xFF); // High bits cleared
+    print_test_result("test_alu32_add_imm", success);
+    assert(success);
+}
+
+void test_alu32_sub_reg() {
+    std::cout << "--- Running Test: test_alu32_sub_reg ---" << std::endl;
+    vm ebpf_vm;
+    ebpf_vm.r(1) = 0xFFFFFFFF000000C8; // 200
+    ebpf_vm.r(2) = 0x000000000000004B; // 75
+    bpf_insn instructions[] = {
+        { BPF_ALU | BPF_SUB | BPF_X, 1, 2, 0, 0 },   // sub r1, r2 (32-bit) ; r1 = 200 - 75 = 125
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 125 && ret == 125);
+    print_test_result("test_alu32_sub_reg", success);
+    assert(success);
+}
+
+
+// --- JMP Tests ---
+void test_jmp_ja() {
+    std::cout << "--- Running Test: test_jmp_ja ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 10 }, // mov r1, 10
+        { BPF_JMP | BPF_JA, 0, 0, 2, 0 },             // ja +2 (skip next 2 insns)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 20 }, // Should be skipped
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 5 },  // Should be skipped
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 100 },// Target of jump
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },  // r0 = r1 (should be 10)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 10 && ebpf_vm.r(2) == 100 && ret == 10);
+    print_test_result("test_jmp_ja", success);
+    assert(success);
+}
+
+void test_jmp_jeq_imm_true() {
+    std::cout << "--- Running Test: test_jmp_jeq_imm_true ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 50 }, // mov r1, 50
+        { BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 50 },   // jeq r1, 50, +1 (jump to ADD)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 100 },// Should be skipped if jump taken
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 10 }, // r1 = r1 + 10 (target of jump)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 60 && ret == 60); // 50 + 10
+    print_test_result("test_jmp_jeq_imm_true", success);
+    assert(success);
+}
+
+void test_jmp_jeq_imm_false() {
+    std::cout << "--- Running Test: test_jmp_jeq_imm_false ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 50 }, // mov r1, 50
+        { BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 55 },   // jeq r1, 55, +1 (no jump)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 100 },// r2 = 100 (executed)
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 10 }, // r1 = r1 + 10 (executed, not jumped over)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 60 && ebpf_vm.r(2) == 100 && ret == 60); // 50+10
+    print_test_result("test_jmp_jeq_imm_false", success);
+    assert(success);
+}
+
+void test_jmp_jsgt_reg_true() {
+    std::cout << "--- Running Test: test_jmp_jsgt_reg_true ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 50 },  // mov r2, 50
+        { BPF_JMP | BPF_JSGT | BPF_X, 1, 2, 1, 0 },    // jsgt r1, r2, +1 (jump)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 999 }, // skipped
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 5 },   // r1 += 5
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 105 && ret == 105);
+    print_test_result("test_jmp_jsgt_reg_true", success);
+    assert(success);
+}
+
+void test_jmp_jslt_imm_false_signed() {
+    std::cout << "--- Running Test: test_jmp_jslt_imm_false_signed ---" << std::endl;
+    vm ebpf_vm;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -5 }, // mov r1, -5
+        { BPF_JMP | BPF_JSLT | BPF_K, 1, 0, 1, -10 }, // jslt r1 (signed -5), -10 (false)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 111 },// r2 = 111 (executed)
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 1 },  // r1 += 1 (-5 + 1 = -4)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == (uint64_t)-4 && ebpf_vm.r(2) == 111 && ret == (uint64_t)-4);
+    print_test_result("test_jmp_jslt_imm_false_signed", success);
+    assert(success);
+}
+
+
+// --- JMP32 Tests ---
+void test_jmp32_jeq_imm_true() {
+    std::cout << "--- Running Test: test_jmp32_jeq_imm_true ---" << std::endl;
+    vm ebpf_vm;
+    ebpf_vm.r(1) = 0xFFFFFFFF000A000A; // r1 = 0xA000A (high bits will be ignored by jmp32)
+    bpf_insn instructions[] = {
+        { BPF_JMP32 | BPF_JEQ | BPF_K, 1, 0, 1, 0x000A000A }, // jeq (u32)r1, 0xA000A, +1
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 100 },        // skipped
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 1 },          // r1 = r1 + 1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == 0xFFFFFFFF000A000B && ret == 0xFFFFFFFF000A000B);
+    print_test_result("test_jmp32_jeq_imm_true", success);
+    assert(success);
+}
+
+// --- Load/Store Tests ---
+void test_ldx_stx_stack() {
+    std::cout << "--- Running Test: test_ldx_stx_stack ---" << std::endl;
+    vm ebpf_vm;
+    uint64_t val_to_store = 0xABCDEF0123456789;
+    bpf_insn instructions[] = {
+        // Store a 64-bit value onto the stack
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val_to_store & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(val_to_store >> 32) },
+        { BPF_STX | BPF_MEM | BPF_DW, 10, 1, -8, 0 }, // *(u64 *)(r10 - 8) = r1
+
+        // Store a 32-bit value
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, (int32_t)0xCAFEBABE }, // mov r2, 0xCAFEBABE
+        { BPF_STX | BPF_MEM | BPF_W, 10, 2, -12, 0 }, // *(u32 *)(r10 - 12) = r2
+
+        // Load the 64-bit value back
+        { BPF_LDX | BPF_MEM | BPF_DW, 3, 10, -8, 0 }, // r3 = *(u64 *)(r10 - 8)
+
+        // Load the 32-bit value back (zero-extended to 64-bit)
+        { BPF_LDX | BPF_MEM | BPF_W, 4, 10, -12, 0 }, // r4 = *(u32 *)(r10 - 12)
+
+        // Store immediate byte
+        { BPF_ST | BPF_MEM | BPF_B, 10, 0, -13, 0xEE },// *(u8 *)(r10 - 13) = 0xEE
+        // Load immediate byte
+        { BPF_LDX | BPF_MEM | BPF_B, 5, 10, -13, 0 },  // r5 = *(u8 *)(r10 - 13)
+
+
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 3, 0, 0 },   // r0 = r3 (for checking the 64-bit value)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+
+    bool success = (ret == val_to_store &&
+                    ebpf_vm.r(3) == val_to_store &&
+                    ebpf_vm.r(4) == 0xCAFEBABE && // Loaded 32-bit, zero extended
+                    ebpf_vm.r(5) == 0xEE);
+    print_test_result("test_ldx_stx_stack", success);
+    assert(success);
+}
+
+// --- Load Immediate 64-bit ---
+void test_ld_imm64() {
+    std::cout << "--- Running Test: test_ld_imm64 ---" << std::endl;
+    vm ebpf_vm;
+    uint64_t immediate_val = 0x11223344AABBCCDD;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(immediate_val & 0xFFFFFFFF) }, // lddw r1, immediate_val (low 32 bits)
+        { 0, 0, 0, 0, (int32_t)(immediate_val >> 32) },                                // (high 32 bits)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool success = (ebpf_vm.r(1) == immediate_val && ret == immediate_val);
+    print_test_result("test_ld_imm64", success);
+    assert(success);
+}
+
+
+void test_call_relative() {
+    std::cout << "--- Running Test: test_call_relative ---" << std::endl;
+    vm ebpf_vm;
+
+    // Main function code
+    bpf_insn main_instructions[] = {
+        // Main func: insn 0, 1 (CALL), 2, 3, 4 (EXIT)
+        // Helper func starts at insn 5
+        // CALL at insn 1. Target is insn 5. Offset = 5 - (1+1) = 3.
+        // The immediate in BPF_CALL (src_reg=1) is relative to PC of *next* instruction.
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 10 }, // main: mov r1, 10 (pc=0)
+        { BPF_JMP | BPF_CALL, 0, 1, 0, 3 },           // main: call +3 (pc=1) -> target is pc+1+3 = 5
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 100}, // main: r1 += 100 (after call) (pc=2)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },  // main: mov r0, r1 (pc=3)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },           // main: exit (pc=4)
+        // helper_start: (at index 5 from start of this combined block)
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 5 },  // helper: add r1, 5 (pc=5)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }            // helper: return (pc=6)
+    };
+
+    assert(load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option); // Main starts at 0x1000
+
+    // Expected: r1 = 10 (initial) -> helper adds 5 (r1=15) -> returns -> main adds 100 (r1=115)
+    bool success = (ebpf_vm.r(1) == 115 && ret == 115);
+    print_test_result("test_call_relative", success);
+    assert(success);
+}
+
+
+void test_call_pseudo_func() {
+    std::cout << "--- Running Test: test_call_pseudo_func ---" << std::endl;
+    vm ebpf_vm;
+    uint64_t helper_paddr = 0x2000;
+
+    // Main function code
+    bpf_insn main_instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 20 },  // mov r1, 20 (arg for helper)
+        // For BPF_CALL | BPF_X, dst_reg contains the target address.
+        // We need to load helper_paddr into a register, say r6.
+        // This requires a 64-bit immediate load (lddw).
+        { BPF_LD | BPF_IMM | BPF_DW, 6, 0, 0, (int32_t)(helper_paddr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(helper_paddr >> 32) },
+        // Now r6 holds helper_paddr
+        { BPF_JMP | BPF_CALL | BPF_X, 6, 0, 0, 0 },    // call r6 (dst_reg is 6, src_reg is ignored)
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 200},  // r1 += 200 (after call returns)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }             // exit from main
+    };
+
+    // Simple helper function (add 5 to r1)
+    bpf_insn helper_func_code[] = {
+        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 5 }, // add r1, 5
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }           // return from helper (effectively BPF_JA to caller's pc+1)
+    };
+
+    assert(load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn))); // Loads at 0x1000
+    assert(load_program_to_vm(ebpf_vm, helper_func_code, sizeof(helper_func_code) / sizeof(bpf_insn), helper_paddr));
+
+    uint64_t ret = ebpf_vm.run(&option); // Main starts at 0x1000
+
+    // Expected: r1 = 20 (initial) -> helper adds 5 (r1=25) -> returns -> main adds 200 (r1=225)
+    bool success = (ebpf_vm.r(1) == 225 && ret == 225);
+    print_test_result("test_call_pseudo_func", success);
+    assert(success);
+}
+
+
+int main() {
+    std::cout << "Starting eBPF VM Tests..." << std::endl;
+
+    // ALU64 Tests
+    test_alu64_add_imm();
+    test_alu64_sub_reg();
+    test_alu64_mul_imm();
+    test_alu64_div_imm();
+    test_alu64_div_by_zero_imm();
+    test_alu64_mod_imm();
+    test_alu64_mod_by_zero_imm();
+    test_alu64_and_imm();
+    test_alu64_or_reg();
+    test_alu64_lsh_imm();
+    test_alu64_rsh_imm();
+    test_alu64_arsh_imm();
+    test_alu64_neg();
+
+    // ALU32 Tests
+    test_alu32_add_imm();
+    test_alu32_sub_reg();
+
+    // JMP Tests
+    test_jmp_ja();
+    test_jmp_jeq_imm_true();
+    test_jmp_jeq_imm_false();
+    test_jmp_jsgt_reg_true();
+    test_jmp_jslt_imm_false_signed();
+
+    // JMP32 Tests
+    test_jmp32_jeq_imm_true();
+
+    // Load/Store Tests
+    test_ldx_stx_stack();
+
+    // Load Immediate 64-bit
+    test_ld_imm64();
+
+    // Function Call Tests
+    test_call_relative();
+    test_call_pseudo_func();
+
+    std::cout << "All eBPF VM Tests completed." << std::endl;
+    return 0;
+}
