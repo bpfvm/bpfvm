@@ -424,6 +424,18 @@ bool vm::jmp32() {
 }
 
 
+void vm::log_mem_violation(const char* type, uint64_t addr) {
+    std::cerr << "Memory access violation at PC 0x" << std::hex << unmmu(pc)
+              << ": invalid " << type << " at address 0x" << addr << std::dec << std::endl;
+    std::cerr << "Current memory maps:" << std::endl;
+    for(const auto& map : maps) {
+        std::cerr << "  Start: 0x" << std::hex << map.paddr 
+                  << " End: 0x" << (map.paddr + map.size) 
+                  << " Size: 0x" << map.size 
+                  << " Flags: " << map.flags << std::dec << std::endl;
+    }
+}
+
 bool vm::ld() {
     if(pc->dst_reg >= 10) {
         return false;
@@ -437,7 +449,12 @@ bool vm::ldx() {
     if(pc->dst_reg >= 10) {
         return false;
     }
-    void* addr = mmu(r(pc->src_reg) + pc->off);
+    uint64_t target_addr = r(pc->src_reg) + pc->off;
+    void* addr = mmu(target_addr);
+    if (addr == nullptr) {
+        log_mem_violation("read", target_addr);
+        return false;
+    }
     if((pc->code & 0xe0) == BPF_MEM) {
         switch(pc->code & 0x18) {
         case BPF_DW:
@@ -474,7 +491,12 @@ bool vm::ldx() {
 }
 
 bool vm::st() {
-    void* addr = mmu(r(pc->dst_reg) + pc->off);
+    uint64_t target_addr = r(pc->dst_reg) + pc->off;
+    void* addr = mmu(target_addr);
+    if (addr == nullptr) {
+        log_mem_violation("write", target_addr);
+        return false;
+    }
     switch (pc->code & 0x18) {
     case BPF_DW:
         *(uint64_t*)addr = pc->imm;
@@ -496,7 +518,12 @@ bool vm::stx() {
     if((pc->code & 0xe0) == BPF_ATOMIC) {
         return false;
     }
-    void* addr = mmu(r(pc->dst_reg) + pc->off);
+    uint64_t target_addr = r(pc->dst_reg) + pc->off;
+    void* addr = mmu(target_addr);
+    if (addr == nullptr) {
+        log_mem_violation("write", target_addr);
+        return false;
+    }
     switch (pc->code & 0x18) {
     case BPF_DW:
         *(uint64_t*)addr = r(pc->src_reg);

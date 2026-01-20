@@ -158,6 +158,7 @@ class vm {
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
+    void log_mem_violation(const char* type, uint64_t addr);
     bool ld();
     bool ldx();
     bool st();
