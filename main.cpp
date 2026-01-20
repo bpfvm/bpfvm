@@ -105,8 +105,12 @@ int main(int argc, char** argv) {
         map.paddr = phdr.p_vaddr;
         map.size = phdr.p_memsz;
         if(phdr.p_flags & PF_W) {
-            map.data = (unsigned char*)malloc(map.size);
-            if(pread(fd, map.data, phdr.p_filesz, phdr.p_offset) != phdr.p_filesz) {
+            map.data = (unsigned char*)mmap(nullptr, map.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if(map.data == MAP_FAILED) {
+                std::cerr << "Failed to mmap section: " << strerror(errno) << std::endl;
+                return 1;
+            }
+            if(pread(fd, map.data, phdr.p_filesz, phdr.p_offset) != (ssize_t)phdr.p_filesz) {
                 std::cerr << "Failed to read section: " << strerror(errno) << std::endl;
                 return 1;
             }

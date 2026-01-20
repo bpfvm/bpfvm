@@ -15,7 +15,7 @@
 
 
 memmap::~memmap() {
-    if(data == nullptr) {
+    if(data == nullptr || data == MAP_FAILED) {
         return;
     }
     munmap(data, size);
