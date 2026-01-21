@@ -15,6 +15,9 @@ struct vmOptions option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
+    .envp = nullptr,
+    .argc = 0,
+    .argv = nullptr,
 };
 
 // Helper function to load BPF program code into the VM's memory
@@ -269,17 +272,17 @@ void test_alu64_neg() {
 void test_alu32_add_imm() {
     std::cout << "--- Running Test: test_alu32_add_imm ---" << std::endl;
     vm ebpf_vm;
-    ebpf_vm.r(1) = 0xFFFFFFFF000000AA; // Set r1 with high bits set
+    ebpf_vm.r(2) = 0xFFFFFFFF000000AA; // Set r2 with high bits set
     bpf_insn instructions[] = {
-        // r1 is pre-set
-        { BPF_ALU | BPF_ADD | BPF_K, 1, 0, 0, 0x55 },  // add r1, 0x55 (32-bit) ; r1 = 0xAA + 0x55 = 0xFF
-                                                       // High bits of r1 should be cleared
-        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1
+        // r2 is pre-set
+        { BPF_ALU | BPF_ADD | BPF_K, 2, 0, 0, 0x55 },  // add r2, 0x55 (32-bit) ; r2 = 0xAA + 0x55 = 0xFF
+                                                       // High bits of r2 should be cleared
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },   // mov r0, r2
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
     uint64_t ret = ebpf_vm.run(&option);
-    bool success = (ebpf_vm.r(1) == 0xFF && ret == 0xFF); // High bits cleared
+    bool success = (ebpf_vm.r(2) == 0xFF && ret == 0xFF); // High bits cleared
     print_test_result("test_alu32_add_imm", success);
     assert(success);
 }
@@ -287,16 +290,16 @@ void test_alu32_add_imm() {
 void test_alu32_sub_reg() {
     std::cout << "--- Running Test: test_alu32_sub_reg ---" << std::endl;
     vm ebpf_vm;
-    ebpf_vm.r(1) = 0xFFFFFFFF000000C8; // 200
-    ebpf_vm.r(2) = 0x000000000000004B; // 75
+    ebpf_vm.r(2) = 0xFFFFFFFF000000C8; // 200
+    ebpf_vm.r(3) = 0x000000000000004B; // 75
     bpf_insn instructions[] = {
-        { BPF_ALU | BPF_SUB | BPF_X, 1, 2, 0, 0 },   // sub r1, r2 (32-bit) ; r1 = 200 - 75 = 125
-        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_ALU | BPF_SUB | BPF_X, 2, 3, 0, 0 },   // sub r2, r3 (32-bit) ; r2 = 200 - 75 = 125
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
     uint64_t ret = ebpf_vm.run(&option);
-    bool success = (ebpf_vm.r(1) == 125 && ret == 125);
+    bool success = (ebpf_vm.r(2) == 125 && ret == 125);
     print_test_result("test_alu32_sub_reg", success);
     assert(success);
 }
@@ -400,17 +403,17 @@ void test_jmp_jslt_imm_false_signed() {
 void test_jmp32_jeq_imm_true() {
     std::cout << "--- Running Test: test_jmp32_jeq_imm_true ---" << std::endl;
     vm ebpf_vm;
-    ebpf_vm.r(1) = 0xFFFFFFFF000A000A; // r1 = 0xA000A (high bits will be ignored by jmp32)
+    ebpf_vm.r(2) = 0xFFFFFFFF000A000A; // r2 = 0xA000A (high bits will be ignored by jmp32)
     bpf_insn instructions[] = {
-        { BPF_JMP32 | BPF_JEQ | BPF_K, 1, 0, 1, 0x000A000A }, // jeq (u32)r1, 0xA000A, +1
+        { BPF_JMP32 | BPF_JEQ | BPF_K, 2, 0, 1, 0x000A000A }, // jeq (u32)r2, 0xA000A, +1
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 100 },        // skipped
-        { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 1 },          // r1 = r1 + 1
-        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_ALU64 | BPF_ADD | BPF_K, 2, 0, 0, 1 },          // r2 = r2 + 1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
     uint64_t ret = ebpf_vm.run(&option);
-    bool success = (ebpf_vm.r(1) == 0xFFFFFFFF000A000B && ret == 0xFFFFFFFF000A000B);
+    bool success = (ebpf_vm.r(2) == 0xFFFFFFFF000A000B && ret == 0xFFFFFFFF000A000B);
     print_test_result("test_jmp32_jeq_imm_true", success);
     assert(success);
 }

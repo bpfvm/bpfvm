@@ -11,8 +11,8 @@
 #include <stddef.h>
 #include <assert.h>
 
-#define STACK_SIZE (1024 * 1024)
-#define STACK_BASE STACK_SIZE
+#define STACK_SIZE (8 * 1024 * 1024)
+#define STACK_BASE 0x10000000ULL
 #define STACK_LIMIT 4096
 
 #ifndef PF_X
@@ -147,6 +147,9 @@ struct vmOptions {
     bool verbose;
     uint64_t breakpoint;
     bool step_run;
+    const char** envp;
+    size_t argc;
+    char** argv;
 };
 
 class vm {

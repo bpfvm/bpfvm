@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
+#include <string.h>
 
 
 memmap::~memmap() {
@@ -276,6 +277,7 @@ bool vm::jmp() {
                     r(0) = -errno;
                     break;
                 }
+                r(0) = rc;
                 break;
             }
             case BPF_CALL_CLOSE: {
@@ -747,7 +749,6 @@ uint64_t vm::unmmu(const void* addr) {
 void* vm::unmap(uint64_t addr) {
     for(auto it = maps.begin(); it != maps.end(); ++it) {
         if(addr == it->paddr) {
-            auto addr = it->data;
             maps.erase(it);
             return it->data;
         }
@@ -761,6 +762,85 @@ uint64_t vm::run(const vmOptions* options) {
     if(options->verbose) {
         printf("entry: 0x%lx\n", options->entry);
     }
+
+    const char** envp = options->envp;
+    size_t argc = options->argc;
+    char** argv = options->argv;
+
+    unsigned char* stack_base = (unsigned char*)mmu(STACK_BASE);
+    if(stack_base == nullptr) {
+        std::cerr << "Failed to map stack base" << std::endl;
+        return 0;
+    }
+
+    if(argc > 0 && argv == nullptr) {
+        std::cerr << "argv is null with positive argc" << std::endl;
+        return 0;
+    }
+
+    size_t envc = 0;
+    if(envp != nullptr) {
+        while(envp[envc] != nullptr) {
+            envc++;
+        }
+    }
+
+    size_t strings_bytes = 0;
+    for(size_t i = 0; i < argc; i++) {
+        strings_bytes += strlen(argv[i]) + 1;
+    }
+    for(size_t i = 0; i < envc; i++) {
+        strings_bytes += strlen(envp[i]) + 1;
+    }
+
+    // Stack layout at STACK_BASE (low to high):
+    // +------------------+
+    // | argc             |
+    // +------------------+
+    // | argv[0] ptr       |
+    // | argv[1] ptr       |
+    // | ...               |
+    // | argv[argc-1] ptr  |
+    // | NULL              |
+    // +------------------+
+    // | envp[0] ptr       |
+    // | envp[1] ptr       |
+    // | ...               |
+    // | envp[envc-1] ptr  |
+    // | NULL              |
+    // +------------------+
+    // | argv/env strings  |
+    // +------------------+
+    size_t header_qwords = 1 + (argc + 1) + (envc + 1);
+    size_t header_bytes = header_qwords * sizeof(uint64_t);
+    size_t total_bytes = header_bytes + strings_bytes;
+    if(total_bytes > STACK_SIZE) {
+        std::cerr << "Stack arguments exceed stack size" << std::endl;
+        return 0;
+    }
+
+    uint64_t* header = (uint64_t*)stack_base;
+    header[0] = argc;
+    size_t cursor = header_bytes;
+
+    for(size_t i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        memcpy(stack_base + cursor, argv[i], len);
+        header[1 + i] = STACK_BASE + cursor;
+        cursor += len;
+    }
+    header[1 + argc] = 0;
+
+    size_t env_base = 1 + (argc + 1);
+    for(size_t i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        memcpy(stack_base + cursor, envp[i], len);
+        header[env_base + i] = STACK_BASE + cursor;
+        cursor += len;
+    }
+    header[env_base + envc] = 0;
+
+    reg[1] = STACK_BASE;
     pc = (const bpf_insn*)mmu(options->entry);
     frames.emplace(nullptr, reg);
     while(step()) {

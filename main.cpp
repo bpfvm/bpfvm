@@ -128,8 +128,10 @@ int main(int argc, char** argv) {
     close(fd);
 
     signal(SIGTRAP, SIG_IGN);
-    vm.r(1) = 10;
-    vm.r(2) = 20;
     options.entry = ehdr.e_entry;
+    extern char **environ;
+    options.envp = (const char**)environ;
+    options.argc = (size_t)(argc - optind);
+    options.argv = argv + optind;
     std::cout<<(int)vm.run(&options)<<std::endl;
 }
