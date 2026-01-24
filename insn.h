@@ -174,6 +174,7 @@ class vm {
 
 public:
     vm();
+    uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     uint64_t& r(int n) {
         return reg[n];

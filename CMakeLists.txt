@@ -16,3 +16,4 @@ target_link_libraries(bpfvm ${LIBELF_LIBRARIES})
 
 
 add_executable(bpfvm_test insn.cpp insn_test.cpp)
+target_link_libraries(bpfvm_test ${LIBELF_LIBRARIES})
