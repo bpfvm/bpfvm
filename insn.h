@@ -5,11 +5,12 @@
 #ifndef INSN_H
 #define INSN_H
 #include <list>
-#include <stack>
+#include <deque>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <assert.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -154,11 +155,14 @@ struct vmOptions {
 };
 
 class vm {
+    static std::atomic<uint64_t> next_pid;
     vmOptions options;
     const bpf_insn* pc;
     uint64_t reg[11];
-    std::stack<frame> frames;
+    std::deque<frame> frames;
     std::list<memmap> maps;
+    uint64_t pid = 0;
+    uint64_t ppid = 0;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
@@ -189,29 +193,32 @@ class vm {
     bool do_renameat();
     bool do_readlink();
     bool do_execve();
+    bool do_fork();
+    bool do_getpid();
 
 public:
-    vm();
+    explicit vm(uint64_t ppid = 0);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     uint64_t& r(int n) {
         return reg[n];
     }
     void push_frame() {
-        frames.emplace(pc, reg);
+        frames.emplace_back(pc, reg);
         reg[10] -= STACK_LIMIT;
     }
     void pop_frame() {
         assert(!frames.empty());
-        pc = frames.top().pc;
-        reg[6] = frames.top().r6;
-        reg[7] = frames.top().r7;
-        reg[8] = frames.top().r8;
-        reg[9] = frames.top().r9;
-        reg[10] = frames.top().r10;
-        frames.pop();
+        pc = frames.back().pc;
+        reg[6] = frames.back().r6;
+        reg[7] = frames.back().r7;
+        reg[8] = frames.back().r8;
+        reg[9] = frames.back().r9;
+        reg[10] = frames.back().r10;
+        frames.pop_back();
     }
     uint64_t run(const vmOptions* options);
+    uint64_t run_forked();
 };
 
 

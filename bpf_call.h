@@ -19,6 +19,8 @@
 #define BPF_CALL_RENAMEAT  0x1000C
 #define BPF_CALL_READLINK  0x1000D
 #define BPF_CALL_EXECVE    0x1000E
+#define BPF_CALL_FORK      0x1000F
+#define BPF_CALL_GETPID    0x10010
 
 
 #endif //BPF_CALL_H

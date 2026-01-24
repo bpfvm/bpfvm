@@ -18,6 +18,8 @@
 #include <errno.h>
 
 
+std::atomic<uint64_t> vm::next_pid{1};
+
 memmap::~memmap() {
     if(data == nullptr || data == MAP_FAILED) {
         return;
@@ -147,7 +149,9 @@ void dump(uint64_t addr, const bpf_insn* insn) {
     }
 }
 
-vm::vm() {
+vm::vm(uint64_t ppid) {
+    pid = next_pid.fetch_add(1);
+    this->ppid = ppid;
     memmap stack_memmap;
     stack_memmap.data = (unsigned char *)mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     stack_memmap.size = STACK_SIZE;
@@ -782,11 +786,19 @@ uint64_t vm::run(const vmOptions* options) {
         return 0;
     }
     pc = (const bpf_insn*)mmu(options->entry);
-    frames.emplace(nullptr, reg);
+    frames.emplace_back(nullptr, reg);
     while(step()) {
         pc++;
     }
-    frames = {};
+    frames.clear();
+    return r(0);
+}
+
+uint64_t vm::run_forked() {
+    while(step()) {
+        pc++;
+    }
+    frames.clear();
     return r(0);
 }
 
