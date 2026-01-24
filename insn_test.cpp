@@ -15,9 +15,8 @@ struct vmOptions option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
-    .envp = nullptr,
-    .argc = 0,
-    .argv = nullptr,
+    .argv = {},
+    .envp = {},
 };
 
 // Helper function to load BPF program code into the VM's memory

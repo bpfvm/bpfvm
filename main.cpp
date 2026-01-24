@@ -54,9 +54,15 @@ int main(int argc, char** argv) {
 
     signal(SIGTRAP, SIG_IGN);
     options.entry = entry;
+    options.argv.reserve(argc - optind);
+    for(int i = optind; i < argc; i++) {
+        options.argv.emplace_back(argv[i]);
+    }
     extern char **environ;
-    options.envp = (const char**)environ;
-    options.argc = (size_t)(argc - optind);
-    options.argv = argv + optind;
+    if(environ != nullptr) {
+        for(size_t i = 0; environ[i] != nullptr; i++) {
+            options.envp.emplace_back(environ[i]);
+        }
+    }
     std::cout<<(int)vm.run(&options)<<std::endl;
 }

@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <assert.h>
+#include <string>
+#include <vector>
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
@@ -147,9 +149,8 @@ struct vmOptions {
     bool verbose;
     uint64_t breakpoint;
     bool step_run;
-    const char** envp;
-    size_t argc;
-    char** argv;
+    std::vector<std::string> argv;
+    std::vector<std::string> envp;
 };
 
 class vm {
@@ -171,6 +172,9 @@ class vm {
     bool jmp();
     bool jmp32();
     bool step();
+    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
+    bool read_c_string(uint64_t addr, std::string& out, size_t max_len);
+    bool read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
 
 public:
     vm();

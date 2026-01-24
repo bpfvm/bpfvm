@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <string.h>
+#include <errno.h>
 
 
 memmap::~memmap() {
@@ -335,8 +336,12 @@ bool vm::jmp() {
                 break;
             }
             case BPF_CALL_OPEN:{
-                const char* path = (const char*)mmu(r(1));
-                int fd = open(path, r(2), r(3));
+                std::string path;
+                if(!read_c_string(r(1), path, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                int fd = open(path.c_str(), r(2), r(3));
                 if(fd == -1) {
                     r(0) = -errno;
                     break;
@@ -381,7 +386,12 @@ bool vm::jmp() {
                 break;
             }
             case BPF_CALL_UNLINK: {
-                int rc = unlink((const char*)mmu(r(1)));
+                std::string path;
+                if(!read_c_string(r(1), path, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                int rc = unlink(path.c_str());
                 if(rc == -1) {
                     r(0) = -errno;
                     break;
@@ -390,7 +400,13 @@ bool vm::jmp() {
                 break;
             }
             case BPF_CALL_RENAMEAT: {
-                int rc = renameat(r(1), (const char*)mmu(r(2)), r(3), (const char*)mmu(r(4)));
+                std::string old_path;
+                std::string new_path;
+                if(!read_c_string(r(2), old_path, 4096) || !read_c_string(r(4), new_path, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                int rc = renameat(r(1), old_path.c_str(), r(3), new_path.c_str());
                 if(rc == -1) {
                     r(0) = -errno;
                     break;
@@ -399,12 +415,68 @@ bool vm::jmp() {
                 break;
             }
             case BPF_CALL_READLINK: {
-                int rc = readlink((const char*)mmu(r(1)), (char*)mmu(r(2)), r(3));
+                std::string path;
+                if(!read_c_string(r(1), path, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                int rc = readlink(path.c_str(), (char*)mmu(r(2)), r(3));
                 if(rc == -1) {
                     r(0) = -errno;
                     break;
                 }
                 r(0) = rc;
+                break;
+            }
+            case BPF_CALL_EXECVE: {
+                std::string path;
+                std::vector<std::string> argv_strings;
+                std::vector<std::string> envp_strings;
+                if(!read_c_string(r(1), path, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                if(!read_c_string_array(r(2), argv_strings, 1024, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+                if(!read_c_string_array(r(3), envp_strings, 1024, 4096)) {
+                    r(0) = -EFAULT;
+                    break;
+                }
+
+                vm fresh;
+                uint64_t entry = fresh.load_elf(path.c_str());
+                if(entry == 0) {
+                    r(0) = -ENOEXEC;
+                    break;
+                }
+
+                for(size_t i = 0; i < 11; i++) {
+                    fresh.reg[i] = 0;
+                }
+                fresh.reg[10] = STACK_BASE + STACK_SIZE - 8;
+                if(!fresh.setup_stack(argv_strings, envp_strings)) {
+                    r(0) = -E2BIG;
+                    break;
+                }
+                const bpf_insn* new_pc = (const bpf_insn*)fresh.mmu(entry);
+                if(new_pc == nullptr) {
+                    r(0) = -ENOEXEC;
+                    break;
+                }
+
+                maps.swap(fresh.maps);
+                while(!frames.empty()) {
+                    frames.pop();
+                }
+                for(size_t i = 0; i < 11; i++) {
+                    reg[i] = fresh.reg[i];
+                }
+                frames.emplace(nullptr, reg);
+                pc = new_pc;
+                pc--;
+                r(0) = 0;
                 break;
             }
             default:
@@ -445,6 +517,48 @@ bool vm::jmp() {
         break;
     }
     return true;
+}
+
+bool vm::read_c_string(uint64_t addr, std::string& out, size_t max_len) {
+    out.clear();
+    if(addr == 0) {
+        return false;
+    }
+    for(size_t i = 0; i < max_len; i++) {
+        void* p = mmu(addr + i);
+        if(p == nullptr) {
+            return false;
+        }
+        char c = *(char*)p;
+        if(c == '\0') {
+            return true;
+        }
+        out.push_back(c);
+    }
+    return false;
+}
+
+bool vm::read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len) {
+    out.clear();
+    if(addr == 0) {
+        return true;
+    }
+    for(size_t i = 0; i < max_count; i++) {
+        void* p = mmu(addr + i * sizeof(uint64_t));
+        if(p == nullptr) {
+            return false;
+        }
+        uint64_t str_addr = *(uint64_t*)p;
+        if(str_addr == 0) {
+            return true;
+        }
+        std::string value;
+        if(!read_c_string(str_addr, value, max_str_len)) {
+            return false;
+        }
+        out.push_back(std::move(value));
+    }
+    return false;
 }
 
 bool vm::jmp32() {
@@ -854,34 +968,31 @@ uint64_t vm::run(const vmOptions* options) {
         printf("entry: 0x%lx\n", options->entry);
     }
 
-    const char** envp = options->envp;
-    size_t argc = options->argc;
-    char** argv = options->argv;
+    if(!setup_stack(options->argv, options->envp)) {
+        return 0;
+    }
+    pc = (const bpf_insn*)mmu(options->entry);
+    frames.emplace(nullptr, reg);
+    while(step()) {
+        pc++;
+    }
+    frames = {};
+    return r(0);
+}
 
+bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp) {
     unsigned char* stack_base = (unsigned char*)mmu(STACK_BASE);
     if(stack_base == nullptr) {
         std::cerr << "Failed to map stack base" << std::endl;
-        return 0;
-    }
-
-    if(argc > 0 && argv == nullptr) {
-        std::cerr << "argv is null with positive argc" << std::endl;
-        return 0;
-    }
-
-    size_t envc = 0;
-    if(envp != nullptr) {
-        while(envp[envc] != nullptr) {
-            envc++;
-        }
+        return false;
     }
 
     size_t strings_bytes = 0;
-    for(size_t i = 0; i < argc; i++) {
-        strings_bytes += strlen(argv[i]) + 1;
+    for(const auto& arg : argv) {
+        strings_bytes += arg.size() + 1;
     }
-    for(size_t i = 0; i < envc; i++) {
-        strings_bytes += strlen(envp[i]) + 1;
+    for(const auto& env : envp) {
+        strings_bytes += env.size() + 1;
     }
 
     // Stack layout at STACK_BASE (low to high):
@@ -902,41 +1013,35 @@ uint64_t vm::run(const vmOptions* options) {
     // +------------------+
     // | argv/env strings  |
     // +------------------+
-    size_t header_qwords = 1 + (argc + 1) + (envc + 1);
+    size_t header_qwords = 1 + (argv.size() + 1) + (envp.size() + 1);
     size_t header_bytes = header_qwords * sizeof(uint64_t);
     size_t total_bytes = header_bytes + strings_bytes;
     if(total_bytes > STACK_SIZE) {
         std::cerr << "Stack arguments exceed stack size" << std::endl;
-        return 0;
+        return false;
     }
 
     uint64_t* header = (uint64_t*)stack_base;
-    header[0] = argc;
+    header[0] = argv.size();
     size_t cursor = header_bytes;
 
-    for(size_t i = 0; i < argc; i++) {
-        size_t len = strlen(argv[i]) + 1;
-        memcpy(stack_base + cursor, argv[i], len);
+    for(size_t i = 0; i < argv.size(); i++) {
+        size_t len = argv[i].size() + 1;
+        memcpy(stack_base + cursor, argv[i].c_str(), len);
         header[1 + i] = STACK_BASE + cursor;
         cursor += len;
     }
-    header[1 + argc] = 0;
+    header[1 + argv.size()] = 0;
 
-    size_t env_base = 1 + (argc + 1);
-    for(size_t i = 0; i < envc; i++) {
-        size_t len = strlen(envp[i]) + 1;
-        memcpy(stack_base + cursor, envp[i], len);
+    size_t env_base = 1 + (argv.size() + 1);
+    for(size_t i = 0; i < envp.size(); i++) {
+        size_t len = envp[i].size() + 1;
+        memcpy(stack_base + cursor, envp[i].c_str(), len);
         header[env_base + i] = STACK_BASE + cursor;
         cursor += len;
     }
-    header[env_base + envc] = 0;
+    header[env_base + envp.size()] = 0;
 
     reg[1] = STACK_BASE;
-    pc = (const bpf_insn*)mmu(options->entry);
-    frames.emplace(nullptr, reg);
-    while(step()) {
-        pc++;
-    }
-    frames = {};
-    return r(0);
+    return true;
 }
