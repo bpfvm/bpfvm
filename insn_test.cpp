@@ -1,7 +1,11 @@
 #include "insn.h"
+#include "bpf_call.h"
 #include <iostream>
 #include <cassert>
+#include <cstdio>
 #include <cstring> // For memcpy
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -47,6 +51,29 @@ bool load_program_to_vm(vm& ebpf_vm, const bpf_insn* instructions, size_t num_in
     prog_mem.data = prog_data;
     prog_mem.flags = PF_R | PF_X | PF_W; // PF_W for free() by memmap destructor, PF_R | PF_X for execution
     ebpf_vm.addmem(std::move(prog_mem));
+    return true;
+}
+
+bool add_data_mem(vm& ebpf_vm, uint64_t paddr, size_t size, unsigned char** out_ptr) {
+    if(size == 0) {
+        return false;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    size_t map_size = (size + page_size - 1) / page_size * page_size;
+    unsigned char* data = (unsigned char*)mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) {
+        std::cerr << "Error: Failed to allocate memory for data memmap." << std::endl;
+        return false;
+    }
+    memmap data_mem;
+    data_mem.paddr = paddr;
+    data_mem.size = map_size;
+    data_mem.data = data;
+    data_mem.flags = PF_R | PF_W;
+    ebpf_vm.addmem(std::move(data_mem));
+    if(out_ptr != nullptr) {
+        *out_ptr = data;
+    }
     return true;
 }
 
@@ -544,6 +571,116 @@ void test_call_pseudo_func() {
     assert(success);
 }
 
+void test_syscall_gettimeofday() {
+    std::cout << "--- Running Test: test_syscall_gettimeofday ---" << std::endl;
+    vm ebpf_vm;
+    unsigned char* data = nullptr;
+    uint64_t data_paddr = 0x3000;
+    size_t data_size = 128;
+    assert(add_data_mem(ebpf_vm, data_paddr, data_size, &data));
+    memset(data, 0, data_size);
+
+    uint64_t tv_addr = data_paddr;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(tv_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(tv_addr >> 32) },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 }, // tz = NULL
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_GETTIMEOFDAY },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    struct timeval* tv = (struct timeval*)data;
+    bool success = (ret == 0 && tv->tv_sec > 0);
+    print_test_result("test_syscall_gettimeofday", success);
+    assert(success);
+}
+
+void test_syscall_file_io() {
+    std::cout << "--- Running Test: test_syscall_file_io ---" << std::endl;
+    vm ebpf_vm;
+    unsigned char* data = nullptr;
+    uint64_t data_paddr = 0x4000;
+    size_t data_size = 256;
+    assert(add_data_mem(ebpf_vm, data_paddr, data_size, &data));
+    memset(data, 0, data_size);
+
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/bpfvm_syscall_test_%d.txt", getpid());
+    unlink(path);
+
+    size_t path_len = strlen(path) + 1;
+    uint64_t path_addr = data_paddr;
+    memcpy(data, path, path_len);
+
+    const char* payload = "hello";
+    size_t payload_len = strlen(payload);
+    uint64_t write_buf_addr = data_paddr + 64;
+    uint64_t read_buf_addr = data_paddr + 96;
+    memcpy(data + 64, payload, payload_len);
+
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(path_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(path_addr >> 32) },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, O_CREAT | O_TRUNC | O_RDWR },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0644 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_OPEN },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 }, // r6 = fd
+
+        { BPF_LD | BPF_IMM | BPF_DW, 2, 0, 0, (int32_t)(write_buf_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(write_buf_addr >> 32) },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 }, // r1 = fd
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, (int)payload_len },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WRITE },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 7, 0, 0, 0 }, // r7 = write rc
+
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 }, // r1 = fd
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 }, // SEEK_SET
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_LSEEK },
+
+        { BPF_LD | BPF_IMM | BPF_DW, 2, 0, 0, (int32_t)(read_buf_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(read_buf_addr >> 32) },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 }, // r1 = fd
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, (int)payload_len },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_READ },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 8, 0, 0, 0 }, // r8 = read rc
+
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 }, // r1 = fd
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_CLOSE },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 5, 0, 0, 0 }, // r5 = close rc
+
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(path_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(path_addr >> 32) },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_UNLINK },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 9, 0, 0, 0 }, // r9 = unlink rc
+
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 8, 0, 0 }, // r0 = read rc
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm.run(&option);
+    bool unlinked = (access(path, F_OK) == -1 && errno == ENOENT);
+    bool success = (ret == payload_len &&
+                    memcmp(data + 96, payload, payload_len) == 0 &&
+                    unlinked);
+    if(!success) {
+        std::cout << "  debug: ret=" << (long long)ret
+                  << " fd=" << (long long)ebpf_vm.r(6)
+                  << " write_rc=" << (long long)ebpf_vm.r(7)
+                  << " read_rc=" << (long long)ebpf_vm.r(8)
+                  << " close_rc=" << (long long)ebpf_vm.r(5)
+                  << " unlink_rc=" << (long long)ebpf_vm.r(9)
+                  << " unlinked=" << unlinked
+                  << " read_buf=\"" << std::string((char*)(data + 96), payload_len) << "\""
+                  << std::endl;
+    }
+    print_test_result("test_syscall_file_io", success);
+    assert(success);
+}
+
 
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
@@ -586,6 +723,10 @@ int main() {
     // Function Call Tests
     test_call_relative();
     test_call_pseudo_func();
+
+    // Syscall Tests
+    test_syscall_gettimeofday();
+    test_syscall_file_io();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

@@ -175,6 +175,20 @@ class vm {
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool read_c_string(uint64_t addr, std::string& out, size_t max_len);
     bool read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
+    bool do_syscall(uint32_t call);
+    bool do_mmap();
+    bool do_munmap();
+    bool do_exit();
+    bool do_gettimeofday();
+    bool do_open();
+    bool do_read();
+    bool do_write();
+    bool do_lseek();
+    bool do_close();
+    bool do_unlink();
+    bool do_renameat();
+    bool do_readlink();
+    bool do_execve();
 
 public:
     vm();

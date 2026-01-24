@@ -72,7 +72,7 @@ void dump(uint64_t addr, const bpf_insn* insn) {
             if(insn->code & 0x08)
                 printf("r%d\n", insn->dst_reg);
             else if(insn->src_reg == 0) {
-                printf("sys %d\n", insn->imm);
+                printf("sys 0x%X\n", insn->imm);
             }else if(insn->src_reg == 1) {
                 printf("%d\n", insn->imm);
             }else {
@@ -293,197 +293,7 @@ bool vm::jmp() {
             pc = (const bpf_insn*)mmu(r(pc->dst_reg));
             pc--;
         }else if(pc->src_reg == 0) {
-            switch(pc->imm){
-            case BPF_CALL_MMAP: {
-                void* addr = mmap(nullptr, r(1), r(2), r(3), r(4), r(5));
-                if(addr == MAP_FAILED) {
-                    r(0) = -errno;
-                    break;
-                }
-                memmap mem;
-                mem.data = (unsigned char*)addr;
-                mem.paddr = maps.back().paddr + maps.back().size;
-                mem.flags = r(3);
-                mem.size = r(1);
-                r(0) = mem.paddr;
-                addmem(std::move(mem));
-                break;
-            }
-            case BPF_CALL_MUNMAP: {
-                auto addr = unmap(r(1));
-                if(addr == nullptr) {
-                    r(0) = -EINVAL;
-                    break;
-                }
-                if(munmap(addr, r(2)) == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = 0;
-                break;
-            }
-            case BPF_CALL_EXIT:
-                r(0) = r(1);
-                return false;
-            case BPF_CALL_GETTIMEOFDAY: {
-                struct timeval* tv = (struct timeval*)mmu(r(1));
-                struct timezone* tz = (struct timezone*)mmu(r(2));
-                if(gettimeofday(tv, tz) == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = 0;
-                break;
-            }
-            case BPF_CALL_OPEN:{
-                std::string path;
-                if(!read_c_string(r(1), path, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                int fd = open(path.c_str(), r(2), r(3));
-                if(fd == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = fd;
-                break;
-            }
-            case BPF_CALL_READ: {
-                int rc = read(r(1), mmu(r(2)), r(3));
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = rc;
-                break;
-            }
-            case BPF_CALL_WRITE: {
-                int rc = write(r(1), mmu(r(2)), r(3));
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = rc;
-                break;
-            }
-            case BPF_CALL_LSEEK: {
-                int rc = lseek64(r(1), r(2), r(3));
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = rc;
-                break;
-            }
-            case BPF_CALL_CLOSE: {
-                int rc = close(r(1));
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = 0;
-                break;
-            }
-            case BPF_CALL_UNLINK: {
-                std::string path;
-                if(!read_c_string(r(1), path, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                int rc = unlink(path.c_str());
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = 0;
-                break;
-            }
-            case BPF_CALL_RENAMEAT: {
-                std::string old_path;
-                std::string new_path;
-                if(!read_c_string(r(2), old_path, 4096) || !read_c_string(r(4), new_path, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                int rc = renameat(r(1), old_path.c_str(), r(3), new_path.c_str());
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = 0;
-                break;
-            }
-            case BPF_CALL_READLINK: {
-                std::string path;
-                if(!read_c_string(r(1), path, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                int rc = readlink(path.c_str(), (char*)mmu(r(2)), r(3));
-                if(rc == -1) {
-                    r(0) = -errno;
-                    break;
-                }
-                r(0) = rc;
-                break;
-            }
-            case BPF_CALL_EXECVE: {
-                std::string path;
-                std::vector<std::string> argv_strings;
-                std::vector<std::string> envp_strings;
-                if(!read_c_string(r(1), path, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                if(!read_c_string_array(r(2), argv_strings, 1024, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-                if(!read_c_string_array(r(3), envp_strings, 1024, 4096)) {
-                    r(0) = -EFAULT;
-                    break;
-                }
-
-                vm fresh;
-                uint64_t entry = fresh.load_elf(path.c_str());
-                if(entry == 0) {
-                    r(0) = -ENOEXEC;
-                    break;
-                }
-
-                for(size_t i = 0; i < 11; i++) {
-                    fresh.reg[i] = 0;
-                }
-                fresh.reg[10] = STACK_BASE + STACK_SIZE - 8;
-                if(!fresh.setup_stack(argv_strings, envp_strings)) {
-                    r(0) = -E2BIG;
-                    break;
-                }
-                const bpf_insn* new_pc = (const bpf_insn*)fresh.mmu(entry);
-                if(new_pc == nullptr) {
-                    r(0) = -ENOEXEC;
-                    break;
-                }
-
-                maps.swap(fresh.maps);
-                while(!frames.empty()) {
-                    frames.pop();
-                }
-                for(size_t i = 0; i < 11; i++) {
-                    reg[i] = fresh.reg[i];
-                }
-                frames.emplace(nullptr, reg);
-                pc = new_pc;
-                pc--;
-                r(0) = 0;
-                break;
-            }
-            default:
-                fprintf(stderr, "unsupported func: 0x%x\n", pc->imm);
-                r(0) = -ENOSYS;
-                break;
-            }
+            return do_syscall(pc->imm);
         }else if(pc->src_reg == 1) {
             push_frame();
             pc += pc->imm;
@@ -636,9 +446,9 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
               << ": invalid " << type << " at address 0x" << addr << std::dec << std::endl;
     std::cerr << "Current memory maps:" << std::endl;
     for(const auto& map : maps) {
-        std::cerr << "  Start: 0x" << std::hex << map.paddr 
-                  << " End: 0x" << (map.paddr + map.size) 
-                  << " Size: 0x" << map.size 
+        std::cerr << "  Start: 0x" << std::hex << map.paddr
+                  << " End: 0x" << (map.paddr + map.size)
+                  << " Size: 0x" << map.size
                   << " Flags: " << map.flags << std::dec << std::endl;
     }
 }
