@@ -47,6 +47,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_fork();
     case BPF_CALL_GETPID:
         return do_getpid();
+    case BPF_CALL_WAITPID:
+        return do_waitpid();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -111,12 +113,18 @@ bool vm::do_open() {
         r(0) = -errno;
         return true;
     }
+    fds[fd] = std::make_shared<fd_handle>(fd);
     r(0) = fd;
     return true;
 }
 
 bool vm::do_read() {
-    int rc = read(r(1), mmu(r(2)), r(3));
+    auto it = fds.find(r(1));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    int rc = read(it->second->fd, mmu(r(2)), r(3));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -126,7 +134,12 @@ bool vm::do_read() {
 }
 
 bool vm::do_write() {
-    int rc = write(r(1), mmu(r(2)), r(3));
+    auto it = fds.find(r(1));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    int rc = write(it->second->fd, mmu(r(2)), r(3));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -136,7 +149,12 @@ bool vm::do_write() {
 }
 
 bool vm::do_lseek() {
-    int rc = lseek64(r(1), r(2), r(3));
+    auto it = fds.find(r(1));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    int rc = lseek64(it->second->fd, r(2), r(3));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -146,11 +164,12 @@ bool vm::do_lseek() {
 }
 
 bool vm::do_close() {
-    int rc = close(r(1));
-    if(rc == -1) {
-        r(0) = -errno;
+    auto it = fds.find(r(1));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
         return true;
     }
+    fds.erase(it);
     r(0) = 0;
     return true;
 }
@@ -218,33 +237,33 @@ bool vm::do_execve() {
         return true;
     }
 
-    vm fresh(ppid);
-    uint64_t entry = fresh.load_elf(path.c_str());
+    auto fresh = vm::create(0, {}); //for temporary use
+    uint64_t entry = fresh->load_elf(path.c_str());
     if(entry == 0) {
         r(0) = -ENOEXEC;
         return true;
     }
 
     for(size_t i = 0; i < 11; i++) {
-        fresh.reg[i] = 0;
+        fresh->reg[i] = 0;
     }
-    fresh.reg[10] = STACK_BASE + STACK_SIZE - 8;
-    if(!fresh.setup_stack(argv_strings, envp_strings)) {
+    fresh->reg[10] = STACK_BASE + STACK_SIZE - 8;
+    if(!fresh->setup_stack(argv_strings, envp_strings)) {
         r(0) = -E2BIG;
         return true;
     }
-    const bpf_insn* new_pc = (const bpf_insn*)fresh.mmu(entry);
+    const bpf_insn* new_pc = (const bpf_insn*)fresh->mmu(entry);
     if(new_pc == nullptr) {
         r(0) = -ENOEXEC;
         return true;
     }
 
-    fresh.pid = pid;
-    fresh.ppid = ppid;
-    maps.swap(fresh.maps);
+    fresh->pid = pid;
+    fresh->ppid = ppid;
+    maps.swap(fresh->maps);
     frames.clear();
     for(size_t i = 0; i < 11; i++) {
-        reg[i] = fresh.reg[i];
+        reg[i] = fresh->reg[i];
     }
     frames.emplace_back(nullptr, reg);
     pc = new_pc;
@@ -254,7 +273,7 @@ bool vm::do_execve() {
 }
 
 bool vm::do_fork() {
-    auto child = std::make_shared<vm>(pid);
+    auto child = vm::create(pid, fds);
 
     child->options = options;
     child->maps.clear();
@@ -314,15 +333,71 @@ bool vm::do_fork() {
         return true;
     }
     child->pc = child_pc + 1;
-
+    child->worker = std::thread([child]() {
+        child->run();
+    });
     r(0) = child->pid;
-    std::thread([child]() {
-        child->run_forked();
-    }).detach();
     return true;
 }
 
 bool vm::do_getpid() {
     r(0) = pid;
+    return true;
+}
+
+bool vm::do_waitpid() {
+    int64_t target_pid = static_cast<int64_t>(r(1));
+    uint64_t status_addr = r(2);
+    uint64_t options = r(3);
+
+    if(options != 0) {
+        r(0) = -EINVAL;
+        return true;
+    }
+
+    if(target_pid == pid || target_pid <= 0) {
+        r(0) = -EINVAL;
+        return true;
+    }
+
+    int* status_ptr = nullptr;
+    if(status_addr != 0) {
+        status_ptr = static_cast<int*>(mmu(status_addr));
+        if(status_ptr == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+    }
+
+
+    std::shared_ptr<vm> child;
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        auto it = pid_map.find(static_cast<uint64_t>(target_pid));
+        if(it == pid_map.end()) {
+            r(0) = -ESRCH;
+            return true;
+        }
+        child = it->second;
+    }
+
+    if(child->ppid != pid) {
+        r(0) = -ECHILD;
+        return true;
+    }
+
+    //wait不能加锁，否则会死锁
+    uint64_t exit_code = child->wait();
+    if(status_ptr != nullptr) {
+        int status = (static_cast<int>(exit_code) & 0xff) << 8;
+        *status_ptr = status;
+    }
+
+    uint64_t child_pid = child->pid;
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map.erase(child_pid);
+    }
+    r(0) = child_pid;
     return true;
 }

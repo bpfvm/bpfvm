@@ -21,6 +21,7 @@
 #define BPF_CALL_EXECVE    0x1000E
 #define BPF_CALL_FORK      0x1000F
 #define BPF_CALL_GETPID    0x10010
+#define BPF_CALL_WAITPID   0x10011
 
 
 #endif //BPF_CALL_H

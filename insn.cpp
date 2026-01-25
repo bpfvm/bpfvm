@@ -16,9 +16,13 @@
 #include <sys/syscall.h>
 #include <string.h>
 #include <errno.h>
+#include <mutex>
 
 
 std::atomic<uint64_t> vm::next_pid{1};
+std::unordered_map<uint64_t, std::shared_ptr<vm>> vm::pid_map{};
+std::mutex vm::pid_map_mutex;
+static std::mutex log_mutex;
 
 memmap::~memmap() {
     if(data == nullptr || data == MAP_FAILED) {
@@ -27,6 +31,11 @@ memmap::~memmap() {
     munmap(data, size);
 }
 
+fd_handle::~fd_handle() {
+    if(fd >= 0) {
+        close(fd);
+    }
+}
 
 void dump(uint64_t addr, const bpf_insn* insn) {
     static const char* aluop[] = {
@@ -149,9 +158,10 @@ void dump(uint64_t addr, const bpf_insn* insn) {
     }
 }
 
-vm::vm(uint64_t ppid) {
+vm::vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
     pid = next_pid.fetch_add(1);
     this->ppid = ppid;
+    fds = opened;
     memmap stack_memmap;
     stack_memmap.data = (unsigned char *)mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     stack_memmap.size = STACK_SIZE;
@@ -159,6 +169,15 @@ vm::vm(uint64_t ppid) {
     stack_memmap.flags = PF_W;
     addmem(std::move(stack_memmap));
     reg[10] = STACK_BASE + STACK_SIZE - 8;
+}
+
+std::shared_ptr<vm> vm::create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
+    auto v = std::make_shared<vm>(Token{}, ppid, opened);
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map[v->pid] = v;
+    }
+    return v;
 }
 
 uint64_t vm::load_elf(const char* elf_file_path) {
@@ -705,6 +724,8 @@ bool vm::alu() {
 bool vm::step() {
     uint64_t addr = unmmu(pc);
     if(options.verbose) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("[#%lu] ", pid);
         dump(addr, pc);
     }
     if(options.step_run || (options.breakpoint && options.breakpoint == addr)) {
@@ -775,6 +796,13 @@ void* vm::unmap(uint64_t addr) {
     return nullptr;
 }
 
+uint64_t vm::run() {
+    while(step()) {
+        pc++;
+    }
+    frames.clear();
+    return r(0);
+}
 
 uint64_t vm::run(const vmOptions* options) {
     this->options = *options;
@@ -794,11 +822,10 @@ uint64_t vm::run(const vmOptions* options) {
     return r(0);
 }
 
-uint64_t vm::run_forked() {
-    while(step()) {
-        pc++;
+uint64_t vm::wait() {
+    if(worker.joinable()) {
+        worker.join();
     }
-    frames.clear();
     return r(0);
 }
 

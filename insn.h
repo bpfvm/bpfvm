@@ -11,7 +11,11 @@
 #include <stddef.h>
 #include <assert.h>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #define STACK_SIZE (8 * 1024 * 1024)
@@ -154,8 +158,16 @@ struct vmOptions {
     std::vector<std::string> envp;
 };
 
+struct fd_handle {
+    const int fd = -1;
+    explicit fd_handle(int fd) : fd(fd) {}
+    ~fd_handle();
+};
+
 class vm {
     static std::atomic<uint64_t> next_pid;
+    static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
+    static std::mutex pid_map_mutex;
     vmOptions options;
     const bpf_insn* pc;
     uint64_t reg[11];
@@ -163,6 +175,8 @@ class vm {
     std::list<memmap> maps;
     uint64_t pid = 0;
     uint64_t ppid = 0;
+    std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
+    std::thread worker;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
@@ -195,9 +209,13 @@ class vm {
     bool do_execve();
     bool do_fork();
     bool do_getpid();
+    bool do_waitpid();
 
+    struct Token { explicit Token() = default; };
 public:
-    explicit vm(uint64_t ppid = 0);
+    vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
+    static std::shared_ptr<vm> create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
+    uint64_t wait();
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     uint64_t& r(int n) {
@@ -217,8 +235,8 @@ public:
         reg[10] = frames.back().r10;
         frames.pop_back();
     }
+    uint64_t run();
     uint64_t run(const vmOptions* options);
-    uint64_t run_forked();
 };
 
 

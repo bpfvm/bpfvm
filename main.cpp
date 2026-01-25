@@ -46,8 +46,12 @@ int main(int argc, char** argv) {
     }
     const char* elf_file_path = argv[optind];
 
-    vm vm;
-    uint64_t entry = vm.load_elf(elf_file_path);
+    std::unordered_map<int, std::shared_ptr<fd_handle>> fd_table;
+    fd_table.emplace(0, std::make_shared<fd_handle>(0));
+    fd_table.emplace(1, std::make_shared<fd_handle>(1));
+    fd_table.emplace(2, std::make_shared<fd_handle>(2));
+    auto vm = vm::create(0, fd_table);
+    uint64_t entry = vm->load_elf(elf_file_path);
     if(entry == 0) {
         return 1;
     }
@@ -64,5 +68,5 @@ int main(int argc, char** argv) {
             options.envp.emplace_back(environ[i]);
         }
     }
-    std::cout<<(int)vm.run(&options)<<std::endl;
+    std::cout<<(int)vm->run(&options)<<std::endl;
 }
