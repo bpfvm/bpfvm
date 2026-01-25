@@ -177,6 +177,7 @@ class vm {
     std::atomic<uint64_t> ppid{0};
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
     std::thread worker;
+    std::atomic<bool> exited{false};
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);

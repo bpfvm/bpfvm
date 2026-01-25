@@ -102,7 +102,7 @@ bool vm::do_exit() {
     if(pid != 1) {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         for(auto& entry : pid_map) {
-            if(entry.second && entry.second->ppid.load() == pid) {
+            if(entry.second->ppid.load() == pid) {
                 entry.second->ppid.store(1);
             }
         }
@@ -373,7 +373,7 @@ bool vm::do_waitpid() {
     uint64_t status_addr = r(2);
     int32_t options = arg_s32(r(3));
 
-    if(options != 0) {
+    if((options & ~WNOHANG) != 0) {
         r(0) = -EINVAL;
         return true;
     }
@@ -394,18 +394,36 @@ bool vm::do_waitpid() {
 
 
     std::shared_ptr<vm> child;
+    bool has_child = false;
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         if(target_pid == -1) {
             for(const auto& entry : pid_map) {
-                if(entry.second && entry.second->ppid.load() == pid) {
+                if(entry.second->ppid.load() != pid) {
+                    continue;
+                }
+                has_child = true;
+                if((options & WNOHANG) == 0) {
+                    child = entry.second;
+                    break;
+                }
+                if(entry.second->exited.load(std::memory_order_acquire)) {
                     child = entry.second;
                     break;
                 }
             }
         } else if(target_pid > 0) {
             auto it = pid_map.find(static_cast<uint64_t>(target_pid));
-            if(it != pid_map.end()) {
+            if(it == pid_map.end()) {
+                r(0) = -ECHILD;
+                return true;
+            }
+            if(it->second->ppid.load() != pid) {
+                r(0) = -ECHILD;
+                return true;
+            }
+            has_child = true;
+            if((options & WNOHANG) == 0 || it->second->exited.load(std::memory_order_acquire)) {
                 child = it->second;
             }
         } else {
@@ -414,9 +432,16 @@ bool vm::do_waitpid() {
         }
     }
 
-    if(child == nullptr || child->ppid.load() != pid) {
-        r(0) = -ECHILD;
-        return true;
+    if(child == nullptr) {
+        if(has_child) {
+            //all child processes are still running
+            assert(options & WNOHANG);
+            r(0) = 0;
+            return true;
+        } else {
+            r(0) = -ECHILD;
+            return true;
+        }
     }
 
     //wait不能加锁，否则会死锁

@@ -805,6 +805,7 @@ uint64_t vm::run() {
         pc++;
     }
     frames.clear();
+    exited.store(true, std::memory_order_release);
     return r(0);
 }
 
@@ -823,6 +824,7 @@ uint64_t vm::run(const vmOptions* options) {
         pc++;
     }
     frames.clear();
+    exited.store(true, std::memory_order_release);
     return r(0);
 }
 

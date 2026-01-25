@@ -23,5 +23,8 @@
 #define BPF_CALL_GETPID    0x10010
 #define BPF_CALL_WAITPID   0x10011
 
+#ifndef WNOHANG
+#define WNOHANG 1
+#endif
 
 #endif //BPF_CALL_H

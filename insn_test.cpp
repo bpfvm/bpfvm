@@ -766,6 +766,29 @@ void test_syscall_waitpid_any_twice() {
     assert(success);
 }
 
+void test_syscall_waitpid_any_no_child_wnohang() {
+    std::cout << "--- Running Test: test_syscall_waitpid_any_no_child_wnohang ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, WNOHANG },       // r3 = options = WNOHANG
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = -ECHILD (no children)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },          // if r0 == -ECHILD jump to success
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },             // fail
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 1);
+    print_test_result("test_syscall_waitpid_any_no_child_wnohang", success);
+    assert(success);
+}
+
 
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
@@ -815,6 +838,7 @@ int main() {
     test_syscall_fork_waitpid();
     test_syscall_waitpid_self();
     test_syscall_waitpid_any_twice();
+    test_syscall_waitpid_any_no_child_wnohang();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;
