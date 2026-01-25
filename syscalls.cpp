@@ -63,6 +63,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_waitpid();
     case BPF_CALL_DUP2:
         return do_dup2();
+    case BPF_CALL_PIPE2:
+        return do_pipe2();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -483,5 +485,29 @@ bool vm::do_dup2() {
 
     fds[new_fd] = it->second;
     r(0) = new_fd;
+    return true;
+}
+
+bool vm::do_pipe2() {
+    int* pipefd = static_cast<int*>(mmu(r(1)));
+    if(pipefd == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+
+    int flags = arg_s32(r(2));
+    int host_fds[2] = {-1, -1};
+
+    int rc = pipe2(host_fds, flags);
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+
+    pipefd[0] = host_fds[0];
+    pipefd[1] = host_fds[1];
+    fds[host_fds[0]] = std::make_shared<fd_handle>(host_fds[0]);
+    fds[host_fds[1]] = std::make_shared<fd_handle>(host_fds[1]);
+    r(0) = 0;
     return true;
 }
