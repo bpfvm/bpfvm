@@ -213,6 +213,7 @@ class vm {
     bool do_fork();
     bool do_getpid();
     bool do_waitpid();
+    bool do_dup2();
 
     struct Token { explicit Token() = default; };
 public:

@@ -61,6 +61,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_getpid();
     case BPF_CALL_WAITPID:
         return do_waitpid();
+    case BPF_CALL_DUP2:
+        return do_dup2();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -457,5 +459,29 @@ bool vm::do_waitpid() {
         pid_map.erase(child_pid);
     }
     r(0) = child_pid;
+    return true;
+}
+
+bool vm::do_dup2() {
+    int old_fd = arg_s32(r(1));
+    int new_fd = arg_s32(r(2));
+    if(old_fd < 0 || new_fd < 0) {
+        r(0) = -EBADF;
+        return true;
+    }
+
+    auto it = fds.find(old_fd);
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+
+    if(old_fd == new_fd) {
+        r(0) = new_fd;
+        return true;
+    }
+
+    fds[new_fd] = it->second;
+    r(0) = new_fd;
     return true;
 }
