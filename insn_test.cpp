@@ -681,6 +681,91 @@ void test_syscall_file_io() {
     assert(success);
 }
 
+void test_syscall_fork_waitpid() {
+    std::cout << "--- Running Test: test_syscall_fork_waitpid ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+
+    bpf_insn instructions[] = {
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 8, 0 },               // if r0 == 0 jump to child
+        { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },             // r6 = child pid
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 },             // r1 = pid
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = waited pid
+        { BPF_JMP | BPF_JNE | BPF_X, 0, 6, 4, 0 },               // if r0 != r6 jump to fail
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 11 },            // child: return 11
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },             // fail
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 1);
+    print_test_result("test_syscall_fork_waitpid", success);
+    assert(success);
+}
+
+void test_syscall_waitpid_self() {
+    std::cout << "--- Running Test: test_syscall_waitpid_self ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+
+    bpf_insn instructions[] = {
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_GETPID },         // r0 = pid
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 0, 0, 0 },              // r1 = pid (self)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },              // r2 = status = NULL
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },              // r3 = options = 0
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },        // r0 = -EINVAL
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -EINVAL },          // if r0 == -EINVAL jump to success
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },              // fail
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },              // success
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 1);
+    print_test_result("test_syscall_waitpid_self", success);
+    assert(success);
+}
+
+void test_syscall_waitpid_any_twice() {
+    std::cout << "--- Running Test: test_syscall_waitpid_any_twice ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+
+    bpf_insn instructions[] = {
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 10, 0 },              // if r0 == 0 jump to child
+        { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },             // r6 = child pid
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = waited pid (first)
+        { BPF_JMP | BPF_JNE | BPF_X, 0, 6, 6, 0 },               // if r0 != r6 jump to fail
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = -ECHILD (second)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },          // if r0 == -ECHILD jump to success
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },             // fail
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 11 },            // child: return 11
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 1);
+    print_test_result("test_syscall_waitpid_any_twice", success);
+    assert(success);
+}
+
 
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
@@ -727,6 +812,9 @@ int main() {
     // Syscall Tests
     test_syscall_gettimeofday();
     test_syscall_file_io();
+    test_syscall_fork_waitpid();
+    test_syscall_waitpid_self();
+    test_syscall_waitpid_any_twice();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

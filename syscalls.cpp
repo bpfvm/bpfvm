@@ -15,6 +15,18 @@
 #include <string.h>
 #include <unistd.h>
 
+static inline int32_t arg_s32(uint64_t v) {
+    return static_cast<int32_t>(v);
+}
+
+static inline uint32_t arg_u32(uint64_t v) {
+    return static_cast<uint32_t>(v);
+}
+
+static inline size_t arg_size(uint64_t v) {
+    return static_cast<size_t>(v);
+}
+
 bool vm::do_syscall(uint32_t call) {
     switch (call) {
     case BPF_CALL_MMAP:
@@ -57,7 +69,7 @@ bool vm::do_syscall(uint32_t call) {
 }
 
 bool vm::do_mmap() {
-    void* addr = mmap(nullptr, r(1), r(2), r(3), r(4), r(5));
+    void* addr = mmap(nullptr, arg_size(r(1)), arg_s32(r(2)), arg_s32(r(3)), arg_s32(r(4)), (off_t)r(5));
     if(addr == MAP_FAILED) {
         r(0) = -errno;
         return true;
@@ -65,8 +77,8 @@ bool vm::do_mmap() {
     memmap mem;
     mem.data = (unsigned char*)addr;
     mem.paddr = maps.back().paddr + maps.back().size;
-    mem.flags = r(3);
-    mem.size = r(1);
+    mem.flags = arg_u32(r(3));
+    mem.size = arg_size(r(1));
     r(0) = mem.paddr;
     addmem(std::move(mem));
     return true;
@@ -78,7 +90,7 @@ bool vm::do_munmap() {
         r(0) = -EINVAL;
         return true;
     }
-    if(munmap(addr, r(2)) == -1) {
+    if(munmap(addr, arg_size(r(2))) == -1) {
         r(0) = -errno;
         return true;
     }
@@ -87,7 +99,18 @@ bool vm::do_munmap() {
 }
 
 bool vm::do_exit() {
-    r(0) = r(1);
+    if(pid != 1) {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        for(auto& entry : pid_map) {
+            if(entry.second && entry.second->ppid.load() == pid) {
+                entry.second->ppid.store(1);
+            }
+        }
+    }
+    r(0) = (uint64_t)arg_s32(r(1));
+    maps.clear();
+    frames.clear();
+    fds.clear();
     return false;
 }
 
@@ -108,7 +131,7 @@ bool vm::do_open() {
         r(0) = -EFAULT;
         return true;
     }
-    int fd = open(path.c_str(), r(2), r(3));
+    int fd = open(path.c_str(), arg_s32(r(2)), (mode_t)arg_u32(r(3)));
     if(fd == -1) {
         r(0) = -errno;
         return true;
@@ -119,12 +142,12 @@ bool vm::do_open() {
 }
 
 bool vm::do_read() {
-    auto it = fds.find(r(1));
+    auto it = fds.find(arg_s32(r(1)));
     if(it == fds.end()) {
         r(0) = -EBADF;
         return true;
     }
-    int rc = read(it->second->fd, mmu(r(2)), r(3));
+    int rc = read(it->second->fd, mmu(r(2)), arg_size(r(3)));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -134,12 +157,12 @@ bool vm::do_read() {
 }
 
 bool vm::do_write() {
-    auto it = fds.find(r(1));
+    auto it = fds.find(arg_s32(r(1)));
     if(it == fds.end()) {
         r(0) = -EBADF;
         return true;
     }
-    int rc = write(it->second->fd, mmu(r(2)), r(3));
+    int rc = write(it->second->fd, mmu(r(2)), arg_size(r(3)));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -149,12 +172,12 @@ bool vm::do_write() {
 }
 
 bool vm::do_lseek() {
-    auto it = fds.find(r(1));
+    auto it = fds.find(arg_s32(r(1)));
     if(it == fds.end()) {
         r(0) = -EBADF;
         return true;
     }
-    int rc = lseek64(it->second->fd, r(2), r(3));
+    int rc = lseek64(it->second->fd, (off_t)r(2), arg_s32(r(3)));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -164,7 +187,7 @@ bool vm::do_lseek() {
 }
 
 bool vm::do_close() {
-    auto it = fds.find(r(1));
+    auto it = fds.find(arg_s32(r(1)));
     if(it == fds.end()) {
         r(0) = -EBADF;
         return true;
@@ -196,7 +219,7 @@ bool vm::do_renameat() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = renameat(r(1), old_path.c_str(), r(3), new_path.c_str());
+    int rc = renameat(arg_s32(r(1)), old_path.c_str(), arg_s32(r(3)), new_path.c_str());
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -211,7 +234,7 @@ bool vm::do_readlink() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = readlink(path.c_str(), (char*)mmu(r(2)), r(3));
+    int rc = readlink(path.c_str(), (char*)mmu(r(2)), arg_size(r(3)));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -237,7 +260,7 @@ bool vm::do_execve() {
         return true;
     }
 
-    auto fresh = vm::create(0, {}); //for temporary use
+    auto fresh = std::shared_ptr<vm>(new vm(Token{}, ppid.load(), fds)); // temporary use, avoid pid_map pollution
     uint64_t entry = fresh->load_elf(path.c_str());
     if(entry == 0) {
         r(0) = -ENOEXEC;
@@ -247,7 +270,6 @@ bool vm::do_execve() {
     for(size_t i = 0; i < 11; i++) {
         fresh->reg[i] = 0;
     }
-    fresh->reg[10] = STACK_BASE + STACK_SIZE - 8;
     if(!fresh->setup_stack(argv_strings, envp_strings)) {
         r(0) = -E2BIG;
         return true;
@@ -259,7 +281,7 @@ bool vm::do_execve() {
     }
 
     fresh->pid = pid;
-    fresh->ppid = ppid;
+    fresh->ppid = ppid.load();
     maps.swap(fresh->maps);
     frames.clear();
     for(size_t i = 0; i < 11; i++) {
@@ -273,10 +295,8 @@ bool vm::do_execve() {
 }
 
 bool vm::do_fork() {
-    auto child = vm::create(pid, fds);
-
+    auto child = std::shared_ptr<vm>(new vm(Token{}, pid, fds));
     child->options = options;
-    child->maps.clear();
     for(const auto& map : maps) {
         memmap cloned;
         cloned.size = map.size;
@@ -309,7 +329,6 @@ bool vm::do_fork() {
     }
     child->r(0) = 0;
 
-    child->frames.clear();
     for(const auto& entry : frames) {
         const bpf_insn* parent_pc = entry.pc;
         const bpf_insn* child_pc = nullptr;
@@ -333,6 +352,10 @@ bool vm::do_fork() {
         return true;
     }
     child->pc = child_pc + 1;
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map[child->pid] = child;
+    }
     child->worker = std::thread([child]() {
         child->run();
     });
@@ -346,16 +369,16 @@ bool vm::do_getpid() {
 }
 
 bool vm::do_waitpid() {
-    int64_t target_pid = static_cast<int64_t>(r(1));
+    int64_t target_pid = static_cast<int64_t>(arg_s32(r(1)));
     uint64_t status_addr = r(2);
-    uint64_t options = r(3);
+    int32_t options = arg_s32(r(3));
 
     if(options != 0) {
         r(0) = -EINVAL;
         return true;
     }
 
-    if(target_pid == pid || target_pid <= 0) {
+    if(target_pid == pid || target_pid == 0) {
         r(0) = -EINVAL;
         return true;
     }
@@ -373,15 +396,25 @@ bool vm::do_waitpid() {
     std::shared_ptr<vm> child;
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
-        auto it = pid_map.find(static_cast<uint64_t>(target_pid));
-        if(it == pid_map.end()) {
-            r(0) = -ESRCH;
+        if(target_pid == -1) {
+            for(const auto& entry : pid_map) {
+                if(entry.second && entry.second->ppid.load() == pid) {
+                    child = entry.second;
+                    break;
+                }
+            }
+        } else if(target_pid > 0) {
+            auto it = pid_map.find(static_cast<uint64_t>(target_pid));
+            if(it != pid_map.end()) {
+                child = it->second;
+            }
+        } else {
+            r(0) = -EINVAL;
             return true;
         }
-        child = it->second;
     }
 
-    if(child->ppid != pid) {
+    if(child == nullptr || child->ppid.load() != pid) {
         r(0) = -ECHILD;
         return true;
     }

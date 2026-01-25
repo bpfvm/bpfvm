@@ -174,13 +174,15 @@ class vm {
     std::deque<frame> frames;
     std::list<memmap> maps;
     uint64_t pid = 0;
-    uint64_t ppid = 0;
+    std::atomic<uint64_t> ppid{0};
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
     std::thread worker;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
+    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     void log_mem_violation(const char* type, uint64_t addr);
+
     bool ld();
     bool ldx();
     bool st();
@@ -190,7 +192,7 @@ class vm {
     bool jmp();
     bool jmp32();
     bool step();
-    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
+
     bool read_c_string(uint64_t addr, std::string& out, size_t max_len);
     bool read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
     bool do_syscall(uint32_t call);
@@ -214,6 +216,7 @@ class vm {
     struct Token { explicit Token() = default; };
 public:
     vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
+    ~vm();
     static std::shared_ptr<vm> create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
     uint64_t wait();
     uint64_t load_elf(const char* elf_file_path);

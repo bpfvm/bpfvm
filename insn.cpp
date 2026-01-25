@@ -162,13 +162,17 @@ vm::vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_ha
     pid = next_pid.fetch_add(1);
     this->ppid = ppid;
     fds = opened;
-    memmap stack_memmap;
-    stack_memmap.data = (unsigned char *)mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    stack_memmap.size = STACK_SIZE;
-    stack_memmap.paddr = STACK_BASE;
-    stack_memmap.flags = PF_W;
-    addmem(std::move(stack_memmap));
-    reg[10] = STACK_BASE + STACK_SIZE - 8;
+}
+
+vm::~vm() {
+    if(!worker.joinable()) {
+        return;
+    }
+    if(worker.get_id() == std::this_thread::get_id()) {
+        worker.detach();
+    } else {
+        worker.join();
+    }
 }
 
 std::shared_ptr<vm> vm::create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
@@ -832,8 +836,18 @@ uint64_t vm::wait() {
 bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp) {
     unsigned char* stack_base = (unsigned char*)mmu(STACK_BASE);
     if(stack_base == nullptr) {
-        std::cerr << "Failed to map stack base" << std::endl;
-        return false;
+        unsigned char* data = (unsigned char*)mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if(data == MAP_FAILED) {
+            std::cerr << "Failed to allocate stack" << std::endl;
+            return false;
+        }
+        memmap stack_memmap;
+        stack_memmap.data = data;
+        stack_memmap.size = STACK_SIZE;
+        stack_memmap.paddr = STACK_BASE;
+        stack_memmap.flags = PF_W;
+        addmem(std::move(stack_memmap));
+        stack_base = data;
     }
 
     size_t strings_bytes = 0;
@@ -892,5 +906,6 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     header[env_base + envp.size()] = 0;
 
     reg[1] = STACK_BASE;
+    reg[10] = STACK_BASE + STACK_SIZE - 8;
     return true;
 }
