@@ -3,7 +3,7 @@
 //
 
 #include "insn.h"
-#include "bpf_call.h"
+#include "include/bpf_call.h"
 #include <iostream>
 
 #include <libelf.h>

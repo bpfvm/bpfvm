@@ -3,7 +3,7 @@
 //
 
 #include "insn.h"
-#include "bpf_call.h"
+#include "include/bpf_call.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -28,42 +28,46 @@ static inline size_t arg_size(uint64_t v) {
 }
 
 bool vm::do_syscall(uint32_t call) {
-    switch (call) {
-    case BPF_CALL_MMAP:
+    uint32_t sys_id = call;
+    if(call >= BPF_CALL_BASE) {
+        sys_id = BPF_CALL_TO_ID(call);
+    }
+    switch (sys_id) {
+    case BPF_SYS_MMAP:
         return do_mmap();
-    case BPF_CALL_MUNMAP:
+    case BPF_SYS_MUNMAP:
         return do_munmap();
-    case BPF_CALL_EXIT:
+    case BPF_SYS_EXIT:
         return do_exit();
-    case BPF_CALL_GETTIMEOFDAY:
+    case BPF_SYS_GETTIMEOFDAY:
         return do_gettimeofday();
-    case BPF_CALL_OPEN:
+    case BPF_SYS_OPEN:
         return do_open();
-    case BPF_CALL_READ:
+    case BPF_SYS_READ:
         return do_read();
-    case BPF_CALL_WRITE:
+    case BPF_SYS_WRITE:
         return do_write();
-    case BPF_CALL_LSEEK:
+    case BPF_SYS_LSEEK:
         return do_lseek();
-    case BPF_CALL_CLOSE:
+    case BPF_SYS_CLOSE:
         return do_close();
-    case BPF_CALL_UNLINK:
+    case BPF_SYS_UNLINK:
         return do_unlink();
-    case BPF_CALL_RENAMEAT:
+    case BPF_SYS_RENAMEAT:
         return do_renameat();
-    case BPF_CALL_READLINK:
+    case BPF_SYS_READLINK:
         return do_readlink();
-    case BPF_CALL_EXECVE:
+    case BPF_SYS_EXECVE:
         return do_execve();
-    case BPF_CALL_FORK:
+    case BPF_SYS_FORK:
         return do_fork();
-    case BPF_CALL_GETPID:
+    case BPF_SYS_GETPID:
         return do_getpid();
-    case BPF_CALL_WAITPID:
+    case BPF_SYS_WAITPID:
         return do_waitpid();
-    case BPF_CALL_DUP2:
+    case BPF_SYS_DUP2:
         return do_dup2();
-    case BPF_CALL_PIPE2:
+    case BPF_SYS_PIPE2:
         return do_pipe2();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
