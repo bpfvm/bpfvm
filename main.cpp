@@ -1,13 +1,13 @@
+#include "insn.h"
+
 #include <iostream>
 #include <algorithm>
 
 #include <libgen.h>
 #include <string.h>
 #include <getopt.h>
-
 #include <signal.h>
 
-#include "insn.h"
 
 static struct option long_options[] = {
     {"verbose", no_argument, nullptr, 'v'},

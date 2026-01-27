@@ -11,12 +11,19 @@
 #include <stddef.h>
 #include <assert.h>
 #include <atomic>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "include/bpf_call.h"
+namespace bpf{
+    #define BPF_NO_SYSCALL
+    #include "include/signal.h"
+}
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
@@ -168,6 +175,11 @@ class vm {
     static std::atomic<uint64_t> next_pid;
     static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
     static std::mutex pid_map_mutex;
+    struct signal_action {
+        uint64_t handler = 0;
+        uint64_t mask = 0;
+        int flags = 0;
+    };
     vmOptions options;
     const bpf_insn* pc;
     uint64_t reg[11];
@@ -178,11 +190,16 @@ class vm {
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
     std::thread worker;
     std::atomic<bool> exited{false};
+    std::array<signal_action, NSIG> signal_actions{};
+    std::deque<int> pending_signals;
+    std::mutex signal_mutex;
+    const bpf_insn* signal_return_pc = nullptr;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     void log_mem_violation(const char* type, uint64_t addr);
+    bool handle_pending_signals();
 
     bool ld();
     bool ldx();
@@ -215,6 +232,8 @@ class vm {
     bool do_waitpid();
     bool do_dup2();
     bool do_pipe2();
+    bool do_kill();
+    bool do_sigaction();
 
     struct Token { explicit Token() = default; };
 public:
@@ -224,6 +243,7 @@ public:
     uint64_t wait();
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
+    void queue_signal(int sig);
     uint64_t& r(int n) {
         return reg[n];
     }

@@ -1,8 +1,8 @@
 #ifndef SIGNAL_H
 #define SIGNAL_H
 
-#include_next <signal.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifndef SIGHUP
 #define SIGHUP 1
@@ -74,34 +74,6 @@ struct sigaction {
 #ifndef SIG_SETMASK
 #define SIG_SETMASK 2
 #endif
-
-
-#ifndef SIGHUP
-#define SIGHUP 1
-#endif
-#ifndef SIGQUIT
-#define SIGQUIT 3
-#endif
-#ifndef SIGPIPE
-#define SIGPIPE 13
-#endif
-#ifndef SIGTSTP
-#define SIGTSTP 20
-#endif
-#ifndef SIGTTIN
-#define SIGTTIN 21
-#endif
-#ifndef SIGTTOU
-#define SIGTTOU 22
-#endif
-#ifndef SIGCONT
-#define SIGCONT 18
-#endif
-#ifndef SIGCHLD
-#define SIGCHLD 17
-#endif
-#ifndef NSIG
-#define NSIG 32
 
 #ifndef BPF_NO_SYSCALL
 int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact);

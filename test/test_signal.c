@@ -6,7 +6,7 @@ static volatile sig_atomic_t got_term = 0;
 
 static void on_term(int sig) {
     (void)sig;
-    got_term = 1;
+    got_term++;
 }
 
 int main(void) {
@@ -22,6 +22,11 @@ int main(void) {
         return 2;
     }
 
-    printf("got_term=%d\n", got_term ? 1 : 0);
-    return got_term ? 0 : 3;
+    if (kill(getpid(), SIGTERM) != 0) {
+        perror("kill");
+        return 2;
+    }
+
+    printf("got_term=%d\n", (int)got_term);
+    return (got_term == 2) ? 0 : 3;
 }

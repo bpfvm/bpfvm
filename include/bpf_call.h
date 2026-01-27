@@ -30,6 +30,8 @@ enum bpf_syscall_id {
     BPF_SYS_GETPID,
     BPF_SYS_GETPPID,
     BPF_SYS_WAITPID,
+    BPF_SYS_KILL,
+    BPF_SYS_SIGACTION,
     BPF_SYS_DUP2,
     BPF_SYS_PIPE2,
     BPF_SYS_CHDIR,

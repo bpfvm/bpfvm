@@ -328,6 +328,9 @@ bool vm::jmp() {
         break;
     case BPF_EXIT:
         pop_frame();
+        if(signal_return_pc != nullptr && pc == signal_return_pc) {
+            signal_return_pc = nullptr;
+        }
         if (frames.empty()) {
             return false;
         }
@@ -478,6 +481,67 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
                   << " Size: 0x" << map.size
                   << " Flags: " << map.flags << std::dec << std::endl;
     }
+}
+
+void vm::queue_signal(int sig) {
+    std::lock_guard<std::mutex> lock(signal_mutex);
+    pending_signals.push_back(sig);
+}
+
+bool vm::handle_pending_signals() {
+    int sig = 0;
+    {
+        std::lock_guard<std::mutex> lock(signal_mutex);
+        if(pending_signals.empty()) {
+            return true;
+        }
+        sig = pending_signals.front();
+        pending_signals.pop_front();
+    }
+    if(sig <= 0 || sig >= NSIG) {
+        return true;
+    }
+    const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
+    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
+    uint64_t handler = signal_actions[static_cast<size_t>(sig)].handler;
+    if(sig == SIGKILL) {
+        handler = sig_dfl;
+    }
+    if(options.verbose) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("[#%lu] signal %d handler=0x%lx return=0x%lx\n",
+               pid, sig, static_cast<unsigned long>(handler), unmmu(pc));
+    }
+    if(handler == sig_ign) {
+        return true;
+    }
+    if(handler == sig_dfl) {
+        switch(sig) {
+        case SIGTERM:
+        case SIGINT:
+        case SIGABRT:
+        case SIGSEGV:
+        case SIGILL:
+        case SIGFPE:
+        case SIGKILL:
+            r(1) = 128 + static_cast<uint64_t>(sig);
+            return do_exit();
+        default:
+            return true;
+        }
+    }
+
+    const bpf_insn* handler_pc = (const bpf_insn*)mmu(handler);
+    if(handler_pc == nullptr) {
+        r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
+        return do_exit();
+    }
+    signal_return_pc = pc - 1;
+    pc = signal_return_pc;
+    push_frame();
+    r(1) = static_cast<uint64_t>(sig);
+    pc = handler_pc;
+    return true;
 }
 
 bool vm::ld() {
@@ -726,6 +790,12 @@ bool vm::alu() {
 
 
 bool vm::step() {
+    if(signal_return_pc == nullptr) {
+        if(!handle_pending_signals()) {
+            //be killed
+            return false;
+        }
+    }
     uint64_t addr = unmmu(pc);
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);

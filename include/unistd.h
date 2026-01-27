@@ -33,6 +33,8 @@ gid_t getgid(void);
 gid_t getegid(void);
 int getgroups(int size, gid_t list[]);
 
+#endif
+
 #define F_OK 0
 #define X_OK 1
 #define W_OK 2

@@ -1,9 +1,7 @@
 //
 // Created by chouryzhou on 24-10-28.
 //
-
 #include "insn.h"
-#include "include/bpf_call.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -14,6 +12,7 @@
 #include <thread>
 #include <string.h>
 #include <unistd.h>
+
 
 static inline int32_t arg_s32(uint64_t v) {
     return static_cast<int32_t>(v);
@@ -69,6 +68,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_dup2();
     case BPF_SYS_PIPE2:
         return do_pipe2();
+    case BPF_SYS_KILL:
+        return do_kill();
+    case BPF_SYS_SIGACTION:
+        return do_sigaction();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -119,6 +122,7 @@ bool vm::do_exit() {
     maps.clear();
     frames.clear();
     fds.clear();
+    signal_return_pc = nullptr;
     return false;
 }
 
@@ -305,6 +309,8 @@ bool vm::do_execve() {
 bool vm::do_fork() {
     auto child = std::shared_ptr<vm>(new vm(Token{}, pid, fds));
     child->options = options;
+    child->signal_actions = signal_actions;
+    child->signal_return_pc = nullptr;
     for(const auto& map : maps) {
         memmap cloned;
         cloned.size = map.size;
@@ -512,6 +518,86 @@ bool vm::do_pipe2() {
     pipefd[1] = host_fds[1];
     fds[host_fds[0]] = std::make_shared<fd_handle>(host_fds[0]);
     fds[host_fds[1]] = std::make_shared<fd_handle>(host_fds[1]);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_kill() {
+    int target_pid = arg_s32(r(1));
+    int sig = arg_s32(r(2));
+    if(sig < 0 || sig >= NSIG || target_pid <= 0) {
+        r(0) = -EINVAL;
+        return true;
+    }
+    if(sig == 0) {
+        if(static_cast<uint64_t>(target_pid) == pid) {
+            r(0) = 0;
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        r(0) = (pid_map.count(static_cast<uint64_t>(target_pid)) > 0) ? 0 : -ESRCH;
+        return true;
+    }
+    if(static_cast<uint64_t>(target_pid) == pid) {
+        queue_signal(sig);
+        r(0) = 0;
+        return true;
+    }
+    std::shared_ptr<vm> target;
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        auto it = pid_map.find(static_cast<uint64_t>(target_pid));
+        if(it != pid_map.end()) {
+            target = it->second;
+        }
+    }
+    if(target == nullptr) {
+        r(0) = -ESRCH;
+        return true;
+    }
+    target->queue_signal(sig);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_sigaction() {
+    int signo = arg_s32(r(1));
+    uint64_t act_addr = r(2);
+    uint64_t oldact_addr = r(3);
+
+    if(signo <= 0 || signo >= NSIG || signo == SIGKILL) {
+        r(0) = -EINVAL;
+        return true;
+    }
+
+    if(oldact_addr != 0) {
+        auto oldact = static_cast<struct bpf::sigaction*>(mmu(oldact_addr));
+        if(oldact == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+        const auto& current = signal_actions[static_cast<size_t>(signo)];
+        oldact->sa_handler = reinterpret_cast<void (*)(int)>(static_cast<uintptr_t>(current.handler));
+        oldact->sa_mask = static_cast<bpf::sigset_t>(current.mask);
+        oldact->sa_flags = current.flags;
+    }
+
+    if(act_addr != 0) {
+        auto action = static_cast<const struct bpf::sigaction*>(mmu(act_addr));
+        if(action == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+        if(reinterpret_cast<uintptr_t>(action->sa_handler) == reinterpret_cast<uintptr_t>(SIG_ERR)) {
+            r(0) = -EINVAL;
+            return true;
+        }
+        auto& current = signal_actions[static_cast<size_t>(signo)];
+        current.handler = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(action->sa_handler));
+        current.mask = static_cast<uint64_t>(action->sa_mask);
+        current.flags = action->sa_flags;
+    }
+
     r(0) = 0;
     return true;
 }
