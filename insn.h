@@ -191,6 +191,7 @@ class vm {
     std::atomic<uint64_t> ppid{0};
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
     std::string cwd;
+    uint32_t umask_val = 0022;
     std::thread worker;
     std::atomic<bool> exited{false};
     std::array<signal_action, NSIG> signal_actions{};
@@ -252,6 +253,7 @@ class vm {
     bool do_closedir();
     bool do_mkdir();
     bool do_rmdir();
+    bool do_umask();
 
     struct Token { explicit Token() = default; };
 public:

@@ -155,6 +155,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_fcntl();
     case BPF_SYS_IOCTL:
         return do_ioctl();
+    case BPF_SYS_UMASK:
+        return do_umask();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -226,7 +228,7 @@ bool vm::do_open() {
         r(0) = -EFAULT;
         return true;
     }
-    int fd = open(resolve_path(path).c_str(), arg_s32(r(2)), (mode_t)arg_u32(r(3)));
+    int fd = open(resolve_path(path).c_str(), arg_s32(r(2)), (mode_t)(arg_u32(r(3)) & ~umask_val));
     if(fd == -1) {
         r(0) = -errno;
         return true;
@@ -313,7 +315,7 @@ bool vm::do_mkdir() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = mkdir(resolve_path(path).c_str(), (mode_t)arg_u32(r(2)));
+    int rc = mkdir(resolve_path(path).c_str(), (mode_t)(arg_u32(r(2)) & ~umask_val));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -436,6 +438,7 @@ bool vm::do_fork() {
     child->signal_actions = signal_actions;
     child->signal_return_pc = nullptr;
     child->cwd = cwd;
+    child->umask_val = umask_val;
     for(const auto& map : maps) {
         memmap cloned;
         cloned.size = map.size;
@@ -988,5 +991,12 @@ bool vm::do_ioctl() {
     } else {
         r(0) = rc;
     }
+    return true;
+}
+
+bool vm::do_umask() {
+    uint32_t new_mask = arg_u32(r(1));
+    r(0) = umask_val;
+    umask_val = new_mask & 0777;
     return true;
 }

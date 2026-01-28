@@ -7,6 +7,7 @@
 #include <string.h>
 #include <getopt.h>
 #include <signal.h>
+#include <sys/stat.h>
 
 
 static struct option long_options[] = {
@@ -68,5 +69,6 @@ int main(int argc, char** argv) {
             options.envp.emplace_back(environ[i]);
         }
     }
+    umask(0);
     std::cout<<(int)vm->run(&options)<<std::endl;
 }
