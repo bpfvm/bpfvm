@@ -105,6 +105,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_close();
     case BPF_SYS_UNLINK:
         return do_unlink();
+    case BPF_SYS_MKDIR:
+        return do_mkdir();
+    case BPF_SYS_RMDIR:
+        return do_rmdir();
     case BPF_SYS_RENAMEAT:
         return do_renameat();
     case BPF_SYS_READLINK:
@@ -281,6 +285,36 @@ bool vm::do_unlink() {
         return true;
     }
     int rc = unlink(resolve_path(path).c_str());
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_mkdir() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = mkdir(resolve_path(path).c_str(), (mode_t)arg_u32(r(2)));
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_rmdir() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = rmdir(resolve_path(path).c_str());
     if(rc == -1) {
         r(0) = -errno;
         return true;

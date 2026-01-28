@@ -243,6 +243,8 @@ class vm {
     bool do_sigaction();
     bool do_chdir();
     bool do_getcwd();
+    bool do_mkdir();
+    bool do_rmdir();
 
     struct Token { explicit Token() = default; };
 public:
