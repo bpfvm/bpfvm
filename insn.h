@@ -23,6 +23,7 @@
 namespace bpf{
     #define BPF_NO_SYSCALL
     #include "include/signal.h"
+    #include "include/sys/stat.h"
 }
 
 #define STACK_SIZE (8 * 1024 * 1024)
@@ -235,6 +236,9 @@ class vm {
     bool do_waitpid();
     bool do_dup2();
     bool do_pipe2();
+    bool do_stat();
+    bool do_lstat();
+    bool do_fstat();
     bool do_kill();
     bool do_sigaction();
     bool do_chdir();

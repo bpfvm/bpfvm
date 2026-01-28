@@ -2,9 +2,8 @@
 #define SYS_STAT_H
 
 #include <sys/types.h>
-#include <time.h>
 
-struct stat64 {
+struct stat {
     dev_t st_dev;
     ino_t st_ino;
     mode_t st_mode;
@@ -18,7 +17,6 @@ struct stat64 {
     long st_atime;
     long st_mtime;
     long st_ctime;
-    struct timespec st_mtim;
 };
 
 #define S_IFMT  0170000
@@ -43,9 +41,9 @@ struct stat64 {
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 #ifndef BPF_NO_SYSCALL
-int stat(const char *path, struct stat64 *buf);
-int lstat(const char *path, struct stat64 *buf);
-int fstat(int fd, struct stat64 *buf);
+int stat(const char *path, struct stat *buf);
+int lstat(const char *path, struct stat *buf);
+int fstat(int fd, struct stat *buf);
 mode_t umask(mode_t mask);
 
 #endif

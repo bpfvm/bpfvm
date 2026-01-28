@@ -15,6 +15,45 @@
 #include <unistd.h>
 #include <filesystem>
 
+static void fill_bpf_stat64(const struct stat& st, bpf::stat& out) {
+    out.st_dev = static_cast<decltype(out.st_dev)>(st.st_dev);
+    out.st_ino = static_cast<decltype(out.st_ino)>(st.st_ino);
+    out.st_mode = static_cast<decltype(out.st_mode)>(st.st_mode);
+    out.st_nlink = static_cast<decltype(out.st_nlink)>(st.st_nlink);
+    out.st_uid = static_cast<decltype(out.st_uid)>(st.st_uid);
+    out.st_gid = static_cast<decltype(out.st_gid)>(st.st_gid);
+    out.st_rdev = static_cast<decltype(out.st_rdev)>(st.st_rdev);
+    out.st_size = static_cast<decltype(out.st_size)>(st.st_size);
+    out.st_blksize = static_cast<decltype(out.st_blksize)>(st.st_blksize);
+    out.st_blocks = static_cast<decltype(out.st_blocks)>(st.st_blocks);
+#pragma push_macro("st_atime")
+#undef st_atime
+#if defined(__linux__)
+    out.st_atime = static_cast<decltype(out.st_atime)>(st.st_atim.tv_sec);
+#else
+    out.st_atime = static_cast<decltype(out.st_atime)>(st.st_atime);
+#endif
+#pragma pop_macro("st_atime")
+
+#pragma push_macro("st_mtime")
+#undef st_mtime
+#if defined(__linux__)
+    out.st_mtime = static_cast<decltype(out.st_mtime)>(st.st_mtim.tv_sec);
+#else
+    out.st_mtime = static_cast<decltype(out.st_mtime)>(st.st_mtime);
+#endif
+#pragma pop_macro("st_mtime")
+
+#pragma push_macro("st_ctime")
+#undef st_ctime
+#if defined(__linux__)
+    out.st_ctime = static_cast<decltype(out.st_ctime)>(st.st_ctim.tv_sec);
+#else
+    out.st_ctime = static_cast<decltype(out.st_ctime)>(st.st_ctime);
+#endif
+#pragma pop_macro("st_ctime")
+}
+
 
 static inline int32_t arg_s32(uint64_t v) {
     return static_cast<int32_t>(v);
@@ -88,6 +127,12 @@ bool vm::do_syscall(uint32_t call) {
         return do_chdir();
     case BPF_SYS_GETCWD:
         return do_getcwd();
+    case BPF_SYS_STAT:
+        return do_stat();
+    case BPF_SYS_LSTAT:
+        return do_lstat();
+    case BPF_SYS_FSTAT:
+        return do_fstat();
     case BPF_SYS_KILL:
         return do_kill();
     case BPF_SYS_SIGACTION:
@@ -599,6 +644,69 @@ bool vm::do_getcwd() {
     }
     memcpy(buf, path.c_str(), path.size() + 1);
     r(0) = buf_addr;
+    return true;
+}
+
+bool vm::do_stat() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    auto out = static_cast<bpf::stat*>(mmu(r(2)));
+    if(out == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    struct stat st = {};
+    if(stat(resolve_path(path).c_str(), &st) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    fill_bpf_stat64(st, *out);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_lstat() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    auto out = static_cast<bpf::stat*>(mmu(r(2)));
+    if(out == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    struct stat st = {};
+    if(lstat(resolve_path(path).c_str(), &st) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    fill_bpf_stat64(st, *out);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_fstat() {
+    auto it = fds.find(arg_s32(r(1)));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    auto out = static_cast<bpf::stat*>(mmu(r(2)));
+    if(out == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    struct stat st = {};
+    if(fstat(it->second->fd, &st) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    fill_bpf_stat64(st, *out);
+    r(0) = 0;
     return true;
 }
 
