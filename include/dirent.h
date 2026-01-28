@@ -2,23 +2,27 @@
 #define DIRENT_H
 
 #include <sys/types.h>
+#include <stdint.h>
 
-typedef struct {
-    int dummy;
-} DIR;
-
-struct dirent64 {
+struct dirent {
     char d_name[256];
     unsigned char d_type;
 };
 
-#define DT_UNKNOWN 0
-#define DT_DIR 4
-#define DT_LNK 10
+typedef struct {
+    uint64_t handle;
+    struct dirent entry;
+} DIR;
+
+enum{
+    DT_UNKNOWN = 0,
+    DT_DIR = 4,
+    DT_LNK = 10,
+};
 
 #ifndef BPF_NO_SYSCALL
 DIR *opendir(const char *pathname);
-struct dirent64 *readdir(DIR *dirp);
+struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
 #endif
 

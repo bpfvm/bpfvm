@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <memory>
 #include <thread>
 #include <string.h>
@@ -131,6 +132,12 @@ bool vm::do_syscall(uint32_t call) {
         return do_chdir();
     case BPF_SYS_GETCWD:
         return do_getcwd();
+    case BPF_SYS_OPENDIR:
+        return do_opendir();
+    case BPF_SYS_READDIR:
+        return do_readdir();
+    case BPF_SYS_CLOSEDIR:
+        return do_closedir();
     case BPF_SYS_STAT:
         return do_stat();
     case BPF_SYS_LSTAT:
@@ -678,6 +685,84 @@ bool vm::do_getcwd() {
     }
     memcpy(buf, path.c_str(), path.size() + 1);
     r(0) = buf_addr;
+    return true;
+}
+
+bool vm::do_opendir() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    auto out_dir = static_cast<bpf::DIR*>(mmu(r(2)));
+    if(out_dir == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    DIR* dir = opendir(resolve_path(path).c_str());
+    if(dir == nullptr) {
+        r(0) = -errno;
+        return true;
+    }
+    out_dir->handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dir));
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_readdir() {
+    auto dirp = static_cast<bpf::DIR*>(mmu(r(1)));
+    if(dirp == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    auto out_entry = static_cast<bpf::dirent*>(mmu(r(2)));
+    if(out_entry == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    if(dirp->handle == 0) {
+        r(0) = -EBADF;
+        return true;
+    }
+    DIR* dir = reinterpret_cast<DIR*>(static_cast<uintptr_t>(dirp->handle));
+    errno = 0;
+    struct dirent* ent = readdir(dir);
+    if(ent == nullptr) {
+        if(errno != 0) {
+            r(0) = -errno;
+        } else {
+            r(0) = 0;
+        }
+        return true;
+    }
+    memset(out_entry, 0, sizeof(*out_entry));
+    strncpy(out_entry->d_name, ent->d_name, sizeof(out_entry->d_name) - 1);
+#ifdef _DIRENT_HAVE_D_TYPE
+    out_entry->d_type = ent->d_type;
+#else
+    out_entry->d_type = DT_UNKNOWN;
+#endif
+    r(0) = 1;
+    return true;
+}
+
+bool vm::do_closedir() {
+    auto dirp = static_cast<bpf::DIR*>(mmu(r(1)));
+    if(dirp == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    if(dirp->handle == 0) {
+        r(0) = -EBADF;
+        return true;
+    }
+    DIR* dir = reinterpret_cast<DIR*>(static_cast<uintptr_t>(dirp->handle));
+    if(closedir(dir) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    dirp->handle = 0;
+    r(0) = 0;
     return true;
 }
 

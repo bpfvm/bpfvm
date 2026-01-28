@@ -1,4 +1,4 @@
-TARGETS := test_arg.out test_execve.out test_signal.out test_path.out
+TARGETS := test_arg.out test_execve.out test_signal.out test_path.out test_readdir.out
 OBJECTS := $(TARGETS:.out=.o)
 
 all: $(TARGETS)

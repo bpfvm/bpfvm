@@ -24,6 +24,7 @@ namespace bpf{
     #define BPF_NO_SYSCALL
     #include "include/signal.h"
     #include "include/sys/stat.h"
+    #include "include/dirent.h"
 }
 
 #define STACK_SIZE (8 * 1024 * 1024)
@@ -243,6 +244,9 @@ class vm {
     bool do_sigaction();
     bool do_chdir();
     bool do_getcwd();
+    bool do_opendir();
+    bool do_readdir();
+    bool do_closedir();
     bool do_mkdir();
     bool do_rmdir();
 
