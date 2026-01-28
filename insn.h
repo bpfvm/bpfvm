@@ -25,6 +25,7 @@ namespace bpf{
     #include "include/signal.h"
     #include "include/sys/stat.h"
     #include "include/dirent.h"
+    #include "include/sys/times.h"
 }
 
 #define STACK_SIZE (8 * 1024 * 1024)
@@ -223,6 +224,7 @@ class vm {
     bool do_munmap();
     bool do_exit();
     bool do_gettimeofday();
+    bool do_times();
     bool do_open();
     bool do_read();
     bool do_write();

@@ -95,6 +95,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_exit();
     case BPF_SYS_GETTIMEOFDAY:
         return do_gettimeofday();
+    case BPF_SYS_TIMES:
+        return do_times();
     case BPF_SYS_OPEN:
         return do_open();
     case BPF_SYS_READ:
@@ -219,6 +221,34 @@ bool vm::do_gettimeofday() {
         return true;
     }
     r(0) = 0;
+    return true;
+}
+
+bool vm::do_times() {
+    auto tms = static_cast<bpf::tms*>(mmu(r(1)));
+    if (tms == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+
+    const long ticks_per_sec = 100;
+    tms->tms_utime = ts.tv_sec * ticks_per_sec + ts.tv_nsec * ticks_per_sec / 1000000000;
+    tms->tms_stime = 0;
+    tms->tms_cutime = 0;
+    tms->tms_cstime = 0;
+
+    struct timespec ts_mono;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts_mono) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = (uint64_t)(ts_mono.tv_sec * ticks_per_sec + ts_mono.tv_nsec * ticks_per_sec / 1000000000);
     return true;
 }
 
