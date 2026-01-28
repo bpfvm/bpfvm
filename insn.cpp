@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
+#include <limits.h>
 #include <string.h>
 #include <errno.h>
 #include <mutex>
@@ -162,6 +163,12 @@ vm::vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_ha
     pid = next_pid.fetch_add(1);
     this->ppid = ppid;
     fds = opened;
+    char buf[PATH_MAX];
+    if(::getcwd(buf, sizeof(buf)) != nullptr) {
+        cwd = buf;
+    } else {
+        cwd = "/";
+    }
 }
 
 vm::~vm() {

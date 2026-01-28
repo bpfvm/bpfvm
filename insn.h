@@ -188,6 +188,7 @@ class vm {
     uint64_t pid = 0;
     std::atomic<uint64_t> ppid{0};
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
+    std::string cwd;
     std::thread worker;
     std::atomic<bool> exited{false};
     std::array<signal_action, NSIG> signal_actions{};
@@ -213,6 +214,7 @@ class vm {
 
     bool read_c_string(uint64_t addr, std::string& out, size_t max_len);
     bool read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
+    std::string resolve_path(const std::string& path) const;
     bool do_syscall(uint32_t call);
     bool do_mmap();
     bool do_munmap();
@@ -235,6 +237,8 @@ class vm {
     bool do_pipe2();
     bool do_kill();
     bool do_sigaction();
+    bool do_chdir();
+    bool do_getcwd();
 
     struct Token { explicit Token() = default; };
 public:

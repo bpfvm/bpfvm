@@ -8,10 +8,12 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <memory>
 #include <thread>
 #include <string.h>
 #include <unistd.h>
+#include <filesystem>
 
 
 static inline int32_t arg_s32(uint64_t v) {
@@ -24,6 +26,18 @@ static inline uint32_t arg_u32(uint64_t v) {
 
 static inline size_t arg_size(uint64_t v) {
     return static_cast<size_t>(v);
+}
+
+std::string vm::resolve_path(const std::string& path) const {
+    if(path.empty()) {
+        return path;
+    }
+    std::filesystem::path input(path);
+    if(input.is_absolute()) {
+        return input.lexically_normal().string();
+    }
+    std::filesystem::path base = cwd.empty() ? std::filesystem::path("/") : std::filesystem::path(cwd);
+    return (base / input).lexically_normal().string();
 }
 
 bool vm::do_syscall(uint32_t call) {
@@ -70,6 +84,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_dup2();
     case BPF_SYS_PIPE2:
         return do_pipe2();
+    case BPF_SYS_CHDIR:
+        return do_chdir();
+    case BPF_SYS_GETCWD:
+        return do_getcwd();
     case BPF_SYS_KILL:
         return do_kill();
     case BPF_SYS_SIGACTION:
@@ -145,7 +163,7 @@ bool vm::do_open() {
         r(0) = -EFAULT;
         return true;
     }
-    int fd = open(path.c_str(), arg_s32(r(2)), (mode_t)arg_u32(r(3)));
+    int fd = open(resolve_path(path).c_str(), arg_s32(r(2)), (mode_t)arg_u32(r(3)));
     if(fd == -1) {
         r(0) = -errno;
         return true;
@@ -217,7 +235,7 @@ bool vm::do_unlink() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = unlink(path.c_str());
+    int rc = unlink(resolve_path(path).c_str());
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -233,7 +251,17 @@ bool vm::do_renameat() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = renameat(arg_s32(r(1)), old_path.c_str(), arg_s32(r(3)), new_path.c_str());
+    int old_dirfd = arg_s32(r(1));
+    int new_dirfd = arg_s32(r(3));
+    std::string resolved_old = old_path;
+    std::string resolved_new = new_path;
+    if(old_dirfd == AT_FDCWD) {
+        resolved_old = resolve_path(old_path);
+    }
+    if(new_dirfd == AT_FDCWD) {
+        resolved_new = resolve_path(new_path);
+    }
+    int rc = renameat(old_dirfd, resolved_old.c_str(), new_dirfd, resolved_new.c_str());
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -248,7 +276,7 @@ bool vm::do_readlink() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = readlink(path.c_str(), (char*)mmu(r(2)), arg_size(r(3)));
+    int rc = readlink(resolve_path(path).c_str(), (char*)mmu(r(2)), arg_size(r(3)));
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -275,7 +303,8 @@ bool vm::do_execve() {
     }
 
     auto fresh = std::shared_ptr<vm>(new vm(Token{}, ppid.load(), fds)); // temporary use, avoid pid_map pollution
-    uint64_t entry = fresh->load_elf(path.c_str());
+    fresh->cwd = cwd;
+    uint64_t entry = fresh->load_elf(resolve_path(path).c_str());
     if(entry == 0) {
         r(0) = -ENOEXEC;
         return true;
@@ -313,6 +342,7 @@ bool vm::do_fork() {
     child->options = options;
     child->signal_actions = signal_actions;
     child->signal_return_pc = nullptr;
+    child->cwd = cwd;
     for(const auto& map : maps) {
         memmap cloned;
         cloned.size = map.size;
@@ -526,6 +556,49 @@ bool vm::do_pipe2() {
     fds[host_fds[0]] = std::make_shared<fd_handle>(host_fds[0]);
     fds[host_fds[1]] = std::make_shared<fd_handle>(host_fds[1]);
     r(0) = 0;
+    return true;
+}
+
+bool vm::do_chdir() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    std::string resolved = resolve_path(path);
+    struct stat st = {};
+    if(stat(resolved.c_str(), &st) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    if(!S_ISDIR(st.st_mode)) {
+        r(0) = -ENOTDIR;
+        return true;
+    }
+    cwd = resolved.empty() ? std::string("/") : resolved;
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_getcwd() {
+    uint64_t buf_addr = r(1);
+    size_t size = arg_size(r(2));
+    if(buf_addr == 0) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    char* buf = static_cast<char*>(mmu(buf_addr));
+    if(buf == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    std::string path = cwd.empty() ? "/" : cwd;
+    if(size == 0 || size <= path.size()) {
+        r(0) = -ERANGE;
+        return true;
+    }
+    memcpy(buf, path.c_str(), path.size() + 1);
+    r(0) = buf_addr;
     return true;
 }
 
