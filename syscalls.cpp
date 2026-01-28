@@ -125,6 +125,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_getppid();
     case BPF_SYS_WAITPID:
         return do_waitpid();
+    case BPF_SYS_DUP:
+        return do_dup();
     case BPF_SYS_DUP2:
         return do_dup2();
     case BPF_SYS_PIPE2:
@@ -599,6 +601,29 @@ bool vm::do_waitpid() {
         pid_map.erase(child_pid);
     }
     r(0) = child_pid;
+    return true;
+}
+
+bool vm::do_dup() {
+    int old_fd = arg_s32(r(1));
+    if(old_fd < 0) {
+        r(0) = -EBADF;
+        return true;
+    }
+
+    auto it = fds.find(old_fd);
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+
+    int new_fd = 0;
+    while(fds.count(new_fd)) {
+        new_fd++;
+    }
+
+    fds[new_fd] = it->second;
+    r(0) = new_fd;
     return true;
 }
 
