@@ -229,6 +229,7 @@ class vm {
     bool do_execve();
     bool do_fork();
     bool do_getpid();
+    bool do_getppid();
     bool do_waitpid();
     bool do_dup2();
     bool do_pipe2();

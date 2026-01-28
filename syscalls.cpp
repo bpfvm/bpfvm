@@ -62,6 +62,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_fork();
     case BPF_SYS_GETPID:
         return do_getpid();
+    case BPF_SYS_GETPPID:
+        return do_getppid();
     case BPF_SYS_WAITPID:
         return do_waitpid();
     case BPF_SYS_DUP2:
@@ -379,6 +381,11 @@ bool vm::do_fork() {
 
 bool vm::do_getpid() {
     r(0) = pid;
+    return true;
+}
+
+bool vm::do_getppid() {
+    r(0) = ppid.load();
     return true;
 }
 
