@@ -242,6 +242,8 @@ class vm {
     bool do_fstat();
     bool do_kill();
     bool do_sigaction();
+    bool do_fcntl();
+    bool do_ioctl();
     bool do_chdir();
     bool do_getcwd();
     bool do_opendir();

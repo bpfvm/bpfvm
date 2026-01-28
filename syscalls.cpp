@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <memory>
@@ -148,6 +149,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_kill();
     case BPF_SYS_SIGACTION:
         return do_sigaction();
+    case BPF_SYS_FCNTL:
+        return do_fcntl();
+    case BPF_SYS_IOCTL:
+        return do_ioctl();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -906,5 +911,57 @@ bool vm::do_sigaction() {
     }
 
     r(0) = 0;
+    return true;
+}
+
+bool vm::do_fcntl() {
+    auto it = fds.find(arg_s32(r(1)));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    int cmd = arg_s32(r(2));
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+         r(0) = -EINVAL;
+         return true;
+    }
+    uint64_t arg = r(3);
+    int rc = -1;
+    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+         rc = fcntl(it->second->fd, cmd, mmu(arg));
+    } else {
+         rc = fcntl(it->second->fd, cmd, arg);
+    }
+
+    if(rc == -1) {
+        r(0) = -errno;
+    } else {
+        r(0) = rc;
+    }
+    return true;
+}
+
+bool vm::do_ioctl() {
+    auto it = fds.find(arg_s32(r(1)));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    unsigned long request = r(2);
+    int rc;
+
+    // Check if the command has a size field > 0, indicating a pointer argument.
+    // Linux ioctl encoding: size is bits 16-29 (14 bits).
+    if ((request >> 16) & 0x3FFF) {
+        rc = ioctl(it->second->fd, request, mmu(r(3)));
+    } else {
+        rc = ioctl(it->second->fd, request, (void*)r(3));
+    }
+
+    if(rc == -1) {
+        r(0) = -errno;
+    } else {
+        r(0) = rc;
+    }
     return true;
 }
