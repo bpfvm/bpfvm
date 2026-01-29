@@ -64,11 +64,7 @@ int main(int argc, char** argv) {
         options.argv.emplace_back(argv[i]);
     }
     extern char **environ;
-    if(environ != nullptr) {
-        for(size_t i = 0; environ[i] != nullptr; i++) {
-            options.envp.emplace_back(environ[i]);
-        }
-    }
+    options.envp.emplace_back("HOME=/");
     umask(0);
     std::cout<<(int)vm->run(&options)<<std::endl;
 }

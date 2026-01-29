@@ -225,12 +225,12 @@ uint64_t vm::load_elf(const char* elf_file_path) {
     }
 
     if(ehdr.e_type != ET_EXEC) {
-        std::cerr << "Not an executable ELF file: " << ehdr.e_type << std::endl;
+        std::cerr << "Not an executable ELF file: " << elf_file_path << " type: " << ehdr.e_type << std::endl;
         goto out;
     }
 
     if(ehdr.e_machine != 0xf7) {
-        std::cerr << "Not an bpf ELF file: "<<ehdr.e_machine << std::endl;
+        std::cerr << "Not an bpf ELF file: " << elf_file_path << " machine: " << ehdr.e_machine << std::endl;
         goto out;
     }
 
