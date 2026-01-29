@@ -159,6 +159,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_ioctl();
     case BPF_SYS_UMASK:
         return do_umask();
+    case BPF_SYS_SETJMP:
+        return do_setjmp();
+    case BPF_SYS_LONGJMP:
+        return do_longjmp();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
@@ -207,9 +211,8 @@ bool vm::do_exit() {
     }
     r(0) = (uint64_t)arg_s32(r(1));
     maps.clear();
-    frames.clear();
     fds.clear();
-    signal_return_pc = nullptr;
+    signal_depth = 0;
     return false;
 }
 
@@ -451,12 +454,11 @@ bool vm::do_execve() {
     fresh->pid = pid;
     fresh->ppid = ppid.load();
     maps.swap(fresh->maps);
-    frames.clear();
     for(size_t i = 0; i < 11; i++) {
         reg[i] = fresh->reg[i];
     }
-    frames.emplace_back(nullptr, reg);
     pc = new_pc;
+    push_frame(0);
     pc--;
     r(0) = 0;
     return true;
@@ -466,7 +468,7 @@ bool vm::do_fork() {
     auto child = std::shared_ptr<vm>(new vm(Token{}, pid, fds));
     child->options = options;
     child->signal_actions = signal_actions;
-    child->signal_return_pc = nullptr;
+    child->signal_depth = signal_depth;
     child->cwd = cwd;
     child->umask_val = umask_val;
     for(const auto& map : maps) {
@@ -500,22 +502,6 @@ bool vm::do_fork() {
         child->reg[i] = reg[i];
     }
     child->r(0) = 0;
-
-    for(const auto& entry : frames) {
-        const bpf_insn* parent_pc = entry.pc;
-        const bpf_insn* child_pc = nullptr;
-        if(parent_pc != nullptr) {
-            uint64_t addr = unmmu(parent_pc);
-            child_pc = (const bpf_insn*)child->mmu(addr);
-        }
-        uint64_t scratch[11] = {};
-        scratch[6] = entry.r6;
-        scratch[7] = entry.r7;
-        scratch[8] = entry.r8;
-        scratch[9] = entry.r9;
-        scratch[10] = entry.r10;
-        child->frames.emplace_back(child_pc, scratch);
-    }
 
     uint64_t pc_addr = unmmu(pc);
     const bpf_insn* child_pc = (const bpf_insn*)child->mmu(pc_addr);
@@ -1028,5 +1014,45 @@ bool vm::do_umask() {
     uint32_t new_mask = arg_u32(r(1));
     r(0) = umask_val;
     umask_val = new_mask & 0777;
+    return true;
+}
+
+bool vm::do_setjmp() {
+    uint64_t env_addr = r(1);
+    uint64_t* env = (uint64_t*)mmu(env_addr);
+    if (!env) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    env[0] = r(6);
+    env[1] = r(7);
+    env[2] = r(8);
+    env[3] = r(9);
+    env[4] = r(10);
+    env[5] = unmmu(pc);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_longjmp() {
+    uint64_t env_addr = r(1);
+    int32_t val = arg_s32(r(2));
+    uint64_t* env = (uint64_t*)mmu(env_addr);
+    if (!env) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    r(6) = env[0];
+    r(7) = env[1];
+    r(8) = env[2];
+    r(9) = env[3];
+    r(10) = env[4];
+    uint64_t saved_pc = env[5];
+    pc = (const bpf_insn*)mmu(saved_pc);
+    // pc points to syscall instruction.
+    // loop increments pc.
+    // next instruction is executed.
+
+    r(0) = (val == 0) ? 1 : val;
     return true;
 }

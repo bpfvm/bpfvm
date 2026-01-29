@@ -146,19 +146,6 @@ struct memmap {
     ~memmap();
 };
 
-struct frame {
-    const bpf_insn* pc;
-    uint64_t r6,r7,r8,r9,r10;
-    frame(const bpf_insn* pc, uint64_t reg[10]) {
-        this->pc = pc;
-        r6 = reg[6];
-        r7 = reg[7];
-        r8 = reg[8];
-        r9 = reg[9];
-        r10 = reg[10];
-    }
-};
-
 struct vmOptions {
     uint64_t entry;
     bool verbose;
@@ -186,7 +173,6 @@ class vm {
     vmOptions options;
     const bpf_insn* pc;
     uint64_t reg[11];
-    std::deque<frame> frames;
     std::list<memmap> maps;
     uint64_t pid = 0;
     std::atomic<uint64_t> ppid{0};
@@ -198,7 +184,7 @@ class vm {
     std::array<signal_action, NSIG> signal_actions{};
     std::deque<int> pending_signals;
     std::mutex signal_mutex;
-    const bpf_insn* signal_return_pc = nullptr;
+    size_t signal_depth = 0;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
@@ -256,6 +242,8 @@ class vm {
     bool do_mkdir();
     bool do_rmdir();
     bool do_umask();
+    bool do_setjmp();
+    bool do_longjmp();
 
     struct Token { explicit Token() = default; };
 public:
@@ -269,20 +257,9 @@ public:
     uint64_t& r(int n) {
         return reg[n];
     }
-    void push_frame() {
-        frames.emplace_back(pc, reg);
-        reg[10] -= STACK_LIMIT;
-    }
-    void pop_frame() {
-        assert(!frames.empty());
-        pc = frames.back().pc;
-        reg[6] = frames.back().r6;
-        reg[7] = frames.back().r7;
-        reg[8] = frames.back().r8;
-        reg[9] = frames.back().r9;
-        reg[10] = frames.back().r10;
-        frames.pop_back();
-    }
+    bool push_frame(uint64_t return_addr, bool is_signal = false);
+    uint64_t pop_frame();
+
     uint64_t run();
     uint64_t run(const vmOptions* options);
 };

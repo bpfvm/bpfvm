@@ -8,7 +8,7 @@ int main(void) {
     int pid = fork();
     if(pid == 0) {
         printf("child: before execve\n");
-        int rc = execve("test_arg.out", (char *const*)argv, (char *const*)envp);
+        int rc = execve("test/test_arg.out", (char *const*)argv, (char *const*)envp);
         printf("child: execve failed: %d\n", rc);
         return rc;
     }

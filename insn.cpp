@@ -280,6 +280,132 @@ out:
     return entry;
 }
 
+/*
+ * Stack Frame Layout:
+ *
+ * Normal Frame (64 bytes):
+ * +------------------+
+ * | flags (0)        | frame_base[0]
+ * +------------------+
+ * | r6               | frame_base[1]
+ * | r7               | frame_base[2]
+ * | r8               | frame_base[3]
+ * | r9               | frame_base[4]
+ * +------------------+
+ * | old_r10 (SP)     | frame_base[5]
+ * +------------------+
+ * | return_address   | frame_base[6]
+ * +------------------+
+ * | unused           | frame_base[7]
+ * +------------------+
+ *
+ * Signal Frame (128 bytes):
+ * +------------------+
+ * | flags (1)        | frame_base[0]
+ * +------------------+
+ * | r0               | frame_base[1]
+ * | r1               | frame_base[2]
+ * | r2               | frame_base[3]
+ * | r3               | frame_base[4]
+ * | r4               | frame_base[5]
+ * | r5               | frame_base[6]
+ * | r6               | frame_base[7]
+ * | r7               | frame_base[8]
+ * | r8               | frame_base[9]
+ * | r9               | frame_base[10]
+ * +------------------+
+ * | old_r10 (SP)     | frame_base[11]
+ * +------------------+
+ * | return_address   | frame_base[12]
+ * +------------------+
+ * | unused (3 slots) | frame_base[13..15]
+ * +------------------+
+ */
+bool vm::push_frame(uint64_t return_addr, bool is_signal) {
+    uint32_t frame_size = is_signal ? 128 : 64;
+    if(r(10) - STACK_LIMIT - frame_size < STACK_BASE) {
+        log_mem_violation("stack overflow", r(10));
+        return false;
+    }
+    if(options.verbose) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("[#%lu] [STACK] PUSH sp=%lx ret=%lx sig=%d size=%d\n", pid, r(10), return_addr, is_signal, frame_size);
+    }
+    uint64_t sp = r(10) - STACK_LIMIT;
+    uint64_t frame_base_addr = sp - frame_size;
+    uint64_t* frame_base = (uint64_t*)mmu(frame_base_addr);
+    if(!frame_base) {
+        log_mem_violation("stack access", frame_base_addr);
+        return false;
+    }
+
+    frame_base[0] = is_signal ? 1 : 0; // flags
+    if (is_signal) {
+        signal_depth++;
+        frame_base[1] = r(0);
+        frame_base[2] = r(1);
+        frame_base[3] = r(2);
+        frame_base[4] = r(3);
+        frame_base[5] = r(4);
+        frame_base[6] = r(5);
+        frame_base[7] = r(6);
+        frame_base[8] = r(7);
+        frame_base[9] = r(8);
+        frame_base[10] = r(9);
+        frame_base[11] = r(10);
+        frame_base[12] = return_addr;
+    } else {
+        frame_base[1] = r(6);
+        frame_base[2] = r(7);
+        frame_base[3] = r(8);
+        frame_base[4] = r(9);
+        frame_base[5] = r(10);
+        frame_base[6] = return_addr;
+    }
+
+    r(10) = frame_base_addr;
+    return true;
+}
+
+uint64_t vm::pop_frame() {
+    uint64_t sp = r(10);
+    uint64_t* frame_base = (uint64_t*)mmu(sp);
+    if(!frame_base) return 0;
+
+    uint64_t old_sp;
+    uint64_t ret_addr;
+    bool is_signal = frame_base[0] != 0;
+    if (is_signal) {
+        signal_depth--;
+        r(0) = frame_base[1];
+        r(1) = frame_base[2];
+        r(2) = frame_base[3];
+        r(3) = frame_base[4];
+        r(4) = frame_base[5];
+        r(5) = frame_base[6];
+        r(6) = frame_base[7];
+        r(7) = frame_base[8];
+        r(8) = frame_base[9];
+        r(9) = frame_base[10];
+        old_sp = frame_base[11];
+        ret_addr = frame_base[12];
+    } else {
+        r(6) = frame_base[1];
+        r(7) = frame_base[2];
+        r(8) = frame_base[3];
+        r(9) = frame_base[4];
+        old_sp = frame_base[5];
+        ret_addr = frame_base[6];
+    }
+
+    if(options.verbose) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("[#%lu] [STACK] POP sp=%lx new_sp=%lx ret=%lx sig=%d\n", pid, sp, old_sp, ret_addr, is_signal);
+    }
+    r(10) = old_sp;
+    return ret_addr;
+}
+
 bool vm::jmp() {
     uint64_t src = (pc->code & 0x08) == BPF_X ? r(pc->src_reg) : pc->imm;
     switch (pc->code & 0xf0) {
@@ -323,25 +449,40 @@ bool vm::jmp() {
         break;
     case BPF_CALL:
         if((pc->code & 0x08) == BPF_X) {
-            push_frame();
-            pc = (const bpf_insn*)mmu(r(pc->dst_reg));
+            if(!push_frame(unmmu(pc + 1))) {
+                return false;
+            }
+            uint64_t target = r(pc->dst_reg);
+            pc = (const bpf_insn*)mmu(target);
+            if(pc == nullptr) {
+                log_mem_violation("call", target);
+                return false;
+            }
             pc--;
         }else if(pc->src_reg == 0) {
             return do_syscall(pc->imm);
         }else if(pc->src_reg == 1) {
-            push_frame();
+            if(!push_frame(unmmu(pc + 1))) {
+                return false;
+            }
             pc += pc->imm;
         }
         break;
     case BPF_EXIT:
-        pop_frame();
-        if(signal_return_pc != nullptr && pc == signal_return_pc) {
-            signal_return_pc = nullptr;
-        }
-        if (frames.empty()) {
+    {
+        uint64_t ret = pop_frame();
+        if(ret == 0) {
+            //到栈底了
             return false;
         }
+        pc = (const bpf_insn*)mmu(ret);
+        if(pc == nullptr) {
+            log_mem_violation("return", ret);
+            return false;
+        }
+        pc--; // counter loop increment
         break;
+    }
     case BPF_JLT:
         if (r(pc->dst_reg) < src) {
             pc += pc->off;
@@ -543,9 +684,9 @@ bool vm::handle_pending_signals() {
         r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
         return do_exit();
     }
-    signal_return_pc = pc - 1;
-    pc = signal_return_pc;
-    push_frame();
+    if(!push_frame(unmmu(pc), true)) {
+        return do_exit();
+    }
     r(1) = static_cast<uint64_t>(sig);
     pc = handler_pc;
     return true;
@@ -797,7 +938,7 @@ bool vm::alu() {
 
 
 bool vm::step() {
-    if(signal_return_pc == nullptr) {
+    if(signal_depth == 0) {
         if(!handle_pending_signals()) {
             //be killed
             return false;
@@ -881,7 +1022,6 @@ uint64_t vm::run() {
     while(step()) {
         pc++;
     }
-    frames.clear();
     exited.store(true, std::memory_order_release);
     return r(0);
 }
@@ -896,11 +1036,10 @@ uint64_t vm::run(const vmOptions* options) {
         return 0;
     }
     pc = (const bpf_insn*)mmu(options->entry);
-    frames.emplace_back(nullptr, reg);
+    push_frame(0);
     while(step()) {
         pc++;
     }
-    frames.clear();
     exited.store(true, std::memory_order_release);
     return r(0);
 }
