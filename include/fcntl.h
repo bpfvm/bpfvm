@@ -20,6 +20,7 @@
 #define O_EXCL     00000200
 #define O_NONBLOCK 00004000
 
+#define F_DUPFD 0
 #define F_GETFL 3
 #define F_SETFL 4
 #define F_DUPFD_CLOEXEC 1030

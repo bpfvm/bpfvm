@@ -966,8 +966,20 @@ bool vm::do_fcntl() {
     }
     int cmd = arg_s32(r(2));
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-         r(0) = -EINVAL;
-         return true;
+        int min_fd = arg_s32(r(3));
+        if (min_fd < 0) {
+            r(0) = -EINVAL;
+            return true;
+        }
+
+        int new_fd = min_fd;
+        while(fds.count(new_fd)) {
+            new_fd++;
+        }
+
+        fds[new_fd] = it->second;
+        r(0) = new_fd;
+        return true;
     }
     uint64_t arg = r(3);
     int rc = -1;
