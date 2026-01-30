@@ -28,32 +28,32 @@ static void fill_bpf_stat64(const struct stat& st, bpf::stat& out) {
     out.st_size = static_cast<decltype(out.st_size)>(st.st_size);
     out.st_blksize = static_cast<decltype(out.st_blksize)>(st.st_blksize);
     out.st_blocks = static_cast<decltype(out.st_blocks)>(st.st_blocks);
-#pragma push_macro("st_atime")
-#undef st_atime
-#if defined(__linux__)
-    out.st_atime = static_cast<decltype(out.st_atime)>(st.st_atim.tv_sec);
-#else
-    out.st_atime = static_cast<decltype(out.st_atime)>(st.st_atime);
-#endif
-#pragma pop_macro("st_atime")
 
-#pragma push_macro("st_mtime")
-#undef st_mtime
 #if defined(__linux__)
-    out.st_mtime = static_cast<decltype(out.st_mtime)>(st.st_mtim.tv_sec);
+    out.st_atim.tv_sec = static_cast<decltype(out.st_atim.tv_sec)>(st.st_atim.tv_sec);
+    out.st_atim.tv_nsec = static_cast<decltype(out.st_atim.tv_nsec)>(st.st_atim.tv_nsec);
 #else
-    out.st_mtime = static_cast<decltype(out.st_mtime)>(st.st_mtime);
+    out.st_atim.tv_sec = static_cast<decltype(out.st_atim.tv_sec)>(st.st_atime);
+    out.st_atim.tv_nsec = 0;
 #endif
-#pragma pop_macro("st_mtime")
 
-#pragma push_macro("st_ctime")
-#undef st_ctime
+
 #if defined(__linux__)
-    out.st_ctime = static_cast<decltype(out.st_ctime)>(st.st_ctim.tv_sec);
+    out.st_mtim.tv_sec = static_cast<decltype(out.st_mtim.tv_sec)>(st.st_mtim.tv_sec);
+    out.st_mtim.tv_nsec = static_cast<decltype(out.st_mtim.tv_nsec)>(st.st_mtim.tv_nsec);
 #else
-    out.st_ctime = static_cast<decltype(out.st_ctime)>(st.st_ctime);
+    out.st_mtim.tv_sec = static_cast<decltype(out.st_mtim.tv_sec)>(st.st_mtime);
+    out.st_mtim.tv_nsec = 0;
 #endif
-#pragma pop_macro("st_ctime")
+
+
+#if defined(__linux__)
+    out.st_ctim.tv_sec = static_cast<decltype(out.st_ctim.tv_sec)>(st.st_ctim.tv_sec);
+    out.st_ctim.tv_nsec = static_cast<decltype(out.st_ctim.tv_nsec)>(st.st_ctim.tv_nsec);
+#else
+    out.st_ctim.tv_sec = static_cast<decltype(out.st_ctim.tv_sec)>(st.st_ctime);
+    out.st_ctim.tv_nsec = 0;
+#endif
 }
 
 
@@ -266,7 +266,11 @@ bool vm::do_open() {
         r(0) = -errno;
         return true;
     }
-    fds[fd] = std::make_shared<fd_handle>(fd);
+    auto handle = std::make_shared<fd_handle>(fd);
+    if (arg_s32(r(2)) & O_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    fds[fd] = handle;
     r(0) = fd;
     return true;
 }
@@ -430,7 +434,14 @@ bool vm::do_execve() {
         return true;
     }
 
-    auto fresh = std::shared_ptr<vm>(new vm(Token{}, ppid.load(), fds)); // temporary use, avoid pid_map pollution
+    std::unordered_map<int, std::shared_ptr<fd_handle>> new_fds;
+    for (const auto& entry : fds) {
+        if (!entry.second->cloexec) {
+            new_fds.insert(entry);
+        }
+    }
+
+    auto fresh = std::shared_ptr<vm>(new vm(Token{}, ppid.load(), new_fds)); // temporary use, avoid pid_map pollution
     fresh->cwd = cwd;
     uint64_t entry = fresh->load_elf(resolve_path(path).c_str());
     if(entry == 0) {
@@ -454,6 +465,7 @@ bool vm::do_execve() {
     fresh->pid = pid;
     fresh->ppid = ppid.load();
     maps.swap(fresh->maps);
+    fds.swap(fresh->fds);
     for(size_t i = 0; i < 11; i++) {
         reg[i] = fresh->reg[i];
     }
@@ -465,7 +477,19 @@ bool vm::do_execve() {
 }
 
 bool vm::do_fork() {
-    auto child = std::shared_ptr<vm>(new vm(Token{}, pid, fds));
+    std::unordered_map<int, std::shared_ptr<fd_handle>> child_fds;
+    for(const auto& entry : fds) {
+        int new_host_fd = dup(entry.second->fd);
+        if(new_host_fd < 0) {
+            r(0) = -errno;
+            return true;
+        }
+        auto new_handle = std::make_shared<fd_handle>(new_host_fd);
+        new_handle->cloexec = entry.second->cloexec;
+        child_fds[entry.first] = new_handle;
+    }
+
+    auto child = std::shared_ptr<vm>(new vm(Token{}, pid, child_fds));
     child->options = options;
     child->signal_actions = signal_actions;
     child->signal_depth = signal_depth;
@@ -636,12 +660,18 @@ bool vm::do_dup() {
         return true;
     }
 
+    int new_host_fd = dup(it->second->fd);
+    if(new_host_fd < 0) {
+        r(0) = -errno;
+        return true;
+    }
+
     int new_fd = 0;
     while(fds.count(new_fd)) {
         new_fd++;
     }
 
-    fds[new_fd] = it->second;
+    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd);
     r(0) = new_fd;
     return true;
 }
@@ -665,7 +695,13 @@ bool vm::do_dup2() {
         return true;
     }
 
-    fds[new_fd] = it->second;
+    int new_host_fd = dup(it->second->fd);
+    if(new_host_fd < 0) {
+        r(0) = -errno;
+        return true;
+    }
+
+    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd);
     r(0) = new_fd;
     return true;
 }
@@ -690,6 +726,10 @@ bool vm::do_pipe2() {
     pipefd[1] = host_fds[1];
     fds[host_fds[0]] = std::make_shared<fd_handle>(host_fds[0]);
     fds[host_fds[1]] = std::make_shared<fd_handle>(host_fds[1]);
+    if (flags & O_CLOEXEC) {
+        fds[host_fds[0]]->cloexec = true;
+        fds[host_fds[1]]->cloexec = true;
+    }
     r(0) = 0;
     return true;
 }
@@ -977,10 +1017,30 @@ bool vm::do_fcntl() {
             new_fd++;
         }
 
-        fds[new_fd] = it->second;
+        int new_host_fd = dup(it->second->fd);
+        if(new_host_fd < 0) {
+            r(0) = -errno;
+            return true;
+        }
+
+        auto new_handle = std::make_shared<fd_handle>(new_host_fd);
+        if (cmd == F_DUPFD_CLOEXEC) {
+            new_handle->cloexec = true;
+        }
+        fds[new_fd] = new_handle;
         r(0) = new_fd;
         return true;
     }
+    if (cmd == F_GETFD) {
+        r(0) = it->second->cloexec ? FD_CLOEXEC : 0;
+        return true;
+    }
+    if (cmd == F_SETFD) {
+        it->second->cloexec = (r(3) & FD_CLOEXEC) != 0;
+        r(0) = 0;
+        return true;
+    }
+
     uint64_t arg = r(3);
     int rc = -1;
     if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {

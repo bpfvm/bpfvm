@@ -22,5 +22,8 @@ typedef long off_t;
 typedef long long off64_t;
 typedef long ssize_t;
 typedef long time_t;
+typedef long blksize_t;
+typedef long blkcnt_t;
+typedef int id_t;
 
 #endif

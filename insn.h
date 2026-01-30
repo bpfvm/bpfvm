@@ -157,6 +157,7 @@ struct vmOptions {
 
 struct fd_handle {
     const int fd = -1;
+    bool cloexec = false;
     explicit fd_handle(int fd) : fd(fd) {}
     ~fd_handle();
 };

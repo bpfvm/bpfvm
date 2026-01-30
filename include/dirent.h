@@ -22,6 +22,7 @@ enum{
 
 #ifndef BPF_NO_SYSCALL
 DIR *opendir(const char *pathname);
+DIR *fdopendir(int fd);
 struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
 #endif

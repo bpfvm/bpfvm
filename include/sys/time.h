@@ -3,11 +3,9 @@
 
 #include <time.h>
 
-#define suseconds_t unsigned long long
-
 struct timeval {
-    time_t      tv_sec;
-    suseconds_t tv_usec;
+    time_t tv_sec;
+    long   tv_usec;
 };
 
 struct timezone {
