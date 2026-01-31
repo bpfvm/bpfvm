@@ -21,7 +21,7 @@ rm -f src/builtins.def src/builtins.c src/builtins.h
     --host=bpf-unknown-none \
     CC="clang" \
     CC_FOR_BUILD="gcc" \
-    CFLAGS="-std=gnu11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin -isystem $ROOT_DIR/include -isystem $ROOT_DIR/libc/include -isystem $CLANG_RES -g -DJOBS=0" \
+    CFLAGS="-std=gnu11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin -isystem $ROOT_DIR/libc/include -isystem $ROOT_DIR/include -isystem $CLANG_RES -g -DJOBS=0" \
     LDFLAGS="-target bpf -nostdlib -Wl,-e,_start" \
     LIBS="$ROOT_DIR/libc/lib64/libpdclib.a"
 
