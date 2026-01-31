@@ -77,9 +77,11 @@ int mkdir(const char *path, mode_t mode);
 int mknod(const char *pathname, mode_t mode, dev_t dev);
 int chmod(const char *path, mode_t mode);
 int fchmod(int fd, mode_t mode);
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
 int chown(const char *path, uid_t owner, gid_t group);
 int fchown(int fd, uid_t owner, gid_t group);
 int lchown(const char *pathname, uid_t owner, gid_t group);
+int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags);
 int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);
 #endif
 

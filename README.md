@@ -21,7 +21,7 @@
 *   **C++ 编译器**: 支持 C++20 标准 (推荐 Clang 或 GCC)。
 *   **CMake**: 3.16 或更高版本。
 *   **libelf**: 用于 ELF 文件解析 (`libelf-dev` 或 `elfutils-libelf-devel`)。
-*   **BPF 工具链**: 用于编译 Guest 程序 (`clang`, `llvm-objcopy`, `bpf-ld` / `binutils-bpf`)。
+*   **BPF 工具链**: 用于编译 Guest 程序 (`clang >= 19`, `binutils-bpf >= 2.44`)。
 
 ### 编译虚拟机
 
@@ -97,7 +97,7 @@ make -C test
 ## 已知问题
 
 *   **工具链问题**: `bpf-ld` (binutils-bpf 2.44) 可能会错误合并 `.rodata` 中的字符串字面量。
-    *   *临时解决*: 使用 `llvm-objcopy` 修改段标志，如 `build_dash.sh` 中所示。
+    *   *临时解决*: 使用 `bpf-objcopy` 修改段标志，如 `build_dash.sh` 中所示。也可以使用仓库内 `bpf-cc` 包装器编译（自动对 `.o` 应用 `bpf-objcopy` 修正段标志）。
 
 ## 许可证
 

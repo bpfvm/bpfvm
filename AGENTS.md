@@ -40,11 +40,11 @@
 
 ## Configuration & Dependencies
 - Requires `libelf` via `pkg-config` for the VM build.
-- BPF toolchain dependencies: `clang`, `llvm-objcopy`, and `bpf-ld` for `test/` programs.
+- BPF toolchain dependencies: `clang`, `bpf-objcopy`, and `bpf-ld` for `test/` programs.
 
 ## Known Toolchain Issues
 - `bpf-ld` (binutils-bpf 2.44) may mis-merge string literals (off-by-one addresses in `.rodata`).
-- Workaround: strip merge flags on `.rodata.str1.1` with `llvm-objcopy --set-section-flags .rodata.str1.1=alloc,readonly,data`.
+- Workaround: strip merge flags on `.rodata.str1.1` with `bpf-objcopy --set-section-flags .rodata.str1.1=alloc,readonly,data`.
 - Debian bug report: `https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1126689`.
 
 ## BPF Architecture Constraints & Developer Guide
