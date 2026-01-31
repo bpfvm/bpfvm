@@ -8,6 +8,6 @@ struct utimbuf {
     time_t modtime;
 };
 
-utime(const char *filename, const struct utimbuf *times);
+int utime(const char *filename, const struct utimbuf *times);
 
 #endif

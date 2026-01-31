@@ -97,8 +97,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_gettimeofday();
     case BPF_SYS_TIMES:
         return do_times();
-    case BPF_SYS_OPEN:
-        return do_open();
+    case BPF_SYS_OPENAT:
+        return do_openat();
     case BPF_SYS_READ:
         return do_read();
     case BPF_SYS_WRITE:
@@ -107,12 +107,16 @@ bool vm::do_syscall(uint32_t call) {
         return do_lseek();
     case BPF_SYS_CLOSE:
         return do_close();
-    case BPF_SYS_UNLINK:
-        return do_unlink();
+    case BPF_SYS_UNLINKAT:
+        return do_unlinkat();
     case BPF_SYS_MKDIR:
         return do_mkdir();
     case BPF_SYS_RMDIR:
         return do_rmdir();
+    case BPF_SYS_SYMLINKAT:
+        return do_symlinkat();
+    case BPF_SYS_LINKAT:
+        return do_linkat();
     case BPF_SYS_RENAMEAT:
         return do_renameat();
     case BPF_SYS_READLINK:
@@ -137,18 +141,20 @@ bool vm::do_syscall(uint32_t call) {
         return do_chdir();
     case BPF_SYS_GETCWD:
         return do_getcwd();
-    case BPF_SYS_OPENDIR:
-        return do_opendir();
+    case BPF_SYS_FDOPENDIR:
+        return do_fdopendir();
     case BPF_SYS_READDIR:
         return do_readdir();
     case BPF_SYS_CLOSEDIR:
         return do_closedir();
-    case BPF_SYS_STAT:
-        return do_stat();
-    case BPF_SYS_LSTAT:
-        return do_lstat();
-    case BPF_SYS_FSTAT:
-        return do_fstat();
+    case BPF_SYS_FSTATAT:
+        return do_fstatat();
+    case BPF_SYS_FCHMODAT:
+        return do_fchmodat();
+    case BPF_SYS_UTIMENSAT:
+        return do_utimensat();
+    case BPF_SYS_FACCESSAT:
+        return do_faccessat();
     case BPF_SYS_KILL:
         return do_kill();
     case BPF_SYS_SIGACTION:
@@ -171,7 +177,20 @@ bool vm::do_syscall(uint32_t call) {
 }
 
 bool vm::do_mmap() {
-    void* addr = mmap(nullptr, arg_size(r(1)), arg_s32(r(2)), arg_s32(r(3)), arg_s32(r(4)), (off_t)r(5));
+    int flags = arg_s32(r(3));
+    int fd = arg_s32(r(4));
+    int host_fd = -1;
+
+    if (!(flags & MAP_ANONYMOUS)) {
+        auto it = fds.find(fd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        host_fd = it->second->fd;
+    }
+
+    void* addr = mmap(nullptr, arg_size(r(1)), arg_s32(r(2)), flags, host_fd, (off_t)r(5));
     if(addr == MAP_FAILED) {
         r(0) = -errno;
         return true;
@@ -255,19 +274,32 @@ bool vm::do_times() {
     return true;
 }
 
-bool vm::do_open() {
+bool vm::do_openat() {
+    int dirfd = arg_s32(r(1));
     std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
+    if(!read_c_string(r(2), path, 4096)) {
         r(0) = -EFAULT;
         return true;
     }
-    int fd = open(resolve_path(path).c_str(), arg_s32(r(2)), (mode_t)(arg_u32(r(3)) & ~umask_val));
+    int flags = arg_s32(r(3));
+    mode_t mode = (mode_t)(arg_u32(r(4)) & ~umask_val);
+    int fd = -1;
+    if(dirfd == AT_FDCWD) {
+        fd = openat(AT_FDCWD, resolve_path(path).c_str(), flags, mode);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        fd = openat(it->second->fd, path.c_str(), flags, mode);
+    }
     if(fd == -1) {
         r(0) = -errno;
         return true;
     }
     auto handle = std::make_shared<fd_handle>(fd);
-    if (arg_s32(r(2)) & O_CLOEXEC) {
+    if(flags & O_CLOEXEC) {
         handle->cloexec = true;
     }
     fds[fd] = handle;
@@ -331,13 +363,25 @@ bool vm::do_close() {
     return true;
 }
 
-bool vm::do_unlink() {
+bool vm::do_unlinkat() {
+    int dirfd = arg_s32(r(1));
     std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
+    if(!read_c_string(r(2), path, 4096)) {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = unlink(resolve_path(path).c_str());
+    int flags = arg_s32(r(3));
+    int rc = -1;
+    if(dirfd == AT_FDCWD) {
+        rc = unlinkat(AT_FDCWD, resolve_path(path).c_str(), flags);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = unlinkat(it->second->fd, path.c_str(), flags);
+    }
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -376,6 +420,82 @@ bool vm::do_rmdir() {
     return true;
 }
 
+bool vm::do_symlinkat() {
+    std::string target;
+    std::string linkpath;
+    if(!read_c_string(r(1), target, 4096) || !read_c_string(r(3), linkpath, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int new_dirfd = arg_s32(r(2));
+    int rc = -1;
+    if(new_dirfd == AT_FDCWD) {
+        rc = symlinkat(target.c_str(), AT_FDCWD, resolve_path(linkpath).c_str());
+    } else {
+        auto it = fds.find(new_dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = symlinkat(target.c_str(), it->second->fd, linkpath.c_str());
+    }
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_linkat() {
+    std::string oldpath;
+    std::string newpath;
+    if(!read_c_string(r(2), oldpath, 4096) || !read_c_string(r(4), newpath, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int olddirfd = arg_s32(r(1));
+    int newdirfd = arg_s32(r(3));
+    int flags = arg_s32(r(5));
+
+    int host_olddirfd = AT_FDCWD;
+    if (olddirfd != AT_FDCWD) {
+        auto it = fds.find(olddirfd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        host_olddirfd = it->second->fd;
+    }
+
+    int host_newdirfd = AT_FDCWD;
+    if (newdirfd != AT_FDCWD) {
+        auto it = fds.find(newdirfd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        host_newdirfd = it->second->fd;
+    }
+
+    std::string resolved_old = oldpath;
+    if (olddirfd == AT_FDCWD) {
+        resolved_old = resolve_path(oldpath);
+    }
+    std::string resolved_new = newpath;
+    if (newdirfd == AT_FDCWD) {
+        resolved_new = resolve_path(newpath);
+    }
+
+    int rc = linkat(host_olddirfd, resolved_old.c_str(), host_newdirfd, resolved_new.c_str(), flags);
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
+}
+
 bool vm::do_renameat() {
     std::string old_path;
     std::string new_path;
@@ -385,6 +505,27 @@ bool vm::do_renameat() {
     }
     int old_dirfd = arg_s32(r(1));
     int new_dirfd = arg_s32(r(3));
+
+    int host_old_dirfd = AT_FDCWD;
+    if (old_dirfd != AT_FDCWD) {
+        auto it = fds.find(old_dirfd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        host_old_dirfd = it->second->fd;
+    }
+
+    int host_new_dirfd = AT_FDCWD;
+    if (new_dirfd != AT_FDCWD) {
+        auto it = fds.find(new_dirfd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        host_new_dirfd = it->second->fd;
+    }
+
     std::string resolved_old = old_path;
     std::string resolved_new = new_path;
     if(old_dirfd == AT_FDCWD) {
@@ -393,7 +534,7 @@ bool vm::do_renameat() {
     if(new_dirfd == AT_FDCWD) {
         resolved_new = resolve_path(new_path);
     }
-    int rc = renameat(old_dirfd, resolved_old.c_str(), new_dirfd, resolved_new.c_str());
+    int rc = renameat(host_old_dirfd, resolved_old.c_str(), host_new_dirfd, resolved_new.c_str());
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -777,23 +918,26 @@ bool vm::do_getcwd() {
     return true;
 }
 
-bool vm::do_opendir() {
-    std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
-        r(0) = -EFAULT;
-        return true;
-    }
+bool vm::do_fdopendir() {
+    int fd = arg_s32(r(1));
     auto out_dir = static_cast<bpf::DIR*>(mmu(r(2)));
     if(out_dir == nullptr) {
         r(0) = -EFAULT;
         return true;
     }
-    DIR* dir = opendir(resolve_path(path).c_str());
+    auto it = fds.find(fd);
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    it->second->cloexec = true;
+    DIR* dir = fdopendir(it->second->fd);
     if(dir == nullptr) {
         r(0) = -errno;
         return true;
     }
     out_dir->handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dir));
+    out_dir->fd = fd;
     r(0) = 0;
     return true;
 }
@@ -850,24 +994,40 @@ bool vm::do_closedir() {
         r(0) = -errno;
         return true;
     }
+    fds.erase(dirp->fd);
+    dirp->fd = -1;
     dirp->handle = 0;
     r(0) = 0;
     return true;
 }
 
-bool vm::do_stat() {
+bool vm::do_fstatat() {
+    int dirfd = arg_s32(r(1));
     std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
+    if(!read_c_string(r(2), path, 4096)) {
         r(0) = -EFAULT;
         return true;
     }
-    auto out = static_cast<bpf::stat*>(mmu(r(2)));
+    auto out = static_cast<bpf::stat*>(mmu(r(3)));
     if(out == nullptr) {
         r(0) = -EFAULT;
         return true;
     }
+    int flags = arg_s32(r(4));
+    int host_dirfd = AT_FDCWD;
     struct stat st = {};
-    if(stat(resolve_path(path).c_str(), &st) == -1) {
+    int rc = -1;
+    if(dirfd == AT_FDCWD) {
+        rc = fstatat(AT_FDCWD, resolve_path(path).c_str(), &st, flags);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = fstatat(it->second->fd, path.c_str(), &st, flags);
+    }
+    if(rc == -1) {
         r(0) = -errno;
         return true;
     }
@@ -876,44 +1036,115 @@ bool vm::do_stat() {
     return true;
 }
 
-bool vm::do_lstat() {
+bool vm::do_fchmodat() {
+    int dirfd = arg_s32(r(1));
     std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
+    if(!read_c_string(r(2), path, 4096)) {
         r(0) = -EFAULT;
         return true;
     }
-    auto out = static_cast<bpf::stat*>(mmu(r(2)));
-    if(out == nullptr) {
-        r(0) = -EFAULT;
-        return true;
+    mode_t mode = (mode_t)arg_u32(r(3));
+    int flags = arg_s32(r(4));
+    int rc = -1;
+    if(dirfd == AT_FDCWD) {
+        rc = fchmodat(AT_FDCWD, resolve_path(path).c_str(), mode, flags);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = fchmodat(it->second->fd, path.c_str(), mode, flags);
     }
-    struct stat st = {};
-    if(lstat(resolve_path(path).c_str(), &st) == -1) {
+    if(rc == -1) {
         r(0) = -errno;
         return true;
     }
-    fill_bpf_stat64(st, *out);
     r(0) = 0;
     return true;
 }
 
-bool vm::do_fstat() {
-    auto it = fds.find(arg_s32(r(1)));
-    if(it == fds.end()) {
-        r(0) = -EBADF;
-        return true;
+bool vm::do_utimensat() {
+    int dirfd = arg_s32(r(1));
+    std::string path;
+    bool has_path = (r(2) != 0);
+
+    if (has_path) {
+        if(!read_c_string(r(2), path, 4096)) {
+            r(0) = -EFAULT;
+            return true;
+        }
     }
-    auto out = static_cast<bpf::stat*>(mmu(r(2)));
-    if(out == nullptr) {
-        r(0) = -EFAULT;
-        return true;
+
+    uint64_t times_addr = r(3);
+    int flags = arg_s32(r(4));
+
+    struct timespec pts[2];
+    struct timespec* times_ptr = nullptr;
+
+    if (times_addr != 0) {
+        int64_t* raw = (int64_t*)mmu(times_addr);
+        if (raw == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+        pts[0].tv_sec = raw[0];
+        pts[0].tv_nsec = raw[1];
+        pts[1].tv_sec = raw[2];
+        pts[1].tv_nsec = raw[3];
+        times_ptr = pts;
     }
-    struct stat st = {};
-    if(fstat(it->second->fd, &st) == -1) {
+
+    int rc = -1;
+    if (dirfd == AT_FDCWD) {
+        if (!has_path) {
+            r(0) = -EFAULT;
+            return true;
+        }
+        rc = utimensat(AT_FDCWD, resolve_path(path).c_str(), times_ptr, flags);
+    } else {
+        auto it = fds.find(dirfd);
+        if (it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = utimensat(it->second->fd, has_path ? path.c_str() : nullptr, times_ptr, flags);
+    }
+
+    if(rc == -1) {
         r(0) = -errno;
         return true;
     }
-    fill_bpf_stat64(st, *out);
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_faccessat() {
+    int dirfd = arg_s32(r(1));
+    std::string path;
+    if(!read_c_string(r(2), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int mode = arg_s32(r(3));
+    int flags = arg_s32(r(4));
+
+    int rc = -1;
+    if (dirfd == AT_FDCWD) {
+        rc = faccessat(AT_FDCWD, resolve_path(path).c_str(), mode, flags);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            r(0) = -EBADF;
+            return true;
+        }
+        rc = faccessat(it->second->fd, path.c_str(), mode, flags);
+    }
+
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
     r(0) = 0;
     return true;
 }

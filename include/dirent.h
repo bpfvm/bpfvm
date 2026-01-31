@@ -11,6 +11,7 @@ struct dirent {
 
 typedef struct {
     uint64_t handle;
+    int fd;
     struct dirent entry;
 } DIR;
 

@@ -11,6 +11,7 @@
 #define AT_REMOVEDIR        0x200
 #define AT_SYMLINK_FOLLOW   0x400
 #define AT_EACCESS          0x200
+#define AT_EMPTY_PATH       0x1000
 
 #define O_RDONLY         00
 #define O_WRONLY         01

@@ -621,11 +621,12 @@ void test_syscall_file_io() {
     memcpy(data + 64, payload, payload_len);
 
     bpf_insn instructions[] = {
-        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(path_addr & 0xFFFFFFFF) },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, (int32_t)AT_FDCWD },
+        { BPF_LD | BPF_IMM | BPF_DW, 2, 0, 0, (int32_t)(path_addr & 0xFFFFFFFF) },
         { 0, 0, 0, 0, (int32_t)(path_addr >> 32) },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, O_CREAT | O_TRUNC | O_RDWR },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0644 },
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_OPEN },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, O_CREAT | O_TRUNC | O_RDWR },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 4, 0, 0, 0644 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_OPENAT },
         { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 }, // r6 = fd
 
         { BPF_LD | BPF_IMM | BPF_DW, 2, 0, 0, (int32_t)(write_buf_addr & 0xFFFFFFFF) },
@@ -653,7 +654,12 @@ void test_syscall_file_io() {
 
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(path_addr & 0xFFFFFFFF) },
         { 0, 0, 0, 0, (int32_t)(path_addr >> 32) },
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_UNLINK },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, (int32_t)AT_FDCWD },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 3, 1, 0, 0 }, // r3 = path_addr
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 2, 0, 0 }, // r1 = AT_FDCWD
+        { BPF_ALU64 | BPF_MOV | BPF_X, 2, 3, 0, 0 }, // r2 = path_addr
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 }, // flags = 0
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_UNLINKAT },
         { BPF_ALU64 | BPF_MOV | BPF_X, 9, 0, 0, 0 }, // r9 = unlink rc
 
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 8, 0, 0 }, // r0 = read rc

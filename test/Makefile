@@ -1,4 +1,5 @@
-TARGETS := test_arg.out test_execve.out test_signal.out test_path.out test_readdir.out test_umask.out test_setjmp.out test_va.out test_cloexec.out test_cloexec_child.out
+SOURCES := $(wildcard *.c)
+TARGETS := $(SOURCES:.c=.out)
 OBJECTS := $(TARGETS:.out=.o)
 
 all: $(TARGETS)

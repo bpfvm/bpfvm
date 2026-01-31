@@ -23,6 +23,7 @@ make \
     LIB="libutf.a libutil.a ${ROOT_DIR}/libc/lib64/libpdclib.a" \
     LDFLAGS="-target bpf -Wl,-e,_start -nostdlib -static" \
     ls cal cat mkdir rmdir printf printenv basename dirname sort head false yes expand cut cmp comm fold join paste split strings tee tr true tsort unexpand uniq unlink wc \
-    md5sum sha1sum sha224sum sha256sum sha384sum sha512-224sum sha512-256sum sha512sum 
+    md5sum sha1sum sha224sum sha256sum sha384sum sha512-224sum sha512-256sum sha512sum \
+    chmod chown chgrp echo pathchk pwd readlink mknod od mv ln link which nohup tar test uudecode uuencode xinstall cp du rm rev cols
  
 echo "Build complete. Binary is at sbase"
