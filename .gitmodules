@@ -2,3 +2,7 @@
 	path = pdclib
 	url = https://github.com/choury/pdclib.git
 	branch = bpf
+[submodule "dash"]
+	path = dash
+	url = https://github.com/choury/dash.git
+	branch = bpf
