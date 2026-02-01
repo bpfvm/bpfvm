@@ -11,6 +11,7 @@
 *   **系统调用模拟**: 实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
 *   **标准库支持**: 深度集成了 `PDCLib`，为 BPF 程序提供标准 C 库支持 (stdio, stdlib, string 等)。
 *   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `sbase` (coreutils) 等复杂程序。
+*   **Demo Rootfs**: 提供脚本一键构建 `dash + sbase` 的最小 rootfs，并安装到 `root/`。
 
 ## 构建指南
 
@@ -64,14 +65,14 @@ VM 自身的指令集单元测试：
 ./build/bpfvm_test
 ```
 
-### 编译并运行 Dash Shell
+### 构建 Demo Rootfs (dash + sbase)
 
-本项目包含构建 `dash` 的辅助脚本：
+一键构建 `dash` 和 `sbase`，并将产物安装到 `root/bin`：
 
 ```bash
-./build_dash.sh
-# 运行 dash
-./build/bpfvm build/dash/src/dash
+./build_root.sh
+# 运行 dash（示例）
+./build/bpfvm root/bin/dash
 ```
 
 ### 运行集成测试
@@ -97,7 +98,7 @@ make -C test
 ## 已知问题
 
 *   **工具链问题**: `bpf-ld` (binutils-bpf 2.44) 可能会错误合并 `.rodata` 中的字符串字面量。
-    *   *临时解决*: 使用 `bpf-objcopy` 修改段标志，如 `build_dash.sh` 中所示。也可以使用仓库内 `bpf-cc` 包装器编译（自动对 `.o` 应用 `bpf-objcopy` 修正段标志）。
+    *   *临时解决*: 使用 `bpf-objcopy` 修改段标志。也可以使用仓库内 `bpf-cc` 包装器编译（自动对 `.o` 应用 `bpf-objcopy` 修正段标志）。
 
 ## 许可证
 

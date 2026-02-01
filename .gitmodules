@@ -6,3 +6,7 @@
 	path = dash
 	url = https://github.com/choury/dash.git
 	branch = bpf
+[submodule "sbase"]
+	path = sbase
+	url = https://github.com/choury/sbase
+	branch = bpf

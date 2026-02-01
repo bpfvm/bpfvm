@@ -26,6 +26,7 @@ namespace bpf{
     #include "include/sys/stat.h"
     #include "include/dirent.h"
     #include "include/sys/times.h"
+    #include "include/termios.h"
 }
 
 #define STACK_SIZE (8 * 1024 * 1024)

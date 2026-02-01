@@ -5,6 +5,8 @@
 - `include/`: BPF-facing headers used by the VM and test programs.
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
+- `sbase/`: sbase coreutils sources for the BPF cross-build.
+- `root/`: demo rootfs output directory (binaries installed to `root/bin`).
 - `test/`: small BPF test programs (`.c`) and expected outputs (`.out`), built via a local Makefile.
 - `testdrivers/`, `test_support/`: PDCLib test drivers and helpers; treat as upstream-style fixtures.
 - `build/`: local build outputs (CMake and cross-build artifacts).
@@ -14,7 +16,7 @@
 - `./build/bpfvm <elf-file>` — run the VM on a BPF ELF file.
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
 - `make -C test` — build BPF test programs into `.out` files using `clang` and `bpf-ld`.
-- `./build_dash.sh` — build the BPF cross-compiled `dash` binary (requires `clang`, `gcc`, and `libelf`).
+- `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
 
 ## Coding Style & Naming Conventions
 - C++20 (`CMAKE_CXX_STANDARD 20`); keep code compatible with `clang`.

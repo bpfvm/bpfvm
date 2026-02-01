@@ -45,7 +45,11 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] <elf-file>" << std::endl;
         return 1;
     }
-    const char* elf_file_path = argv[optind];
+    const char* elf_file_path = realpath(argv[optind], nullptr);
+    if(elf_file_path == nullptr) {
+        std::cerr << "Failed to resolve path: " << argv[optind] << std::endl;
+        return 1;
+    }
 
     std::unordered_map<int, std::shared_ptr<fd_handle>> fd_table;
     fd_table.emplace(0, std::make_shared<fd_handle>(0));
@@ -64,7 +68,11 @@ int main(int argc, char** argv) {
         options.argv.emplace_back(argv[i]);
     }
     extern char **environ;
-    options.envp.emplace_back("HOME=/");
+    options.envp.emplace_back(std::string("HOME=") + getcwd(nullptr, 0));
+    const char* dir = dirname((char*)elf_file_path);
+    options.envp.emplace_back(std::string("PATH=") + dir);
     umask(0);
     std::cout<<(int)vm->run(&options)<<std::endl;
+    free((void*)elf_file_path);
+    return vm->r(0);
 }
