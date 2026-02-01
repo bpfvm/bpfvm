@@ -16,6 +16,9 @@
 #ifndef SIGILL
 #define SIGILL 4
 #endif
+#ifndef SIGBUS
+#define SIGBUS 7
+#endif
 #ifndef SIGABRT
 #define SIGABRT 6
 #endif
@@ -31,14 +34,26 @@
 #ifndef SIGPIPE
 #define SIGPIPE 13
 #endif
+#ifndef SIGUSR1
+#define SIGUSR1 10
+#endif
+#ifndef SIGUSR2
+#define SIGUSR2 12
+#endif
 #ifndef SIGTERM
 #define SIGTERM 15
+#endif
+#ifndef SIGALRM
+#define SIGALRM 14
 #endif
 #ifndef SIGCHLD
 #define SIGCHLD 17
 #endif
 #ifndef SIGCONT
 #define SIGCONT 18
+#endif
+#ifndef SIGSTOP
+#define SIGSTOP 19
 #endif
 #ifndef SIGTSTP
 #define SIGTSTP 20
@@ -48,6 +63,9 @@
 #endif
 #ifndef SIGTTOU
 #define SIGTTOU 22
+#endif
+#ifndef SIGURG
+#define SIGURG 23
 #endif
 #ifndef NSIG
 #define NSIG 32

@@ -44,6 +44,8 @@ int pipe2(int pipefd[2], int flags);
 int close(int fd);
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
+int truncate(const char *pathname, off_t length);
+int ftruncate(int fd, off_t length);
 int unlink(const char *pathname);
 int unlinkat(int dirfd, const char *pathname, int flags);
 int rmdir(const char *pathname);
@@ -63,6 +65,7 @@ pid_t wait(int *status);
 int chdir(const char *path);
 char *getcwd(char *buf, size_t size);
 int isatty(int fd);
+char *ttyname(int fd);
 uid_t getuid(void);
 uid_t geteuid(void);
 gid_t getgid(void);
@@ -71,6 +74,11 @@ int getgroups(int size, gid_t list[]);
 
 int access(const char *pathname, int mode);
 int faccessat(int dirfd, const char *pathname, int mode, int flags);
+long sysconf(int name);
+long pathconf(const char *path, int name);
+long fpathconf(int fd, int name);
+size_t confstr(int name, char *buf, size_t len);
+unsigned int sleep(unsigned int seconds);
 
 #endif
 
@@ -79,6 +87,10 @@ int faccessat(int dirfd, const char *pathname, int mode, int flags);
 #define W_OK 2
 #define R_OK 4
 
-#define _SC_LOGIN_NAME_MAX 256
+#define _SC_ARG_MAX  0
+#define _SC_PAGESIZE 1
+#define _SC_PAGE_SIZE _SC_PAGESIZE
+#define _SC_CLK_TCK 2
+#define _SC_LOGIN_NAME_MAX 71
 
 #endif

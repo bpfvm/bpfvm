@@ -66,6 +66,8 @@ struct stat {
 #define AT_REMOVEDIR		0x200
 #define AT_SYMLINK_FOLLOW	0x400
 #define AT_EACCESS		0x200
+#define UTIME_NOW		((1L << 30) - 1L)
+#define UTIME_OMIT		((1L << 30) - 2L)
 
 #ifndef BPF_NO_SYSCALL
 int stat(const char *path, struct stat *buf);
@@ -83,6 +85,7 @@ int fchown(int fd, uid_t owner, gid_t group);
 int lchown(const char *pathname, uid_t owner, gid_t group);
 int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags);
 int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);
+int futimens(int fd, const struct timespec times[2]);
 #endif
 
 #endif

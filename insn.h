@@ -210,12 +210,12 @@ class vm {
     bool do_mmap();
     bool do_munmap();
     bool do_exit();
-    bool do_gettimeofday();
-    bool do_times();
     bool do_openat();
     bool do_read();
     bool do_write();
     bool do_lseek();
+    bool do_truncate();
+    bool do_ftruncate();
     bool do_close();
     bool do_unlinkat();
     bool do_renameat();
@@ -248,6 +248,8 @@ class vm {
     bool do_umask();
     bool do_setjmp();
     bool do_longjmp();
+    bool do_nanosleep();
+    bool do_clock_gettime();
 
     struct Token { explicit Token() = default; };
 public:

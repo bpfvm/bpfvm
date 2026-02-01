@@ -10,9 +10,11 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include <dirent.h>
 #include <memory>
 #include <thread>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <filesystem>
@@ -93,10 +95,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_munmap();
     case BPF_SYS_EXIT:
         return do_exit();
-    case BPF_SYS_GETTIMEOFDAY:
-        return do_gettimeofday();
-    case BPF_SYS_TIMES:
-        return do_times();
+    case BPF_SYS_NANOSLEEP:
+        return do_nanosleep();
     case BPF_SYS_OPENAT:
         return do_openat();
     case BPF_SYS_READ:
@@ -105,6 +105,10 @@ bool vm::do_syscall(uint32_t call) {
         return do_write();
     case BPF_SYS_LSEEK:
         return do_lseek();
+    case BPF_SYS_TRUNCATE:
+        return do_truncate();
+    case BPF_SYS_FTRUNCATE:
+        return do_ftruncate();
     case BPF_SYS_CLOSE:
         return do_close();
     case BPF_SYS_UNLINKAT:
@@ -169,11 +173,28 @@ bool vm::do_syscall(uint32_t call) {
         return do_setjmp();
     case BPF_SYS_LONGJMP:
         return do_longjmp();
+    case BPF_SYS_CLOCK_GETTIME:
+        return do_clock_gettime();
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         r(0) = -ENOSYS;
         return true;
     }
+}
+
+bool vm::do_clock_gettime() {
+    clockid_t clock_id = (clockid_t)arg_s32(r(1));
+    struct timespec* tp = (struct timespec*)mmu(r(2));
+    if(tp == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    if(clock_gettime(clock_id, tp) == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
 }
 
 bool vm::do_mmap() {
@@ -235,42 +256,37 @@ bool vm::do_exit() {
     return false;
 }
 
-bool vm::do_gettimeofday() {
-    struct timeval* tv = (struct timeval*)mmu(r(1));
-    struct timezone* tz = (struct timezone*)mmu(r(2));
-    if(gettimeofday(tv, tz) == -1) {
-        r(0) = -errno;
-        return true;
-    }
-    r(0) = 0;
-    return true;
-}
-
-bool vm::do_times() {
-    auto tms = static_cast<bpf::tms*>(mmu(r(1)));
-    if (tms == nullptr) {
+bool vm::do_nanosleep() {
+    const struct timespec* req = static_cast<const struct timespec*>(mmu(r(1)));
+    if(req == nullptr) {
         r(0) = -EFAULT;
         return true;
     }
 
-    struct timespec ts;
-    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == -1) {
+    struct timespec* rem = nullptr;
+    if(r(2) != 0) {
+        rem = static_cast<struct timespec*>(mmu(r(2)));
+        if(rem == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+    }
+
+    struct timespec host_req = {};
+    if(req != nullptr) {
+        host_req = *req;
+    }
+
+    struct timespec host_rem = {};
+    int rc = nanosleep(&host_req, rem != nullptr ? &host_rem : nullptr);
+    if(rc == -1) {
+        if(rem != nullptr) {
+            *rem = host_rem;
+        }
         r(0) = -errno;
         return true;
     }
-
-    const long ticks_per_sec = 100;
-    tms->tms_utime = ts.tv_sec * ticks_per_sec + ts.tv_nsec * ticks_per_sec / 1000000000;
-    tms->tms_stime = 0;
-    tms->tms_cutime = 0;
-    tms->tms_cstime = 0;
-
-    struct timespec ts_mono;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts_mono) == -1) {
-        r(0) = -errno;
-        return true;
-    }
-    r(0) = (uint64_t)(ts_mono.tv_sec * ticks_per_sec + ts_mono.tv_nsec * ticks_per_sec / 1000000000);
+    r(0) = 0;
     return true;
 }
 
@@ -349,6 +365,36 @@ bool vm::do_lseek() {
         return true;
     }
     r(0) = rc;
+    return true;
+}
+
+bool vm::do_truncate() {
+    std::string path;
+    if(!read_c_string(r(1), path, 4096)) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = truncate(resolve_path(path).c_str(), static_cast<off_t>(r(2)));
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
+    return true;
+}
+
+bool vm::do_ftruncate() {
+    auto it = fds.find(arg_s32(r(1)));
+    if(it == fds.end()) {
+        r(0) = -EBADF;
+        return true;
+    }
+    int rc = ftruncate(it->second->fd, static_cast<off_t>(r(2)));
+    if(rc == -1) {
+        r(0) = -errno;
+        return true;
+    }
+    r(0) = 0;
     return true;
 }
 
@@ -914,7 +960,7 @@ bool vm::do_getcwd() {
         return true;
     }
     memcpy(buf, path.c_str(), path.size() + 1);
-    r(0) = buf_addr;
+    r(0) = path.size() + 1;
     return true;
 }
 
@@ -1297,12 +1343,28 @@ bool vm::do_ioctl() {
     unsigned long request = r(2);
     int rc;
 
-    // Check if the command has a size field > 0, indicating a pointer argument.
-    // Linux ioctl encoding: size is bits 16-29 (14 bits).
-    if ((request >> 16) & 0x3FFF) {
-        rc = ioctl(it->second->fd, request, mmu(r(3)));
+    if (request == TCGETS) {
+        struct termios host_t = {};
+        rc = ioctl(it->second->fd, TCGETS, &host_t);
+        if (rc == 0) {
+            auto guest_t = (bpf::termios*)mmu(r(3));
+            if (guest_t) {
+                guest_t->c_lflag = host_t.c_lflag;
+            } else {
+                r(0) = -EFAULT;
+                return true;
+            }
+        }
+    } else if (request == TIOCGWINSZ) {
+        rc = ioctl(it->second->fd, TIOCGWINSZ, mmu(r(3)));
     } else {
-        rc = ioctl(it->second->fd, request, (void*)r(3));
+        // Check if the command has a size field > 0, indicating a pointer argument.
+        // Linux ioctl encoding: size is bits 16-29 (14 bits).
+        if ((request >> 16) & 0x3FFF) {
+            rc = ioctl(it->second->fd, request, mmu(r(3)));
+        } else {
+            rc = ioctl(it->second->fd, request, (void*)r(3));
+        }
     }
 
     if(rc == -1) {

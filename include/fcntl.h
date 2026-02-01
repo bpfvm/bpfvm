@@ -36,7 +36,15 @@ int open3(const char *pathname, int flags, mode_t mode);
 int openat4(int dirfd, const char *pathname, int flags, mode_t mode);
 int creat(const char *pathname, mode_t mode);
 off64_t lseek(int fd, off64_t offset, int whence);
-int fcntl(int fd, int cmd, long arg);
+int fcntl3(int fd, int cmd, long arg);
+
+static inline int fcntl2(int fd, int cmd)
+{
+    return fcntl3(fd, cmd, 0);
+}
+
+#define __bpf_pick_fcntl(_1, _2, _3, name, ...) name
+#define fcntl(...) __bpf_pick_fcntl(__VA_ARGS__, fcntl3, fcntl2)(__VA_ARGS__)
 
 static inline int open2(const char *pathname, int flags)
 {

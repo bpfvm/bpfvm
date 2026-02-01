@@ -571,8 +571,8 @@ void test_call_pseudo_func() {
     assert(success);
 }
 
-void test_syscall_gettimeofday() {
-    std::cout << "--- Running Test: test_syscall_gettimeofday ---" << std::endl;
+void test_syscall_clock_gettime() {
+    std::cout << "--- Running Test: test_syscall_clock_gettime ---" << std::endl;
     auto ebpf_vm = vm::create(0, {});
     unsigned char* data = nullptr;
     uint64_t data_paddr = 0x3000;
@@ -580,20 +580,21 @@ void test_syscall_gettimeofday() {
     assert(add_data_mem(*ebpf_vm, data_paddr, data_size, &data));
     memset(data, 0, data_size);
 
-    uint64_t tv_addr = data_paddr;
+    uint64_t tp_addr = data_paddr;
     bpf_insn instructions[] = {
-        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(tv_addr & 0xFFFFFFFF) },
-        { 0, 0, 0, 0, (int32_t)(tv_addr >> 32) },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 }, // tz = NULL
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_GETTIMEOFDAY },
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)CLOCK_REALTIME },
+        { 0, 0, 0, 0, 0 },
+        { BPF_LD | BPF_IMM | BPF_DW, 2, 0, 0, (int32_t)(tp_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(tp_addr >> 32) },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_CLOCK_GETTIME },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
     uint64_t ret = ebpf_vm->run(&option);
-    struct timeval* tv = (struct timeval*)data;
-    bool success = (ret == 0 && tv->tv_sec > 0);
-    print_test_result("test_syscall_gettimeofday", success);
+    struct timespec* tp = (struct timespec*)data;
+    bool success = (ret == 0 && tp->tv_sec > 0);
+    print_test_result("test_syscall_clock_gettime", success);
     assert(success);
 }
 
@@ -839,7 +840,7 @@ int main() {
     test_call_pseudo_func();
 
     // Syscall Tests
-    test_syscall_gettimeofday();
+    test_syscall_clock_gettime();
     test_syscall_file_io();
     test_syscall_fork_waitpid();
     test_syscall_waitpid_self();
