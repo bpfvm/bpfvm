@@ -5,7 +5,6 @@
 #ifndef INSN_H
 #define INSN_H
 #include <list>
-#include <deque>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -163,6 +162,23 @@ struct fd_handle {
     ~fd_handle();
 };
 
+class MpscQueue {
+    struct slot {
+        std::atomic<uint64_t> seq;
+        int value = 0;
+    };
+    static constexpr size_t k_capacity = 1024;
+    static constexpr size_t k_mask = k_capacity - 1;
+    static_assert((k_capacity & (k_capacity - 1)) == 0, "k_capacity must be power of two");
+    std::array<slot, k_capacity> slots{};
+    std::atomic<uint64_t> head{0};
+    std::atomic<uint64_t> tail{0};
+public:
+    MpscQueue();
+    bool try_push(int value);
+    bool try_pop(int& value);
+};
+
 class vm {
     static std::atomic<uint64_t> next_pid;
     static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
@@ -184,8 +200,7 @@ class vm {
     std::thread worker;
     std::atomic<bool> exited{false};
     std::array<signal_action, NSIG> signal_actions{};
-    std::deque<int> pending_signals;
-    std::mutex signal_mutex;
+    MpscQueue pending_signals;
     size_t signal_depth = 0;
     void* mmu(uint64_t addr);
     uint64_t unmmu(const void* addr);

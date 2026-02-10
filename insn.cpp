@@ -38,6 +38,52 @@ fd_handle::~fd_handle() {
     }
 }
 
+MpscQueue::MpscQueue() {
+    for(size_t i = 0; i < k_capacity; ++i) {
+        slots[i].seq.store(i, std::memory_order_relaxed);
+    }
+}
+
+bool MpscQueue::try_push(int value) {
+    uint64_t pos = tail.load(std::memory_order_relaxed);
+    while(true) {
+        slot& s = slots[pos & k_mask];
+        uint64_t seq = s.seq.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        if(dif == 0) {
+            if(tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                s.value = value;
+                s.seq.store(pos + 1, std::memory_order_release);
+                return true;
+            }
+        } else if(dif < 0) {
+            return false;
+        } else {
+            pos = tail.load(std::memory_order_relaxed);
+        }
+    }
+}
+
+bool MpscQueue::try_pop(int& value) {
+    uint64_t pos = head.load(std::memory_order_relaxed);
+    while(true) {
+        slot& s = slots[pos & k_mask];
+        uint64_t seq = s.seq.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        if(dif == 0) {
+            if(head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                value = s.value;
+                s.seq.store(pos + k_capacity, std::memory_order_release);
+                return true;
+            }
+        } else if(dif < 0) {
+            return false;
+        } else {
+            pos = head.load(std::memory_order_relaxed);
+        }
+    }
+}
+
 void dump(uint64_t addr, const bpf_insn* insn) {
     static const char* aluop[] = {
         "add", "sub", "mul", "div", "or", "and", "lsh",
@@ -632,19 +678,14 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
 }
 
 void vm::queue_signal(int sig) {
-    std::lock_guard<std::mutex> lock(signal_mutex);
-    pending_signals.push_back(sig);
+    // Best-effort: drop if the queue is full to avoid blocking the VM thread.
+    pending_signals.try_push(sig);
 }
 
 bool vm::handle_pending_signals() {
     int sig = 0;
-    {
-        std::lock_guard<std::mutex> lock(signal_mutex);
-        if(pending_signals.empty()) {
-            return true;
-        }
-        sig = pending_signals.front();
-        pending_signals.pop_front();
+    if(!pending_signals.try_pop(sig)) {
+        return true;
     }
     if(sig <= 0 || sig >= NSIG) {
         return true;
