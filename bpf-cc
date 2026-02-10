@@ -34,9 +34,14 @@ if [ "$compile_only" -eq 1 ]; then
     if [ -z "$out" ] && [ -n "$src" ]; then
         out="${src%.*}.o"
     fi
-    if [ -n "$out" ] && [ -f "$out" ]; then
-        if bpf-readelf -S "$out" 2>/dev/null | grep -q '\.rodata\.str1\.1'; then
-            bpf-objcopy --set-section-flags .rodata.str1.1=alloc,readonly,data "$out"
-        fi
+else
+    if [ -z "$out" ]; then
+        out="a.out"
+    fi
+fi
+
+if [ -n "$out" ] && [ -f "$out" ]; then
+    if bpf-readelf -S "$out" 2>/dev/null | grep -q '\.rodata\.str1\.1'; then
+        bpf-objcopy --set-section-flags .rodata.str1.1=alloc,readonly,data "$out"
     fi
 fi
