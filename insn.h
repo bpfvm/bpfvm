@@ -13,8 +13,8 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -177,6 +177,9 @@ public:
     MpscQueue();
     bool try_push(int value);
     bool try_pop(int& value);
+    bool empty() const {
+        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
+    }
 };
 
 class vm {
@@ -194,10 +197,12 @@ class vm {
     std::list<memmap> maps;
     uint64_t pid = 0;
     std::atomic<uint64_t> ppid{0};
+    pthread_t tid = 0;
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
     std::string cwd;
     uint32_t umask_val = 0022;
-    std::thread worker;
+    pthread_mutex_t exit_mutex;
+    pthread_cond_t exit_cv;
     std::atomic<bool> exited{false};
     std::array<signal_action, NSIG> signal_actions{};
     MpscQueue pending_signals;
@@ -272,7 +277,7 @@ public:
     vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
     ~vm();
     static std::shared_ptr<vm> create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
-    uint64_t wait();
+    bool wait_for_exit(int timeout_ms);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     void queue_signal(int sig);

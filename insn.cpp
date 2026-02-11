@@ -18,6 +18,7 @@
 #include <string.h>
 #include <errno.h>
 #include <mutex>
+#include <time.h>
 
 
 std::atomic<uint64_t> vm::next_pid{1};
@@ -215,17 +216,13 @@ vm::vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_ha
     } else {
         cwd = "/";
     }
+    pthread_mutex_init(&exit_mutex, nullptr);
+    pthread_cond_init(&exit_cv, nullptr);
 }
 
 vm::~vm() {
-    if(!worker.joinable()) {
-        return;
-    }
-    if(worker.get_id() == std::this_thread::get_id()) {
-        worker.detach();
-    } else {
-        worker.join();
-    }
+    pthread_cond_destroy(&exit_cv);
+    pthread_mutex_destroy(&exit_mutex);
 }
 
 std::shared_ptr<vm> vm::create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
@@ -680,6 +677,9 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
 void vm::queue_signal(int sig) {
     // Best-effort: drop if the queue is full to avoid blocking the VM thread.
     pending_signals.try_push(sig);
+    if (tid != 0) {
+        pthread_kill(tid, SIGUSR1);
+    }
 }
 
 bool vm::handle_pending_signals() {
@@ -1060,14 +1060,19 @@ void* vm::unmap(uint64_t addr) {
 }
 
 uint64_t vm::run() {
+    tid = pthread_self();
     while(step()) {
         pc++;
     }
     exited.store(true, std::memory_order_release);
+    pthread_mutex_lock(&exit_mutex);
+    pthread_cond_broadcast(&exit_cv);
+    pthread_mutex_unlock(&exit_mutex);
     return r(0);
 }
 
 uint64_t vm::run(const vmOptions* options) {
+    tid = pthread_self();
     this->options = *options;
     if(options->verbose) {
         printf("entry: 0x%lx\n", options->entry);
@@ -1082,14 +1087,30 @@ uint64_t vm::run(const vmOptions* options) {
         pc++;
     }
     exited.store(true, std::memory_order_release);
+    pthread_mutex_lock(&exit_mutex);
+    pthread_cond_broadcast(&exit_cv);
+    pthread_mutex_unlock(&exit_mutex);
     return r(0);
 }
 
-uint64_t vm::wait() {
-    if(worker.joinable()) {
-        worker.join();
+bool vm::wait_for_exit(int timeout_ms) {
+    if(exited.load(std::memory_order_acquire)) {
+        return true;
     }
-    return r(0);
+    pthread_mutex_lock(&exit_mutex);
+    if(!exited.load(std::memory_order_acquire)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += timeout_ms / 1000;
+        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+        if(ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
+    }
+    pthread_mutex_unlock(&exit_mutex);
+    return exited.load(std::memory_order_acquire);
 }
 
 bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp) {

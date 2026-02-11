@@ -61,7 +61,23 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    signal(SIGTRAP, SIG_IGN);
+    static class vm* g_vm = vm.get();
+    struct sigaction sa = {};
+
+    // Ignore SIGTRAP
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGTRAP, &sa, nullptr);
+
+    // SIGUSR1 for internal wakeup (no SA_RESTART)
+    sa.sa_handler = [](int) {};
+    sigaction(SIGUSR1, &sa, nullptr);
+
+    // Logical signals for the VM
+    sa.sa_handler = [](int sig) {
+        g_vm->queue_signal(sig);
+    };
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
     options.entry = entry;
     options.argv.reserve(argc - optind);
     for(int i = optind; i < argc; i++) {

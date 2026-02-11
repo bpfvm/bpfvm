@@ -13,7 +13,6 @@
 #include <termios.h>
 #include <dirent.h>
 #include <memory>
-#include <thread>
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
@@ -721,13 +720,36 @@ bool vm::do_fork() {
         return true;
     }
     child->pc = child_pc + 1;
+    pthread_attr_t attr;
+    pthread_t worker;
+    int rc = pthread_attr_init(&attr);
+    if(rc != 0) {
+        r(0) = -rc;
+        return true;
+    }
+    rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if(rc != 0) {
+        pthread_attr_destroy(&attr);
+        r(0) = -rc;
+        return true;
+    }
+    auto* holder = new std::shared_ptr<vm>(child);
+    rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
+        auto* child = static_cast<std::shared_ptr<vm>*>(arg);
+        (*child)->run();
+        delete child;
+        return nullptr;
+    }, holder);
+    pthread_attr_destroy(&attr);
+    if(rc != 0) {
+        delete holder;
+        r(0) = -rc;
+        return true;
+    }
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         pid_map[child->pid] = child;
     }
-    child->worker = std::thread([child]() {
-        child->run();
-    });
     r(0) = child->pid;
     return true;
 }
@@ -766,9 +788,7 @@ bool vm::do_waitpid() {
         }
     }
 
-
-    std::shared_ptr<vm> child;
-    bool has_child = false;
+    std::vector<std::shared_ptr<vm>> children;
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         if(target_pid == -1) {
@@ -776,15 +796,12 @@ bool vm::do_waitpid() {
                 if(entry.second->ppid.load() != pid) {
                     continue;
                 }
-                has_child = true;
-                if((options & WNOHANG) == 0) {
-                    child = entry.second;
-                    break;
-                }
                 if(entry.second->exited.load(std::memory_order_acquire)) {
-                    child = entry.second;
+                    children.clear();
+                    children.push_back(entry.second);
                     break;
                 }
+                children.push_back(entry.second);
             }
         } else if(target_pid > 0) {
             auto it = pid_map.find(static_cast<uint64_t>(target_pid));
@@ -796,30 +813,43 @@ bool vm::do_waitpid() {
                 r(0) = -ECHILD;
                 return true;
             }
-            has_child = true;
-            if((options & WNOHANG) == 0 || it->second->exited.load(std::memory_order_acquire)) {
-                child = it->second;
-            }
+            children.push_back(it->second);
         } else {
             r(0) = -EINVAL;
             return true;
         }
     }
 
-    if(child == nullptr) {
-        if(has_child) {
-            //all child processes are still running
-            assert(options & WNOHANG);
+    if(children.empty()) {
+        r(0) = -ECHILD;
+        return true;
+    }
+
+    std::shared_ptr<vm> child;
+    if(children.size() == 1 && children[0]->exited.load(std::memory_order_acquire)) {
+        child = children[0];
+    } else {
+        if(options & WNOHANG) {
             r(0) = 0;
             return true;
-        } else {
-            r(0) = -ECHILD;
-            return true;
         }
+
+        do {
+            for(const auto& candidate : children) {
+                if(candidate->wait_for_exit(100)) {
+                    child = candidate;
+                    break;
+                }
+                if(!pending_signals.empty()) {
+                    r(0) = -EINTR;
+                    return true;
+                }
+            }
+        } while(child == nullptr);
     }
 
     //wait不能加锁，否则会死锁
-    uint64_t exit_code = child->wait();
+    uint64_t exit_code = child->r(0);
     if(status_ptr != nullptr) {
         int status = (static_cast<int>(exit_code) & 0xff) << 8;
         *status_ptr = status;
