@@ -853,7 +853,7 @@ bool vm::do_waitpid() {
                     child = candidate;
                     break;
                 }
-                if(!pending_signals.empty()) {
+                if(!pending_signals.empty() || exited.load(std::memory_order_acquire)) {
                     r(0) = -EINTR;
                     return true;
                 }
