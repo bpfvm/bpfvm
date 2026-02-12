@@ -158,7 +158,8 @@ struct vmOptions {
 struct fd_handle {
     const int fd = -1;
     bool cloexec = false;
-    explicit fd_handle(int fd) : fd(fd) {}
+    std::string path;
+    explicit fd_handle(int fd, std::string path = {}) : fd(fd), path(std::move(path)) {}
     ~fd_handle();
 };
 
@@ -258,7 +259,7 @@ class vm {
     bool do_sigaction();
     bool do_fcntl();
     bool do_ioctl();
-    bool do_chdir();
+    bool do_fchdir();
     bool do_getcwd();
     bool do_fdopendir();
     bool do_readdir();

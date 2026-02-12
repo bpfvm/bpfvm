@@ -140,8 +140,8 @@ bool vm::do_syscall(uint32_t call) {
         return do_dup2();
     case BPF_SYS_PIPE2:
         return do_pipe2();
-    case BPF_SYS_CHDIR:
-        return do_chdir();
+    case BPF_SYS_FCHDIR:
+        return do_fchdir();
     case BPF_SYS_GETCWD:
         return do_getcwd();
     case BPF_SYS_FDOPENDIR:
@@ -299,8 +299,10 @@ bool vm::do_openat() {
     int flags = arg_s32(r(3));
     mode_t mode = (mode_t)(arg_u32(r(4)) & ~umask_val);
     int fd = -1;
+    std::string resolved;
     if(dirfd == AT_FDCWD) {
-        fd = openat(AT_FDCWD, resolve_path(path).c_str(), flags, mode);
+        resolved = resolve_path(path);
+        fd = openat(AT_FDCWD, resolved.c_str(), flags, mode);
     } else {
         auto it = fds.find(dirfd);
         if(it == fds.end()) {
@@ -308,12 +310,15 @@ bool vm::do_openat() {
             return true;
         }
         fd = openat(it->second->fd, path.c_str(), flags, mode);
+        if(!it->second->path.empty()) {
+            resolved = (std::filesystem::path(it->second->path) / path).lexically_normal().string();
+        }
     }
     if(fd == -1) {
         r(0) = -errno;
         return true;
     }
-    auto handle = std::make_shared<fd_handle>(fd);
+    auto handle = std::make_shared<fd_handle>(fd, std::move(resolved));
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
     }
@@ -683,7 +688,7 @@ bool vm::do_fork() {
             r(0) = -errno;
             return true;
         }
-        auto new_handle = std::make_shared<fd_handle>(new_host_fd);
+        auto new_handle = std::make_shared<fd_handle>(new_host_fd, entry.second->path);
         new_handle->cloexec = entry.second->cloexec;
         child_fds[entry.first] = new_handle;
     }
@@ -901,7 +906,7 @@ bool vm::do_dup() {
         new_fd++;
     }
 
-    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd);
+    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd, it->second->path);
     r(0) = new_fd;
     return true;
 }
@@ -931,7 +936,7 @@ bool vm::do_dup2() {
         return true;
     }
 
-    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd);
+    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd, it->second->path);
     r(0) = new_fd;
     return true;
 }
@@ -964,15 +969,15 @@ bool vm::do_pipe2() {
     return true;
 }
 
-bool vm::do_chdir() {
-    std::string path;
-    if(!read_c_string(r(1), path, 4096)) {
-        r(0) = -EFAULT;
+bool vm::do_fchdir() {
+    int fd = arg_s32(r(1));
+    auto it = fds.find(fd);
+    if(it == fds.end()) {
+        r(0) = -EBADF;
         return true;
     }
-    std::string resolved = resolve_path(path);
     struct stat st = {};
-    if(stat(resolved.c_str(), &st) == -1) {
+    if(fstat(it->second->fd, &st) == -1) {
         r(0) = -errno;
         return true;
     }
@@ -980,7 +985,11 @@ bool vm::do_chdir() {
         r(0) = -ENOTDIR;
         return true;
     }
-    cwd = resolved.empty() ? std::string("/") : resolved;
+    if(it->second->path.empty()) {
+        r(0) = -ENOENT;
+        return true;
+    }
+    cwd = it->second->path;
     r(0) = 0;
     return true;
 }
@@ -1343,7 +1352,7 @@ bool vm::do_fcntl() {
             return true;
         }
 
-        auto new_handle = std::make_shared<fd_handle>(new_host_fd);
+        auto new_handle = std::make_shared<fd_handle>(new_host_fd, it->second->path);
         if (cmd == F_DUPFD_CLOEXEC) {
             new_handle->cloexec = true;
         }

@@ -63,6 +63,7 @@ int vfork(void);
 int waitpid(int pid, int *status, int options);
 pid_t wait(int *status);
 int chdir(const char *path);
+int fchdir(int fd);
 char *getcwd(char *buf, size_t size);
 int isatty(int fd);
 char *ttyname(int fd);
