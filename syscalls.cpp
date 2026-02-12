@@ -648,6 +648,17 @@ bool vm::do_execve() {
         return true;
     }
 
+    std::array<signal_action, NSIG> new_actions{};
+    const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
+    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
+    for(size_t i = 0; i < new_actions.size(); i++) {
+        if(signal_actions[i].handler == sig_ign) {
+            new_actions[i].handler = sig_ign;
+        } else {
+            new_actions[i].handler = sig_dfl;
+        }
+    }
+
     fresh->pid = pid;
     fresh->ppid = ppid.load();
     maps.swap(fresh->maps);
@@ -655,6 +666,8 @@ bool vm::do_execve() {
     for(size_t i = 0; i < 11; i++) {
         reg[i] = fresh->reg[i];
     }
+    signal_actions = new_actions;
+    signal_depth = 0;
     pc = new_pc;
     push_frame(0);
     pc--;
@@ -1268,7 +1281,7 @@ bool vm::do_sigaction() {
     uint64_t act_addr = r(2);
     uint64_t oldact_addr = r(3);
 
-    if(signo <= 0 || signo >= NSIG || signo == SIGKILL) {
+    if(signo <= 0 || signo >= NSIG || signo == SIGKILL || signo == SIGSTOP) {
         r(0) = -EINVAL;
         return true;
     }
@@ -1425,6 +1438,7 @@ bool vm::do_setjmp() {
     env[3] = r(9);
     env[4] = r(10);
     env[5] = unmmu(pc);
+    env[6] = signal_depth;
     r(0) = 0;
     return true;
 }
@@ -1443,6 +1457,7 @@ bool vm::do_longjmp() {
     r(9) = env[3];
     r(10) = env[4];
     uint64_t saved_pc = env[5];
+    signal_depth = static_cast<size_t>(env[6]);
     pc = (const bpf_insn*)mmu(saved_pc);
     // pc points to syscall instruction.
     // loop increments pc.

@@ -204,6 +204,7 @@ class vm {
     pthread_mutex_t exit_mutex;
     pthread_cond_t exit_cv;
     std::atomic<bool> exited{false};
+    std::atomic<bool> stopped{false};
     std::array<signal_action, NSIG> signal_actions{};
     MpscQueue pending_signals;
     size_t signal_depth = 0;

@@ -693,7 +693,7 @@ bool vm::handle_pending_signals() {
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
     const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
     uint64_t handler = signal_actions[static_cast<size_t>(sig)].handler;
-    if(sig == SIGKILL) {
+    if(sig == SIGKILL || sig == SIGSTOP) {
         handler = sig_dfl;
     }
     if(options.verbose) {
@@ -715,6 +715,33 @@ bool vm::handle_pending_signals() {
         case SIGKILL:
             r(1) = 128 + static_cast<uint64_t>(sig);
             return do_exit();
+        case SIGSTOP:
+        case SIGTSTP:
+        case SIGTTIN:
+        case SIGTTOU: {
+            stopped.store(true, std::memory_order_release);
+            pthread_mutex_lock(&exit_mutex);
+            pthread_cond_broadcast(&exit_cv);
+            while(stopped.load(std::memory_order_acquire)) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 100000000L; // 100ms
+                if(ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec += 1;
+                    ts.tv_nsec -= 1000000000L;
+                }
+                pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
+                int pending = 0;
+                while(pending_signals.try_pop(pending)) {
+                    if(pending == SIGCONT) {
+                        stopped.store(false, std::memory_order_release);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&exit_mutex);
+            pthread_cond_broadcast(&exit_cv);
+            return true;
+        }
         default:
             return true;
         }
