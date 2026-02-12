@@ -128,6 +128,11 @@ For load and store instructions the 8-bit 'code' field is divided as:
 #define BPF_MEMSX  0x80  /* sign-extension load operations */
 #define BPF_ATOMIC 0xc0  /*atomic operations*/
 
+// Atomic operation codes (encoded in imm field of BPF_ATOMIC instructions)
+#define BPF_FETCH   0x01
+#define BPF_XCHG    0xe0 | BPF_FETCH
+#define BPF_CMPXCHG 0xf0 | BPF_FETCH
+
 struct memmap {
     unsigned char* data = nullptr;
     size_t size = 0;

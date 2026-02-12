@@ -294,6 +294,164 @@ void test_alu64_neg() {
     assert(success);
 }
 
+// --- Byte Swap Tests ---
+void test_alu_end_le16() {
+    std::cout << "--- Running Test: test_alu_end_le16 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
+        { BPF_ALU | BPF_END | BPF_K, 1, 0, 0, 16 },        // le16 r1 (zero-extend to 16 bits)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // LE on little-endian host: just zero-extend, so 0x0102 & 0xFFFF = 0x0102
+    bool success = (ret == 0x0102);
+    print_test_result("test_alu_end_le16", success);
+    assert(success);
+}
+
+void test_alu_end_le32() {
+    std::cout << "--- Running Test: test_alu_end_le32 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    uint64_t val = 0xAABBCCDD11223344ULL;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(val >> 32) },
+        { BPF_ALU | BPF_END | BPF_K, 1, 0, 0, 32 },        // le32 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // LE on little-endian host: zero-extend low 32 bits -> 0x11223344
+    bool success = (ret == 0x11223344);
+    print_test_result("test_alu_end_le32", success);
+    assert(success);
+}
+
+void test_alu_end_le64() {
+    std::cout << "--- Running Test: test_alu_end_le64 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    uint64_t val = 0x0102030405060708ULL;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(val >> 32) },
+        { BPF_ALU | BPF_END | BPF_K, 1, 0, 0, 64 },        // le64 r1 (no-op on LE host)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == val);
+    print_test_result("test_alu_end_le64", success);
+    assert(success);
+}
+
+void test_alu_end_be16() {
+    std::cout << "--- Running Test: test_alu_end_be16 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
+        { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 16 },        // be16 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // BE on little-endian host: bswap16(0x0102) = 0x0201
+    bool success = (ret == 0x0201);
+    print_test_result("test_alu_end_be16", success);
+    assert(success);
+}
+
+void test_alu_end_be32() {
+    std::cout << "--- Running Test: test_alu_end_be32 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x01020304 }, // mov r1, 0x01020304
+        { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 32 },            // be32 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // BE on little-endian host: bswap32(0x01020304) = 0x04030201
+    bool success = (ret == 0x04030201);
+    print_test_result("test_alu_end_be32", success);
+    assert(success);
+}
+
+void test_alu_end_be64() {
+    std::cout << "--- Running Test: test_alu_end_be64 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    uint64_t val = 0x0102030405060708ULL;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(val >> 32) },
+        { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 64 },        // be64 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // bswap64(0x0102030405060708) = 0x0807060504030201
+    bool success = (ret == 0x0807060504030201ULL);
+    print_test_result("test_alu_end_be64", success);
+    assert(success);
+}
+
+void test_alu64_end_bswap16() {
+    std::cout << "--- Running Test: test_alu64_end_bswap16 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
+        { BPF_ALU64 | BPF_END | BPF_K, 1, 0, 0, 16 },      // bswap16 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 0x0201);
+    print_test_result("test_alu64_end_bswap16", success);
+    assert(success);
+}
+
+void test_alu64_end_bswap32() {
+    std::cout << "--- Running Test: test_alu64_end_bswap32 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x01020304 }, // mov r1, 0x01020304
+        { BPF_ALU64 | BPF_END | BPF_K, 1, 0, 0, 32 },          // bswap32 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 0x04030201);
+    print_test_result("test_alu64_end_bswap32", success);
+    assert(success);
+}
+
+void test_alu64_end_bswap64() {
+    std::cout << "--- Running Test: test_alu64_end_bswap64 ---" << std::endl;
+    auto ebpf_vm = vm::create(0, {});
+    uint64_t val = 0x0102030405060708ULL;
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(val >> 32) },
+        { BPF_ALU64 | BPF_END | BPF_K, 1, 0, 0, 64 },      // bswap64 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 0x0807060504030201ULL);
+    print_test_result("test_alu64_end_bswap64", success);
+    assert(success);
+}
+
 // --- ALU32 Tests ---
 void test_alu32_add_imm() {
     std::cout << "--- Running Test: test_alu32_add_imm ---" << std::endl;
@@ -814,6 +972,17 @@ int main() {
     test_alu64_rsh_imm();
     test_alu64_arsh_imm();
     test_alu64_neg();
+
+    // Byte Swap Tests (ALU LE/BE, ALU64 bswap)
+    test_alu_end_le16();
+    test_alu_end_le32();
+    test_alu_end_le64();
+    test_alu_end_be16();
+    test_alu_end_be32();
+    test_alu_end_be64();
+    test_alu64_end_bswap16();
+    test_alu64_end_bswap32();
+    test_alu64_end_bswap64();
 
     // ALU32 Tests
     test_alu32_add_imm();

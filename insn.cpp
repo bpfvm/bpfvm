@@ -186,6 +186,38 @@ void dump(uint64_t addr, const bpf_insn* insn) {
         break;
     }
     case BPF_STX: {
+        if((insn->code & 0xe0) == BPF_ATOMIC) {
+            static const char* atomicop[] = {
+                "add", "or", "and", "xor",
+            };
+            const char* size = (insn->code & 0x18) == BPF_DW ? "64" : "32";
+            int32_t op = insn->imm;
+            if(insn->off == 0) {
+                printf("lock%s [r%d] ", size, insn->dst_reg);
+            } else if(insn->off > 0) {
+                printf("lock%s [r%d+%d] ", size, insn->dst_reg, insn->off);
+            } else {
+                printf("lock%s [r%d%d] ", size, insn->dst_reg, insn->off);
+            }
+            int base_op = op & ~BPF_FETCH;
+            if((op & ~BPF_FETCH) == (BPF_XCHG & ~BPF_FETCH)) {
+                printf("xchg r%d\n", insn->src_reg);
+            } else if((op & ~BPF_FETCH) == (BPF_CMPXCHG & ~BPF_FETCH)) {
+                printf("cmpxchg r%d\n", insn->src_reg);
+            } else if(base_op == BPF_ADD || base_op == BPF_OR ||
+                      base_op == BPF_AND || base_op == BPF_XOR) {
+                int idx = base_op == BPF_ADD ? 0 : base_op == BPF_OR ? 1 :
+                          base_op == BPF_AND ? 2 : 3;
+                if(op & BPF_FETCH) {
+                    printf("fetch_%s r%d\n", atomicop[idx], insn->src_reg);
+                } else {
+                    printf("%s r%d\n", atomicop[idx], insn->src_reg);
+                }
+            } else {
+                printf("unknown(0x%x) r%d\n", op, insn->src_reg);
+            }
+            break;
+        }
         printf("stx%s ", lsize[(insn->code & 0x18) >> 3]);
         if((insn->code & 0xe0) != BPF_MEM) {
             fprintf(stderr, "Invalid mode for stx\n");
@@ -824,9 +856,42 @@ bool vm::st() {
     return true;
 }
 
+template<typename T>
+static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
+    T src = (T)src_reg;
+    T old = *p;
+    switch(op) {
+    case BPF_ADD:                *p = old + src; break;
+    case BPF_OR:                 *p = old | src; break;
+    case BPF_AND:                *p = old & src; break;
+    case BPF_XOR:                *p = old ^ src; break;
+    case BPF_ADD | BPF_FETCH:    *p = old + src; src_reg = old; break;
+    case BPF_OR  | BPF_FETCH:    *p = old | src; src_reg = old; break;
+    case BPF_AND | BPF_FETCH:    *p = old & src; src_reg = old; break;
+    case BPF_XOR | BPF_FETCH:    *p = old ^ src; src_reg = old; break;
+    case BPF_XCHG:               *p = src; src_reg = old; break;
+    case BPF_CMPXCHG:
+        if(old == (T)r0) { *p = src; }
+        r0 = old;
+        break;
+    default: return false;
+    }
+    return true;
+}
+
 bool vm::stx() {
     if((pc->code & 0xe0) == BPF_ATOMIC) {
-        return false;
+        uint64_t target_addr = r(pc->dst_reg) + pc->off;
+        void* addr = mmu(target_addr);
+        if(addr == nullptr) {
+            log_mem_violation("atomic", target_addr);
+            return false;
+        }
+        switch(pc->code & 0x18) {
+        case BPF_DW: return do_atomic((uint64_t*)addr, pc->imm, r(pc->src_reg), r(0));
+        case BPF_W:  return do_atomic((uint32_t*)addr, pc->imm, r(pc->src_reg), r(0));
+        default:     return false;
+        }
     }
     uint64_t target_addr = r(pc->dst_reg) + pc->off;
     void* addr = mmu(target_addr);
@@ -914,8 +979,20 @@ bool vm::alu64() {
         dst = (int64_t)dst >> (src & 0x3f);
         break;
     case BPF_END:
-        //TODO
-        abort();
+        switch(pc->imm) {
+        case 16:
+            dst = __builtin_bswap16((uint16_t)dst);
+            break;
+        case 32:
+            dst = __builtin_bswap32((uint32_t)dst);
+            break;
+        case 64:
+            dst = __builtin_bswap64(dst);
+            break;
+        default:
+            return false;
+        }
+        break;
     }
     return true;
 }
@@ -981,8 +1058,23 @@ bool vm::alu() {
         dst = (int32_t)dst >> (src & 0x1f);
         break;
     case BPF_END:
-        //TODO
-        abort();
+        if((pc->code & 0x08) == BPF_X) {
+            // BE: host byte order -> big endian (byte swap on little-endian host)
+            switch(pc->imm) {
+            case 16: r(pc->dst_reg) = __builtin_bswap16((uint16_t)dst); return true;
+            case 32: r(pc->dst_reg) = __builtin_bswap32(dst); return true;
+            case 64: r(pc->dst_reg) = __builtin_bswap64(r(pc->dst_reg)); return true;
+            default: return false;
+            }
+        } else {
+            // LE: host byte order -> little endian (no-op on little-endian host, just zero-extend)
+            switch(pc->imm) {
+            case 16: r(pc->dst_reg) = (uint16_t)dst; return true;
+            case 32: r(pc->dst_reg) = (uint32_t)dst; return true;
+            case 64: return true;
+            default: return false;
+            }
+        }
     }
     // clear high 32 bits
     r(pc->dst_reg) = (uint64_t)dst;
@@ -1083,8 +1175,10 @@ uint64_t vm::unmmu(const void* addr) {
 void* vm::unmap(uint64_t addr) {
     for(auto it = maps.begin(); it != maps.end(); ++it) {
         if(addr == it->paddr) {
+            void* data = it->data;
+            it->data = nullptr;
             maps.erase(it);
-            return it->data;
+            return data;
         }
     }
     return nullptr;
