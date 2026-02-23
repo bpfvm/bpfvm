@@ -333,7 +333,13 @@ bool vm::do_read() {
         r(0) = -EBADF;
         return true;
     }
-    int rc = read(it->second->fd, mmu(r(2)), arg_size(r(3)));
+    size_t count = arg_size(r(3));
+    void* buf = mmu(r(2), count);
+    if(buf == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = read(it->second->fd, buf, count);
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -348,7 +354,13 @@ bool vm::do_write() {
         r(0) = -EBADF;
         return true;
     }
-    int rc = write(it->second->fd, mmu(r(2)), arg_size(r(3)));
+    size_t count = arg_size(r(3));
+    void* buf = mmu(r(2), count);
+    if(buf == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = write(it->second->fd, buf, count);
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -599,7 +611,13 @@ bool vm::do_readlink() {
         r(0) = -EFAULT;
         return true;
     }
-    int rc = readlink(resolve_path(path).c_str(), (char*)mmu(r(2)), arg_size(r(3)));
+    size_t bufsiz = arg_size(r(3));
+    char* buf = (char*)mmu(r(2), bufsiz);
+    if(buf == nullptr) {
+        r(0) = -EFAULT;
+        return true;
+    }
+    int rc = readlink(resolve_path(path).c_str(), buf, bufsiz);
     if(rc == -1) {
         r(0) = -errno;
         return true;
@@ -942,7 +960,7 @@ bool vm::do_dup2() {
 }
 
 bool vm::do_pipe2() {
-    int* pipefd = static_cast<int*>(mmu(r(1)));
+    int* pipefd = static_cast<int*>(mmu(r(1), 2 * sizeof(int)));
     if(pipefd == nullptr) {
         r(0) = -EFAULT;
         return true;
@@ -997,17 +1015,17 @@ bool vm::do_fchdir() {
 bool vm::do_getcwd() {
     uint64_t buf_addr = r(1);
     size_t size = arg_size(r(2));
-    if(buf_addr == 0) {
-        r(0) = -EFAULT;
+    if(size == 0) {
+        r(0) = -ERANGE;
         return true;
     }
-    char* buf = static_cast<char*>(mmu(buf_addr));
+    char* buf = static_cast<char*>(mmu(buf_addr, size));
     if(buf == nullptr) {
         r(0) = -EFAULT;
         return true;
     }
     std::string path = cwd.empty() ? "/" : cwd;
-    if(size == 0 || size <= path.size()) {
+    if(size <= path.size()) {
         r(0) = -ERANGE;
         return true;
     }
@@ -1408,12 +1426,23 @@ bool vm::do_ioctl() {
             }
         }
     } else if (request == TIOCGWINSZ) {
-        rc = ioctl(it->second->fd, TIOCGWINSZ, mmu(r(3)));
+        void* arg = mmu(r(3), sizeof(struct winsize));
+        if(arg == nullptr) {
+            r(0) = -EFAULT;
+            return true;
+        }
+        rc = ioctl(it->second->fd, TIOCGWINSZ, arg);
     } else {
         // Check if the command has a size field > 0, indicating a pointer argument.
         // Linux ioctl encoding: size is bits 16-29 (14 bits).
-        if ((request >> 16) & 0x3FFF) {
-            rc = ioctl(it->second->fd, request, mmu(r(3)));
+        size_t ioctl_size = (request >> 16) & 0x3FFF;
+        if (ioctl_size) {
+            void* arg = mmu(r(3), ioctl_size);
+            if(arg == nullptr) {
+                r(0) = -EFAULT;
+                return true;
+            }
+            rc = ioctl(it->second->fd, request, arg);
         } else {
             rc = ioctl(it->second->fd, request, (void*)r(3));
         }

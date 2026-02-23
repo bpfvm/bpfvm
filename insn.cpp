@@ -1154,9 +1154,12 @@ void vm::addmem(memmap&& memmap) {
     maps.insert(it, std::move(memmap));
 }
 
-void* vm::mmu(uint64_t addr) {
+void* vm::mmu(uint64_t addr, size_t size) {
+    if(size == 0) return nullptr;
+    uint64_t end = addr + size;
+    if(end < addr) return nullptr; // overflow
     for(const auto& map: maps) {
-        if(addr >= map.paddr && addr < map.paddr + map.size) {
+        if(addr >= map.paddr && end <= map.paddr + map.size) {
             return map.data + (addr - map.paddr);
         }
     }

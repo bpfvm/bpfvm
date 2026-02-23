@@ -214,7 +214,7 @@ class vm {
     std::array<signal_action, NSIG> signal_actions{};
     MpscQueue pending_signals;
     size_t signal_depth = 0;
-    void* mmu(uint64_t addr);
+    void* mmu(uint64_t addr, size_t size = 1);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
