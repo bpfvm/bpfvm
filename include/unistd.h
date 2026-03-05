@@ -73,6 +73,13 @@ gid_t getgid(void);
 gid_t getegid(void);
 int getgroups(int size, gid_t list[]);
 
+int chroot(const char *path);
+int gethostname(char *name, size_t len);
+int sethostname(const char *name, size_t len);
+char *getlogin(void);
+pid_t setsid(void);
+pid_t getpgrp(void);
+
 int access(const char *pathname, int mode);
 int faccessat(int dirfd, const char *pathname, int mode, int flags);
 long sysconf(int name);
