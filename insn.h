@@ -18,15 +18,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "include/bpf_call.h"
-namespace bpf{
-    #define BPF_NO_SYSCALL
-    #include "include/signal.h"
-    #include "include/sys/stat.h"
-    #include "include/dirent.h"
-    #include "include/sys/times.h"
-    #include "include/termios.h"
-}
+#ifndef NSIG
+#define NSIG 32
+#endif
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
@@ -214,6 +208,7 @@ class vm {
     std::array<signal_action, NSIG> signal_actions{};
     MpscQueue pending_signals;
     size_t signal_depth = 0;
+    friend struct Syscalls;
     void* mmu(uint64_t addr, size_t size = 1);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
@@ -231,53 +226,7 @@ class vm {
     bool jmp32();
     bool step();
 
-    bool read_c_string(uint64_t addr, std::string& out, size_t max_len);
-    bool read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
-    std::string resolve_path(const std::string& path) const;
     bool do_syscall(uint32_t call);
-    bool do_mmap();
-    bool do_munmap();
-    bool do_exit();
-    bool do_openat();
-    bool do_read();
-    bool do_write();
-    bool do_lseek();
-    bool do_truncate();
-    bool do_ftruncate();
-    bool do_close();
-    bool do_unlinkat();
-    bool do_renameat();
-    bool do_readlink();
-    bool do_execve();
-    bool do_fork();
-    bool do_getpid();
-    bool do_getppid();
-    bool do_waitpid();
-    bool do_dup();
-    bool do_dup2();
-    bool do_pipe2();
-    bool do_fstatat();
-    bool do_fchmodat();
-    bool do_utimensat();
-    bool do_faccessat();
-    bool do_kill();
-    bool do_sigaction();
-    bool do_fcntl();
-    bool do_ioctl();
-    bool do_fchdir();
-    bool do_getcwd();
-    bool do_fdopendir();
-    bool do_readdir();
-    bool do_closedir();
-    bool do_mkdir();
-    bool do_rmdir();
-    bool do_symlinkat();
-    bool do_linkat();
-    bool do_umask();
-    bool do_setjmp();
-    bool do_longjmp();
-    bool do_nanosleep();
-    bool do_clock_gettime();
 
     struct Token { explicit Token() = default; };
 public:

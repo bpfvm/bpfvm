@@ -582,48 +582,6 @@ bool vm::jmp() {
     return true;
 }
 
-bool vm::read_c_string(uint64_t addr, std::string& out, size_t max_len) {
-    out.clear();
-    if(addr == 0) {
-        return false;
-    }
-    for(size_t i = 0; i < max_len; i++) {
-        void* p = mmu(addr + i);
-        if(p == nullptr) {
-            return false;
-        }
-        char c = *(char*)p;
-        if(c == '\0') {
-            return true;
-        }
-        out.push_back(c);
-    }
-    return false;
-}
-
-bool vm::read_c_string_array(uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len) {
-    out.clear();
-    if(addr == 0) {
-        return true;
-    }
-    for(size_t i = 0; i < max_count; i++) {
-        void* p = mmu(addr + i * sizeof(uint64_t));
-        if(p == nullptr) {
-            return false;
-        }
-        uint64_t str_addr = *(uint64_t*)p;
-        if(str_addr == 0) {
-            return true;
-        }
-        std::string value;
-        if(!read_c_string(str_addr, value, max_str_len)) {
-            return false;
-        }
-        out.push_back(std::move(value));
-    }
-    return false;
-}
-
 bool vm::jmp32() {
     uint32_t src = (pc->code & 0x08) == BPF_X ? (uint32_t)r(pc->src_reg) : pc->imm;
     auto dst = (uint32_t)r(pc->dst_reg);
@@ -753,7 +711,7 @@ bool vm::handle_pending_signals() {
         case SIGILL:
         case SIGFPE:
             r(1) = 128 + static_cast<uint64_t>(sig);
-            return do_exit();
+            return do_syscall(BPF_SYS_EXIT);
         case SIGTSTP:
         case SIGTTIN:
         case SIGTTOU:
@@ -768,10 +726,10 @@ bool vm::handle_pending_signals() {
     const bpf_insn* handler_pc = (const bpf_insn*)mmu(handler);
     if(handler_pc == nullptr) {
         r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
-        return do_exit();
+        return do_syscall(BPF_SYS_EXIT);
     }
     if(!push_frame(unmmu(pc), true)) {
-        return do_exit();
+        return do_syscall(BPF_SYS_EXIT);
     }
     r(1) = static_cast<uint64_t>(sig);
     pc = handler_pc;
@@ -1094,7 +1052,7 @@ bool vm::step() {
     while(true) {
         if(exited.load(std::memory_order_acquire)) {
             r(1) = 128 + SIGKILL;
-            return do_exit();
+            return do_syscall(BPF_SYS_EXIT);
         }
         if(!stopped.load(std::memory_order_acquire)) break;
         struct timespec ts;
