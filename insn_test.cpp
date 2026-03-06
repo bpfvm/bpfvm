@@ -19,6 +19,17 @@ struct vmOptions option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
+    .syscall_handler = empty_syscall,
+    .argv = {},
+    .envp = {},
+};
+
+struct vmOptions posix_option = {
+    .entry = 0x1000,
+    .verbose = true,
+    .breakpoint = 0,
+    .step_run = false,
+    .syscall_handler = posix_syscall,
     .argv = {},
     .envp = {},
 };
@@ -749,7 +760,7 @@ void test_syscall_clock_gettime() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     struct timespec* tp = (struct timespec*)data;
     bool success = (ret == 0 && tp->tv_sec > 0);
     print_test_result("test_syscall_clock_gettime", success);
@@ -826,7 +837,7 @@ void test_syscall_file_io() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     bool unlinked = (access(path, F_OK) == -1 && errno == ENOENT);
     bool success = (ret == payload_len &&
                     memcmp(data + 96, payload, payload_len) == 0 &&
@@ -868,7 +879,7 @@ void test_syscall_fork_waitpid() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     bool success = (ret == 1);
     print_test_result("test_syscall_fork_waitpid", success);
     assert(success);
@@ -892,7 +903,7 @@ void test_syscall_waitpid_self() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     bool success = (ret == 1);
     print_test_result("test_syscall_waitpid_self", success);
     assert(success);
@@ -925,7 +936,7 @@ void test_syscall_waitpid_any_twice() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     bool success = (ret == 1);
     print_test_result("test_syscall_waitpid_any_twice", success);
     assert(success);
@@ -948,7 +959,7 @@ void test_syscall_waitpid_any_no_child_wnohang() {
     };
 
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
-    uint64_t ret = ebpf_vm->run(&option);
+    uint64_t ret = ebpf_vm->run(&posix_option);
     bool success = (ret == 1);
     print_test_result("test_syscall_waitpid_any_no_child_wnohang", success);
     assert(success);

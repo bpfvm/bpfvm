@@ -11,9 +11,9 @@ pkg_check_modules(LIBELF REQUIRED libelf)
 
 include_directories(${LIBELF_INCLUDE_DIRS})
 link_directories(${LIBELF_LIBRARY_DIRS})
-add_executable(bpfvm main.cpp insn.cpp syscalls.cpp)
+add_executable(bpfvm main.cpp insn.cpp posix_syscalls.cpp)
 target_link_libraries(bpfvm ${LIBELF_LIBRARIES})
 
 
-add_executable(bpfvm_test insn.cpp syscalls.cpp insn_test.cpp)
+add_executable(bpfvm_test insn.cpp posix_syscalls.cpp empty_syscalls.cpp insn_test.cpp)
 target_link_libraries(bpfvm_test ${LIBELF_LIBRARIES})

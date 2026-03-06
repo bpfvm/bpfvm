@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     options.verbose = false; // 默认值
     options.breakpoint = 0;   // 默认值
     options.step_run = false; // 默认值
+    options.syscall_handler = posix_syscall;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "vb:s", long_options, nullptr)) != -1) {
