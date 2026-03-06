@@ -52,9 +52,9 @@ int main(int argc, char** argv) {
     }
 
     std::unordered_map<int, std::shared_ptr<fd_handle>> fd_table;
-    fd_table.emplace(0, std::make_shared<fd_handle>(0));
-    fd_table.emplace(1, std::make_shared<fd_handle>(1));
-    fd_table.emplace(2, std::make_shared<fd_handle>(2));
+    fd_table.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
+    fd_table.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
+    fd_table.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
     auto vm = vm::create(0, fd_table);
     uint64_t entry = vm->load_elf(elf_file_path);
     if(entry == 0) {

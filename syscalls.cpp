@@ -80,6 +80,14 @@ static inline size_t arg_size(uint64_t v) {
 }
 
 struct Syscalls {
+    static int allocate_fd(vm& v, int min_fd = 0) {
+        int fd = min_fd;
+        while(v.fds.count(fd)) {
+            fd++;
+        }
+        return fd;
+    }
+
     static bool read_c_string(vm& v, uint64_t addr, std::string& out, size_t max_len) {
         out.clear();
         if(addr == 0) {
@@ -275,8 +283,9 @@ struct Syscalls {
         if(flags & O_CLOEXEC) {
             handle->cloexec = true;
         }
-        v.fds[fd] = handle;
-        v.r(0) = fd;
+        int guest_fd = allocate_fd(v);
+        v.fds[guest_fd] = handle;
+        v.r(0) = guest_fd;
         return true;
     }
 
@@ -872,11 +881,7 @@ struct Syscalls {
             return true;
         }
 
-        int new_fd = 0;
-        while(v.fds.count(new_fd)) {
-            new_fd++;
-        }
-
+        int new_fd = allocate_fd(v);
         v.fds[new_fd] = std::make_shared<fd_handle>(new_host_fd, it->second->path);
         v.r(0) = new_fd;
         return true;
@@ -928,14 +933,22 @@ struct Syscalls {
             return true;
         }
 
-        pipefd[0] = host_fds[0];
-        pipefd[1] = host_fds[1];
-        v.fds[host_fds[0]] = std::make_shared<fd_handle>(host_fds[0]);
-        v.fds[host_fds[1]] = std::make_shared<fd_handle>(host_fds[1]);
+        int guest_fd0 = allocate_fd(v);
+        auto handle0 = std::make_shared<fd_handle>(host_fds[0]);
         if (flags & O_CLOEXEC) {
-            v.fds[host_fds[0]]->cloexec = true;
-            v.fds[host_fds[1]]->cloexec = true;
+            handle0->cloexec = true;
         }
+        v.fds[guest_fd0] = handle0;
+
+        int guest_fd1 = allocate_fd(v, guest_fd0 + 1);
+        auto handle1 = std::make_shared<fd_handle>(host_fds[1]);
+        if (flags & O_CLOEXEC) {
+            handle1->cloexec = true;
+        }
+        v.fds[guest_fd1] = handle1;
+
+        pipefd[0] = guest_fd0;
+        pipefd[1] = guest_fd1;
         v.r(0) = 0;
         return true;
     }
@@ -1311,10 +1324,7 @@ struct Syscalls {
                 return true;
             }
 
-            int new_fd = min_fd;
-            while(v.fds.count(new_fd)) {
-                new_fd++;
-            }
+            int new_fd = allocate_fd(v, min_fd);
 
             int new_host_fd = dup(it->second->fd);
             if(new_host_fd < 0) {
