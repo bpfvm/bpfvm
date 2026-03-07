@@ -21,9 +21,6 @@
 #include <time.h>
 
 
-std::atomic<uint64_t> vm::next_pid{1};
-std::unordered_map<uint64_t, std::shared_ptr<vm>> vm::pid_map{};
-std::mutex vm::pid_map_mutex;
 static std::mutex log_mutex;
 
 memmap::~memmap() {
@@ -31,12 +28,6 @@ memmap::~memmap() {
         return;
     }
     munmap(data, size);
-}
-
-fd_handle::~fd_handle() {
-    if(fd >= 0) {
-        close(fd);
-    }
 }
 
 MpscQueue::MpscQueue() {
@@ -238,18 +229,10 @@ void dump(uint64_t addr, const bpf_insn* insn) {
     }
 }
 
-vm::vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
-    pid = next_pid.fetch_add(1);
-    this->ppid = ppid;
-    fds = opened;
-    char buf[PATH_MAX];
-    if(::getcwd(buf, sizeof(buf)) != nullptr) {
-        cwd = buf;
-    } else {
-        cwd = "/";
-    }
+vm::vm(Token) {
     pthread_mutex_init(&exit_mutex, nullptr);
     pthread_cond_init(&exit_cv, nullptr);
+    memset(reg, 0, sizeof(reg));
 }
 
 vm::~vm() {
@@ -257,13 +240,8 @@ vm::~vm() {
     pthread_mutex_destroy(&exit_mutex);
 }
 
-std::shared_ptr<vm> vm::create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened) {
-    auto v = std::make_shared<vm>(Token{}, ppid, opened);
-    {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map[v->pid] = v;
-    }
-    return v;
+std::shared_ptr<vm> vm::create() {
+    return std::make_shared<vm>(Token{});
 }
 
 uint64_t vm::load_elf(const char* elf_file_path) {
@@ -404,7 +382,8 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
     }
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%lu] [STACK] PUSH sp=%lx ret=%lx sig=%d size=%d\n", pid, r(10), return_addr, is_signal, frame_size);
+        printf("[#%d] [STACK] PUSH sp=%lx ret=%lx sig=%d size=%d\n", 
+            options.sys->id(), r(10), return_addr, is_signal, frame_size);
     }
     uint64_t sp = r(10) - STACK_LIMIT;
     uint64_t frame_base_addr = sp - frame_size;
@@ -475,7 +454,8 @@ uint64_t vm::pop_frame() {
 
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%lu] [STACK] POP sp=%lx new_sp=%lx ret=%lx sig=%d\n", pid, sp, old_sp, ret_addr, is_signal);
+        printf("[#%d] [STACK] POP sp=%lx new_sp=%lx ret=%lx sig=%d\n", 
+            options.sys->id(), sp, old_sp, ret_addr, is_signal);
     }
     r(10) = old_sp;
     return ret_addr;
@@ -696,8 +676,8 @@ bool vm::handle_pending_signals() {
     uint64_t handler = signal_actions[static_cast<size_t>(sig)].handler;
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%lu] signal %d handler=0x%lx return=0x%lx\n",
-               pid, sig, static_cast<unsigned long>(handler), unmmu(pc));
+        printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
+               options.sys->id(), sig, static_cast<unsigned long>(handler), unmmu(pc));
     }
     if(handler == sig_ign) {
         return true;
@@ -1069,7 +1049,7 @@ bool vm::step() {
     uint64_t addr = unmmu(pc);
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%lu] ", pid);
+        printf("[#%d] ", options.sys->id());
         dump(addr, pc);
     }
     if(options.step_run || (options.breakpoint && options.breakpoint == addr)) {
@@ -1146,6 +1126,7 @@ void* vm::unmap(uint64_t addr) {
 
 uint64_t vm::run() {
     tid = pthread_self();
+    if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
         pc++;
     }
@@ -1157,6 +1138,7 @@ uint64_t vm::run() {
 uint64_t vm::run(const vmOptions* options) {
     tid = pthread_self();
     this->options = *options;
+    if(options->sys) options->sys->init(shared_from_this());
     if(options->verbose) {
         printf("entry: 0x%lx\n", options->entry);
     }

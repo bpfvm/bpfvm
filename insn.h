@@ -18,8 +18,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "syscall_handler.h"
-
 #ifndef NSIG
 #define NSIG 32
 #endif
@@ -147,22 +145,23 @@ struct memmap {
     ~memmap();
 };
 
+class vm;
+class SyscallHandler{
+public:
+    virtual ~SyscallHandler() = default;
+    virtual void init(const std::shared_ptr<vm>& v) = 0;
+    virtual bool dispatch(uint32_t call) = 0;
+    virtual int id() = 0;
+};
+
 struct vmOptions {
     uint64_t entry;
     bool verbose;
     uint64_t breakpoint;
     bool step_run;
-    syscall_handler_t syscall_handler = nullptr;
     std::vector<std::string> argv;
     std::vector<std::string> envp;
-};
-
-struct fd_handle {
-    const int fd = -1;
-    bool cloexec = false;
-    std::string path;
-    explicit fd_handle(int fd, std::string path = {}) : fd(fd), path(std::move(path)) {}
-    ~fd_handle();
+    std::shared_ptr<SyscallHandler> sys;
 };
 
 class MpscQueue {
@@ -185,9 +184,26 @@ public:
     }
 };
 
-class vm {
-    void log_mem_violation(const char* type, uint64_t addr);
-    bool handle_pending_signals();
+struct signal_action {
+    uint64_t handler = 0;
+    uint64_t mask = 0;
+    int flags = 0;
+};
+
+class vm: public std::enable_shared_from_this<vm> {
+    vmOptions options;
+    const bpf_insn* pc;
+    uint64_t reg[11];
+    std::list<memmap> maps;
+    pthread_mutex_t exit_mutex;
+    pthread_cond_t exit_cv;
+    std::atomic<bool> exited{false};
+    std::atomic<bool> stopped{false};
+    std::array<signal_action, NSIG> signal_actions{};
+    MpscQueue pending_signals;
+    size_t signal_depth = 0;
+    pthread_t tid = 0;
+
 
     bool ld();
     bool ldx();
@@ -200,54 +216,28 @@ class vm {
     bool step();
 
     bool do_syscall(uint32_t call) {
-        if(options.syscall_handler) {
-            return options.syscall_handler(*this, call);
+        if(options.sys) {
+            return options.sys->dispatch(call);
         }
         return true;
     }
 
     friend class SyscallAccessor;
 
-public:
+    void log_mem_violation(const char* type, uint64_t addr);
+    bool handle_pending_signals();
     struct Token { explicit Token() = default; };
-    struct signal_action {
-        uint64_t handler = 0;
-        uint64_t mask = 0;
-        int flags = 0;
-    };
-
-private:
-    vmOptions options;
-    const bpf_insn* pc;
-    uint64_t reg[11];
-    static std::atomic<uint64_t> next_pid;
-    static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
-    static std::mutex pid_map_mutex;
-    std::list<memmap> maps;
-    uint64_t pid = 0;
-    std::atomic<uint64_t> ppid{0};
-    pthread_t tid = 0;
-    std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
-    std::string cwd;
-    uint32_t umask_val = 0022;
-    pthread_mutex_t exit_mutex;
-    pthread_cond_t exit_cv;
-    std::atomic<bool> exited{false};
-    std::atomic<bool> stopped{false};
-    std::array<signal_action, NSIG> signal_actions{};
-    MpscQueue pending_signals;
-    size_t signal_depth = 0;
-
 public:
+    vm(Token);
+    ~vm();
+
+    static std::shared_ptr<vm> create();
     void* mmu(uint64_t addr, size_t size = 1);
     uint64_t unmmu(const void* addr);
     void* unmap(uint64_t addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
     uint64_t pop_frame();
-    vm(Token, uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
-    ~vm();
-    static std::shared_ptr<vm> create(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened);
     bool wait_for_exit(int timeout_ms);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
@@ -260,25 +250,16 @@ public:
     uint64_t run(const vmOptions* options);
 };
 
+
 class SyscallAccessor {
 protected:
-    vm& v_;
-    explicit SyscallAccessor(vm& v) : v_(v) {}
-
-    auto& fds() { return v_.fds; }
-    auto& maps() { return v_.maps; }
-    auto& cwd() { return v_.cwd; }
-    auto& umask_val() { return v_.umask_val; }
-    auto& options() { return v_.options; }
-    auto& exited() { return v_.exited; }
-    auto& signal_actions() { return v_.signal_actions; }
-    auto& pending_signals() { return v_.pending_signals; }
-    auto& signal_depth() { return v_.signal_depth; }
-    auto& pid() { return v_.pid; }
-    auto& ppid() { return v_.ppid; }
-    auto& pc() { return v_.pc; }
-    static auto& pid_map() { return vm::pid_map; }
-    static auto& pid_map_mutex() { return vm::pid_map_mutex; }
+    static auto& maps(vm* v) { return v->maps; }
+    static auto& options(vm* v) { return v->options; }
+    static auto& exited(vm* v) { return v->exited; }
+    static auto& signal_actions(vm* v) { return v->signal_actions; }
+    static auto& pending_signals(vm* v) { return v->pending_signals; }
+    static auto& signal_depth(vm* v) { return v->signal_depth; }
+    static auto& pc(vm* v) { return v->pc; }
 };
 
 

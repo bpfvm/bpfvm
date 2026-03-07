@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "posix_syscall.h"
+#include "empty_syscall.h"
 
 // Helper function to print test results
 void print_test_result(const std::string& test_name, bool success) {
@@ -19,9 +21,9 @@ struct vmOptions option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
-    .syscall_handler = empty_syscall,
     .argv = {},
     .envp = {},
+    .sys = std::make_shared<EmptySyscall>(),
 };
 
 struct vmOptions posix_option = {
@@ -29,9 +31,9 @@ struct vmOptions posix_option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
-    .syscall_handler = posix_syscall,
     .argv = {},
     .envp = {},
+    .sys = std::make_shared<PosixSyscall>(),
 };
 
 // Helper function to load BPF program code into the VM's memory
@@ -91,7 +93,7 @@ bool add_data_mem(vm& ebpf_vm, uint64_t paddr, size_t size, unsigned char** out_
 // --- ALU64 Tests ---
 void test_alu64_add_imm() {
     std::cout << "--- Running Test: test_alu64_add_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_ADD | BPF_K, 1, 0, 0, 50 },  // add r1, 50
@@ -107,7 +109,7 @@ void test_alu64_add_imm() {
 
 void test_alu64_sub_reg() {
     std::cout << "--- Running Test: test_alu64_sub_reg ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 200 }, // mov r1, 200
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 75 },  // mov r2, 75
@@ -124,7 +126,7 @@ void test_alu64_sub_reg() {
 
 void test_alu64_mul_imm() {
     std::cout << "--- Running Test: test_alu64_mul_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 12 },  // mov r1, 12
         { BPF_ALU64 | BPF_MUL | BPF_K, 1, 0, 0, 10 },  // mul r1, 10
@@ -140,7 +142,7 @@ void test_alu64_mul_imm() {
 
 void test_alu64_div_imm() {
     std::cout << "--- Running Test: test_alu64_div_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, 5 },   // div r1, 5
@@ -156,7 +158,7 @@ void test_alu64_div_imm() {
 
 void test_alu64_div_by_zero_imm() {
     std::cout << "--- Running Test: test_alu64_div_by_zero_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, 0 },   // div r1, 0
@@ -174,7 +176,7 @@ void test_alu64_div_by_zero_imm() {
 
 void test_alu64_mod_imm() {
     std::cout << "--- Running Test: test_alu64_mod_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, 7 },   // mod r1, 7
@@ -190,7 +192,7 @@ void test_alu64_mod_imm() {
 
 void test_alu64_mod_by_zero_imm() {
     std::cout << "--- Running Test: test_alu64_mod_by_zero_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, 0 },   // mod r1, 0
@@ -207,7 +209,7 @@ void test_alu64_mod_by_zero_imm() {
 
 void test_alu64_and_imm() {
     std::cout << "--- Running Test: test_alu64_and_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0xF0F0 },  // mov r1, 0xF0F0
         { BPF_ALU64 | BPF_AND | BPF_K, 1, 0, 0, 0x0FF0 },  // and r1, 0x0FF0
@@ -223,7 +225,7 @@ void test_alu64_and_imm() {
 
 void test_alu64_or_reg() {
     std::cout << "--- Running Test: test_alu64_or_reg ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0xF0F0 }, // mov r1, 0xF0F0
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0x0FF0 }, // mov r2, 0x0FF0
@@ -241,7 +243,7 @@ void test_alu64_or_reg() {
 
 void test_alu64_lsh_imm() {
     std::cout << "--- Running Test: test_alu64_lsh_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x123 },// mov r1, 0x123
         { BPF_ALU64 | BPF_LSH | BPF_K, 1, 0, 0, 4 },    // lsh r1, 4
@@ -257,7 +259,7 @@ void test_alu64_lsh_imm() {
 
 void test_alu64_rsh_imm() {
     std::cout << "--- Running Test: test_alu64_rsh_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x1230 }, // mov r1, 0x1230
         { BPF_ALU64 | BPF_RSH | BPF_K, 1, 0, 0, 4 },      // rsh r1, 4 (logical)
@@ -273,7 +275,7 @@ void test_alu64_rsh_imm() {
 
 void test_alu64_arsh_imm() {
     std::cout << "--- Running Test: test_alu64_arsh_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val = 0xF000000000000000; // Negative number if treated as signed
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) }, // mov r1, val (lower 32 bits)
@@ -291,7 +293,7 @@ void test_alu64_arsh_imm() {
 
 void test_alu64_neg() {
     std::cout << "--- Running Test: test_alu64_neg ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_NEG, 1, 0, 0, 0 },           // neg r1
@@ -308,7 +310,7 @@ void test_alu64_neg() {
 // --- Byte Swap Tests ---
 void test_alu_end_le16() {
     std::cout << "--- Running Test: test_alu_end_le16 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
         { BPF_ALU | BPF_END | BPF_K, 1, 0, 0, 16 },        // le16 r1 (zero-extend to 16 bits)
@@ -325,7 +327,7 @@ void test_alu_end_le16() {
 
 void test_alu_end_le32() {
     std::cout << "--- Running Test: test_alu_end_le32 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val = 0xAABBCCDD11223344ULL;
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
@@ -344,7 +346,7 @@ void test_alu_end_le32() {
 
 void test_alu_end_le64() {
     std::cout << "--- Running Test: test_alu_end_le64 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val = 0x0102030405060708ULL;
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
@@ -362,7 +364,7 @@ void test_alu_end_le64() {
 
 void test_alu_end_be16() {
     std::cout << "--- Running Test: test_alu_end_be16 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
         { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 16 },        // be16 r1
@@ -379,7 +381,7 @@ void test_alu_end_be16() {
 
 void test_alu_end_be32() {
     std::cout << "--- Running Test: test_alu_end_be32 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x01020304 }, // mov r1, 0x01020304
         { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 32 },            // be32 r1
@@ -396,7 +398,7 @@ void test_alu_end_be32() {
 
 void test_alu_end_be64() {
     std::cout << "--- Running Test: test_alu_end_be64 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val = 0x0102030405060708ULL;
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
@@ -415,7 +417,7 @@ void test_alu_end_be64() {
 
 void test_alu64_end_bswap16() {
     std::cout << "--- Running Test: test_alu64_end_bswap16 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x0102 }, // mov r1, 0x0102
         { BPF_ALU64 | BPF_END | BPF_K, 1, 0, 0, 16 },      // bswap16 r1
@@ -431,7 +433,7 @@ void test_alu64_end_bswap16() {
 
 void test_alu64_end_bswap32() {
     std::cout << "--- Running Test: test_alu64_end_bswap32 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0x01020304 }, // mov r1, 0x01020304
         { BPF_ALU64 | BPF_END | BPF_K, 1, 0, 0, 32 },          // bswap32 r1
@@ -447,7 +449,7 @@ void test_alu64_end_bswap32() {
 
 void test_alu64_end_bswap64() {
     std::cout << "--- Running Test: test_alu64_end_bswap64 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val = 0x0102030405060708ULL;
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(val & 0xFFFFFFFF) },
@@ -466,7 +468,7 @@ void test_alu64_end_bswap64() {
 // --- ALU32 Tests ---
 void test_alu32_add_imm() {
     std::cout << "--- Running Test: test_alu32_add_imm ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     ebpf_vm->r(2) = 0xFFFFFFFF000000AA; // Set r2 with high bits set
     bpf_insn instructions[] = {
         // r2 is pre-set
@@ -484,7 +486,7 @@ void test_alu32_add_imm() {
 
 void test_alu32_sub_reg() {
     std::cout << "--- Running Test: test_alu32_sub_reg ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     ebpf_vm->r(2) = 0xFFFFFFFF000000C8; // 200
     ebpf_vm->r(3) = 0x000000000000004B; // 75
     bpf_insn instructions[] = {
@@ -503,7 +505,7 @@ void test_alu32_sub_reg() {
 // --- JMP Tests ---
 void test_jmp_ja() {
     std::cout << "--- Running Test: test_jmp_ja ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 10 }, // mov r1, 10
         { BPF_JMP | BPF_JA, 0, 0, 2, 0 },             // ja +2 (skip next 2 insns)
@@ -522,7 +524,7 @@ void test_jmp_ja() {
 
 void test_jmp_jeq_imm_true() {
     std::cout << "--- Running Test: test_jmp_jeq_imm_true ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 50 }, // mov r1, 50
         { BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 50 },   // jeq r1, 50, +1 (jump to ADD)
@@ -540,7 +542,7 @@ void test_jmp_jeq_imm_true() {
 
 void test_jmp_jeq_imm_false() {
     std::cout << "--- Running Test: test_jmp_jeq_imm_false ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 50 }, // mov r1, 50
         { BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 55 },   // jeq r1, 55, +1 (no jump)
@@ -558,7 +560,7 @@ void test_jmp_jeq_imm_false() {
 
 void test_jmp_jsgt_reg_true() {
     std::cout << "--- Running Test: test_jmp_jsgt_reg_true ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 }, // mov r1, 100
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 50 },  // mov r2, 50
@@ -577,7 +579,7 @@ void test_jmp_jsgt_reg_true() {
 
 void test_jmp_jslt_imm_false_signed() {
     std::cout << "--- Running Test: test_jmp_jslt_imm_false_signed ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -5 }, // mov r1, -5
         { BPF_JMP | BPF_JSLT | BPF_K, 1, 0, 1, -10 }, // jslt r1 (signed -5), -10 (false)
@@ -597,7 +599,7 @@ void test_jmp_jslt_imm_false_signed() {
 // --- JMP32 Tests ---
 void test_jmp32_jeq_imm_true() {
     std::cout << "--- Running Test: test_jmp32_jeq_imm_true ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     ebpf_vm->r(2) = 0xFFFFFFFF000A000A; // r2 = 0xA000A (high bits will be ignored by jmp32)
     bpf_insn instructions[] = {
         { BPF_JMP32 | BPF_JEQ | BPF_K, 2, 0, 1, 0x000A000A }, // jeq (u32)r2, 0xA000A, +1
@@ -616,7 +618,7 @@ void test_jmp32_jeq_imm_true() {
 // --- Load/Store Tests ---
 void test_ldx_stx_stack() {
     std::cout << "--- Running Test: test_ldx_stx_stack ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t val_to_store = 0xABCDEF0123456789;
     bpf_insn instructions[] = {
         // Store a 64-bit value onto the stack
@@ -657,7 +659,7 @@ void test_ldx_stx_stack() {
 // --- Load Immediate 64-bit ---
 void test_ld_imm64() {
     std::cout << "--- Running Test: test_ld_imm64 ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t immediate_val = 0x11223344AABBCCDD;
     bpf_insn instructions[] = {
         { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(immediate_val & 0xFFFFFFFF) }, // lddw r1, immediate_val (low 32 bits)
@@ -675,7 +677,7 @@ void test_ld_imm64() {
 
 void test_call_relative() {
     std::cout << "--- Running Test: test_call_relative ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
 
     // Main function code
     bpf_insn main_instructions[] = {
@@ -705,7 +707,7 @@ void test_call_relative() {
 
 void test_call_pseudo_func() {
     std::cout << "--- Running Test: test_call_pseudo_func ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     uint64_t helper_paddr = 0x2000;
 
     // Main function code
@@ -742,7 +744,7 @@ void test_call_pseudo_func() {
 
 void test_syscall_clock_gettime() {
     std::cout << "--- Running Test: test_syscall_clock_gettime ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     unsigned char* data = nullptr;
     uint64_t data_paddr = 0x3000;
     size_t data_size = 128;
@@ -769,7 +771,7 @@ void test_syscall_clock_gettime() {
 
 void test_syscall_file_io() {
     std::cout << "--- Running Test: test_syscall_file_io ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
     unsigned char* data = nullptr;
     uint64_t data_paddr = 0x4000;
     size_t data_size = 256;
@@ -859,7 +861,7 @@ void test_syscall_file_io() {
 
 void test_syscall_fork_waitpid() {
     std::cout << "--- Running Test: test_syscall_fork_waitpid ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
         { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
@@ -887,7 +889,7 @@ void test_syscall_fork_waitpid() {
 
 void test_syscall_waitpid_self() {
     std::cout << "--- Running Test: test_syscall_waitpid_self ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
         { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_GETPID },         // r0 = pid
@@ -911,7 +913,7 @@ void test_syscall_waitpid_self() {
 
 void test_syscall_waitpid_any_twice() {
     std::cout << "--- Running Test: test_syscall_waitpid_any_twice ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
         { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
@@ -944,7 +946,7 @@ void test_syscall_waitpid_any_twice() {
 
 void test_syscall_waitpid_any_no_child_wnohang() {
     std::cout << "--- Running Test: test_syscall_waitpid_any_no_child_wnohang ---" << std::endl;
-    auto ebpf_vm = vm::create(0, {});
+    auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
