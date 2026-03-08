@@ -9,6 +9,7 @@
 #include <gelf.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -43,7 +44,7 @@ void dump(uint64_t addr, const bpf_insn* insn) {
     static const char* lsize[] = {
         "w", "h", "b", "dw"
     };
-    printf("%x: 0x%02x %d %d %d 0x%x: ", addr, insn->code, insn->dst_reg, insn->src_reg, insn->off, insn->imm);
+    printf("%" PRIx64 ": 0x%02x %d %d %d 0x%x: ", addr, insn->code, insn->dst_reg, insn->src_reg, insn->off, insn->imm);
     switch(insn->code & 0x07) {
     case BPF_ALU: case BPF_ALU64: {
         printf("%s ", aluop[(insn->code & 0xf0) >> 4]);
@@ -146,9 +147,9 @@ void dump(uint64_t addr, const bpf_insn* insn) {
                 printf("lock%s [r%d%d] ", size, insn->dst_reg, insn->off);
             }
             int base_op = op & ~BPF_FETCH;
-            if((op & ~BPF_FETCH) == (BPF_XCHG & ~BPF_FETCH)) {
+            if(base_op == (BPF_XCHG & ~BPF_FETCH)) {
                 printf("xchg r%d\n", insn->src_reg);
-            } else if((op & ~BPF_FETCH) == (BPF_CMPXCHG & ~BPF_FETCH)) {
+            } else if(base_op == (BPF_CMPXCHG & ~BPF_FETCH)) {
                 printf("cmpxchg r%d\n", insn->src_reg);
             } else if(base_op == BPF_ADD || base_op == BPF_OR ||
                       base_op == BPF_AND || base_op == BPF_XOR) {
@@ -748,6 +749,7 @@ bool vm::alu64() {
         return false;
     }
     uint64_t src = (pc->code & 0x08) == BPF_X ? r(pc->src_reg) : (uint64_t)(int64_t)pc->imm;
+    int64_t signed_src = static_cast<int64_t>(src);
     auto& dst = r(pc->dst_reg);
     switch (pc->code & 0xf0) {
     case BPF_ADD:
@@ -763,7 +765,7 @@ bool vm::alu64() {
         if(pc->off == 0) {
             dst = (src != 0) ? (dst / src) : 0;
         }else {
-            dst = (src == 0) ? 0 : ((src == -1 && (int64_t)dst == INT64_MIN) ? INT64_MIN : ((int64_t)dst/(int64_t)src));
+            dst = (src == 0) ? 0 : ((signed_src == -1 && (int64_t)dst == INT64_MIN) ? INT64_MIN : ((int64_t)dst / signed_src));
         }
         break;
     case BPF_OR:
@@ -785,7 +787,7 @@ bool vm::alu64() {
         if(pc->off == 0) {
             dst = (src != 0) ? (dst % src) : dst;
         } else {
-            dst = (src == 0) ? dst : ((src == -1 && (int64_t)dst == INT64_MIN) ? 0: ((int64_t)dst % (int64_t)src));
+            dst = (src == 0) ? dst : ((signed_src == -1 && (int64_t)dst == INT64_MIN) ? 0 : ((int64_t)dst % signed_src));
         }
         break;
     case BPF_XOR:
@@ -829,6 +831,7 @@ bool vm::alu() {
         return false;
     }
     uint32_t src = (pc->code & 0x08) == BPF_X ? (uint32_t)r(pc->src_reg) : pc->imm;
+    int32_t signed_src = static_cast<int32_t>(src);
     auto dst = (uint32_t)r(pc->dst_reg);
     switch (pc->code & 0xf0) {
     case BPF_ADD:
@@ -844,7 +847,7 @@ bool vm::alu() {
         if(pc->off == 0) {
             dst = (src != 0) ? ((uint32_t)dst / src) : 0;
         }else {
-            dst = (src == 0) ? 0 : ((src == -1 && (int32_t)dst == INT32_MIN) ? INT32_MIN : ((int32_t)dst/(int32_t)src));
+            dst = (src == 0) ? 0 : ((signed_src == -1 && (int32_t)dst == INT32_MIN) ? INT32_MIN : ((int32_t)dst / signed_src));
         }
         break;
     case BPF_OR:
@@ -866,7 +869,7 @@ bool vm::alu() {
         if(pc->off == 0) {
             dst = (src != 0) ? ((uint32_t)dst % src) : (uint32_t)dst;
         } else {
-            dst = (src == 0) ? (uint32_t)dst : ((src == -1 && (int32_t)dst == INT32_MIN) ? 0: ((int32_t)dst % (int32_t)src));
+            dst = (src == 0) ? (uint32_t)dst : ((signed_src == -1 && (int32_t)dst == INT32_MIN) ? 0 : ((int32_t)dst % signed_src));
         }
         break;
     case BPF_XOR:

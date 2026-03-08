@@ -21,6 +21,7 @@ struct vmOptions option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
+    .raw_stack = false,
     .argv = {},
     .envp = {},
     .sys = std::make_shared<EmptySyscall>(),
@@ -31,6 +32,7 @@ struct vmOptions posix_option = {
     .verbose = true,
     .breakpoint = 0,
     .step_run = false,
+    .raw_stack = false,
     .argv = {},
     .envp = {},
     .sys = std::make_shared<PosixSyscall>(),
@@ -286,7 +288,8 @@ void test_alu64_arsh_imm() {
     };
     assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
     uint64_t ret = ebpf_vm->run(&option);
-    bool success = (ebpf_vm->r(1) == ((int64_t)val >> 4) && ret == ((int64_t)val >> 4));
+    uint64_t expected = static_cast<uint64_t>((int64_t)val >> 4);
+    bool success = (ebpf_vm->r(1) == expected && ret == expected);
     print_test_result("test_alu64_arsh_imm", success);
     assert(success);
 }

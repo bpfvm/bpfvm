@@ -165,12 +165,12 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
 }
 
 void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
-    maps(v.get()).clear();
     fds.clear();
     signal_depth(v.get()) = 0;
     if(pid == 1) {
         return;
     }
+    maps(v.get()).clear();
     std::lock_guard<std::mutex> lock(pid_map_mutex);
     for(auto& entry : pid_map) {
         auto child_sys = sys(entry.second.get());
