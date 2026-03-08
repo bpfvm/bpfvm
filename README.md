@@ -8,8 +8,10 @@
 
 *   **ELF 加载器**: 解析并加载标准 BPF ELF 可执行文件。
 *   **指令集支持**: 实现了核心 eBPF 指令集解释执行。
-*   **系统调用模拟**: 实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
+*   **系统调用模拟**: 通过可插拔的 `SyscallHandler` 接口实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
 *   **标准库支持**: 深度集成了 `PDCLib`，为 BPF 程序提供标准 C 库支持 (stdio, stdlib, string 等)。
+*   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用。
+*   **内存安全**: 提供内存越界检查机制。
 *   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `sbase` (coreutils) 等复杂程序。
 *   **Demo Rootfs**: 提供脚本一键构建 `dash + sbase` 的最小 rootfs，并安装到 `root/`。
 
@@ -82,6 +84,24 @@ VM 自身的指令集单元测试：
 ```bash
 make -C test
 ```
+
+## 项目结构
+
+```
+├── main.cpp              # VM 入口，命令行解析
+├── insn.h / insn.cpp     # VM 核心：指令定义与解释执行
+├── posix_syscall.h/cpp   # POSIX 系统调用实现 (PosixSyscall)
+├── empty_syscall.h       # 空系统调用桩 (EmptySyscall, 用于测试)
+├── insn_test.cpp         # 指令集单元测试
+├── include/              # BPF Guest 程序使用的头文件
+├── pdclib/               # PDCLib 标准 C 库 (子模块)
+├── dash/                 # dash shell (子模块)
+├── sbase/                # sbase coreutils
+├── test/                 # BPF 集成测试用例
+└── root/                 # Demo rootfs 输出目录
+```
+
+VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp`) 与系统调用处理 (`posix_syscall.cpp`) 解耦。`PosixSyscall` 提供完整的 POSIX 系统调用模拟，`EmptySyscall` 则作为测试用的空实现。
 
 ## 架构限制与开发指南
 

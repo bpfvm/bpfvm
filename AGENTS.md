@@ -1,8 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `main.cpp`, `insn.cpp`, `syscalls.cpp`, `insn.h`: core VM entry point, instruction handling, and syscall glue.
-- `include/`: BPF-facing headers used by the VM and test programs.
+- `main.cpp`: VM entry point, command-line parsing, signal setup.
+- `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, and instruction definitions.
+- `insn.cpp`: BPF instruction execution (interpreter loop).
+- `posix_syscall.h`, `posix_syscall.cpp`: full POSIX syscall implementation (`PosixSyscall` class), fd management, signal queue, process control.
+- `empty_syscall.h`: stub syscall handler (`EmptySyscall`) returning `-ENOSYS`, used for testing.
+- `insn_test.cpp`: unit tests for instruction execution, built into `bpfvm_test`.
+- `include/`: BPF-facing headers (syscall IDs, POSIX types) used by guest programs.
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
@@ -30,8 +35,10 @@
 - No coverage requirement is defined; add focused tests for new VM instructions or syscalls.
 
 ## Syscall Implementation & C Library Wrappers
-- Syscall IDs are defined in `include/bpf_call.h` and encoded via `BPF_CALL_BASE` / `BPF_CALL_ID()`; the VM decodes them in `syscalls.cpp` (`vm::do_syscall`). 
+- Syscall handling is decoupled from the VM via the abstract `SyscallHandler` interface (defined in `insn.h`), with `PosixSyscall` (`posix_syscall.cpp`) as the main implementation and `EmptySyscall` (`empty_syscall.h`) as a stub for testing.
+- Syscall IDs are defined in `include/bpf_call.h` and encoded via `BPF_CALL_BASE` / `BPF_CALL_ID()`; the VM dispatches them through the `SyscallHandler::syscall()` virtual method.
 - The VM reads syscall arguments from registers (`r(1)`..`r(5)`), translates guest pointers with `mmu()`, and returns results in `r(0)`; errors are negative `errno` values.
+- Signal handling uses a lock-free multi-producer-single-consumer queue (`MpscQueue`) in `PosixSyscall`, with support for `SIGKILL`/`SIGSTOP`/`SIGCONT` bypassing the queue via direct flags.
 - C library wrappers live in `pdclib/platform/bpf/functions/posix/syscall.c` and map POSIX functions (`open`, `read`, `mmap`, `fork`, etc.) to `BPF_CALL_*` IDs.
 - The low-level `syscall()` macro in `pdclib/platform/bpf/include/pdclib/_PDCLIB_config.h` dispatches by casting the call ID to a function pointer with 0–5 args, so the VM sees a direct call to `BPF_CALL_*`.
 

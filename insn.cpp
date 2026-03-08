@@ -1026,22 +1026,17 @@ uint64_t vm::run() {
 
 uint64_t vm::run(const vmOptions* options) {
     this->options = *options;
-    if(options->sys) options->sys->init(shared_from_this());
     if(options->verbose) {
         printf("entry: 0x%lx\n", options->entry);
     }
 
-    if(!setup_stack(options->argv, options->envp)) {
+    if(!options->raw_stack && !setup_stack(options->argv, options->envp)) {
         return 0;
     }
+    reg[10] = STACK_BASE + STACK_SIZE - 8;
     pc = (const bpf_insn*)mmu(options->entry);
     push_frame(0);
-    while(step()) {
-        pc++;
-    }
-    exited.store(true, std::memory_order_release);
-    pthread_cond_broadcast(&exit_cv);
-    return r(0);
+    return run();
 }
 
 bool vm::wait_for_exit(int timeout_ms) {
@@ -1137,6 +1132,5 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     header[env_base + envp.size()] = 0;
 
     reg[1] = STACK_BASE;
-    reg[10] = STACK_BASE + STACK_SIZE - 8;
     return true;
 }

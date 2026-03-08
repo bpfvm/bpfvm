@@ -164,16 +164,10 @@ struct vmOptions {
     bool verbose;
     uint64_t breakpoint;
     bool step_run;
+    bool raw_stack;
     std::vector<std::string> argv;
     std::vector<std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
-};
-
-
-struct signal_action {
-    uint64_t handler = 0;
-    uint64_t mask = 0;
-    int flags = 0;
 };
 
 class vm: public std::enable_shared_from_this<vm> {

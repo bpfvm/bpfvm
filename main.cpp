@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
     options.verbose = false; // 默认值
     options.breakpoint = 0;   // 默认值
     options.step_run = false; // 默认值
+    options.raw_stack = false; // 默认值
     options.sys = std::make_shared<PosixSyscall>();
 
     int opt;

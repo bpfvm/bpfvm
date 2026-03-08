@@ -38,6 +38,12 @@ public:
 #endif
 
 class PosixSyscall: public SyscallHandler{
+    struct signal_action {
+        uint64_t handler = 0;
+        uint64_t mask = 0;
+        int flags = 0;
+    };
+
     std::string cwd;
     uint32_t umask_val = 0022;
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
