@@ -3,7 +3,6 @@
 //
 
 #include "insn.h"
-#include "include/bpf_call.h"
 #include <iostream>
 
 #include <libelf.h>
@@ -920,11 +919,14 @@ bool vm::step() {
     }
 
     while(true) {
-        if(exited.load(std::memory_order_acquire)) {
-            r(1) = 128 + SIGKILL;
-            return do_syscall(BPF_SYS_EXIT);
+        uint32_t f = flags.load(std::memory_order_acquire);
+        if(f & (VM_EXITED | VM_KILLED)) {
+            if (f & VM_KILLED) {
+                r(0) = 128 + SIGKILL;
+            }
+            return false;
         }
-        if(!stopped.load(std::memory_order_acquire)) break;
+        if(!(f & VM_STOPPED)) break;
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 100000000L; // 100ms
@@ -1019,7 +1021,8 @@ uint64_t vm::run() {
     while(step()) {
         pc++;
     }
-    exited.store(true, std::memory_order_release);
+    if(options.sys) options.sys->fini(shared_from_this());
+    flags.fetch_or(VM_EXITED, std::memory_order_release);
     pthread_cond_broadcast(&exit_cv);
     return r(0);
 }
@@ -1040,11 +1043,11 @@ uint64_t vm::run(const vmOptions* options) {
 }
 
 bool vm::wait_for_exit(int timeout_ms) {
-    if(exited.load(std::memory_order_acquire)) {
+    if(flags.load(std::memory_order_acquire) & VM_EXITED) {
         return true;
     }
     pthread_mutex_lock(&exit_mutex);
-    if(!exited.load(std::memory_order_acquire)) {
+    if(!(flags.load(std::memory_order_acquire) & VM_EXITED)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += timeout_ms / 1000;
@@ -1056,7 +1059,7 @@ bool vm::wait_for_exit(int timeout_ms) {
         pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
     }
     pthread_mutex_unlock(&exit_mutex);
-    return exited.load(std::memory_order_acquire);
+    return (flags.load(std::memory_order_acquire) & VM_EXITED) != 0;
 }
 
 bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp) {

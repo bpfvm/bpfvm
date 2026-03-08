@@ -146,13 +146,13 @@ class SyscallHandler{
 protected:
     static auto& maps(vm* v);
     static auto& options(vm* v);
-    static auto& exited(vm* v);
-    static auto& stopped(vm* v);
+    static auto& flags(vm* v);
     static auto& signal_depth(vm* v);
     static auto& pc(vm* v);
 public:
     virtual ~SyscallHandler() = default;
     virtual void init(const std::shared_ptr<vm>& v) = 0;
+    virtual void fini(const std::shared_ptr<vm>& v) = 0;
     virtual bool syscall(vm* v, uint32_t call) = 0;
     virtual void queue_signal(vm* v, int sig) = 0;
     virtual bool handle_signals(vm* v) = 0;
@@ -177,8 +177,7 @@ class vm: public std::enable_shared_from_this<vm> {
     std::list<memmap> maps;
     pthread_mutex_t exit_mutex;
     pthread_cond_t exit_cv;
-    std::atomic<bool> exited{false};
-    std::atomic<bool> stopped{false};
+    std::atomic<uint32_t> flags{0};
     size_t signal_depth = 0;
 
     bool ld();
@@ -200,6 +199,10 @@ class vm: public std::enable_shared_from_this<vm> {
     struct Token { explicit Token() = default; };
     uint64_t pop_frame();
 public:
+    static constexpr uint32_t VM_EXITED = 0x1;
+    static constexpr uint32_t VM_STOPPED = 0x2;
+    static constexpr uint32_t VM_KILLED = 0x4;
+
     vm(Token);
     ~vm();
 
@@ -223,8 +226,7 @@ public:
 
 inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
-inline auto& SyscallHandler::exited(vm* v) { return v->exited; }
-inline auto& SyscallHandler::stopped(vm* v) { return v->stopped; }
+inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
 inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 

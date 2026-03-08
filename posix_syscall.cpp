@@ -164,15 +164,31 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
     if(pid == 1) pid_map[pid] = v;
 }
 
+void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
+    maps(v.get()).clear();
+    fds.clear();
+    signal_depth(v.get()) = 0;
+    if(pid == 1) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(pid_map_mutex);
+    for(auto& entry : pid_map) {
+        auto child_sys = sys(entry.second.get());
+        if(child_sys && child_sys->ppid.load() == pid) {
+            child_sys->ppid.store(1);
+        }
+    }
+}
+
 void PosixSyscall::queue_signal(vm* v, int sig) {
     if(sig == SIGKILL) {
-        exited(v).store(true, std::memory_order_release);
+        flags(v).fetch_or(vm::VM_KILLED, std::memory_order_release);
         v->wakeup();
     } else if(sig == SIGSTOP) {
-        stopped(v).store(true, std::memory_order_release);
+        flags(v).fetch_or(vm::VM_STOPPED, std::memory_order_release);
         v->wakeup();
     } else if(sig == SIGCONT) {
-        stopped(v).store(false, std::memory_order_release);
+        flags(v).fetch_and(~vm::VM_STOPPED, std::memory_order_release);
         v->wakeup();
     } else {
         // Best-effort: drop if the queue is full to avoid blocking the VM thread.
@@ -215,7 +231,7 @@ bool PosixSyscall::handle_signals(vm* v) {
         case SIGTSTP:
         case SIGTTIN:
         case SIGTTOU:
-            stopped(v).store(true, std::memory_order_release);
+            flags(v).fetch_or(vm::VM_STOPPED, std::memory_order_release);
             v->wakeup();
             return true;
         default:
@@ -366,19 +382,7 @@ bool PosixSyscall::do_munmap(vm* v) {
 }
 
 bool PosixSyscall::do_exit(vm* v) {
-    if(pid != 1) {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        for(auto& entry : pid_map) {
-            auto child_sys = sys(entry.second.get());
-            if(child_sys && child_sys->ppid.load() == pid) {
-                child_sys->ppid.store(1);
-            }
-        }
-    }
     v->r(0) = (uint64_t)arg_s32(v->r(1));
-    maps(v).clear();
-    fds.clear();
-    signal_depth(v) = 0;
     return false;
 }
 
@@ -808,9 +812,8 @@ bool PosixSyscall::do_execve(vm* v) {
         }
     }
     fds.swap(new_fds);
-    for(size_t i = 0; i < 11; i++) {
-        v->r(i) = fresh->r(i);
-    }
+    v->r(1) = fresh->r(1);
+    v->r(10) = STACK_BASE + STACK_SIZE - 8;
     pc(v) = new_pc;
     v->push_frame(0);
     pc(v)--;
@@ -956,7 +959,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
                 if(child_sys && child_sys->ppid.load() != pid) {
                     continue;
                 }
-                if(exited(entry.second.get()).load(std::memory_order_acquire)) {
+                if(flags(entry.second.get()).load(std::memory_order_acquire) & vm::VM_EXITED) {
                     children.clear();
                     children.push_back(entry.second);
                     break;
@@ -987,7 +990,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
     }
 
     std::shared_ptr<vm> child;
-    if(children.size() == 1 && exited(children[0].get()).load(std::memory_order_acquire)) {
+    if(children.size() == 1 && (flags(children[0].get()).load(std::memory_order_acquire) & vm::VM_EXITED)) {
         child = children[0];
     } else {
         if(options & WNOHANG) {
@@ -1001,7 +1004,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
                     child = candidate;
                     break;
                 }
-                if(!pending_signals.empty() || exited(v).load(std::memory_order_acquire)) {
+                if(!pending_signals.empty() || (flags(v).load(std::memory_order_acquire) & vm::VM_EXITED)) {
                     v->r(0) = -EINTR;
                     return true;
                 }

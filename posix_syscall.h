@@ -58,6 +58,7 @@ class PosixSyscall: public SyscallHandler{
     MpscQueue pending_signals;
 
     virtual void init(const std::shared_ptr<vm>& v) override;
+    virtual void fini(const std::shared_ptr<vm>& v) override;
     virtual void queue_signal(vm* v, int sig) override;
     virtual bool handle_signals(vm* v) override;
     virtual bool syscall(vm* v, uint32_t call) override;
