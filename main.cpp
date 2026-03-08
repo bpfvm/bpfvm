@@ -57,7 +57,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    static class vm* g_vm = vm.get();
     struct sigaction sa = {};
 
     // Ignore SIGTRAP
@@ -69,8 +68,10 @@ int main(int argc, char** argv) {
     sigaction(SIGUSR1, &sa, nullptr);
 
     // Logical signals for the VM
+    static class vm* g_vm = vm.get();
+    static SyscallHandler* g_sys = options.sys.get();
     sa.sa_handler = [](int sig) {
-        g_vm->queue_signal(sig);
+        g_sys->queue_signal(g_vm, sig);
     };
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);

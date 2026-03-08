@@ -21,7 +21,7 @@
 #include <time.h>
 
 
-static std::mutex log_mutex;
+std::mutex log_mutex;
 
 memmap::~memmap() {
     if(data == nullptr || data == MAP_FAILED) {
@@ -30,51 +30,7 @@ memmap::~memmap() {
     munmap(data, size);
 }
 
-MpscQueue::MpscQueue() {
-    for(size_t i = 0; i < k_capacity; ++i) {
-        slots[i].seq.store(i, std::memory_order_relaxed);
-    }
-}
 
-bool MpscQueue::try_push(int value) {
-    uint64_t pos = tail.load(std::memory_order_relaxed);
-    while(true) {
-        slot& s = slots[pos & k_mask];
-        uint64_t seq = s.seq.load(std::memory_order_acquire);
-        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
-        if(dif == 0) {
-            if(tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                s.value = value;
-                s.seq.store(pos + 1, std::memory_order_release);
-                return true;
-            }
-        } else if(dif < 0) {
-            return false;
-        } else {
-            pos = tail.load(std::memory_order_relaxed);
-        }
-    }
-}
-
-bool MpscQueue::try_pop(int& value) {
-    uint64_t pos = head.load(std::memory_order_relaxed);
-    while(true) {
-        slot& s = slots[pos & k_mask];
-        uint64_t seq = s.seq.load(std::memory_order_acquire);
-        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
-        if(dif == 0) {
-            if(head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                value = s.value;
-                s.seq.store(pos + k_capacity, std::memory_order_release);
-                return true;
-            }
-        } else if(dif < 0) {
-            return false;
-        } else {
-            pos = head.load(std::memory_order_relaxed);
-        }
-    }
-}
 
 void dump(uint64_t addr, const bpf_insn* insn) {
     static const char* aluop[] = {
@@ -644,77 +600,11 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     }
 }
 
-void vm::queue_signal(int sig) {
-    if(sig == SIGKILL) {
-        exited.store(true, std::memory_order_release);
-        pthread_cond_broadcast(&exit_cv);
-    } else if(sig == SIGSTOP) {
-        stopped.store(true, std::memory_order_release);
-        pthread_cond_broadcast(&exit_cv);
-    } else if(sig == SIGCONT) {
-        stopped.store(false, std::memory_order_release);
-        pthread_cond_broadcast(&exit_cv);
-    } else {
-        // Best-effort: drop if the queue is full to avoid blocking the VM thread.
-        pending_signals.try_push(sig);
-    }
-    if (tid != 0) {
-        pthread_kill(tid, SIGUSR1);
-    }
+void vm::wakeup() {
+    pthread_cond_broadcast(&exit_cv);
 }
 
-bool vm::handle_pending_signals() {
-    int sig = 0;
-    if(!pending_signals.try_pop(sig)) {
-        return true;
-    }
-    if(sig <= 0 || sig >= NSIG) {
-        return true;
-    }
-    const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
-    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
-    uint64_t handler = signal_actions[static_cast<size_t>(sig)].handler;
-    if(options.verbose) {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
-               options.sys->id(), sig, static_cast<unsigned long>(handler), unmmu(pc));
-    }
-    if(handler == sig_ign) {
-        return true;
-    }
-    if(handler == sig_dfl) {
-        switch(sig) {
-        case SIGTERM:
-        case SIGINT:
-        case SIGABRT:
-        case SIGSEGV:
-        case SIGILL:
-        case SIGFPE:
-            r(1) = 128 + static_cast<uint64_t>(sig);
-            return do_syscall(BPF_SYS_EXIT);
-        case SIGTSTP:
-        case SIGTTIN:
-        case SIGTTOU:
-            stopped.store(true, std::memory_order_release);
-            pthread_cond_broadcast(&exit_cv);
-            return true;
-        default:
-            return true;
-        }
-    }
 
-    const bpf_insn* handler_pc = (const bpf_insn*)mmu(handler);
-    if(handler_pc == nullptr) {
-        r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
-        return do_syscall(BPF_SYS_EXIT);
-    }
-    if(!push_frame(unmmu(pc), true)) {
-        return do_syscall(BPF_SYS_EXIT);
-    }
-    r(1) = static_cast<uint64_t>(sig);
-    pc = handler_pc;
-    return true;
-}
 
 bool vm::ld() {
     if(pc->dst_reg >= 10) {
@@ -1023,7 +913,7 @@ bool vm::alu() {
 
 bool vm::step() {
     if(signal_depth == 0) {
-        if(!handle_pending_signals()) {
+        if(!options.sys->handle_signals(this)) {
             //be killed
             return false;
         }
@@ -1125,7 +1015,6 @@ void* vm::unmap(uint64_t addr) {
 }
 
 uint64_t vm::run() {
-    tid = pthread_self();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
         pc++;
@@ -1136,7 +1025,6 @@ uint64_t vm::run() {
 }
 
 uint64_t vm::run(const vmOptions* options) {
-    tid = pthread_self();
     this->options = *options;
     if(options->sys) options->sys->init(shared_from_this());
     if(options->verbose) {

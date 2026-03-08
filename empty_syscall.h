@@ -4,22 +4,23 @@
 
 
 class EmptySyscall: public SyscallHandler{
-    std::weak_ptr<vm> v;
 public:
-    virtual void init(const std::shared_ptr<vm>& v_) override{
-        v = v_;
-    }
-    virtual bool dispatch(uint32_t call) override{
+    virtual void init(const std::shared_ptr<vm>&) override{}
+    virtual bool syscall(vm* v, uint32_t call) override{
         (void)call;
-        auto locked = v.lock();
-        if(locked) {
-            locked->r(0) = -ENOSYS;
-            return true;
-        }
-        return false;
+        v->r(0) = -ENOSYS;
+        return true;
     }
     virtual int id() override {
         return 1;
+    }
+    virtual void queue_signal(vm* v, int sig) override {
+        (void)v;
+        (void)sig;
+    }
+    virtual bool handle_signals(vm* v) override {
+        (void)v;
+        return true;
     }
 };
 

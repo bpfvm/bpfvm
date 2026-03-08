@@ -1,7 +1,3 @@
-//
-// Created by chouryzhou on 24-10-28.
-//
-#include "insn.h"
 #include "posix_syscall.h"
 #include "include/bpf_call.h"
 namespace bpf{
@@ -9,7 +5,6 @@ namespace bpf{
     #include "include/signal.h"
     #include "include/sys/stat.h"
     #include "include/dirent.h"
-    //#include "include/sys/times.h"
     #include "include/termios.h"
 }
 
@@ -27,7 +22,57 @@ namespace bpf{
 #include <string.h>
 #include <unistd.h>
 #include <filesystem>
+#include <signal.h>
+#include <pthread.h>
 
+#undef sa_handler
+#undef sa_sigaction
+
+MpscQueue::MpscQueue() {
+    for(size_t i = 0; i < k_capacity; ++i) {
+        slots[i].seq.store(i, std::memory_order_relaxed);
+    }
+}
+
+bool MpscQueue::try_push(int value) {
+    uint64_t pos = tail.load(std::memory_order_relaxed);
+    while(true) {
+        slot& s = slots[pos & k_mask];
+        uint64_t seq = s.seq.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        if(dif == 0) {
+            if(tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                s.value = value;
+                s.seq.store(pos + 1, std::memory_order_release);
+                return true;
+            }
+        } else if(dif < 0) {
+            return false;
+        } else {
+            pos = tail.load(std::memory_order_relaxed);
+        }
+    }
+}
+
+bool MpscQueue::try_pop(int& value) {
+    uint64_t pos = head.load(std::memory_order_relaxed);
+    while(true) {
+        slot& s = slots[pos & k_mask];
+        uint64_t seq = s.seq.load(std::memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        if(dif == 0) {
+            if(head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                value = s.value;
+                s.seq.store(pos + k_capacity, std::memory_order_release);
+                return true;
+            }
+        } else if(dif < 0) {
+            return false;
+        } else {
+            pos = head.load(std::memory_order_relaxed);
+        }
+    }
+}
 
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
 std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map{};
@@ -113,8 +158,83 @@ PosixSyscall::PosixSyscall(uint64_t ppid, const std::unordered_map<int, std::sha
 }
 
 void PosixSyscall::init(const std::shared_ptr<vm>& v){
+    tid = pthread_self();
     std::lock_guard<std::mutex> lock(pid_map_mutex);
+    //这里只对1号进程添加，其他进程由fork添加，因为推迟到这里就太晚了
     if(pid == 1) pid_map[pid] = v;
+}
+
+void PosixSyscall::queue_signal(vm* v, int sig) {
+    if(sig == SIGKILL) {
+        exited(v).store(true, std::memory_order_release);
+        v->wakeup();
+    } else if(sig == SIGSTOP) {
+        stopped(v).store(true, std::memory_order_release);
+        v->wakeup();
+    } else if(sig == SIGCONT) {
+        stopped(v).store(false, std::memory_order_release);
+        v->wakeup();
+    } else {
+        // Best-effort: drop if the queue is full to avoid blocking the VM thread.
+        pending_signals.try_push(sig);
+    }
+    if (tid != 0) {
+        pthread_kill(tid, SIGUSR1);
+    }
+}
+
+bool PosixSyscall::handle_signals(vm* v) {
+    int sig = 0;
+    if(!pending_signals.try_pop(sig)) {
+        return true;
+    }
+    if(sig <= 0 || sig >= NSIG) {
+        return true;
+    }
+    const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
+    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
+    uint64_t handler = signal_actions[static_cast<size_t>(sig)].handler;
+    if(options(v).verbose) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
+               id(), sig, static_cast<unsigned long>(handler), v->unmmu(pc(v)));
+    }
+    if(handler == sig_ign) {
+        return true;
+    }
+    if(handler == sig_dfl) {
+        switch(sig) {
+        case SIGTERM:
+        case SIGINT:
+        case SIGABRT:
+        case SIGSEGV:
+        case SIGILL:
+        case SIGFPE:
+            v->r(1) = 128 + static_cast<uint64_t>(sig);
+            return do_exit(v);
+        case SIGTSTP:
+        case SIGTTIN:
+        case SIGTTOU:
+            stopped(v).store(true, std::memory_order_release);
+            v->wakeup();
+            return true;
+        default:
+            return true;
+        }
+    }
+
+    const bpf_insn* handler_pc = (const bpf_insn*)v->mmu(handler);
+    if(handler_pc == nullptr) {
+        v->r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
+        return do_exit(v);
+    }
+    if(!v->push_frame(v->unmmu(pc(v)), true)) {
+        v->r(1) = 128 + static_cast<uint64_t>(SIGBUS);
+        return do_exit(v);
+    }
+    v->r(1) = static_cast<uint64_t>(sig);
+    pc(v) = handler_pc;
+    return true;
 }
 
 std::shared_ptr<PosixSyscall> PosixSyscall::sys(vm* v) {
@@ -250,7 +370,7 @@ bool PosixSyscall::do_exit(vm* v) {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         for(auto& entry : pid_map) {
             auto child_sys = sys(entry.second.get());
-            if(child_sys->ppid.load() == pid) {
+            if(child_sys && child_sys->ppid.load() == pid) {
                 child_sys->ppid.store(1);
             }
         }
@@ -668,17 +788,17 @@ bool PosixSyscall::do_execve(vm* v) {
     }
     maps(v).swap(maps(fresh.get()));
 
-    std::array<signal_action, NSIG> new_actions{};
+    decltype(signal_actions) new_actions{};
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
     const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
     for(size_t i = 0; i < new_actions.size(); i++) {
-        if(signal_actions(v)[i].handler == sig_ign) {
+        if(signal_actions[i].handler == sig_ign) {
             new_actions[i].handler = sig_ign;
         } else {
             new_actions[i].handler = sig_dfl;
         }
     }
-    signal_actions(v) = new_actions;
+    signal_actions = new_actions;
     signal_depth(v) = 0;
 
     std::unordered_map<int, std::shared_ptr<fd_handle>> new_fds;
@@ -713,11 +833,11 @@ bool PosixSyscall::do_fork(vm* v) {
 
     auto child = vm::create();
     options(child.get()) = options(v);
-    signal_actions(child.get()) = signal_actions(v);
     signal_depth(child.get()) = signal_depth(v);
 
     auto child_sys = std::make_shared<PosixSyscall>(pid, child_fds, cwd);
     child_sys->umask_val = umask_val;
+    child_sys->signal_actions = signal_actions;
     options(child.get()).sys = child_sys;
 
     for(const auto& map : maps(v)) {
@@ -833,7 +953,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
         if(target_pid == -1) {
             for(const auto& entry : pid_map) {
                 auto child_sys = sys(entry.second.get());
-                if(child_sys->ppid.load() != pid) {
+                if(child_sys && child_sys->ppid.load() != pid) {
                     continue;
                 }
                 if(exited(entry.second.get()).load(std::memory_order_acquire)) {
@@ -850,7 +970,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
                 return true;
             }
             auto child_sys = sys(it->second.get());
-            if(child_sys->ppid.load() != pid) {
+            if(child_sys == nullptr || child_sys->ppid.load() != pid) {
                 v->r(0) = -ECHILD;
                 return true;
             }
@@ -881,7 +1001,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
                     child = candidate;
                     break;
                 }
-                if(!pending_signals(v).empty() || exited(v).load(std::memory_order_acquire)) {
+                if(!pending_signals.empty() || exited(v).load(std::memory_order_acquire)) {
                     v->r(0) = -EINTR;
                     return true;
                 }
@@ -1290,7 +1410,7 @@ bool PosixSyscall::do_kill(vm* v) {
         return true;
     }
     if(static_cast<uint64_t>(target_pid) == pid) {
-        v->queue_signal(sig);
+        queue_signal(v, sig);
         v->r(0) = 0;
         return true;
     }
@@ -1306,7 +1426,7 @@ bool PosixSyscall::do_kill(vm* v) {
         v->r(0) = -ESRCH;
         return true;
     }
-    target->queue_signal(sig);
+    options(target.get()).sys->queue_signal(target.get(), sig);
     v->r(0) = 0;
     return true;
 }
@@ -1327,7 +1447,7 @@ bool PosixSyscall::do_sigaction(vm* v) {
             v->r(0) = -EFAULT;
             return true;
         }
-        const auto& current = signal_actions(v)[static_cast<size_t>(signo)];
+        const auto& current = signal_actions[static_cast<size_t>(signo)];
         oldact->sa_handler = reinterpret_cast<void (*)(int)>(static_cast<uintptr_t>(current.handler));
         oldact->sa_mask = static_cast<bpf::sigset_t>(current.mask);
         oldact->sa_flags = current.flags;
@@ -1343,7 +1463,7 @@ bool PosixSyscall::do_sigaction(vm* v) {
             v->r(0) = -EINVAL;
             return true;
         }
-        auto& current = signal_actions(v)[static_cast<size_t>(signo)];
+        auto& current = signal_actions[static_cast<size_t>(signo)];
         current.handler = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(action->sa_handler));
         current.mask = static_cast<uint64_t>(action->sa_mask);
         current.flags = action->sa_flags;
@@ -1511,64 +1631,55 @@ bool PosixSyscall::do_longjmp(vm* v) {
 }
 
 
-bool PosixSyscall::dispatch(uint32_t call) {
-    std::shared_ptr<vm> v;
-    {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        auto it = pid_map.find(pid);
-        if(it == pid_map.end()) {
-            return false;
-        }
-        v = it->second;
-    }
+bool PosixSyscall::syscall(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
         sys_id = BPF_CALL_TO_ID(call);
     }
     switch (sys_id) {
-    case BPF_SYS_MMAP:          return do_mmap(v.get());
-    case BPF_SYS_MUNMAP:        return do_munmap(v.get());
-    case BPF_SYS_EXIT:          return do_exit(v.get());
-    case BPF_SYS_NANOSLEEP:     return do_nanosleep(v.get());
-    case BPF_SYS_OPENAT:        return do_openat(v.get());
-    case BPF_SYS_READ:          return do_read(v.get());
-    case BPF_SYS_WRITE:         return do_write(v.get());
-    case BPF_SYS_LSEEK:         return do_lseek(v.get());
-    case BPF_SYS_TRUNCATE:      return do_truncate(v.get());
-    case BPF_SYS_FTRUNCATE:     return do_ftruncate(v.get());
-    case BPF_SYS_CLOSE:         return do_close(v.get());
-    case BPF_SYS_UNLINKAT:      return do_unlinkat(v.get());
-    case BPF_SYS_MKDIR:         return do_mkdir(v.get());
-    case BPF_SYS_RMDIR:         return do_rmdir(v.get());
-    case BPF_SYS_SYMLINKAT:     return do_symlinkat(v.get());
-    case BPF_SYS_LINKAT:        return do_linkat(v.get());
-    case BPF_SYS_RENAMEAT:      return do_renameat(v.get());
-    case BPF_SYS_READLINK:      return do_readlink(v.get());
-    case BPF_SYS_EXECVE:        return do_execve(v.get());
-    case BPF_SYS_FORK:          return do_fork(v.get());
-    case BPF_SYS_GETPID:        return do_getpid(v.get());
-    case BPF_SYS_GETPPID:       return do_getppid(v.get());
-    case BPF_SYS_WAITPID:       return do_waitpid(v.get());
-    case BPF_SYS_DUP:           return do_dup(v.get());
-    case BPF_SYS_DUP2:          return do_dup2(v.get());
-    case BPF_SYS_PIPE2:         return do_pipe2(v.get());
-    case BPF_SYS_FCHDIR:        return do_fchdir(v.get());
-    case BPF_SYS_GETCWD:        return do_getcwd(v.get());
-    case BPF_SYS_FDOPENDIR:     return do_fdopendir(v.get());
-    case BPF_SYS_READDIR:       return do_readdir(v.get());
-    case BPF_SYS_CLOSEDIR:      return do_closedir(v.get());
-    case BPF_SYS_FSTATAT:       return do_fstatat(v.get());
-    case BPF_SYS_FCHMODAT:      return do_fchmodat(v.get());
-    case BPF_SYS_UTIMENSAT:     return do_utimensat(v.get());
-    case BPF_SYS_FACCESSAT:     return do_faccessat(v.get());
-    case BPF_SYS_KILL:          return do_kill(v.get());
-    case BPF_SYS_SIGACTION:     return do_sigaction(v.get());
-    case BPF_SYS_FCNTL:         return do_fcntl(v.get());
-    case BPF_SYS_IOCTL:         return do_ioctl(v.get());
-    case BPF_SYS_UMASK:         return do_umask(v.get());
-    case BPF_SYS_SETJMP:        return do_setjmp(v.get());
-    case BPF_SYS_LONGJMP:       return do_longjmp(v.get());
-    case BPF_SYS_CLOCK_GETTIME: return do_clock_gettime(v.get());
+    case BPF_SYS_MMAP:          return do_mmap(v);
+    case BPF_SYS_MUNMAP:        return do_munmap(v);
+    case BPF_SYS_EXIT:          return do_exit(v);
+    case BPF_SYS_NANOSLEEP:     return do_nanosleep(v);
+    case BPF_SYS_OPENAT:        return do_openat(v);
+    case BPF_SYS_READ:          return do_read(v);
+    case BPF_SYS_WRITE:         return do_write(v);
+    case BPF_SYS_LSEEK:         return do_lseek(v);
+    case BPF_SYS_TRUNCATE:      return do_truncate(v);
+    case BPF_SYS_FTRUNCATE:     return do_ftruncate(v);
+    case BPF_SYS_CLOSE:         return do_close(v);
+    case BPF_SYS_UNLINKAT:      return do_unlinkat(v);
+    case BPF_SYS_MKDIR:         return do_mkdir(v);
+    case BPF_SYS_RMDIR:         return do_rmdir(v);
+    case BPF_SYS_SYMLINKAT:     return do_symlinkat(v);
+    case BPF_SYS_LINKAT:        return do_linkat(v);
+    case BPF_SYS_RENAMEAT:      return do_renameat(v);
+    case BPF_SYS_READLINK:      return do_readlink(v);
+    case BPF_SYS_EXECVE:        return do_execve(v);
+    case BPF_SYS_FORK:          return do_fork(v);
+    case BPF_SYS_GETPID:        return do_getpid(v);
+    case BPF_SYS_GETPPID:       return do_getppid(v);
+    case BPF_SYS_WAITPID:       return do_waitpid(v);
+    case BPF_SYS_DUP:           return do_dup(v);
+    case BPF_SYS_DUP2:          return do_dup2(v);
+    case BPF_SYS_PIPE2:         return do_pipe2(v);
+    case BPF_SYS_FCHDIR:        return do_fchdir(v);
+    case BPF_SYS_GETCWD:        return do_getcwd(v);
+    case BPF_SYS_FDOPENDIR:     return do_fdopendir(v);
+    case BPF_SYS_READDIR:       return do_readdir(v);
+    case BPF_SYS_CLOSEDIR:      return do_closedir(v);
+    case BPF_SYS_FSTATAT:       return do_fstatat(v);
+    case BPF_SYS_FCHMODAT:      return do_fchmodat(v);
+    case BPF_SYS_UTIMENSAT:     return do_utimensat(v);
+    case BPF_SYS_FACCESSAT:     return do_faccessat(v);
+    case BPF_SYS_KILL:          return do_kill(v);
+    case BPF_SYS_SIGACTION:     return do_sigaction(v);
+    case BPF_SYS_FCNTL:         return do_fcntl(v);
+    case BPF_SYS_IOCTL:         return do_ioctl(v);
+    case BPF_SYS_UMASK:         return do_umask(v);
+    case BPF_SYS_SETJMP:        return do_setjmp(v);
+    case BPF_SYS_LONGJMP:       return do_longjmp(v);
+    case BPF_SYS_CLOCK_GETTIME: return do_clock_gettime(v);
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         v->r(0) = -ENOSYS;

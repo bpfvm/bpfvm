@@ -2,6 +2,9 @@
 #define POSIX_SYSCALL_H__
 #include "insn.h"
 
+#include <unordered_map>
+#include <array>
+
 struct fd_handle {
     const int fd = -1;
     bool cloexec = false;
@@ -10,7 +13,31 @@ struct fd_handle {
     ~fd_handle();
 };
 
-class PosixSyscall: public SyscallHandler, public SyscallAccessor{
+class MpscQueue {
+    struct slot {
+        std::atomic<uint64_t> seq;
+        int value = 0;
+    };
+    static constexpr size_t k_capacity = 1024;
+    static constexpr size_t k_mask = k_capacity - 1;
+    static_assert((k_capacity & (k_capacity - 1)) == 0, "k_capacity must be power of two");
+    std::array<slot, k_capacity> slots{};
+    std::atomic<uint64_t> head{0};
+    std::atomic<uint64_t> tail{0};
+public:
+    MpscQueue();
+    bool try_push(int value);
+    bool try_pop(int& value);
+    bool empty() const {
+        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
+    }
+};
+
+#ifndef NSIG
+#define NSIG 32
+#endif
+
+class PosixSyscall: public SyscallHandler{
     std::string cwd;
     uint32_t umask_val = 0022;
     std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
@@ -20,9 +47,14 @@ class PosixSyscall: public SyscallHandler, public SyscallAccessor{
     static std::mutex pid_map_mutex;
     uint64_t pid = 0;
     std::atomic<uint64_t> ppid{0};
+    pthread_t tid = 0;
+    std::array<signal_action, NSIG> signal_actions{};
+    MpscQueue pending_signals;
 
     virtual void init(const std::shared_ptr<vm>& v) override;
-    virtual bool dispatch(uint32_t call) override;
+    virtual void queue_signal(vm* v, int sig) override;
+    virtual bool handle_signals(vm* v) override;
+    virtual bool syscall(vm* v, uint32_t call) override;
     virtual int id() override {
         return (int)pid;
     }

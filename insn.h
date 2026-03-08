@@ -10,17 +10,13 @@
 #include <stddef.h>
 #include <assert.h>
 #include <atomic>
-#include <array>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-#ifndef NSIG
-#define NSIG 32
-#endif
+extern std::mutex log_mutex;
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
@@ -147,10 +143,19 @@ struct memmap {
 
 class vm;
 class SyscallHandler{
+protected:
+    static auto& maps(vm* v);
+    static auto& options(vm* v);
+    static auto& exited(vm* v);
+    static auto& stopped(vm* v);
+    static auto& signal_depth(vm* v);
+    static auto& pc(vm* v);
 public:
     virtual ~SyscallHandler() = default;
     virtual void init(const std::shared_ptr<vm>& v) = 0;
-    virtual bool dispatch(uint32_t call) = 0;
+    virtual bool syscall(vm* v, uint32_t call) = 0;
+    virtual void queue_signal(vm* v, int sig) = 0;
+    virtual bool handle_signals(vm* v) = 0;
     virtual int id() = 0;
 };
 
@@ -164,25 +169,6 @@ struct vmOptions {
     std::shared_ptr<SyscallHandler> sys;
 };
 
-class MpscQueue {
-    struct slot {
-        std::atomic<uint64_t> seq;
-        int value = 0;
-    };
-    static constexpr size_t k_capacity = 1024;
-    static constexpr size_t k_mask = k_capacity - 1;
-    static_assert((k_capacity & (k_capacity - 1)) == 0, "k_capacity must be power of two");
-    std::array<slot, k_capacity> slots{};
-    std::atomic<uint64_t> head{0};
-    std::atomic<uint64_t> tail{0};
-public:
-    MpscQueue();
-    bool try_push(int value);
-    bool try_pop(int& value);
-    bool empty() const {
-        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
-    }
-};
 
 struct signal_action {
     uint64_t handler = 0;
@@ -199,11 +185,7 @@ class vm: public std::enable_shared_from_this<vm> {
     pthread_cond_t exit_cv;
     std::atomic<bool> exited{false};
     std::atomic<bool> stopped{false};
-    std::array<signal_action, NSIG> signal_actions{};
-    MpscQueue pending_signals;
     size_t signal_depth = 0;
-    pthread_t tid = 0;
-
 
     bool ld();
     bool ldx();
@@ -216,17 +198,13 @@ class vm: public std::enable_shared_from_this<vm> {
     bool step();
 
     bool do_syscall(uint32_t call) {
-        if(options.sys) {
-            return options.sys->dispatch(call);
-        }
-        return true;
+        return options.sys->syscall(this, call);
     }
 
-    friend class SyscallAccessor;
-
+    friend class SyscallHandler;
     void log_mem_violation(const char* type, uint64_t addr);
-    bool handle_pending_signals();
     struct Token { explicit Token() = default; };
+    uint64_t pop_frame();
 public:
     vm(Token);
     ~vm();
@@ -237,11 +215,10 @@ public:
     void* unmap(uint64_t addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
-    uint64_t pop_frame();
     bool wait_for_exit(int timeout_ms);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
-    void queue_signal(int sig);
+    void wakeup();
     uint64_t& r(int n) {
         return reg[n];
     }
@@ -250,17 +227,11 @@ public:
     uint64_t run(const vmOptions* options);
 };
 
-
-class SyscallAccessor {
-protected:
-    static auto& maps(vm* v) { return v->maps; }
-    static auto& options(vm* v) { return v->options; }
-    static auto& exited(vm* v) { return v->exited; }
-    static auto& signal_actions(vm* v) { return v->signal_actions; }
-    static auto& pending_signals(vm* v) { return v->pending_signals; }
-    static auto& signal_depth(vm* v) { return v->signal_depth; }
-    static auto& pc(vm* v) { return v->pc; }
-};
-
+inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
+inline auto& SyscallHandler::options(vm* v) { return v->options; }
+inline auto& SyscallHandler::exited(vm* v) { return v->exited; }
+inline auto& SyscallHandler::stopped(vm* v) { return v->stopped; }
+inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
+inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 
 #endif //INSN_H
