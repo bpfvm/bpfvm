@@ -216,8 +216,8 @@ uint64_t vm::load_elf(const char* elf_file_path) {
         goto out;
     }
 
-    elf = elf_begin(fd, ELF_C_READ, NULL);
-    if(elf == NULL) {
+    elf = elf_begin(fd, ELF_C_READ, nullptr);
+    if(elf == nullptr) {
         std::cerr << "Failed to open ELF file: " << elf_errmsg(-1) << std::endl;
         goto out;
     }
@@ -948,14 +948,11 @@ bool vm::step() {
         dump(addr, pc);
     }
     if(options.step_run || (options.breakpoint && options.breakpoint == addr)) {
-        asm volatile (
-            "syscall"
-            : /* no output operands */
-            : "a" (SYS_kill), // 输入: rax = SYS_kill
-                "D" (0),        // 输入: rdi = 0
-                "S" (SIGTRAP)   // 输入: rsi = SIGTRAP
-            : "rcx", "r11", "memory" // 被破坏的寄存器
-        );
+#if defined(__x86_64__) || defined(__i386__)
+        asm volatile("int3");
+#elif defined(__aarch64__)
+        asm volatile("brk #0");
+#endif
     }
     switch(pc->code & 0x07) {
     case BPF_LD:
@@ -1036,10 +1033,10 @@ uint64_t vm::run(const vmOptions* options) {
         printf("entry: 0x%lx\n", options->entry);
     }
 
-    if(!options->raw_stack && !setup_stack(options->argv, options->envp)) {
+    if(!setup_stack(options->argv, options->envp)) {
         return 0;
     }
-    reg[10] = STACK_BASE + STACK_SIZE - 8;
+    flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
     pc = (const bpf_insn*)mmu(options->entry);
     push_frame(0);
     return run();
@@ -1080,6 +1077,12 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         stack_memmap.flags = PF_W;
         addmem(std::move(stack_memmap));
         stack_base = data;
+    }
+
+    reg[10] = STACK_BASE + STACK_SIZE - 8;
+
+    if(options.raw_stack) {
+        return true;
     }
 
     size_t strings_bytes = 0;
