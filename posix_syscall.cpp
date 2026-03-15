@@ -325,7 +325,7 @@ std::string PosixSyscall::resolve_path(const std::string& path) {
 
 bool PosixSyscall::do_clock_gettime(vm* v) {
     clockid_t clock_id = (clockid_t)arg_s32(v->r(1));
-    struct timespec* tp = (struct timespec*)v->mmu(v->r(2));
+    struct timespec* tp = (struct timespec*)v->mmu_w(v->r(2), sizeof(*tp));
     if(tp == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -339,6 +339,7 @@ bool PosixSyscall::do_clock_gettime(vm* v) {
 }
 
 bool PosixSyscall::do_mmap(vm* v) {
+    int prot = arg_s32(v->r(2));
     int flags = arg_s32(v->r(3));
     int fd = arg_s32(v->r(4));
     int host_fd = -1;
@@ -352,7 +353,7 @@ bool PosixSyscall::do_mmap(vm* v) {
         host_fd = it->second->fd;
     }
 
-    void* addr = mmap(nullptr, arg_size(v->r(1)), arg_s32(v->r(2)), flags, host_fd, (off_t)v->r(5));
+    void* addr = mmap(nullptr, arg_size(v->r(1)), prot, flags, host_fd, (off_t)v->r(5));
     if(addr == MAP_FAILED) {
         v->r(0) = -errno;
         return true;
@@ -360,8 +361,17 @@ bool PosixSyscall::do_mmap(vm* v) {
     memmap mem;
     mem.data = (unsigned char*)addr;
     mem.paddr = maps(v).back().paddr + maps(v).back().size;
-    mem.flags = arg_u32(v->r(3));
     mem.size = arg_size(v->r(1));
+    mem.flags = 0;
+    if(prot & PROT_READ) {
+        mem.flags |= PF_R;
+    }
+    if(prot & PROT_WRITE) {
+        mem.flags |= PF_W;
+    }
+    if(prot & PROT_EXEC) {
+        mem.flags |= PF_X;
+    }
     v->r(0) = mem.paddr;
     v->addmem(std::move(mem));
     return true;
@@ -395,7 +405,7 @@ bool PosixSyscall::do_nanosleep(vm* v) {
 
     struct timespec* rem = nullptr;
     if(v->r(2) != 0) {
-        rem = static_cast<struct timespec*>(v->mmu(v->r(2)));
+        rem = static_cast<struct timespec*>(v->mmu_w(v->r(2), sizeof(*rem)));
         if(rem == nullptr) {
             v->r(0) = -EFAULT;
             return true;
@@ -466,7 +476,7 @@ bool PosixSyscall::do_read(vm* v) {
         return true;
     }
     size_t count = arg_size(v->r(3));
-    void* buf = v->mmu(v->r(2), count);
+    void* buf = v->mmu_w(v->r(2), count);
     if(buf == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -744,7 +754,7 @@ bool PosixSyscall::do_readlink(vm* v) {
         return true;
     }
     size_t bufsiz = arg_size(v->r(3));
-    char* buf = (char*)v->mmu(v->r(2), bufsiz);
+    char* buf = (char*)v->mmu_w(v->r(2), bufsiz);
     if(buf == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -943,7 +953,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
 
     int* status_ptr = nullptr;
     if(status_addr != 0) {
-        status_ptr = static_cast<int*>(v->mmu(status_addr));
+        status_ptr = static_cast<int*>(v->mmu_w(status_addr, sizeof(*status_ptr)));
         if(status_ptr == nullptr) {
             v->r(0) = -EFAULT;
             return true;
@@ -1084,7 +1094,7 @@ bool PosixSyscall::do_dup2(vm* v) {
 }
 
 bool PosixSyscall::do_pipe2(vm* v) {
-    int* pipefd = static_cast<int*>(v->mmu(v->r(1), 2 * sizeof(int)));
+    int* pipefd = static_cast<int*>(v->mmu_w(v->r(1), 2 * sizeof(int)));
     if(pipefd == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1151,7 +1161,7 @@ bool PosixSyscall::do_getcwd(vm* v) {
         v->r(0) = -ERANGE;
         return true;
     }
-    char* buf = static_cast<char*>(v->mmu(buf_addr, size));
+    char* buf = static_cast<char*>(v->mmu_w(buf_addr, size));
     if(buf == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1168,7 +1178,7 @@ bool PosixSyscall::do_getcwd(vm* v) {
 
 bool PosixSyscall::do_fdopendir(vm* v) {
     int fd = arg_s32(v->r(1));
-    auto out_dir = static_cast<bpf::DIR*>(v->mmu(v->r(2)));
+    auto out_dir = static_cast<bpf::DIR*>(v->mmu_w(v->r(2), sizeof(bpf::DIR)));
     if(out_dir == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1196,7 +1206,7 @@ bool PosixSyscall::do_readdir(vm* v) {
         v->r(0) = -EFAULT;
         return true;
     }
-    auto out_entry = static_cast<bpf::dirent*>(v->mmu(v->r(2)));
+    auto out_entry = static_cast<bpf::dirent*>(v->mmu_w(v->r(2), sizeof(bpf::dirent)));
     if(out_entry == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1228,7 +1238,7 @@ bool PosixSyscall::do_readdir(vm* v) {
 }
 
 bool PosixSyscall::do_closedir(vm* v) {
-    auto dirp = static_cast<bpf::DIR*>(v->mmu(v->r(1)));
+    auto dirp = static_cast<bpf::DIR*>(v->mmu_w(v->r(1), sizeof(bpf::DIR)));
     if(dirp == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1256,7 +1266,7 @@ bool PosixSyscall::do_fstatat(vm* v) {
         v->r(0) = -EFAULT;
         return true;
     }
-    auto out = static_cast<bpf::stat*>(v->mmu(v->r(3)));
+    auto out = static_cast<bpf::stat*>(v->mmu_w(v->r(3), sizeof(bpf::stat)));
     if(out == nullptr) {
         v->r(0) = -EFAULT;
         return true;
@@ -1445,7 +1455,7 @@ bool PosixSyscall::do_sigaction(vm* v) {
     }
 
     if(oldact_addr != 0) {
-        auto oldact = static_cast<struct bpf::sigaction*>(v->mmu(oldact_addr));
+        auto oldact = static_cast<struct bpf::sigaction*>(v->mmu_w(oldact_addr, sizeof(struct bpf::sigaction)));
         if(oldact == nullptr) {
             v->r(0) = -EFAULT;
             return true;
@@ -1518,8 +1528,20 @@ bool PosixSyscall::do_fcntl(vm* v) {
 
     uint64_t arg = v->r(3);
     int rc = -1;
-    if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
-            rc = fcntl(it->second->fd, cmd, v->mmu(arg));
+    if (cmd == F_GETLK) {
+            void* guest_arg = v->mmu_w(arg, sizeof(struct flock));
+            if(guest_arg == nullptr) {
+                v->r(0) = -EFAULT;
+                return true;
+            }
+            rc = fcntl(it->second->fd, cmd, guest_arg);
+    } else if (cmd == F_SETLK || cmd == F_SETLKW) {
+            void* guest_arg = v->mmu(arg, sizeof(struct flock));
+            if(guest_arg == nullptr) {
+                v->r(0) = -EFAULT;
+                return true;
+            }
+            rc = fcntl(it->second->fd, cmd, guest_arg);
     } else {
             rc = fcntl(it->second->fd, cmd, arg);
     }
@@ -1545,7 +1567,7 @@ bool PosixSyscall::do_ioctl(vm* v) {
         struct termios host_t = {};
         rc = ioctl(it->second->fd, TCGETS, &host_t);
         if (rc == 0) {
-            auto guest_t = (bpf::termios*)v->mmu(v->r(3));
+            auto guest_t = (bpf::termios*)v->mmu_w(v->r(3), sizeof(bpf::termios));
             if (guest_t) {
                 guest_t->c_lflag = host_t.c_lflag;
             } else {
@@ -1554,7 +1576,7 @@ bool PosixSyscall::do_ioctl(vm* v) {
             }
         }
     } else if (request == TIOCGWINSZ) {
-        void* arg = v->mmu(v->r(3), sizeof(struct winsize));
+        void* arg = v->mmu_w(v->r(3), sizeof(struct winsize));
         if(arg == nullptr) {
             v->r(0) = -EFAULT;
             return true;
@@ -1565,7 +1587,8 @@ bool PosixSyscall::do_ioctl(vm* v) {
         // Linux ioctl encoding: size is bits 16-29 (14 bits).
         size_t ioctl_size = (request >> 16) & 0x3FFF;
         if (ioctl_size) {
-            void* arg = v->mmu(v->r(3), ioctl_size);
+            int dir = _IOC_DIR(request);
+            void* arg = (dir & _IOC_READ) ? v->mmu_w(v->r(3), ioctl_size) : v->mmu(v->r(3), ioctl_size);
             if(arg == nullptr) {
                 v->r(0) = -EFAULT;
                 return true;
@@ -1593,7 +1616,7 @@ bool PosixSyscall::do_umask(vm* v) {
 
 bool PosixSyscall::do_setjmp(vm* v) {
     uint64_t env_addr = v->r(1);
-    uint64_t* env = (uint64_t*)v->mmu(env_addr);
+    uint64_t* env = (uint64_t*)v->mmu_w(env_addr, 7 * sizeof(uint64_t));
     if (!env) {
         v->r(0) = -EFAULT;
         return true;

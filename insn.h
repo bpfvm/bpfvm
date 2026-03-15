@@ -128,17 +128,20 @@ struct memmap {
     size_t size = 0;
     uint64_t paddr = 0;
     uint32_t flags = 0;
+    bool owned = true;
     memmap() = default;
     memmap(memmap&& other) {
         data = other.data;
         size = other.size;
         paddr = other.paddr;
         flags = other.flags;
+        owned = other.owned;
         other.data = nullptr;
         other.size = 0;
         other.flags = 0;
     }
     ~memmap();
+    static memmap static_map(void* addr, size_t size, uint64_t paddr);
 };
 
 class vm;
@@ -208,13 +211,14 @@ public:
 
     static std::shared_ptr<vm> create();
     void* mmu(uint64_t addr, size_t size = 1);
+    void* mmu_w(uint64_t addr, size_t size = 1);
     uint64_t unmmu(const void* addr);
-    void* unmap(uint64_t addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
     bool wait_for_exit(int timeout_ms);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
+    void* unmap(uint64_t addr);
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];

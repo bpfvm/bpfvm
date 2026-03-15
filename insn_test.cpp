@@ -772,6 +772,54 @@ void test_syscall_clock_gettime() {
     assert(success);
 }
 
+void test_syscall_mmap_readonly_rejects_write() {
+    std::cout << "--- Running Test: test_syscall_mmap_readonly_rejects_write ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    const uint64_t map_size = 4096;
+    const uint32_t write_value = 0x12345678;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, (int32_t)map_size },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, PROT_READ },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, MAP_PRIVATE | MAP_ANONYMOUS },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 4, 0, 0, -1 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 5, 0, 0, 0 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_MMAP },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },
+        { BPF_ST | BPF_MEM | BPF_W, 6, 0, 0, (int32_t)write_value },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&posix_option);
+    uint64_t mapped_addr = ebpf_vm->r(6);
+    auto mapped = static_cast<const uint32_t*>(ebpf_vm->mmu(mapped_addr, sizeof(uint32_t)));
+    bool success = (mapped_addr != 0 &&
+                    mapped != nullptr &&
+                    ret == mapped_addr &&
+                    *mapped == 0);
+    print_test_result("test_syscall_mmap_readonly_rejects_write", success);
+    assert(success);
+}
+
+void test_static_memmap_does_not_unmap_external_memory() {
+    std::cout << "--- Running Test: test_static_memmap_does_not_unmap_external_memory ---" << std::endl;
+    long page_size = sysconf(_SC_PAGESIZE);
+    assert(page_size > 0);
+    void* external = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(external != MAP_FAILED);
+
+    {
+        auto ebpf_vm = vm::create();
+        ebpf_vm->addmem(memmap::static_map(external, page_size, 0x9000));
+    }
+
+    int rc = munmap(external, page_size);
+    bool success = (rc == 0);
+    print_test_result("test_static_memmap_does_not_unmap_external_memory", success);
+    assert(success);
+}
+
 void test_syscall_file_io() {
     std::cout << "--- Running Test: test_syscall_file_io ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -1026,6 +1074,8 @@ int main() {
 
     // Syscall Tests
     test_syscall_clock_gettime();
+    test_syscall_mmap_readonly_rejects_write();
+    test_static_memmap_does_not_unmap_external_memory();
     test_syscall_file_io();
     test_syscall_fork_waitpid();
     test_syscall_waitpid_self();

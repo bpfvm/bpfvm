@@ -27,7 +27,19 @@ memmap::~memmap() {
     if(data == nullptr || data == MAP_FAILED) {
         return;
     }
-    munmap(data, size);
+    if(owned) {
+        munmap(data, size);
+    }
+}
+
+memmap memmap::static_map(void* addr, size_t size, uint64_t paddr) {
+    memmap map;
+    map.data = (unsigned char*)addr;
+    map.size = size;
+    map.paddr = paddr;
+    map.flags = PF_R;
+    map.owned = false;
+    return map;
 }
 
 
@@ -662,7 +674,7 @@ bool vm::ldx() {
 
 bool vm::st() {
     uint64_t target_addr = r(pc->dst_reg) + pc->off;
-    void* addr = mmu(target_addr);
+    void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
         log_mem_violation("write", target_addr);
         return false;
@@ -710,7 +722,7 @@ static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
 bool vm::stx() {
     if((pc->code & 0xe0) == BPF_ATOMIC) {
         uint64_t target_addr = r(pc->dst_reg) + pc->off;
-        void* addr = mmu(target_addr);
+        void* addr = mmu_w(target_addr);
         if(addr == nullptr) {
             log_mem_violation("atomic", target_addr);
             return false;
@@ -722,7 +734,7 @@ bool vm::stx() {
         }
     }
     uint64_t target_addr = r(pc->dst_reg) + pc->off;
-    void* addr = mmu(target_addr);
+    void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
         log_mem_violation("write", target_addr);
         return false;
@@ -984,11 +996,35 @@ void vm::addmem(memmap&& memmap) {
     maps.insert(it, std::move(memmap));
 }
 
+void* vm::unmap(uint64_t addr) {
+    for(auto it = maps.begin(); it != maps.end(); ++it) {
+        if(addr == it->paddr) {
+            void* data = it->data;
+            it->data = nullptr;
+            maps.erase(it);
+            return data;
+        }
+    }
+    return nullptr;
+}
+
 void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
     for(const auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
+            return map.data + (addr - map.paddr);
+        }
+    }
+    return nullptr;
+}
+
+void* vm::mmu_w(uint64_t addr, size_t size) {
+    uint64_t end = addr + size;
+    if(end < addr) return nullptr; // overflow
+    for(const auto& map: maps) {
+        if(addr >= map.paddr && end <= map.paddr + map.size) {
+            if(!(map.flags & PF_W)) return nullptr;
             return map.data + (addr - map.paddr);
         }
     }
@@ -1002,18 +1038,6 @@ uint64_t vm::unmmu(const void* addr) {
         }
     }
     return 0;
-}
-
-void* vm::unmap(uint64_t addr) {
-    for(auto it = maps.begin(); it != maps.end(); ++it) {
-        if(addr == it->paddr) {
-            void* data = it->data;
-            it->data = nullptr;
-            maps.erase(it);
-            return data;
-        }
-    }
-    return nullptr;
 }
 
 uint64_t vm::run() {
