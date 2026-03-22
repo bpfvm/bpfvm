@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <string>
 #include <vector>
+#include <sys/mman.h>
 
 extern std::mutex log_mutex;
 
@@ -123,24 +124,34 @@ For load and store instructions the 8-bit 'code' field is divided as:
 #define BPF_XCHG    (0xe0 | BPF_FETCH)
 #define BPF_CMPXCHG (0xf0 | BPF_FETCH)
 
+// Used as both the unique_ptr deleter (for owned mmap memory) and the shared_ptr deleter
+// (for CoW pages shared between parent and child VMs).  The single `owned` flag controls
+// whether munmap is called, so both roles use the exact same codepath.
+struct DataDeleter {
+    size_t size = 0;
+    bool owned = false;
+    DataDeleter() = default;
+    DataDeleter(size_t sz, bool own) : size(sz), owned(own) {}
+    void operator()(unsigned char* p) {
+        if (owned && p && p != (unsigned char*)MAP_FAILED)
+            munmap(p, size);
+    }
+};
+
 struct memmap {
-    unsigned char* data = nullptr;
+    std::unique_ptr<unsigned char, DataDeleter> data{nullptr, DataDeleter{0, false}};
     size_t size = 0;
     uint64_t paddr = 0;
     uint32_t flags = 0;
-    bool owned = true;
+    // non-null: CoW page shared across VMs; DataDeleter owns the actual munmap call.
+    // Use std::get_deleter<DataDeleter>(cow_data) to access/disarm the deleter.
+    std::shared_ptr<unsigned char> cow_data;
     memmap() = default;
-    memmap(memmap&& other) {
-        data = other.data;
-        size = other.size;
-        paddr = other.paddr;
-        flags = other.flags;
-        owned = other.owned;
-        other.data = nullptr;
-        other.size = 0;
-        other.flags = 0;
+    memmap(memmap&&) = default;
+    ~memmap() = default;
+    void set_data(unsigned char* p, size_t sz, bool own = true) {
+        data = std::unique_ptr<unsigned char, DataDeleter>(p, DataDeleter{sz, own});
     }
-    ~memmap();
     static memmap static_map(void* addr, size_t size, uint64_t paddr);
 };
 
@@ -218,7 +229,7 @@ public:
     bool wait_for_exit(int timeout_ms);
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
-    void* unmap(uint64_t addr);
+    bool unmap(uint64_t addr);
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];

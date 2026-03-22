@@ -62,8 +62,8 @@ bool load_program_to_vm(std::shared_ptr<vm> ebpf_vm, const bpf_insn* instruction
 
     memmap prog_mem;
     prog_mem.paddr = paddr; // Use a non-zero base address for program memory to avoid conflict with nullptr or other special addresses
-    prog_mem.size = code_size;
-    prog_mem.data = prog_data;
+    prog_mem.size = code_size;  // VM 地址范围检查用
+    prog_mem.set_data(prog_data, sysconf(_SC_PAGESIZE));  // DataDeleter 用整页大小做 munmap
     prog_mem.flags = PF_R | PF_X | PF_W; // PF_W for free() by memmap destructor, PF_R | PF_X for execution
     ebpf_vm->addmem(std::move(prog_mem));
     return true;
@@ -83,7 +83,7 @@ bool add_data_mem(vm& ebpf_vm, uint64_t paddr, size_t size, unsigned char** out_
     memmap data_mem;
     data_mem.paddr = paddr;
     data_mem.size = map_size;
-    data_mem.data = data;
+    data_mem.set_data(data, map_size);
     data_mem.flags = PF_R | PF_W;
     ebpf_vm.addmem(std::move(data_mem));
     if(out_ptr != nullptr) {

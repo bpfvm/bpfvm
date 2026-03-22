@@ -23,22 +23,12 @@
 
 std::mutex log_mutex;
 
-memmap::~memmap() {
-    if(data == nullptr || data == MAP_FAILED) {
-        return;
-    }
-    if(owned) {
-        munmap(data, size);
-    }
-}
-
 memmap memmap::static_map(void* addr, size_t size, uint64_t paddr) {
     memmap map;
-    map.data = (unsigned char*)addr;
     map.size = size;
+    map.set_data((unsigned char*)addr, size, false);
     map.paddr = paddr;
     map.flags = PF_R;
-    map.owned = false;
     return map;
 }
 
@@ -269,21 +259,23 @@ uint64_t vm::load_elf(const char* elf_file_path) {
         map.paddr = phdr.p_vaddr;
         map.size = phdr.p_memsz;
         if(phdr.p_flags & PF_W) {
-            map.data = (unsigned char*)mmap(nullptr, map.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if(map.data == MAP_FAILED) {
+            auto* raw = (unsigned char*)mmap(nullptr, map.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if(raw == MAP_FAILED) {
                 std::cerr << "Failed to mmap section: " << strerror(errno) << std::endl;
                 goto out;
             }
-            if(pread(fd, map.data, phdr.p_filesz, phdr.p_offset) != (ssize_t)phdr.p_filesz) {
+            map.set_data(raw, map.size);
+            if(pread(fd, map.data.get(), phdr.p_filesz, phdr.p_offset) != (ssize_t)phdr.p_filesz) {
                 std::cerr << "Failed to read section: " << strerror(errno) << std::endl;
                 goto out;
             }
         }else {
-            map.data = (unsigned char*)mmap(nullptr, map.size, PROT_READ, MAP_PRIVATE, fd, phdr.p_offset);
-            if(map.data == MAP_FAILED) {
+            auto* raw = (unsigned char*)mmap(nullptr, map.size, PROT_READ, MAP_PRIVATE, fd, phdr.p_offset);
+            if(raw == MAP_FAILED) {
                 std::cerr << "Failed to mmap section: " << strerror(errno) << std::endl;
                 goto out;
             }
+            map.set_data(raw, map.size);
         }
         map.flags = phdr.p_flags;
         addmem(std::move(map));
@@ -355,7 +347,7 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
     }
     uint64_t sp = r(10) - STACK_LIMIT;
     uint64_t frame_base_addr = sp - frame_size;
-    uint64_t* frame_base = (uint64_t*)mmu(frame_base_addr);
+    uint64_t* frame_base = (uint64_t*)mmu_w(frame_base_addr, frame_size);
     if(!frame_base) {
         log_mem_violation("stack access", frame_base_addr);
         return false;
@@ -996,16 +988,14 @@ void vm::addmem(memmap&& memmap) {
     maps.insert(it, std::move(memmap));
 }
 
-void* vm::unmap(uint64_t addr) {
+bool vm::unmap(uint64_t addr) {
     for(auto it = maps.begin(); it != maps.end(); ++it) {
         if(addr == it->paddr) {
-            void* data = it->data;
-            it->data = nullptr;
-            maps.erase(it);
-            return data;
+            maps.erase(it); // unique_ptr destructor handles munmap if owned
+            return true;
         }
     }
-    return nullptr;
+    return false;
 }
 
 void* vm::mmu(uint64_t addr, size_t size) {
@@ -1013,7 +1003,7 @@ void* vm::mmu(uint64_t addr, size_t size) {
     if(end < addr) return nullptr; // overflow
     for(const auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
-            return map.data + (addr - map.paddr);
+            return map.data.get() + (addr - map.paddr);
         }
     }
     return nullptr;
@@ -1022,10 +1012,27 @@ void* vm::mmu(uint64_t addr, size_t size) {
 void* vm::mmu_w(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
-    for(const auto& map: maps) {
+    for(auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             if(!(map.flags & PF_W)) return nullptr;
-            return map.data + (addr - map.paddr);
+            if(map.cow_data) { // CoW triggered: copy on write
+                if(map.cow_data.use_count() == 1) {
+                    // 唯一引用，直接偷：解除 cow_data 的所有权，unique_ptr 接管
+                    std::get_deleter<DataDeleter>(map.cow_data)->owned = false;
+                    map.cow_data.reset();
+                    map.data.get_deleter().owned = true;
+                } else {
+                    int prot = PROT_READ | PROT_WRITE;
+                    if(map.flags & PF_X) prot |= PROT_EXEC;
+                    auto* p = (unsigned char*)mmap(nullptr, map.size, prot,
+                                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if(p == MAP_FAILED) return nullptr;
+                    memcpy(p, map.data.get(), map.size);
+                    map.cow_data.reset();
+                    map.set_data(p, map.size);
+                }
+            }
+            return map.data.get() + (addr - map.paddr);
         }
     }
     return nullptr;
@@ -1033,8 +1040,8 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
 
 uint64_t vm::unmmu(const void* addr) {
     for(const auto& map: maps) {
-        if(addr >= map.data && addr < map.data + map.size) {
-            return map.paddr + ((unsigned char*)addr - map.data);
+        if(addr >= map.data.get() && addr < map.data.get() + map.size) {
+            return map.paddr + ((unsigned char*)addr - map.data.get());
         }
     }
     return 0;
@@ -1095,7 +1102,7 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
             return false;
         }
         memmap stack_memmap;
-        stack_memmap.data = data;
+        stack_memmap.set_data(data, STACK_SIZE);
         stack_memmap.size = STACK_SIZE;
         stack_memmap.paddr = STACK_BASE;
         stack_memmap.flags = PF_W;

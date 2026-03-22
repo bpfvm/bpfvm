@@ -359,9 +359,9 @@ bool PosixSyscall::do_mmap(vm* v) {
         return true;
     }
     memmap mem;
-    mem.data = (unsigned char*)addr;
-    mem.paddr = maps(v).back().paddr + maps(v).back().size;
     mem.size = arg_size(v->r(1));
+    mem.set_data((unsigned char*)addr, mem.size);
+    mem.paddr = maps(v).back().paddr + maps(v).back().size;
     mem.flags = 0;
     if(prot & PROT_READ) {
         mem.flags |= PF_R;
@@ -378,13 +378,8 @@ bool PosixSyscall::do_mmap(vm* v) {
 }
 
 bool PosixSyscall::do_munmap(vm* v) {
-    auto addr = v->unmap(v->r(1));
-    if(addr == nullptr) {
+    if(!v->unmap(v->r(1))) {
         v->r(0) = -EINVAL;
-        return true;
-    }
-    if(munmap(addr, arg_size(v->r(2))) == -1) {
-        v->r(0) = -errno;
         return true;
     }
     v->r(0) = 0;
@@ -853,31 +848,29 @@ bool PosixSyscall::do_fork(vm* v) {
     child_sys->signal_actions = signal_actions;
     options(child.get()).sys = child_sys;
 
-    for(const auto& map : maps(v)) {
-        memmap cloned;
-        cloned.size = map.size;
-        cloned.paddr = map.paddr;
-        cloned.flags = map.flags;
+    for(auto& map : maps(v)) {
+        memmap child_map;
+        child_map.size  = map.size;
+        child_map.paddr = map.paddr;
+        child_map.flags = map.flags;
 
-        int prot = PROT_READ;
         if(map.flags & PF_W) {
-            prot |= PROT_WRITE;
+            if(!map.cow_data && map.data.get_deleter().owned) {
+                // First fork: convert parent mapping to CoW
+                // Note: PF_W + owned==false + cow_data==null is intentionally left as-is;
+                // it represents externally-managed shared memory (MAP_SHARED semantics) where
+                // writes are meant to be visible across parent and child.
+                map.cow_data = std::shared_ptr<unsigned char>(
+                    map.data.get(), DataDeleter{map.data.get_deleter().size, true});
+                map.data.get_deleter().owned = false; // transfer ownership to cow_data
+            }
+            child_map.set_data(map.data.get(), map.size, false);
+            child_map.cow_data = map.cow_data;
+        } else {
+            // Read-only mapping: share pointer directly (mmu_w rejects writes)
+            child_map.set_data(map.data.get(), map.size, false);
         }
-        if(map.flags & PF_X) {
-            prot |= PROT_EXEC;
-        }
-
-        int copy_prot = prot | PROT_WRITE;
-        cloned.data = (unsigned char*)mmap(nullptr, cloned.size, copy_prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if(cloned.data == MAP_FAILED) {
-            v->r(0) = -ENOMEM;
-            return true;
-        }
-        memcpy(cloned.data, map.data, cloned.size);
-        if((prot & PROT_WRITE) == 0) {
-            mprotect(cloned.data, cloned.size, prot);
-        }
-        child->addmem(std::move(cloned));
+        child->addmem(std::move(child_map));
     }
 
     for(size_t i = 0; i < 11; i++) {
