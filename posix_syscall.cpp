@@ -807,6 +807,7 @@ bool PosixSyscall::do_execve(vm* v) {
         return true;
     }
     maps(v).swap(maps(fresh.get()));
+    v->flush_tlb();
 
     decltype(signal_actions) new_actions{};
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
@@ -883,6 +884,8 @@ bool PosixSyscall::do_fork(vm* v) {
         }
         child->addmem(std::move(child_map));
     }
+
+    v->flush_tlb();
 
     for(size_t i = 0; i < 11; i++) {
         child->r(i) = v->r(i);

@@ -999,12 +999,14 @@ void vm::addmem(memmap&& memmap) {
         it++;
     }
     maps.insert(it, std::move(memmap));
+    flush_tlb();
 }
 
 bool vm::unmap(uint64_t addr) {
     for(auto it = maps.begin(); it != maps.end(); ++it) {
         if(addr == it->paddr) {
             maps.erase(it); // unique_ptr destructor handles munmap if owned
+            flush_tlb();
             return true;
         }
     }
@@ -1014,8 +1016,15 @@ bool vm::unmap(uint64_t addr) {
 void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
+    // TLB fast path (1MB granularity)
+    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    if(addr >= entry.guest_base && end <= entry.guest_end) {
+        return entry.host_base + (addr - entry.guest_base);
+    }
+    // Slow path: linear scan + fill TLB
     for(const auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
+            entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
             return map.data.get() + (addr - map.paddr);
         }
     }
@@ -1025,6 +1034,13 @@ void* vm::mmu(uint64_t addr, size_t size) {
 void* vm::mmu_w(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
+    // TLB fast path (1MB granularity, only when writable and no CoW pending)
+    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    if(addr >= entry.guest_base && end <= entry.guest_end
+       && (entry.flags & PF_W) && !entry.cow) {
+        return entry.host_base + (addr - entry.guest_base);
+    }
+    // Slow path
     for(auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             if(!(map.flags & PF_W)) return nullptr;
@@ -1044,7 +1060,10 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
                     map.cow_data.reset();
                     map.set_data(p, map.size);
                 }
+                flush_tlb();
             }
+            // Fill TLB after CoW is resolved
+            entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
             return map.data.get() + (addr - map.paddr);
         }
     }

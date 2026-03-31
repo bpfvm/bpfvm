@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <string.h>
 #include <assert.h>
 #include <atomic>
 #include <memory>
@@ -186,6 +187,15 @@ struct vmOptions {
 };
 
 class vm: public std::enable_shared_from_this<vm> {
+    struct TlbEntry {
+        uint64_t guest_base;
+        uint64_t guest_end;
+        unsigned char* host_base;
+        uint32_t flags;
+        bool cow;
+    };
+    static constexpr size_t TLB_SIZE = 16;
+    TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
     const bpf_insn* pc;
     uint64_t reg[11];
@@ -233,6 +243,7 @@ public:
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
+    void flush_tlb() { memset(tlb, 0, sizeof(tlb)); }
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];
