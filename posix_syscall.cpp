@@ -192,7 +192,9 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
         v->wakeup();
     } else {
         // Best-effort: drop if the queue is full to avoid blocking the VM thread.
-        pending_signals.try_push(sig);
+        if(pending_signals.try_push(sig)) {
+            signal_pending(v).store(true, std::memory_order_release);
+        }
     }
     if (tid != 0) {
         pthread_kill(tid, SIGUSR1);
@@ -202,7 +204,16 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
 bool PosixSyscall::handle_signals(vm* v) {
     int sig = 0;
     if(!pending_signals.try_pop(sig)) {
-        return true;
+        // Queue is empty. Clear signal_pending with a seq_cst fence, then
+        // re-check to close the race window with a concurrent queue_signal:
+        // if another thread pushed between try_pop and the store, the second
+        // try_pop will catch it; if it pushed after the store, it will have
+        // set signal_pending=true again, so the next safepoint() will retry.
+        signal_pending(v).store(false, std::memory_order_seq_cst);
+        if(!pending_signals.try_pop(sig)) {
+            return true;
+        }
+        signal_pending(v).store(true, std::memory_order_relaxed);
     }
     if(sig <= 0 || sig >= NSIG) {
         return true;

@@ -917,7 +917,7 @@ bool vm::alu() {
 
 
 
-bool vm::step() {
+bool vm::safepoint() {
     if(signal_depth == 0) {
         if(!options.sys->handle_signals(this)) {
             //be killed
@@ -944,6 +944,19 @@ bool vm::step() {
         pthread_mutex_lock(&exit_mutex);
         pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
         pthread_mutex_unlock(&exit_mutex);
+    }
+    return true;
+}
+
+bool vm::step() {
+    // Fast path: avoid a virtual call when there are no pending signals and the VM
+    // is running normally.  Falls through to safepoint() only when needed.
+    uint32_t f = flags.load(std::memory_order_acquire);
+    if((f & (VM_EXITED | VM_KILLED | VM_STOPPED)) ||
+       (signal_depth == 0 && signal_pending.load(std::memory_order_relaxed))) {
+        if(!safepoint()) {
+            return false;
+        }
     }
     uint64_t addr = unmmu(pc);
     if(options.verbose) {

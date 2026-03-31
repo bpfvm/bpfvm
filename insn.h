@@ -161,6 +161,7 @@ protected:
     static auto& maps(vm* v);
     static auto& options(vm* v);
     static auto& flags(vm* v);
+    static auto& signal_pending(vm* v);
     static auto& signal_depth(vm* v);
     static auto& pc(vm* v);
 public:
@@ -192,6 +193,7 @@ class vm: public std::enable_shared_from_this<vm> {
     pthread_mutex_t exit_mutex;
     pthread_cond_t exit_cv;
     std::atomic<uint32_t> flags{0};
+    std::atomic<bool> signal_pending{false};
     size_t signal_depth = 0;
 
     bool ld();
@@ -210,6 +212,7 @@ class vm: public std::enable_shared_from_this<vm> {
 
     friend class SyscallHandler;
     void log_mem_violation(const char* type, uint64_t addr);
+    bool safepoint();
     struct Token { explicit Token() = default; };
     uint64_t pop_frame();
 public:
@@ -242,6 +245,7 @@ public:
 inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
 inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
+inline auto& SyscallHandler::signal_pending(vm* v) { return v->signal_pending; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
 inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 
