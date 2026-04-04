@@ -16,11 +16,11 @@ add_compile_options(-Wall -Wextra -fPIC -fno-omit-frame-pointer)
 
 include_directories(${LIBELF_INCLUDE_DIRS})
 link_directories(${LIBELF_LIBRARY_DIRS})
-add_executable(bpfvm main.cpp insn.cpp posix_syscall.cpp)
+add_executable(bpfvm main.cpp insn.cpp posix_syscall.cpp jit.cpp)
 target_link_libraries(bpfvm ${LIBELF_LIBRARIES})
 
 
-add_executable(bpfvm_test insn.cpp posix_syscall.cpp insn_test.cpp)
+add_executable(bpfvm_test insn.cpp posix_syscall.cpp insn_test.cpp jit.cpp)
 target_link_libraries(bpfvm_test ${LIBELF_LIBRARIES})
 
 if(BUILD_TESTING)

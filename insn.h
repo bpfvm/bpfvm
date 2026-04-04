@@ -157,6 +157,7 @@ struct memmap {
 };
 
 class vm;
+class JitCompiler;
 class SyscallHandler{
 protected:
     static auto& maps(vm* v);
@@ -176,11 +177,11 @@ public:
 };
 
 struct vmOptions {
-    uint64_t entry;
-    bool verbose;
-    uint64_t breakpoint;
-    bool step_run;
-    bool raw_stack;
+    uint64_t entry = 0;
+    bool verbose = false;
+    uint64_t breakpoint = 0;
+    bool step_run = false;
+    bool raw_stack = false;
     std::vector<std::string> argv;
     std::vector<std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
@@ -206,6 +207,8 @@ class vm: public std::enable_shared_from_this<vm> {
     std::atomic<bool> signal_pending{false};
     size_t signal_depth = 0;
 
+    std::unique_ptr<JitCompiler> jit_;
+
     bool ld();
     bool ldx();
     bool st();
@@ -221,6 +224,7 @@ class vm: public std::enable_shared_from_this<vm> {
     }
 
     friend class SyscallHandler;
+    friend class JitCompiler;
     void log_mem_violation(const char* type, uint64_t addr);
     bool safepoint();
     struct Token { explicit Token() = default; };
@@ -243,7 +247,7 @@ public:
     uint64_t load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
-    void flush_tlb() { memset(tlb, 0, sizeof(tlb)); }
+    void flush_tlb();
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];

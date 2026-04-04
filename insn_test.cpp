@@ -505,6 +505,44 @@ void test_alu32_sub_reg() {
 }
 
 
+void test_alu32_movsx8_reg() {
+    std::cout << "--- Running Test: test_alu32_movsx8_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    // r2: high 32 bits set (dirty), low byte has bit 7 set (0x80 = negative in int8)
+    ebpf_vm->r(2) = 0xFFFFFFFFABCDEF80ULL;
+    bpf_insn instructions[] = {
+        // movsx r1, r2 (8-bit): r1 = sign_extend_8_to_32((uint32_t)r2), upper 32 bits zero
+        { BPF_ALU | BPF_MOV | BPF_X, 1, 2, 8, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // 0x80 sign-extended to 32 bits = 0xFFFFFF80; upper 32 bits must be zero
+    bool success = (ebpf_vm->r(1) == 0x00000000FFFFFF80ULL && ret == 0x00000000FFFFFF80ULL);
+    print_test_result("test_alu32_movsx8_reg", success);
+    assert(success);
+}
+
+void test_alu32_movsx16_reg() {
+    std::cout << "--- Running Test: test_alu32_movsx16_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    // r2: high 32 bits set (dirty), low 16 bits have bit 15 set (0x8000 = negative in int16)
+    ebpf_vm->r(2) = 0xFFFFFFFFABCD8000ULL;
+    bpf_insn instructions[] = {
+        // movsx r1, r2 (16-bit): r1 = sign_extend_16_to_32((uint32_t)r2), upper 32 bits zero
+        { BPF_ALU | BPF_MOV | BPF_X, 1, 2, 16, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+    // 0x8000 sign-extended to 32 bits = 0xFFFF8000; upper 32 bits must be zero
+    bool success = (ebpf_vm->r(1) == 0x00000000FFFF8000ULL && ret == 0x00000000FFFF8000ULL);
+    print_test_result("test_alu32_movsx16_reg", success);
+    assert(success);
+}
+
 // --- JMP Tests ---
 void test_jmp_ja() {
     std::cout << "--- Running Test: test_jmp_ja ---" << std::endl;
@@ -1051,6 +1089,8 @@ int main() {
     // ALU32 Tests
     test_alu32_add_imm();
     test_alu32_sub_reg();
+    test_alu32_movsx8_reg();
+    test_alu32_movsx16_reg();
 
     // JMP Tests
     test_jmp_ja();

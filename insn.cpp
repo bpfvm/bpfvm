@@ -5,6 +5,8 @@
 #include "insn.h"
 #include <iostream>
 
+#include "jit.h"
+
 #include <libelf.h>
 #include <gelf.h>
 #include <unistd.h>
@@ -749,6 +751,15 @@ bool vm::stx() {
 }
 
 bool vm::alu64() {
+    auto* block = jit_->compile(pc);
+    if(block) {
+        int count = ((int(*)(vm*))block->code)(this);
+        if(count > 0) {
+            pc += count - 1;
+            return true;
+        }
+        // count == 0: safepoint triggered, fall through to interpreter
+    }
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -831,6 +842,15 @@ bool vm::alu64() {
 }
 
 bool vm::alu() {
+    auto* block = jit_->compile(pc);
+    if(block) {
+        int count = ((int(*)(vm*))block->code)(this);
+        if(count > 0) {
+            pc += count - 1;
+            return true;
+        }
+        // count == 0: safepoint triggered, fall through to interpreter
+    }
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -918,11 +938,9 @@ bool vm::alu() {
 
 
 bool vm::safepoint() {
-    if(signal_depth == 0) {
-        if(!options.sys->handle_signals(this)) {
-            //be killed
-            return false;
-        }
+    if(!options.sys->handle_signals(this)) {
+        //be killed
+        return false;
     }
 
     while(true) {
@@ -1013,6 +1031,10 @@ bool vm::unmap(uint64_t addr) {
     return false;
 }
 
+void vm::flush_tlb() {
+    memset(tlb, 0, sizeof(tlb));
+}
+
 void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
@@ -1080,6 +1102,7 @@ uint64_t vm::unmmu(const void* addr) {
 }
 
 uint64_t vm::run() {
+    if(!jit_) jit_ = std::make_unique<JitCompiler>();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
         pc++;
