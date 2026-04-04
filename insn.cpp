@@ -612,16 +612,7 @@ void vm::wakeup() {
 
 
 
-bool vm::try_jit() {
-    auto* block = jit_->compile(pc);
-    if(!block) return false;
-    int count = ((int(*)(vm*))block->code)(this);
-    if(count > 0) { pc += count - 1; return true; }
-    return false;
-}
-
 bool vm::ld() {
-    if(try_jit()) return true;
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -631,7 +622,6 @@ bool vm::ld() {
 }
 
 bool vm::ldx() {
-    if(try_jit()) return true;
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -677,7 +667,6 @@ bool vm::ldx() {
 }
 
 bool vm::st() {
-    if(try_jit()) return true;
     uint64_t target_addr = r(pc->dst_reg) + pc->off;
     void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
@@ -725,7 +714,6 @@ static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
 }
 
 bool vm::stx() {
-    if(try_jit()) return true;
     if((pc->code & 0xe0) == BPF_ATOMIC) {
         uint64_t target_addr = r(pc->dst_reg) + pc->off;
         void* addr = mmu_w(target_addr);
@@ -763,15 +751,6 @@ bool vm::stx() {
 }
 
 bool vm::alu64() {
-    auto* block = jit_->compile(pc);
-    if(block) {
-        int count = ((int(*)(vm*))block->code)(this);
-        if(count > 0) {
-            pc += count - 1;
-            return true;
-        }
-        // count == 0: safepoint triggered, fall through to interpreter
-    }
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -854,15 +833,6 @@ bool vm::alu64() {
 }
 
 bool vm::alu() {
-    auto* block = jit_->compile(pc);
-    if(block) {
-        int count = ((int(*)(vm*))block->code)(this);
-        if(count > 0) {
-            pc += count - 1;
-            return true;
-        }
-        // count == 0: safepoint triggered, fall through to interpreter
-    }
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -979,8 +949,17 @@ bool vm::safepoint() {
 }
 
 bool vm::step() {
-    // Fast path: avoid a virtual call when there are no pending signals and the VM
-    // is running normally.  Falls through to safepoint() only when needed.
+    // JIT hot path: keep executing compiled blocks in a tight loop
+    for(;;) {
+        auto* block = jit_->compile(pc);
+        if(!block) break;
+        int count = ((int(*)(vm*))block->code)(this);
+        if(count > 0) { pc += count; continue; }  // next block
+        if(count < 0) { pc++; continue; }  // branch taken, pc already set by JIT
+        // count == 0: safepoint triggered in JIT, fall through to interpreter
+        break;
+    }
+    // Safepoint check
     uint32_t f = flags.load(std::memory_order_acquire);
     if((f & (VM_EXITED | VM_KILLED | VM_STOPPED)) ||
        (signal_depth == 0 && signal_pending.load(std::memory_order_relaxed))) {

@@ -208,7 +208,6 @@ class vm: public std::enable_shared_from_this<vm> {
     size_t signal_depth = 0;
 
     std::unique_ptr<JitCompiler> jit_;
-    bool try_jit();
 
     bool ld();
     bool ldx();

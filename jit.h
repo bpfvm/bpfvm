@@ -144,6 +144,21 @@ public:
     // CMP BYTE [RBX+RCX+disp], imm8  (for cow check)
     void sib_cmp_byte(int32_t disp, uint8_t imm);
 
+    // CMP / TEST: compare and test (for conditional jumps)
+    void cmp64();           // CMP RAX, RCX   (48 39 C8)
+    void cmp64_imm(int32_t imm); // CMP RAX, imm32 (48 3D imm32)
+    void cmp32();           // CMP EAX, ECX   (39 C8)
+    void cmp32_imm(int32_t imm); // CMP EAX, imm32 (3D imm32)
+    void test64();          // TEST RAX, RCX  (48 85 C8)
+    void test64_imm(int32_t imm); // TEST RAX, imm32 (48 A9 imm32)
+    void test32();          // TEST EAX, ECX  (85 C8)
+    void test32_imm(int32_t imm); // TEST EAX, imm32 (A9 imm32)
+
+    // Conditional jump with rel32 placeholder: 0F cc 00000000
+    void jcc_rel32(uint8_t cc);
+    // MOVABS RAX, imm64 (48 B8 imm64)
+    void mov_rax_imm64(uint64_t val);
+
     // ALU64 reg,reg: op rax, rcx
     void add64();    // 48 01 C8
     void sub64();    // 48 29 C8
@@ -221,6 +236,12 @@ public:
 
 
 
+struct JumpPatchInfo {
+    size_t jcc_offset;       // offset in Emitter buffer of the Jcc instruction
+    const bpf_insn* target;  // target bpf_insn* pointer (insn + insn->off)
+    int index;               // sequential index of this jump instruction in the block
+};
+
 class JitCompiler {
 public:
     JitCompiler();
@@ -236,24 +257,31 @@ private:
     static const size_t off_signal_pending_;
     static const size_t off_signal_depth_;
     static const size_t off_tlb_;
+    static const size_t off_pc_;
 
     std::unordered_map<const bpf_insn*, JitBlock> blocks_;
 
-    void emit_safepoint(Emitter& e, size_t& jnz_flags, size_t& jne_signal);
-    void emit_patch_safepoint(Emitter& e, size_t jnz_flags, size_t jne_signal, size_t abort_pos);
+    void emit_safepoint(Emitter& e, std::vector<size_t>& abort_jumps);
 
     // Emit code for one ALU64 (64-bit) instruction. Returns false if cannot JIT.
     bool emit_alu64(Emitter& e, const bpf_insn* insn);
     // Emit code for one ALU (32-bit) instruction. Returns false if cannot JIT.
     bool emit_alu32(Emitter& e, const bpf_insn* insn);
 
-    // Emit code for memory instructions.  error_jumps collects JE offsets that
+    // Emit code for memory instructions.  abort_jumps collects JE offsets that
     // must be patched to the block's abort_pos (memory violation → return 0).
     bool emit_ld(Emitter& e, const bpf_insn* insn);
-    bool emit_ldx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
-    bool emit_st(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
-    bool emit_stx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
-    bool emit_stx_atomic(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
+    bool emit_ldx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
+    bool emit_st(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
+    bool emit_stx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
+    bool emit_stx_atomic(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
+
+    // Emit code for one JMP (64-bit) conditional jump. Returns false if cannot JIT.
+    bool emit_jmp64(Emitter& e, const bpf_insn* insn, int index,
+                    std::vector<JumpPatchInfo>& jump_patches);
+    // Emit code for one JMP32 (32-bit) conditional jump. Returns false if cannot JIT.
+    bool emit_jmp32(Emitter& e, const bpf_insn* insn, int index,
+                    std::vector<JumpPatchInfo>& jump_patches);
 
     void emit_helper_call(Emitter& e, void* helper, int32_t dst_disp);
 };

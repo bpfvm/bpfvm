@@ -282,6 +282,33 @@ void Emitter::sar32_imm(uint8_t c) { emit8(0xC1); emit8(0xF8); emit8(c); }
 // 69 /r ModRM(C0=11 000 000: reg=EAX rm=EAX) imm32
 void Emitter::mul32_imm(int32_t imm) { emit8(0x69); emit8(0xC0); emit32(imm); }
 
+// --- CMP / TEST (for conditional jumps) ---
+
+// CMP RAX, RCX  (64-bit): REX.W 39 /r ModRM(C8 = 11 001 000)
+void Emitter::cmp64()          { emit8(0x48); emit8(0x39); emit8(0xC8); }
+// CMP RAX, imm32 (64-bit short form): REX.W 3D imm32
+void Emitter::cmp64_imm(int32_t imm) { emit8(0x48); emit8(0x3D); emit32(imm); }
+// CMP EAX, ECX  (32-bit): 39 C8
+void Emitter::cmp32()          { emit8(0x39); emit8(0xC8); }
+// CMP EAX, imm32 (32-bit short form): 3D imm32
+void Emitter::cmp32_imm(int32_t imm) { emit8(0x3D); emit32(imm); }
+// TEST RAX, RCX (64-bit): REX.W 85 C8
+void Emitter::test64()         { emit8(0x48); emit8(0x85); emit8(0xC8); }
+// TEST RAX, imm32 (64-bit): REX.W A9 imm32
+void Emitter::test64_imm(int32_t imm) { emit8(0x48); emit8(0xA9); emit32(imm); }
+// TEST EAX, ECX (32-bit): 85 C8
+void Emitter::test32()         { emit8(0x85); emit8(0xC8); }
+// TEST EAX, imm32 (32-bit): A9 imm32
+void Emitter::test32_imm(int32_t imm) { emit8(0xA9); emit32(imm); }
+
+// Conditional jump with rel32 placeholder: 0F cc 00000000
+void Emitter::jcc_rel32(uint8_t cc) { emit8(0x0F); emit8(cc); emit32(0); }
+
+// MOVABS RAX, imm64 (48 B8 imm64)
+void Emitter::mov_rax_imm64(uint64_t val) {
+    emit8(0x48); emit8(0xB8); emit64(val);
+}
+
 // --- MOV immediate to memory ---
 
 void Emitter::store_imm64(int32_t disp, int32_t imm) {
@@ -378,6 +405,7 @@ const size_t JitCompiler::off_flags_          = offsetof(vm, flags);
 const size_t JitCompiler::off_signal_pending_ = offsetof(vm, signal_pending);
 const size_t JitCompiler::off_signal_depth_   = offsetof(vm, signal_depth);
 const size_t JitCompiler::off_tlb_            = offsetof(vm, tlb);
+const size_t JitCompiler::off_pc_             = offsetof(vm, pc);
 #pragma GCC diagnostic pop
 
 JitCompiler::JitCompiler() = default;
@@ -388,7 +416,7 @@ JitCompiler::~JitCompiler() {
     }
 }
 
-void JitCompiler::emit_safepoint(Emitter& e, size_t& jnz_flags, size_t& jne_signal) {
+void JitCompiler::emit_safepoint(Emitter& e, std::vector<size_t>& abort_jumps) {
     // Generated code layout:
     //
     //   mov  eax, [rbx + off_flags_]       ; load vm::flags (int, 32-bit)
@@ -416,8 +444,8 @@ void JitCompiler::emit_safepoint(Emitter& e, size_t& jnz_flags, size_t& jne_sign
     e.emit8(0x8B); e.emit8(Emitter::modrm(2, X86::RAX, X86::RBX)); e.emit32(off_flags_);
     // test eax, 0x7
     e.emit8(0xA9); e.emit32(0x7);
-    // jnz .abort  (rel32 placeholder; patched in emit_patch_safepoint)
-    jnz_flags = e.size();
+    // jnz .abort  (rel32 placeholder)
+    abort_jumps.push_back(e.size());
     e.emit8(0x0F); e.emit8(0x85); e.emit32(0);
 
     // cmp qword [rbx + off_signal_depth_], 0  — 64-bit cmp with sign-extended imm8
@@ -434,17 +462,12 @@ void JitCompiler::emit_safepoint(Emitter& e, size_t& jnz_flags, size_t& jne_sign
     e.emit32(off_signal_pending_);
     e.emit8(0x00);
     // jne .abort  (rel32 placeholder)
-    jne_signal = e.size();
+    abort_jumps.push_back(e.size());
     e.emit8(0x0F); e.emit8(0x85); e.emit32(0);
 
     // .skip_signal: patch the short jnz above to land here
     size_t skip_target = e.size();
     e.data()[jnz_depth + 1] = (uint8_t)(skip_target - (jnz_depth + 2));
-}
-
-void JitCompiler::emit_patch_safepoint(Emitter& e, size_t jnz_flags, size_t jne_signal, size_t abort_pos) {
-    e.patch_rel32(jnz_flags, abort_pos);
-    e.patch_rel32(jne_signal, abort_pos);
 }
 
 void JitCompiler::emit_helper_call(Emitter& e, void* helper, int32_t dst_disp) {
@@ -767,7 +790,7 @@ bool JitCompiler::emit_alu32(Emitter& e, const bpf_insn* insn) {
 //
 // For write operations (is_write=true), also checks PF_W permission and !cow.
 // `miss_jumps` receives the offsets of all conditional jumps targeting .slow.
-// `error_jumps` receives the JE offset after the slow-path helper call.
+// `abort_jumps` receives the JE offset after the slow-path helper call.
 // Returns: {slow_start, tlb_done} offsets for patching the JMP .done and
 //          any miss jumps that use rel32.
 // ---------------------------------------------------------------------------
@@ -781,7 +804,7 @@ struct TlbPatchInfo {
 static TlbPatchInfo emit_tlb_lookup(Emitter& e, int32_t tlb_off, int size,
                                      bool is_write,
                                      std::vector<size_t>& miss_jumps,
-                                     std::vector<size_t>& error_jumps) {
+                                     std::vector<size_t>& abort_jumps) {
     TlbPatchInfo info{};
 
     // ── Compute TLB index: (addr >> 20) & 0xF, scaled by sizeof(TlbEntry)=32 ──
@@ -838,7 +861,7 @@ static TlbPatchInfo emit_tlb_lookup(Emitter& e, int32_t tlb_off, int size,
 
     // Test for null (memory violation)
     e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // test rax, rax
-    error_jumps.push_back(e.size());
+    abort_jumps.push_back(e.size());
     e.emit8(0x0F); e.emit8(0x84); e.emit32(0);     // JZ .error → abort_pos
 
     // ── .done: RAX = host pointer ──
@@ -886,7 +909,7 @@ bool JitCompiler::emit_ld(Emitter& e, const bpf_insn* insn) {
 // emit_ldx: load from memory with inline TLB
 // ---------------------------------------------------------------------------
 bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
-                            std::vector<size_t>& error_jumps) {
+                            std::vector<size_t>& abort_jumps) {
     uint8_t mode = insn->code & 0xe0;
     uint8_t size_field = insn->code & 0x18;
     if (mode != BPF_MEM && mode != BPF_MEMSX) return false;
@@ -913,7 +936,7 @@ bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
     // Inline TLB lookup
     std::vector<size_t> miss_jumps;
     auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, false,
-                                miss_jumps, error_jumps);
+                                miss_jumps, abort_jumps);
 
     // At .tlb_done: RAX = host pointer, perform the actual load
     if (mode == BPF_MEM) {
@@ -965,7 +988,7 @@ bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
 // emit_st: store immediate to memory with inline TLB
 // ---------------------------------------------------------------------------
 bool JitCompiler::emit_st(Emitter& e, const bpf_insn* insn,
-                           std::vector<size_t>& error_jumps) {
+                           std::vector<size_t>& abort_jumps) {
     uint8_t mode = insn->code & 0xe0;
     uint8_t size_field = insn->code & 0x18;
     if (mode != BPF_MEM) return false;
@@ -989,7 +1012,7 @@ bool JitCompiler::emit_st(Emitter& e, const bpf_insn* insn,
     // Inline TLB lookup (write)
     std::vector<size_t> miss_jumps;
     auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
-                                miss_jumps, error_jumps);
+                                miss_jumps, abort_jumps);
 
     // Store immediate value to [rax]
     switch (size_field) {
@@ -1020,10 +1043,10 @@ bool JitCompiler::emit_st(Emitter& e, const bpf_insn* insn,
 // emit_stx: store register to memory with inline TLB
 // ---------------------------------------------------------------------------
 bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
-                            std::vector<size_t>& error_jumps) {
+                            std::vector<size_t>& abort_jumps) {
     uint8_t mode = insn->code & 0xe0;
     uint8_t size_field = insn->code & 0x18;
-    if (mode == BPF_ATOMIC) return emit_stx_atomic(e, insn, error_jumps);
+    if (mode == BPF_ATOMIC) return emit_stx_atomic(e, insn, abort_jumps);
     if (mode != BPF_MEM) return false;
 
     int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
@@ -1046,7 +1069,7 @@ bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
     // Inline TLB lookup (write)
     std::vector<size_t> miss_jumps;
     auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
-                                miss_jumps, error_jumps);
+                                miss_jumps, abort_jumps);
 
     // At .tlb_done: RAX = host pointer, load src value and store it
     e.load_r64(X86::RCX, src_disp);
@@ -1092,7 +1115,7 @@ bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
 //   RCX, RDX, RDI = scratch
 // ---------------------------------------------------------------------------
 bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
-                                    std::vector<size_t>& error_jumps) {
+                                    std::vector<size_t>& abort_jumps) {
     uint8_t size_field = insn->code & 0x18;
     if (size_field != BPF_DW && size_field != BPF_W) return false;
 
@@ -1111,7 +1134,7 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
     // Inline TLB lookup (write)
     std::vector<size_t> miss_jumps;
     auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
-                                miss_jumps, error_jumps);
+                                miss_jumps, abort_jumps);
 
     // ── RAX = host pointer.  Save to RDX, load src to RCX ──
     e.emit8(0x48); e.emit8(0x89); e.emit8(0xC2);              // mov rdx, rax
@@ -1224,6 +1247,131 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
 }
 
 // ---------------------------------------------------------------------------
+// emit_jmp64: conditional jumps (64-bit compare)
+// ---------------------------------------------------------------------------
+// Emits: load dst → RAX, load/imm src, CMP/TEST, Jcc .taken.
+// On not-taken: falls through to the next instruction in the block.
+// On taken: jumps to a taken-handler (emitted later) that sets vm::pc and returns
+// a negative count.
+//
+// Returns false for JA/CALL/EXIT (block terminates; interpreter handles them).
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_jmp64(Emitter& e, const bpf_insn* insn, int index,
+                              std::vector<JumpPatchInfo>& jump_patches) {
+    uint8_t op = insn->code & 0xf0;
+    bool is_x = (insn->code & 0x08) == BPF_X;
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int32_t src_disp = off_reg_ + insn->src_reg * 8;
+
+    // JA/CALL/EXIT: cannot JIT within block, terminate
+    if (op == BPF_JA || op == BPF_CALL || op == BPF_EXIT) return false;
+
+    uint8_t x86_cc = 0;
+    bool is_test = false;
+
+    switch (op) {
+    case BPF_JEQ:  x86_cc = 0x84; break; // JE
+    case BPF_JNE:  x86_cc = 0x85; break; // JNE
+    case BPF_JGT:  x86_cc = 0x87; break; // JA  (unsigned above)
+    case BPF_JGE:  x86_cc = 0x83; break; // JAE (unsigned above-or-equal)
+    case BPF_JLT:  x86_cc = 0x82; break; // JB  (unsigned below)
+    case BPF_JLE:  x86_cc = 0x86; break; // JBE (unsigned below-or-equal)
+    case BPF_JSGT: x86_cc = 0x8F; break; // JG  (signed greater)
+    case BPF_JSGE: x86_cc = 0x8D; break; // JGE (signed greater-or-equal)
+    case BPF_JSLT: x86_cc = 0x8C; break; // JL  (signed less)
+    case BPF_JSLE: x86_cc = 0x8E; break; // JLE (signed less-or-equal)
+    case BPF_JSET: x86_cc = 0x85; is_test = true; break; // JNZ after TEST
+    default: return false;
+    }
+
+    // Load dst into RAX (64-bit)
+    e.load_r64(X86::RAX, dst_disp);
+
+    // Compare / test
+    if (is_test) {
+        if (is_x) {
+            e.load_r64(X86::RCX, src_disp);
+            e.test64();
+        } else {
+            e.test64_imm(insn->imm);
+        }
+    } else {
+        if (is_x) {
+            e.load_r64(X86::RCX, src_disp);
+            e.cmp64();
+        } else {
+            e.cmp64_imm(insn->imm);
+        }
+    }
+
+    // Jcc rel32 (placeholder, patched later to taken-handler)
+    size_t jcc_off = e.size();
+    e.jcc_rel32(x86_cc);
+
+    jump_patches.push_back({jcc_off, insn + insn->off, index});
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_jmp32: conditional jumps (32-bit compare)
+// ---------------------------------------------------------------------------
+// Same as emit_jmp64 but uses 32-bit loads and compares (lower 32 bits only).
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_jmp32(Emitter& e, const bpf_insn* insn, int index,
+                              std::vector<JumpPatchInfo>& jump_patches) {
+    uint8_t op = insn->code & 0xf0;
+    bool is_x = (insn->code & 0x08) == BPF_X;
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int32_t src_disp = off_reg_ + insn->src_reg * 8;
+
+    // JA in JMP32 uses imm field; CALL/EXIT not valid in JMP32
+    if (op == BPF_JA || op == BPF_CALL || op == BPF_EXIT) return false;
+
+    uint8_t x86_cc = 0;
+    bool is_test = false;
+
+    switch (op) {
+    case BPF_JEQ:  x86_cc = 0x84; break;
+    case BPF_JNE:  x86_cc = 0x85; break;
+    case BPF_JGT:  x86_cc = 0x87; break;
+    case BPF_JGE:  x86_cc = 0x83; break;
+    case BPF_JLT:  x86_cc = 0x82; break;
+    case BPF_JLE:  x86_cc = 0x86; break;
+    case BPF_JSGT: x86_cc = 0x8F; break;
+    case BPF_JSGE: x86_cc = 0x8D; break;
+    case BPF_JSLT: x86_cc = 0x8C; break;
+    case BPF_JSLE: x86_cc = 0x8E; break;
+    case BPF_JSET: x86_cc = 0x85; is_test = true; break;
+    default: return false;
+    }
+
+    // Load dst lower 32 bits into EAX (zero-extends to 64)
+    e.load_r32(X86::RAX, dst_disp);
+
+    if (is_test) {
+        if (is_x) {
+            e.load_r32(X86::RCX, src_disp);
+            e.test32();
+        } else {
+            e.test32_imm(insn->imm);
+        }
+    } else {
+        if (is_x) {
+            e.load_r32(X86::RCX, src_disp);
+            e.cmp32();
+        } else {
+            e.cmp32_imm(insn->imm);
+        }
+    }
+
+    size_t jcc_off = e.size();
+    e.jcc_rel32(x86_cc);
+
+    jump_patches.push_back({jcc_off, insn + insn->off, index});
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // compile: build a JIT block of consecutive JIT-able instructions
 // ---------------------------------------------------------------------------
 JitBlock* JitCompiler::compile(const bpf_insn* pc) {
@@ -1234,7 +1382,8 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
     }
 
     Emitter e;
-    std::vector<size_t> error_jumps;  // memory violation jumps → abort_pos
+    std::vector<size_t> abort_jumps;  // all jumps targeting abort_pos (safepoint + memory violation)
+    std::vector<JumpPatchInfo> jump_patches;  // conditional jump patching
 
     // ── Prologue ──────────────────────────────────────────────────────────
     // push RBX          ; save caller's RBX (callee-saved); aligns stack to 16
@@ -1243,8 +1392,7 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
     e.mov_rbx_rdi();
 
     // ── Safepoint check ───────────────────────────────────────────────────
-    size_t jnz_flags = 0, jne_signal = 0;
-    emit_safepoint(e, jnz_flags, jne_signal);
+    emit_safepoint(e, abort_jumps);
 
     // ── Scan and emit ────────────────────────────────────────────────────
     // Emit consecutive JIT-able instructions (ALU/ALU64/LD/LDX/ST/STX).
@@ -1271,15 +1419,23 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
             break;
         case BPF_LDX:
             if (p->dst_reg >= 10) goto done;
-            emitted = emit_ldx(e, p, error_jumps);
+            emitted = emit_ldx(e, p, abort_jumps);
             if (emitted) { p++; count++; }
             break;
         case BPF_ST:
-            emitted = emit_st(e, p, error_jumps);
+            emitted = emit_st(e, p, abort_jumps);
             if (emitted) { p++; count++; }
             break;
         case BPF_STX:
-            emitted = emit_stx(e, p, error_jumps);
+            emitted = emit_stx(e, p, abort_jumps);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_JMP:
+            emitted = emit_jmp64(e, p, count, jump_patches);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_JMP32:
+            emitted = emit_jmp32(e, p, count, jump_patches);
             if (emitted) { p++; count++; }
             break;
         default:
@@ -1298,6 +1454,18 @@ done:
     // ret
     e.ret_int(count);
 
+    // ── Taken-handler stubs (conditional jumps that were taken) ───────────
+    // Each stub sets vm::pc to the branch target and returns a negative count.
+    for (auto& jp : jump_patches) {
+        e.patch_rel32(jp.jcc_offset, e.size());
+        // movabs rax, <target bpf_insn*>
+        e.mov_rax_imm64((uint64_t)jp.target);
+        // mov [rbx + off_pc_], rax
+        e.store_r64((int32_t)off_pc_, X86::RAX);
+        // return -(index + 1)
+        e.ret_int(-(jp.index + 1));
+    }
+
     // ── Abort epilogue (safepoint / memory violation target) ──────────────
     // xor EAX, EAX      ; return 0 → interpreter takes over
     // pop RBX
@@ -1305,11 +1473,8 @@ done:
     size_t abort_pos = e.size();
     e.ret_zero();
 
-    // Back-patch the safepoint jumps.
-    emit_patch_safepoint(e, jnz_flags, jne_signal, abort_pos);
-
-    // Patch all memory violation error jumps to abort_pos.
-    for (size_t off : error_jumps) {
+    // Patch all abort jumps (safepoint + memory violation) to abort_pos.
+    for (size_t off : abort_jumps) {
         e.patch_rel32(off, abort_pos);
     }
 
