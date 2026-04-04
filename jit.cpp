@@ -66,9 +66,28 @@ uint32_t jit_mod32(uint32_t dst, uint32_t src, int16_t off) {
 
 } // extern "C"
 
+// MMU helpers for JIT slow path (TLB miss) — only called on miss, not the
+// common inline TLB fast path.
+extern "C" {
+
+void* jit_mmu(vm* v, uint64_t addr, uint64_t size) {
+    return v->mmu_slow(addr, (size_t)size);
+}
+
+void* jit_mmu_w(vm* v, uint64_t addr, uint64_t size) {
+    return v->mmu_w_slow(addr, (size_t)size);
+}
+
+} // extern "C"
+
 // ---------------------------------------------------------------------------
 // Emitter implementation
 // ---------------------------------------------------------------------------
+
+void Emitter::emit16(uint16_t v) {
+    buf_.push_back(v & 0xFF);
+    buf_.push_back((v >> 8) & 0xFF);
+}
 
 void Emitter::emit32(uint32_t v) {
     buf_.push_back(v & 0xFF);
@@ -108,6 +127,38 @@ void Emitter::load_r32(uint8_t dst, int32_t disp) {
     emit8(0x8B);
     emit8(modrm(2, dst, X86::RBX));
     emit32(disp);
+}
+
+// ---------------------------------------------------------------------------
+// SIB-addressed operations: [RBX + RCX + disp32]
+// Used for inline TLB fast-path access.  SIB byte = 0x0B (scale=1, RCX, RBX).
+// ---------------------------------------------------------------------------
+
+void Emitter::sib_op_rax(uint8_t opcode, int32_t disp) {
+    // REX.W(48) + opcode + ModRM(10,000(RAX),100(SIB)) + SIB(00,RCX,RBX) + disp32
+    // ModRM = 0x84 = (2<<6)|(0<<3)|4
+    // SIB   = 0x0B = (0<<6)|(1<<3)|3
+    emit8(0x48); emit8(opcode); emit8(0x84); emit8(0x0B); emit32(disp);
+}
+
+void Emitter::sib_op_rdx(uint8_t opcode, int32_t disp) {
+    // REX.W(48) + opcode + ModRM(10,010(RDX),100(SIB)) + SIB(00,RCX,RBX) + disp32
+    // ModRM = 0x94 = (2<<6)|(2<<3)|4
+    emit8(0x48); emit8(opcode); emit8(0x94); emit8(0x0B); emit32(disp);
+}
+
+void Emitter::sib_test_dword(int32_t disp, uint32_t imm) {
+    // TEST DWORD [RBX+RCX+disp32], imm32
+    // F7 /0  ModRM(10,0,100) SIB(00,RCX,RBX) disp32 imm32
+    // ModRM = 0x84
+    emit8(0xF7); emit8(0x84); emit8(0x0B); emit32(disp); emit32(imm);
+}
+
+void Emitter::sib_cmp_byte(int32_t disp, uint8_t imm) {
+    // CMP BYTE [RBX+RCX+disp32], imm8
+    // 80 /7  ModRM(10,7,100) SIB(00,RCX,RBX) disp32 imm8
+    // ModRM = (2<<6)|(7<<3)|4 = 0xBC
+    emit8(0x80); emit8(0xBC); emit8(0x0B); emit32(disp); emit8(imm);
 }
 
 // --- ALU64 reg,reg ---
@@ -326,6 +377,7 @@ const size_t JitCompiler::off_reg_            = offsetof(vm, reg);
 const size_t JitCompiler::off_flags_          = offsetof(vm, flags);
 const size_t JitCompiler::off_signal_pending_ = offsetof(vm, signal_pending);
 const size_t JitCompiler::off_signal_depth_   = offsetof(vm, signal_depth);
+const size_t JitCompiler::off_tlb_            = offsetof(vm, tlb);
 #pragma GCC diagnostic pop
 
 JitCompiler::JitCompiler() = default;
@@ -703,14 +755,486 @@ bool JitCompiler::emit_alu32(Emitter& e, const bpf_insn* insn) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Inline TLB fast-path helper
+// ---------------------------------------------------------------------------
+// Emits the inline TLB lookup for a memory instruction.  On TLB hit, RAX ends
+// up holding the host pointer.  On miss, falls through to the slow-path label.
+//
+// Input:  RAX = guest address
+// Output: RAX = host pointer (fast path)  or  RAX unchanged (slow path)
+// Clobbers: RCX, RDX
+//
+// For write operations (is_write=true), also checks PF_W permission and !cow.
+// `miss_jumps` receives the offsets of all conditional jumps targeting .slow.
+// `error_jumps` receives the JE offset after the slow-path helper call.
+// Returns: {slow_start, tlb_done} offsets for patching the JMP .done and
+//          any miss jumps that use rel32.
+// ---------------------------------------------------------------------------
+
+struct TlbPatchInfo {
+    size_t slow_start;   // offset of .slow label
+    size_t tlb_done;     // offset of .done label (after load/store code)
+    size_t done_jmp;     // offset of JMP .done (fast path) — needs patching
+};
+
+static TlbPatchInfo emit_tlb_lookup(Emitter& e, int32_t tlb_off, int size,
+                                     bool is_write,
+                                     std::vector<size_t>& miss_jumps,
+                                     std::vector<size_t>& error_jumps) {
+    TlbPatchInfo info{};
+
+    // ── Compute TLB index: (addr >> 20) & 0xF, scaled by sizeof(TlbEntry)=32 ──
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC9);  // mov rcx, rax
+    e.emit8(0x48); e.emit8(0xC1); e.emit8(0xE9); e.emit8(20); // shr rcx, 20
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xE1); e.emit8(0x0F); // and rcx, 0xF
+    e.emit8(0x48); e.emit8(0xC1); e.emit8(0xE1); e.emit8(5);   // shl rcx, 5
+
+    // ── Bounds check 1: addr >= entry.guest_base ──
+    // CMP RAX, [RBX+RCX+tlb_off]
+    e.sib_op_rax(0x3B, tlb_off);
+    // JB .slow (rel32 placeholder)
+    miss_jumps.push_back(e.size());
+    e.emit8(0x0F); e.emit8(0x82); e.emit32(0);
+
+    // ── Bounds check 2: addr + size <= entry.guest_end ──
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC2);  // mov rdx, rax
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xC2); e.emit8((uint8_t)size); // add rdx, size
+    // CMP RDX, [RBX+RCX+tlb_off+8]
+    e.sib_op_rdx(0x3B, tlb_off + 8);
+    // JA .slow
+    miss_jumps.push_back(e.size());
+    e.emit8(0x0F); e.emit8(0x87); e.emit32(0);
+
+    if (is_write) {
+        // ── Write permission: flags & PF_W (PF_W = 0x2) ──
+        e.sib_test_dword(tlb_off + 24, 0x2);
+        miss_jumps.push_back(e.size());
+        e.emit8(0x0F); e.emit8(0x84); e.emit32(0);  // JZ .slow
+
+        // ── No CoW: !cow (byte at offset 28) ──
+        e.sib_cmp_byte(tlb_off + 28, 0);
+        miss_jumps.push_back(e.size());
+        e.emit8(0x0F); e.emit8(0x85); e.emit32(0);  // JNE .slow
+    }
+
+    // ── TLB hit: compute host_ptr = host_base + (addr - guest_base) ──
+    e.sib_op_rax(0x2B, tlb_off);      // SUB RAX, [SIB+tlb_off]  (addr - guest_base)
+    e.sib_op_rax(0x03, tlb_off + 16); // ADD RAX, [SIB+tlb_off+16]  (+ host_base)
+
+    // JMP .done (rel32 placeholder)
+    info.done_jmp = e.size();
+    e.emit8(0xE9); e.emit32(0);
+
+    // ── .slow: TLB miss — call C helper ──
+    info.slow_start = e.size();
+
+    // Set up args: rdi=vm*, rsi=addr, edx=size
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xDF);  // mov rdi, rbx
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC6);  // mov rsi, rax
+    e.emit8(0xBA); e.emit32((uint32_t)size);       // mov edx, size
+    // Call the appropriate MMU helper
+    e.call_helper(is_write ? (void*)jit_mmu_w : (void*)jit_mmu);
+
+    // Test for null (memory violation)
+    e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // test rax, rax
+    error_jumps.push_back(e.size());
+    e.emit8(0x0F); e.emit8(0x84); e.emit32(0);     // JZ .error → abort_pos
+
+    // ── .done: RAX = host pointer ──
+    info.tlb_done = e.size();
+
+    return info;
+}
+
+// Patch all miss jumps to slow_start, and done_jmp to tlb_done
+static void patch_tlb_jumps(Emitter& e, const std::vector<size_t>& miss_jumps,
+                             const TlbPatchInfo& info) {
+    for (size_t off : miss_jumps) {
+        // All miss jumps are 6-byte (0F 8x rel32); patch rel32 at off+2
+        uint32_t rel = (uint32_t)(info.slow_start - (off + 6));
+        memcpy(e.data() + off + 2, &rel, 4);
+    }
+    // JMP .done: E9 rel32 at done_jmp; patch rel32 at done_jmp+1
+    {
+        uint32_t rel = (uint32_t)(info.tlb_done - (info.done_jmp + 5));
+        memcpy(e.data() + info.done_jmp + 1, &rel, 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// emit_ld: LD DW | IMM — load 64-bit immediate (no memory access, no TLB)
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_ld(Emitter& e, const bpf_insn* insn) {
+    uint8_t mode = insn->code & 0xe0;
+    uint8_t size = insn->code & 0x18;
+    if (mode != BPF_IMM || size != BPF_DW) return false;
+    if (insn->dst_reg >= 10) return false;
+
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    uint64_t imm64 = (uint64_t)(int32_t)(insn + 1)->imm << 32 | (uint32_t)insn->imm;
+
+    // movabs rax, imm64
+    e.emit8(0x48); e.emit8(0xB8); e.emit64(imm64);
+    // mov [rbx + dst_disp], rax
+    e.store_r64(dst_disp, X86::RAX);
+    // Note: caller advances p by 2 and count by 2
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_ldx: load from memory with inline TLB
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
+                            std::vector<size_t>& error_jumps) {
+    uint8_t mode = insn->code & 0xe0;
+    uint8_t size_field = insn->code & 0x18;
+    if (mode != BPF_MEM && mode != BPF_MEMSX) return false;
+    if (mode == BPF_MEMSX && size_field == BPF_DW) return false;
+    if (insn->dst_reg >= 10) return false;
+
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int32_t src_disp = off_reg_ + insn->src_reg * 8;
+    int access_size;
+    switch (size_field) {
+    case BPF_DW: access_size = 8; break;
+    case BPF_W:  access_size = 4; break;
+    case BPF_H:  access_size = 2; break;
+    case BPF_B:  access_size = 1; break;
+    default: return false;
+    }
+
+    // Compute guest address: reg[src] + off
+    e.load_r64(X86::RAX, src_disp);
+    if (insn->off != 0) {
+        e.emit8(0x48); e.emit8(0x05); e.emit32((uint32_t)(int32_t)insn->off); // add rax, off
+    }
+
+    // Inline TLB lookup
+    std::vector<size_t> miss_jumps;
+    auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, false,
+                                miss_jumps, error_jumps);
+
+    // At .tlb_done: RAX = host pointer, perform the actual load
+    if (mode == BPF_MEM) {
+        switch (size_field) {
+        case BPF_DW:
+            // mov rax, [rax]  (48 8B 00)
+            e.emit8(0x48); e.emit8(0x8B); e.emit8(0x00);
+            break;
+        case BPF_W:
+            // mov eax, [rax]  (8B 00) — auto zero-extends
+            e.emit8(0x8B); e.emit8(0x00);
+            break;
+        case BPF_H:
+            // movzx eax, word [rax]  (0F B7 00)
+            e.emit8(0x0F); e.emit8(0xB7); e.emit8(0x00);
+            break;
+        case BPF_B:
+            // movzx eax, byte [rax]  (0F B6 00)
+            e.emit8(0x0F); e.emit8(0xB6); e.emit8(0x00);
+            break;
+        }
+    } else { // BPF_MEMSX
+        switch (size_field) {
+        case BPF_W:
+            // movsxd rax, dword [rax]  (48 63 00)
+            e.emit8(0x48); e.emit8(0x63); e.emit8(0x00);
+            break;
+        case BPF_H:
+            // movsx rax, word [rax]  (48 0F BF 00)
+            e.emit8(0x48); e.emit8(0x0F); e.emit8(0xBF); e.emit8(0x00);
+            break;
+        case BPF_B:
+            // movsx rax, byte [rax]  (48 0F BE 00)
+            e.emit8(0x48); e.emit8(0x0F); e.emit8(0xBE); e.emit8(0x00);
+            break;
+        default: return false;
+        }
+    }
+
+    // Store result to reg[dst]
+    e.store_r64(dst_disp, X86::RAX);
+
+    // Patch TLB jumps
+    patch_tlb_jumps(e, miss_jumps, tlb);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_st: store immediate to memory with inline TLB
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_st(Emitter& e, const bpf_insn* insn,
+                           std::vector<size_t>& error_jumps) {
+    uint8_t mode = insn->code & 0xe0;
+    uint8_t size_field = insn->code & 0x18;
+    if (mode != BPF_MEM) return false;
+
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int access_size;
+    switch (size_field) {
+    case BPF_DW: access_size = 8; break;
+    case BPF_W:  access_size = 4; break;
+    case BPF_H:  access_size = 2; break;
+    case BPF_B:  access_size = 1; break;
+    default: return false;
+    }
+
+    // Compute guest address: reg[dst] + off
+    e.load_r64(X86::RAX, dst_disp);
+    if (insn->off != 0) {
+        e.emit8(0x48); e.emit8(0x05); e.emit32((uint32_t)(int32_t)insn->off); // add rax, off
+    }
+
+    // Inline TLB lookup (write)
+    std::vector<size_t> miss_jumps;
+    auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
+                                miss_jumps, error_jumps);
+
+    // Store immediate value to [rax]
+    switch (size_field) {
+    case BPF_DW:
+        // mov qword [rax], sign-extended imm32  (48 C7 00 imm32)
+        e.emit8(0x48); e.emit8(0xC7); e.emit8(0x00); e.emit32(insn->imm);
+        break;
+    case BPF_W:
+        // mov dword [rax], imm32  (C7 00 imm32)
+        e.emit8(0xC7); e.emit8(0x00); e.emit32(insn->imm);
+        break;
+    case BPF_H:
+        // mov word [rax], imm16  (66 C7 00 imm16)
+        e.emit8(0x66); e.emit8(0xC7); e.emit8(0x00); e.emit16((uint16_t)insn->imm);
+        break;
+    case BPF_B:
+        // mov byte [rax], imm8  (C6 00 imm8)
+        e.emit8(0xC6); e.emit8(0x00); e.emit8((uint8_t)insn->imm);
+        break;
+    }
+
+    // Patch TLB jumps
+    patch_tlb_jumps(e, miss_jumps, tlb);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_stx: store register to memory with inline TLB
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
+                            std::vector<size_t>& error_jumps) {
+    uint8_t mode = insn->code & 0xe0;
+    uint8_t size_field = insn->code & 0x18;
+    if (mode == BPF_ATOMIC) return emit_stx_atomic(e, insn, error_jumps);
+    if (mode != BPF_MEM) return false;
+
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int32_t src_disp = off_reg_ + insn->src_reg * 8;
+    int access_size;
+    switch (size_field) {
+    case BPF_DW: access_size = 8; break;
+    case BPF_W:  access_size = 4; break;
+    case BPF_H:  access_size = 2; break;
+    case BPF_B:  access_size = 1; break;
+    default: return false;
+    }
+
+    // Compute guest address: reg[dst] + off
+    e.load_r64(X86::RAX, dst_disp);
+    if (insn->off != 0) {
+        e.emit8(0x48); e.emit8(0x05); e.emit32((uint32_t)(int32_t)insn->off); // add rax, off
+    }
+
+    // Inline TLB lookup (write)
+    std::vector<size_t> miss_jumps;
+    auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
+                                miss_jumps, error_jumps);
+
+    // At .tlb_done: RAX = host pointer, load src value and store it
+    e.load_r64(X86::RCX, src_disp);
+
+    switch (size_field) {
+    case BPF_DW:
+        // mov [rax], rcx  (48 89 08)
+        e.emit8(0x48); e.emit8(0x89); e.emit8(0x08);
+        break;
+    case BPF_W:
+        // mov [rax], ecx  (89 08)
+        e.emit8(0x89); e.emit8(0x08);
+        break;
+    case BPF_H:
+        // mov [rax], cx  (66 89 08)
+        e.emit8(0x66); e.emit8(0x89); e.emit8(0x08);
+        break;
+    case BPF_B:
+        // mov [rax], cl  (88 08)
+        e.emit8(0x88); e.emit8(0x08);
+        break;
+    }
+
+    // Patch TLB jumps
+    patch_tlb_jumps(e, miss_jumps, tlb);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emit_stx_atomic: locked read-modify-write with inline TLB
+// ---------------------------------------------------------------------------
+// Matches Linux kernel's arch/x86/net/bpf_jit_comp.c approach:
+//
+//   ADD, OR, AND, XOR           → lock add/or/and/xor [mem], reg
+//   ADD|FETCH                   → lock xadd [mem], reg  (naturally returns old)
+//   OR|FETCH, AND|FETCH, XCHG   → lock cmpxchg loop (CAS loop)
+//   XCHG                        → xchg [mem], reg  (implicitly locked by x86)
+//   CMPXCHG                     → lock cmpxchg [mem], reg
+//
+// Register allocation at the point where we start emitting:
+//   RAX = host pointer (from TLB)
+//   RBX = vm*
+//   RCX, RDX, RDI = scratch
+// ---------------------------------------------------------------------------
+bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
+                                    std::vector<size_t>& error_jumps) {
+    uint8_t size_field = insn->code & 0x18;
+    if (size_field != BPF_DW && size_field != BPF_W) return false;
+
+    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
+    int32_t src_disp = off_reg_ + insn->src_reg * 8;
+    int32_t r0_disp  = off_reg_;  // r(0)
+    bool is_dw = (size_field == BPF_DW);
+    int access_size = is_dw ? 8 : 4;
+
+    // Compute guest address: reg[dst] + off
+    e.load_r64(X86::RAX, dst_disp);
+    if (insn->off != 0) {
+        e.emit8(0x48); e.emit8(0x05); e.emit32((uint32_t)(int32_t)insn->off); // add rax, off
+    }
+
+    // Inline TLB lookup (write)
+    std::vector<size_t> miss_jumps;
+    auto tlb = emit_tlb_lookup(e, (int32_t)off_tlb_, access_size, true,
+                                miss_jumps, error_jumps);
+
+    // ── RAX = host pointer.  Save to RDX, load src to RCX ──
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC2);              // mov rdx, rax
+    e.load_r64(X86::RCX, src_disp);                            // mov rcx, [rbx+src_disp]
+
+    int32_t op = insn->imm;
+
+    // ── OR/AND/XOR | FETCH: CAS loop (matches Linux kernel) ──
+    // x86 has no single instruction for atomic fetch-or/and/xor,
+    // so we use a lock cmpxchg loop like the kernel does.
+    if (op == (BPF_OR  | BPF_FETCH) ||
+        op == (BPF_AND | BPF_FETCH) ||
+        op == (BPF_XOR | BPF_FETCH)) {
+        uint8_t alu_opcode = ((op & ~BPF_FETCH) == BPF_OR)  ? 0x09
+                            : ((op & ~BPF_FETCH) == BPF_AND) ? 0x21
+                            : 0x31;  // XOR
+
+        // Save r(0) to RDI (CMPXCHG uses RAX as comparison value)
+        e.emit8(0x48); e.emit8(0x8B); e.emit8(0x3B);           // mov rdi, [rbx]  (r0)
+
+        size_t loop_start = e.size();
+
+        // Load old value from memory
+        if (is_dw) {
+            e.emit8(0x48); e.emit8(0x8B); e.emit8(0x02);       // mov rax, [rdx]
+        } else {
+            e.emit8(0x8B); e.emit8(0x02);                       // mov eax, [rdx]
+        }
+
+        // Compute new = old OP src into RDI
+        if (is_dw) {
+            e.emit8(0x48); e.emit8(0x89); e.emit8(0xC7);       // mov rdi, rax
+        } else {
+            e.emit8(0x89); e.emit8(0xC7);                       // mov edi, eax
+        }
+        if (is_dw) e.emit8(0x48);
+        e.emit8(alu_opcode); e.emit8(0xCF);                     // op rdi/edi, rcx/ecx
+
+        // lock cmpxchg [rdx], rdi — try to swap in new value
+        if (is_dw) e.emit8(0x48);
+        e.emit8(0xF0);                                           // lock prefix
+        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x3A);           // cmpxchg [rdx], rdi
+
+        // If ZF=0 (race lost, RAX updated to current value), retry
+        e.emit8(0x75);                                           // jnz loop_start
+        auto loop_end = e.size();
+        int8_t rel = (int8_t)(loop_start - loop_end);
+        e.data()[loop_end - 1] = (uint8_t)rel;
+
+        // src_reg = old value (now in RAX after successful cmpxchg)
+        e.store_r64(src_disp, X86::RAX);
+
+        // Restore r(0)
+        e.emit8(0x48); e.emit8(0x89); e.emit8(0x3B);           // mov [rbx], rdi (saved r0)
+
+        patch_tlb_jumps(e, miss_jumps, tlb);
+        return true;
+    }
+
+    switch (op) {
+    // ── lock xadd [rdx], rcx — old value ends up in rcx ──
+    case BPF_ADD:
+    case BPF_ADD | BPF_FETCH:
+        e.emit8(0xF0);                                           // lock prefix
+        if (is_dw) e.emit8(0x48);                               // REX.W
+        e.emit8(0x0F); e.emit8(0xC1); e.emit8(0x0A);           // xadd [rdx], rcx
+        if (op & BPF_FETCH) {
+            e.store_r64(src_disp, X86::RCX);                    // src_reg = old
+        }
+        break;
+
+    // ── lock or/and/xor [rdx], rcx — no old value needed ──
+    case BPF_OR:
+    case BPF_AND:
+    case BPF_XOR: {
+        uint8_t opcode = (op == BPF_OR) ? 0x09
+                       : (op == BPF_AND) ? 0x21
+                       : 0x31;  // XOR
+        e.emit8(0xF0);                                           // lock prefix
+        if (is_dw) e.emit8(0x48);                               // REX.W
+        e.emit8(opcode); e.emit8(0x0A);                         // op [rdx], rcx
+        break;
+    }
+
+    // ── xchg [rdx], rcx (implicitly locked by x86, no F0 needed) ──
+    case BPF_XCHG:
+        if (is_dw) e.emit8(0x48);                               // REX.W
+        e.emit8(0x87); e.emit8(0x0A);                           // xchg [rdx], rcx
+        // Old value is now in RCX
+        e.store_r64(src_disp, X86::RCX);                        // src_reg = old
+        break;
+
+    // ── lock cmpxchg [rdx], rcx — RAX = r(0) (comparison value) ──
+    case BPF_CMPXCHG:
+        // Load r(0) into RAX (clobbers host ptr, but we saved it to RDX)
+        e.load_r64(X86::RAX, r0_disp);                          // mov rax, [rbx+r0_disp]
+        e.emit8(0xF0);                                           // lock prefix
+        if (is_dw) e.emit8(0x48);                               // REX.W
+        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x0A);           // cmpxchg [rdx], rcx
+        // Old destination value is now in RAX; store to r(0)
+        e.store_r64(r0_disp, X86::RAX);                         // r(0) = old
+        break;
+
+    default:
+        return false;
+    }
+
+    patch_tlb_jumps(e, miss_jumps, tlb);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// compile: build a JIT block of consecutive JIT-able instructions
+// ---------------------------------------------------------------------------
 JitBlock* JitCompiler::compile(const bpf_insn* pc) {
-    // if has exist block, return it.
+    // If we already compiled this block, return it.
     auto it = blocks_.find(pc);
     if (it != blocks_.end()) {
         return &it->second;
     }
 
     Emitter e;
+    std::vector<size_t> error_jumps;  // memory violation jumps → abort_pos
 
     // ── Prologue ──────────────────────────────────────────────────────────
     // push RBX          ; save caller's RBX (callee-saved); aligns stack to 16
@@ -723,17 +1247,48 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
     emit_safepoint(e, jnz_flags, jne_signal);
 
     // ── Scan and emit ────────────────────────────────────────────────────
-    // Emit consecutive BPF_ALU / BPF_ALU64 instructions.
-    // Stop at the first non-ALU instruction, an out-of-range dst_reg, or
-    // an encoding emit_insn64/emit_insn32 cannot handle.
+    // Emit consecutive JIT-able instructions (ALU/ALU64/LD/LDX/ST/STX).
     int count = 0;
     const int MAX_BLOCK = 512;
-    for (const bpf_insn* p = pc; count < MAX_BLOCK; p++, count++) {
+    for (const bpf_insn* p = pc; count < MAX_BLOCK; ) {
         uint8_t cls = p->code & 0x07;
-        if (cls != BPF_ALU && cls != BPF_ALU64) break;
-        if (p->dst_reg >= 10) break;
-        if (!(cls == BPF_ALU64 ? emit_alu64(e, p) : emit_alu32(e, p))) break;
+        bool emitted = false;
+
+        switch (cls) {
+        case BPF_ALU64:
+            if (p->dst_reg >= 10) goto done;
+            emitted = emit_alu64(e, p);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_ALU:
+            if (p->dst_reg >= 10) goto done;
+            emitted = emit_alu32(e, p);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_LD:
+            emitted = emit_ld(e, p);
+            if (emitted) { p += 2; count += 2; }  // LD DW consumes 2 insns
+            break;
+        case BPF_LDX:
+            if (p->dst_reg >= 10) goto done;
+            emitted = emit_ldx(e, p, error_jumps);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_ST:
+            emitted = emit_st(e, p, error_jumps);
+            if (emitted) { p++; count++; }
+            break;
+        case BPF_STX:
+            emitted = emit_stx(e, p, error_jumps);
+            if (emitted) { p++; count++; }
+            break;
+        default:
+            goto done;
+        }
+
+        if (!emitted) break;
     }
+done:
 
     if (count == 0) return nullptr;
 
@@ -743,15 +1298,20 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
     // ret
     e.ret_int(count);
 
-    // ── Abort epilogue (safepoint target) ─────────────────────────────────
+    // ── Abort epilogue (safepoint / memory violation target) ──────────────
     // xor EAX, EAX      ; return 0 → interpreter takes over
     // pop RBX
     // ret
     size_t abort_pos = e.size();
     e.ret_zero();
 
-    // Back-patch the two conditional jumps in the safepoint to land here.
+    // Back-patch the safepoint jumps.
     emit_patch_safepoint(e, jnz_flags, jne_signal, abort_pos);
+
+    // Patch all memory violation error jumps to abort_pos.
+    for (size_t off : error_jumps) {
+        e.patch_rel32(off, abort_pos);
+    }
 
     // Allocate executable memory and copy code
     size_t code_size = e.size();

@@ -208,6 +208,7 @@ class vm: public std::enable_shared_from_this<vm> {
     size_t signal_depth = 0;
 
     std::unique_ptr<JitCompiler> jit_;
+    bool try_jit();
 
     bool ld();
     bool ldx();
@@ -240,6 +241,9 @@ public:
     static std::shared_ptr<vm> create();
     void* mmu(uint64_t addr, size_t size = 1);
     void* mmu_w(uint64_t addr, size_t size = 1);
+    // Slow path: linear scan maps + fill TLB (no TLB lookup).  Called by JIT on miss.
+    void* mmu_slow(uint64_t addr, size_t size);
+    void* mmu_w_slow(uint64_t addr, size_t size);
     uint64_t unmmu(const void* addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool push_frame(uint64_t return_addr, bool is_signal = false);

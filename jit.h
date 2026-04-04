@@ -28,10 +28,11 @@ struct JitBlock {
 //
 // Scope
 // -----
-// Only consecutive BPF_ALU / BPF_ALU64 instructions are JIT-compiled into a
-// single "block".  All other instruction classes (LD, ST, JMP, CALL, EXIT …)
-// remain interpreted.  This covers the hot arithmetic inner loops that account
-// for the bulk of BPF execution time.
+// Consecutive BPF_ALU / BPF_ALU64 / BPF_LD / BPF_LDX / BPF_ST / BPF_STX
+// instructions are JIT-compiled into a single "block".  Other instruction
+// classes (JMP, JMP32, CALL, EXIT, STX ATOMIC …) remain interpreted.
+// Memory instructions use an inline TLB fast path; TLB misses fall through
+// to a C helper for the slow path (map scan + TLB fill + CoW resolution).
 //
 // Register mapping
 // ----------------
@@ -118,6 +119,7 @@ class Emitter {
     std::vector<uint8_t> buf_;
 public:
     void emit8(uint8_t v) { buf_.push_back(v); }
+    void emit16(uint16_t v);
     void emit32(uint32_t v);
     void emit64(uint64_t v);
 
@@ -131,6 +133,16 @@ public:
     void store_r64(int32_t disp, uint8_t src);
     // mov r32, [rbx + disp32]  (zero-extends to 64 bits)
     void load_r32(uint8_t dst, int32_t disp);
+
+    // SIB-addressed operations: [RBX + RCX + disp32]
+    // Used for inline TLB access.  SIB byte = 0x0B (scale=1, index=RCX, base=RBX).
+    // REX.W + opcode + ModRM(10,reg,100) + SIB(00,RCX,RBX) + disp32
+    void sib_op_rax(uint8_t opcode, int32_t disp);
+    void sib_op_rdx(uint8_t opcode, int32_t disp);
+    // TEST DWORD [RBX+RCX+disp], imm32  (for flags check)
+    void sib_test_dword(int32_t disp, uint32_t imm);
+    // CMP BYTE [RBX+RCX+disp], imm8  (for cow check)
+    void sib_cmp_byte(int32_t disp, uint8_t imm);
 
     // ALU64 reg,reg: op rax, rcx
     void add64();    // 48 01 C8
@@ -223,6 +235,7 @@ private:
     static const size_t off_flags_;
     static const size_t off_signal_pending_;
     static const size_t off_signal_depth_;
+    static const size_t off_tlb_;
 
     std::unordered_map<const bpf_insn*, JitBlock> blocks_;
 
@@ -233,6 +246,14 @@ private:
     bool emit_alu64(Emitter& e, const bpf_insn* insn);
     // Emit code for one ALU (32-bit) instruction. Returns false if cannot JIT.
     bool emit_alu32(Emitter& e, const bpf_insn* insn);
+
+    // Emit code for memory instructions.  error_jumps collects JE offsets that
+    // must be patched to the block's abort_pos (memory violation → return 0).
+    bool emit_ld(Emitter& e, const bpf_insn* insn);
+    bool emit_ldx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
+    bool emit_st(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
+    bool emit_stx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
+    bool emit_stx_atomic(Emitter& e, const bpf_insn* insn, std::vector<size_t>& error_jumps);
 
     void emit_helper_call(Emitter& e, void* helper, int32_t dst_disp);
 };

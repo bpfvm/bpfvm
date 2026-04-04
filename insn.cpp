@@ -612,7 +612,16 @@ void vm::wakeup() {
 
 
 
+bool vm::try_jit() {
+    auto* block = jit_->compile(pc);
+    if(!block) return false;
+    int count = ((int(*)(vm*))block->code)(this);
+    if(count > 0) { pc += count - 1; return true; }
+    return false;
+}
+
 bool vm::ld() {
+    if(try_jit()) return true;
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -622,6 +631,7 @@ bool vm::ld() {
 }
 
 bool vm::ldx() {
+    if(try_jit()) return true;
     if(pc->dst_reg >= 10) {
         return false;
     }
@@ -667,6 +677,7 @@ bool vm::ldx() {
 }
 
 bool vm::st() {
+    if(try_jit()) return true;
     uint64_t target_addr = r(pc->dst_reg) + pc->off;
     void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
@@ -714,6 +725,7 @@ static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
 }
 
 bool vm::stx() {
+    if(try_jit()) return true;
     if((pc->code & 0xe0) == BPF_ATOMIC) {
         uint64_t target_addr = r(pc->dst_reg) + pc->off;
         void* addr = mmu_w(target_addr);
@@ -1043,7 +1055,12 @@ void* vm::mmu(uint64_t addr, size_t size) {
     if(addr >= entry.guest_base && end <= entry.guest_end) {
         return entry.host_base + (addr - entry.guest_base);
     }
-    // Slow path: linear scan + fill TLB
+    return mmu_slow(addr, size);
+}
+
+void* vm::mmu_slow(uint64_t addr, size_t size) {
+    uint64_t end = addr + size;
+    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
     for(const auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
@@ -1062,7 +1079,12 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
        && (entry.flags & PF_W) && !entry.cow) {
         return entry.host_base + (addr - entry.guest_base);
     }
-    // Slow path
+    return mmu_w_slow(addr, size);
+}
+
+void* vm::mmu_w_slow(uint64_t addr, size_t size) {
+    uint64_t end = addr + size;
+    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
     for(auto& map: maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             if(!(map.flags & PF_W)) return nullptr;
