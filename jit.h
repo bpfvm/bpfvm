@@ -7,34 +7,15 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/mman.h>
 
 struct bpf_insn;
 class vm;
-
-struct JitBlock {
-    void* code;          // executable entry point
-    int insn_count;      // number of BPF instructions in this block
-    size_t code_size;    // mmap'd size
-};
-
-struct JitStats {
-    uint64_t total_insns = 0;       // 总执行指令数（JIT + 解释器）
-    uint64_t jit_insns = 0;         // JIT 执行的指令数
-    uint64_t jit_compiles = 0;      // 编译的 block 数量
-    uint64_t jit_compiled_insns = 0; // 编译的指令总数（所有 block 的 insn_count 之和）
-    uint64_t jit_block_runs = 0;    // JIT block 被调用次数
-    // Block 终止原因统计
-    uint64_t term_call = 0;         // 遇到 CALL 指令
-    uint64_t term_exit = 0;         // 遇到 EXIT 指令
-    uint64_t term_ja = 0;           // 遇到 JA 指令
-    uint64_t term_max_block = 0;    // 达到最大 block 大小 (512)
-    uint64_t term_unsupported = 0;  // 不支持的指令或非法寄存器
-};
-
-#if defined(__x86_64__)
+struct JitFunction;
 
 // ---------------------------------------------------------------------------
 // JIT compiler overview (x86_64 only)
@@ -42,11 +23,25 @@ struct JitStats {
 //
 // Scope
 // -----
-// Consecutive BPF_ALU / BPF_ALU64 / BPF_LD / BPF_LDX / BPF_ST / BPF_STX
-// instructions are JIT-compiled into a single "block".  Other instruction
-// classes (JMP, JMP32, CALL, EXIT, STX ATOMIC …) remain interpreted.
-// Memory instructions use an inline TLB fast path; TLB misses fall through
-// to a C helper for the slow path (map scan + TLB fill + CoW resolution).
+// Each BPF function is compiled independently into its own x86 function.
+// Reachable BPF instructions within a single function (discovered via BFS
+// from the entry PC, NOT following BPF-to-BPF CALL targets) are compiled
+// into a contiguous x86 function.  Jumps use near rel32 with placeholders
+// patched after code generation.
+//
+// Control flow inside JIT:
+//   - Conditional/unconditional jumps  → Jcc/JMP rel32 (patched post-scan)
+//   - CALL syscall (src_reg==0)        → call jit_do_syscall helper
+//   - CALL BPF-to-BPF (src_reg==1)     → push_frame + set vm::pc + exit JIT
+//   - CALL indirect (BPF_X)            → call jit_resolve_indirect + exit JIT
+//   - EXIT                             → call jit_pop_frame + exit JIT
+//   - Safepoint                        → call jit_safepoint helper (loop headers)
+//   - Memory violation                 → jump to .vm_exit
+//
+// The JIT function always returns -1 to the interpreter (step()), which then:
+//   - Re-enters JIT for the new pc (CALL/EXIT changed pc)
+//   - Handles VM exit flags (VM_EXITED, VM_KILLED)
+//   - Falls through to interpreter on compilation failure
 //
 // Register mapping
 // ----------------
@@ -62,35 +57,26 @@ struct JitStats {
 //   RCX      | src operand (loaded from reg[src] when BPF_X)
 //             | also shift count (x86 requires shift amount in CL)
 //   RDX      | 3rd argument to helper functions (e.g. insn->off for div/mod)
-//   RDI      | 1st argument when calling a C helper (= RAX before call)
-//   RSI      | 2nd argument when calling a C helper (= RCX before call)
+//   RDI      | 1st argument when calling a C helper (= vm*)
+//   RSI      | 2nd argument when calling a C helper
 //
 // BPF reg n is at: [RBX + offsetof(vm, reg) + n*8]
 //
-// JIT block calling convention
-// ----------------------------
-// Each compiled block has the signature:  int block(vm* v)
+// JIT function calling convention
+// -------------------------------
+// Each compiled function has the signature:  int jit_func(vm* v)
 //   - Called with vm* in RDI (System V AMD64 ABI).
-//   - Prologue: push RBX; mov RBX, RDI   (save callee-saved RBX, set vm ptr)
-//   - Returns the number of BPF instructions consumed (> 0) on success.
-//   - Returns 0 if the safepoint check fires (VM flags or signal pending);
-//     the interpreter then handles the single instruction and checks signals.
-//   - Epilogue: mov EAX, count; pop RBX; ret
-//
-// Safepoint
-// ---------
-// At block entry (before any BPF work) the JIT checks:
-//   1. vm::flags & 0x7 (VM_EXITED | VM_KILLED | VM_STOPPED) → abort if set.
-//   2. If vm::signal_depth == 0: vm::signal_pending != 0 → abort if set.
-// Both checks jump to the "abort" epilogue (xor EAX,EAX; pop RBX; ret) which
-// returns 0 to the interpreter.
+//   - Prologue: push RBX; mov RBX, RDI; JMP .entry
+//     .entry: safepoint + BPF instruction code
+//   - Returns -1 on all exits (vm_exit label)
+//   - step() checks vm::flags and vm::pc to determine next action
 //
 // BPF → x86 instruction correspondence
 // --------------------------------------
 // BPF ALU64 (64-bit):
 //   BPF_ADD  dst += src/imm   →  ADD  RAX, RCX / ADD RAX, imm32
 //   BPF_SUB  dst -= src/imm   →  SUB  RAX, RCX / SUB RAX, imm32
-//   BPF_MUL  dst *= src/imm   →  helper jit_mul64(dst, src)
+//   BPF_MUL  dst *= src/imm   →  IMUL RAX, RCX / IMUL RAX, imm32
 //   BPF_DIV  dst /= src/imm   →  helper jit_div64(dst, src, off)
 //   BPF_MOD  dst %= src/imm   →  helper jit_mod64(dst, src, off)
 //   BPF_OR   dst |= src/imm   →  OR   RAX, RCX / OR  RAX, imm32
@@ -112,25 +98,32 @@ struct JitStats {
 //   BPF_END BE bswap          →  helper jit_end{16,32}_32
 //   BPF_END LE zero-extend    →  AND EAX,0xFFFF (16-bit) / load_r32 (32-bit)
 //                                no-op (64-bit, already native endian)
-//
-// MUL, DIV, MOD, and all sign-extend / byte-swap ops use C helpers because
-// BPF semantics for divide-by-zero and overflow differ from native x86.
 // ---------------------------------------------------------------------------
+
+#if defined(__x86_64__)
 
 // x86_64 register encoding (ModRM rm/reg field values)
 namespace X86 {
-    constexpr uint8_t RAX = 0;  // scratch: dst value, return value, 1st helper arg (via RDI)
-    constexpr uint8_t RCX = 1;  // scratch: src value, shift count (CL), 2nd helper arg (via RSI)
-    constexpr uint8_t RDX = 2;  // scratch: 3rd helper argument (e.g. insn->off)
-    constexpr uint8_t RBX = 3;  // vm* pointer — callee-saved, live for the entire block
+    constexpr uint8_t RAX = 0;  // scratch: dst value, return value
+    constexpr uint8_t RCX = 1;  // scratch: src value, shift count (CL)
+    constexpr uint8_t RDX = 2;  // scratch: 3rd helper argument
+    constexpr uint8_t RBX = 3;  // vm* pointer — callee-saved, live throughout
     constexpr uint8_t RSP = 4;
     constexpr uint8_t RBP = 5;
-    constexpr uint8_t RSI = 6;  // 2nd System V arg register (used only in helper calls)
-    constexpr uint8_t RDI = 7;  // 1st System V arg register (used only in helper calls)
+    constexpr uint8_t RSI = 6;  // 2nd System V arg register
+    constexpr uint8_t RDI = 7;  // 1st System V arg register
 }
 
+// ---------------------------------------------------------------------------
+// Emitter: low-level x86_64 code generation
+// ---------------------------------------------------------------------------
 class Emitter {
     std::vector<uint8_t> buf_;
+    struct PendingCall {
+        size_t call_offset;  // offset of the CALL rel32 instruction
+        void* helper;        // target helper address
+    };
+    std::vector<PendingCall> pending_calls_;
 public:
     void emit8(uint8_t v) { buf_.push_back(v); }
     void emit16(uint16_t v);
@@ -149,93 +142,80 @@ public:
     void load_r32(uint8_t dst, int32_t disp);
 
     // SIB-addressed operations: [RBX + RCX + disp32]
-    // Used for inline TLB access.  SIB byte = 0x0B (scale=1, index=RCX, base=RBX).
-    // REX.W + opcode + ModRM(10,reg,100) + SIB(00,RCX,RBX) + disp32
     void sib_op_rax(uint8_t opcode, int32_t disp);
     void sib_op_rdx(uint8_t opcode, int32_t disp);
-    // TEST DWORD [RBX+RCX+disp], imm32  (for flags check)
     void sib_test_dword(int32_t disp, uint32_t imm);
-    // CMP BYTE [RBX+RCX+disp], imm8  (for cow check)
     void sib_cmp_byte(int32_t disp, uint8_t imm);
 
     // CMP / TEST: compare and test (for conditional jumps)
-    void cmp64();           // CMP RAX, RCX   (48 39 C8)
-    void cmp64_imm(int32_t imm); // CMP RAX, imm32 (48 3D imm32)
-    void cmp32();           // CMP EAX, ECX   (39 C8)
-    void cmp32_imm(int32_t imm); // CMP EAX, imm32 (3D imm32)
-    void test64();          // TEST RAX, RCX  (48 85 C8)
-    void test64_imm(int32_t imm); // TEST RAX, imm32 (48 A9 imm32)
-    void test32();          // TEST EAX, ECX  (85 C8)
-    void test32_imm(int32_t imm); // TEST EAX, imm32 (A9 imm32)
+    void cmp64();
+    void cmp64_imm(int32_t imm);
+    void cmp32();
+    void cmp32_imm(int32_t imm);
+    void test64();
+    void test64_imm(int32_t imm);
+    void test32();
+    void test32_imm(int32_t imm);
 
     // Conditional jump with rel32 placeholder: 0F cc 00000000
     void jcc_rel32(uint8_t cc);
+    // Unconditional jump with rel32 placeholder: E9 00000000
+    void jmp_rel32();
+    // Near call with rel32 placeholder: E8 00000000
+    void call_rel32();
+
     // MOVABS RAX, imm64 (48 B8 imm64)
     void mov_rax_imm64(uint64_t val);
 
     // ALU64 reg,reg: op rax, rcx
-    void add64();    // 48 01 C8
-    void sub64();    // 48 29 C8
-    void or64();     // 48 09 C8
-    void and64();    // 48 21 C8
-    void xor64();    // 48 31 C8
-    void mul64();    // 48 0F AF C1
-    void neg64();    // 48 F7 D8
-    void shl64_cl(); // 48 D3 E0
-    void shr64_cl(); // 48 D3 E8
-    void sar64_cl(); // 48 D3 F8
+    void add64();    void sub64();    void or64();     void and64();
+    void xor64();    void mul64();    void neg64();
+    void shl64_cl(); void shr64_cl(); void sar64_cl();
 
     // ALU64 reg,imm32: op rax, imm32
-    void add64_imm(int32_t imm);
-    void sub64_imm(int32_t imm);
-    void or64_imm(int32_t imm);
-    void and64_imm(int32_t imm);
-    void xor64_imm(int32_t imm);
-    void shl64_imm(uint8_t count);
-    void shr64_imm(uint8_t count);
+    void add64_imm(int32_t imm);  void sub64_imm(int32_t imm);
+    void or64_imm(int32_t imm);   void and64_imm(int32_t imm);
+    void xor64_imm(int32_t imm);  void mul64_imm(int32_t imm);
+    void shl64_imm(uint8_t count); void shr64_imm(uint8_t count);
     void sar64_imm(uint8_t count);
-    void mul64_imm(int32_t imm);
 
     // ALU32 reg,reg: op eax, ecx
-    void add32();
-    void sub32();
-    void or32();
-    void and32();
-    void xor32();
-    void mul32();
-    void neg32();
-    void shl32_cl(); // D3 E0
-    void shr32_cl(); // D3 E8
-    void sar32_cl(); // D3 F8
+    void add32();    void sub32();    void or32();     void and32();
+    void xor32();    void mul32();    void neg32();
+    void shl32_cl(); void shr32_cl(); void sar32_cl();
 
     // ALU32 reg,imm32
-    void add32_imm(int32_t imm);
-    void sub32_imm(int32_t imm);
-    void or32_imm(int32_t imm);
-    void and32_imm(int32_t imm);
-    void xor32_imm(int32_t imm);
-    void shl32_imm(uint8_t count);
-    void shr32_imm(uint8_t count);
+    void add32_imm(int32_t imm);  void sub32_imm(int32_t imm);
+    void or32_imm(int32_t imm);   void and32_imm(int32_t imm);
+    void xor32_imm(int32_t imm);  void mul32_imm(int32_t imm);
+    void shl32_imm(uint8_t count); void shr32_imm(uint8_t count);
     void sar32_imm(uint8_t count);
-    void mul32_imm(int32_t imm);
 
-    // MOV: store immediate (64-bit, sign-extended imm32)
+    // MOV: store immediate
     void store_imm64(int32_t disp, int32_t imm);
-    // MOV: mov eax, imm32; store rax 64-bit
     void store_imm32_zext(int32_t disp, int32_t imm);
 
-    // Helper call: movabs rax, addr; call rax
-    // Presumes rdi=arg1, rsi=arg2, rdx=arg3 already set
+    // Helper call: emit CALL rel32 (5 bytes), patched by patch_calls() after mmap.
     void call_helper(void* addr);
 
-    // Save/restore vm* (rbx) around helper calls
-    // vm* is in rbx; before call: save rbx, move rdi to rbx
-    // Actually we keep vm* in rbx always. Before helper call we need to
-    // set rdi as arg1. After call, we don't need to restore (rbx preserved).
-    // push/pop rbx around the call to be safe against potential stack alignment issues
+    // Patch all deferred CALL rel32 sites given the final code base address.
+    // Returns false if any helper is beyond ±2GB (caller should reject the JIT).
+    bool patch_calls(void* code_base);
+
+    // Common register-to-register MOVs
+    void mov_rdi_rbx();    // mov rdi, rbx  (48 89 DF) — 1st arg = vm*
+    void mov_rsi_rax();    // mov rsi, rax  (48 89 C6) — 2nd arg = rax
+    void mov_rdx_rax();    // mov rdx, rax  (48 89 C2) — 3rd arg = rax
+
+    // Common TEST instructions
+    void test_rax_rax();   // test rax, rax (48 85 C0) — null check
+    void test_eax_eax();   // test eax, eax (85 C0)    — zero check (32-bit)
+    void test_al_al();     // test al, al   (84 C0)    — bool check
+
+    // Save/restore vm* (rbx)
     void push_rbx();
     void pop_rbx();
-    void mov_rbx_rdi();  // mov rbx, rdi
+    void mov_rbx_rdi();
 
     // Control flow
     void ret_int(int val);
@@ -244,64 +224,173 @@ public:
     size_t size() const { return buf_.size(); }
     uint8_t* data() { return buf_.data(); }
 
-    // Patch a rel32 at offset (at the 4 bytes after offset+2)
+    // Patch a Jcc rel32 at offset (4 bytes after offset+2)
     void patch_rel32(size_t inst_offset, size_t target_offset);
+    // Patch a JMP/CALL rel32 at offset (4 bytes after offset+1)
+    void patch_jmp_rel32(size_t inst_offset, size_t target_offset);
 };
 
-
-
-struct JumpPatchInfo {
-    size_t jcc_offset;       // offset in Emitter buffer of the Jcc instruction
-    const bpf_insn* target;  // target bpf_insn* pointer (insn + insn->off)
-    int index;               // sequential index of this jump instruction in the block
+// ---------------------------------------------------------------------------
+// Jump / call placeholder for deferred patching
+// ---------------------------------------------------------------------------
+enum class PlaceholderKind : uint8_t {
+    Jcc,    // conditional jump Jcc rel32 (6 bytes, patch at offset+2)
+    Jmp,    // unconditional JMP rel32 (5 bytes, patch at offset+1)
 };
 
+struct JumpPlaceholder {
+    size_t patch_offset;      // offset in Emitter buffer
+    int target_bpf_index;     // target BPF instruction index (relative to entry_pc)
+    PlaceholderKind kind;
+};
+
+struct AbortPatchInfo {
+    size_t jump_offset;       // offset of the conditional jump to .vm_exit
+    int bpf_index;            // BPF instruction index that may trigger abort
+};
+
+// Context for inline TLB memory access: begin_mem_access() fills this,
+// the caller emits the actual load/store, then finish_mem_access() patches.
+struct MemAccessContext {
+    std::vector<size_t> miss_jumps;   // TLB miss Jcc offsets → .slow
+    std::vector<size_t> abort_jumps;  // null-pointer Jcc offsets → .vm_exit
+    size_t slow_start;   // offset of .slow label
+    size_t done_offset;  // offset of .done label (after load/store code)
+    size_t done_jmp;     // offset of JMP .done (fast path) — needs patching
+};
+
+// ---------------------------------------------------------------------------
+// JitFunction: one compiled BPF function
+// ---------------------------------------------------------------------------
+struct JitFunction {
+    void* code;                    // executable entry point
+    int insn_count;                // total BPF instructions compiled
+    size_t code_size;              // mmap'd allocation size
+    const bpf_insn* entry_pc;      // first BPF instruction
+    std::vector<uint32_t> pc_offsets; // BPF index → x86 code offset
+};
+
+// ---------------------------------------------------------------------------
+// JitStats
+// ---------------------------------------------------------------------------
+struct JitStats {
+    uint64_t total_insns = 0;
+    uint64_t jit_insns = 0;
+    uint64_t jit_compiles = 0;
+    uint64_t jit_compiled_insns = 0;
+    uint64_t jit_func_runs = 0;
+    uint64_t compile_ns = 0;       // total JIT compilation time (ns)
+};
+
+// ---------------------------------------------------------------------------
+// JitCompiler
+// ---------------------------------------------------------------------------
 class JitCompiler {
 public:
     JitCompiler();
     ~JitCompiler();
 
-    // Compile or find a block of consecutive ALU/ALU64 instructions starting at pc.
-    // Returns nullptr if first instruction is not ALU/ALU64.
-    JitBlock* compile(const bpf_insn* pc);
+    // Compile or find a JIT function starting at pc.
+    // Returns nullptr if the instruction cannot be JIT-compiled.
+    // v is the VM instance (needed for code segment bounds and address translation).
+    JitFunction* compile(vm* v, const bpf_insn* pc);
 
     JitStats stats;
 
     static void dump_stats(const JitStats& s);
+
 private:
-    // vm field offsets (defined in jit.cpp via offsetof)
+    // vm field offsets
     static const size_t off_reg_;
+    static const size_t off_pc_;
     static const size_t off_flags_;
     static const size_t off_signal_pending_;
     static const size_t off_signal_depth_;
     static const size_t off_tlb_;
-    static const size_t off_pc_;
 
-    std::unordered_map<const bpf_insn*, JitBlock> blocks_;
+    std::unordered_map<const bpf_insn*, JitFunction> functions_;
+    std::unordered_set<const bpf_insn*> failed_;
+    bool enabled_ = true;
 
-    void emit_safepoint(Emitter& e, std::vector<size_t>& abort_jumps);
+    // JIT runtime helpers — called from JIT-generated code via function pointer.
+    // Static member functions use System V AMD64 ABI (same as C functions on x86-64 Linux),
+    // so call_helper() works correctly with their addresses.
+    static int helper_safepoint(vm* v);
+    static bool helper_push_frame(vm* v, uint64_t ret_addr);
+    static uint64_t helper_pop_frame(vm* v);
+    static bool helper_do_syscall(vm* v, uint32_t call_id);
+    static bool helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target);
+    static int helper_return_to_caller(vm* v, uint64_t ret_gpa);
+    static void* helper_mmu(vm* v, uint64_t addr, uint64_t size);
+    static void* helper_mmu_w(vm* v, uint64_t addr, uint64_t size);
 
-    // Emit code for one ALU64 (64-bit) instruction. Returns false if cannot JIT.
-    bool emit_alu64(Emitter& e, const bpf_insn* insn);
-    // Emit code for one ALU (32-bit) instruction. Returns false if cannot JIT.
-    bool emit_alu32(Emitter& e, const bpf_insn* insn);
+    // Pre-scan: discover all reachable BPF instructions via BFS.
+    // Returns a vector<bool> indexed by BPF instruction offset from start.
+    // seg_limit is the max number of instructions in the segment (bounds check).
+    // back_edge_targets is filled with indices that are backward jump targets.
+    // func_size is set to the function extent (one past max reachable index).
+    std::vector<bool> discover_reachable(const bpf_insn* start, int seg_limit,
+                                         std::vector<bool>& back_edge_targets,
+                                         int& func_size);
 
-    // Emit code for memory instructions.  abort_jumps collects JE offsets that
-    // must be patched to the block's abort_pos (memory violation → return 0).
+    // Emit methods for each instruction type.
+    // All return true on success, false if the instruction cannot be JIT-compiled.
+    bool emit_alu64(Emitter& e, const bpf_insn* insn) { return emit_alu<true>(e, insn); }
+    bool emit_alu32(Emitter& e, const bpf_insn* insn) { return emit_alu<false>(e, insn); }
+    template<bool Is64> bool emit_alu(Emitter& e, const bpf_insn* insn);
     bool emit_ld(Emitter& e, const bpf_insn* insn);
-    bool emit_ldx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
-    bool emit_st(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
-    bool emit_stx(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
-    bool emit_stx_atomic(Emitter& e, const bpf_insn* insn, std::vector<size_t>& abort_jumps);
+    bool emit_ldx(Emitter& e, const bpf_insn* insn, std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+    bool emit_st(Emitter& e, const bpf_insn* insn, std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+    bool emit_stx(Emitter& e, const bpf_insn* insn, std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+    bool emit_stx_atomic(Emitter& e, const bpf_insn* insn, std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
-    // Emit code for one JMP (64-bit) conditional jump. Returns false if cannot JIT.
-    bool emit_jmp64(Emitter& e, const bpf_insn* insn, int index,
-                    std::vector<JumpPatchInfo>& jump_patches);
-    // Emit code for one JMP32 (32-bit) conditional jump. Returns false if cannot JIT.
-    bool emit_jmp32(Emitter& e, const bpf_insn* insn, int index,
-                    std::vector<JumpPatchInfo>& jump_patches);
+    // Conditional jumps — emit CMP/TEST + Jcc with placeholder
+    bool emit_jmp64(Emitter& e, const bpf_insn* insn, int current_index,
+                    std::vector<JumpPlaceholder>& placeholders) { return emit_jmp<true>(e, insn, current_index, placeholders); }
+    bool emit_jmp32(Emitter& e, const bpf_insn* insn, int current_index,
+                    std::vector<JumpPlaceholder>& placeholders) { return emit_jmp<false>(e, insn, current_index, placeholders); }
+    template<bool Is64> bool emit_jmp(Emitter& e, const bpf_insn* insn, int current_index,
+                                       std::vector<JumpPlaceholder>& placeholders);
 
+    // Unconditional jump (JA)
+    void emit_ja(Emitter& e, const bpf_insn* insn, int current_index,
+                 std::vector<JumpPlaceholder>& placeholders);
+    void emit_ja32(Emitter& e, const bpf_insn* insn, int current_index,
+                   std::vector<JumpPlaceholder>& placeholders);
+
+    // CALL variants
+    void emit_call_syscall(Emitter& e, const bpf_insn* insn, int current_index,
+                         const bpf_insn* entry_pc,
+                           std::vector<AbortPatchInfo>& abort_patches);
+    void emit_call_bpf(Emitter& e, const bpf_insn* insn, int current_index,
+                       uint64_t ret_gpa,
+                       const bpf_insn* entry_pc,
+                       size_t vm_exit_offset,
+                       std::vector<AbortPatchInfo>& abort_patches);
+    void emit_call_indirect(Emitter& e, const bpf_insn* insn, int current_index,
+                            uint64_t ret_gpa,
+                            std::vector<AbortPatchInfo>& abort_patches);
+
+    // EXIT
+    void emit_exit(Emitter& e, size_t vm_exit_offset);
+
+    // Helper call (div/mod/etc.)
     void emit_helper_call(Emitter& e, void* helper, int32_t dst_disp);
+
+    // TLB memory access helpers: begin loads address + TLB lookup, finish patches jumps.
+    MemAccessContext begin_mem_access(Emitter& e, int32_t base_disp,
+                                      int16_t offset, int access_size, bool is_write);
+    void finish_mem_access(Emitter& e, MemAccessContext& ctx,
+                            std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+
+    // compile() sub-methods
+    size_t emit_prologue(Emitter& e, std::vector<AbortPatchInfo>& abort_patches);
+    bool emit_instruction(Emitter& e, vm* v, const bpf_insn* entry_pc, int i,
+                          size_t vm_exit_offset,
+                          std::vector<JumpPlaceholder>& placeholders,
+                          std::vector<AbortPatchInfo>& abort_patches,
+                          int& compiled_count);
+    void* finalize_code(Emitter& e);
 };
 
 #else // !__x86_64__
@@ -309,7 +398,8 @@ private:
 // Stub: JIT not supported on this architecture.
 class JitCompiler {
 public:
-    JitBlock* compile(const bpf_insn*) { return nullptr; }
+    struct JitFunction { void* code; int insn_count; size_t code_size; const bpf_insn* entry_pc; };
+    JitFunction* compile(vm*, const bpf_insn*) { return nullptr; }
     JitStats stats;
     static void dump_stats(const JitStats& s);
 };

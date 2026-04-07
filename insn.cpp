@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <mutex>
 #include <time.h>
+#include <chrono>
 
 
 std::mutex log_mutex;
@@ -949,18 +950,29 @@ bool vm::safepoint() {
 }
 
 bool vm::step() {
-    // JIT hot path: keep executing compiled blocks in a tight loop
+    // JIT hot path: keep executing compiled functions in a tight loop
     for(;;) {
-        auto* block = jit_->compile(pc);
-        if(!block) break;
-        jit_->stats.jit_block_runs++;
-        int count = ((int(*)(vm*))block->code)(this);
-        int n = count > 0 ? count : (count < 0 ? -count : 0);
-        jit_->stats.jit_insns += n;
-        jit_->stats.total_insns += n;
-        if(count > 0) { pc += count; continue; }  // next block
-        if(count < 0) { pc++; continue; }  // branch taken, pc already set by JIT
-        // count == 0: safepoint triggered in JIT, fall through to interpreter
+        auto* func = jit_->compile(this, pc);
+        if(!func) break;
+        jit_->stats.jit_func_runs++;
+        const bpf_insn* pc_before = pc;
+        ((int(*)(vm*))func->code)(this);
+        jit_->stats.jit_insns += func->insn_count;
+        jit_->stats.total_insns += func->insn_count;
+        // result == -1: JIT aborted (safepoint, syscall failure, pc changed, etc.)
+        // Check if it's a real VM exit or something recoverable.
+        uint32_t f = flags.load(std::memory_order_acquire);
+        if(f & (VM_EXITED | VM_KILLED)) {
+            return false;
+        }
+        // JIT aborted but VM isn't exiting.  If syscall/signal/call/exit changed pc
+        // (e.g. longjmp, signal handler, BPF CALL, BPF EXIT), pc has been updated.
+        // Continue in the JIT loop without returning to run().
+        if(pc != pc_before) {
+            continue;
+        }
+        // Otherwise (e.g. memory violation with no flags set), fall through to
+        // interpreter for one step to report the error.
         break;
     }
     jit_->stats.total_insns++;
@@ -985,25 +997,18 @@ bool vm::step() {
         asm volatile("brk #0");
 #endif
     }
+    bool ok = false;
     switch(pc->code & 0x07) {
-    case BPF_LD:
-        return ld();
-    case BPF_LDX:
-        return ldx();
-    case BPF_ST:
-        return st();
-    case BPF_STX:
-        return stx();
-    case BPF_ALU:
-        return alu();
-    case BPF_ALU64:
-        return alu64();
-    case BPF_JMP:
-        return jmp();
-    case BPF_JMP32:
-        return jmp32();
+    case BPF_LD:   ok = ld(); break;
+    case BPF_LDX:  ok = ldx(); break;
+    case BPF_ST:   ok = st(); break;
+    case BPF_STX:  ok = stx(); break;
+    case BPF_ALU:  ok = alu(); break;
+    case BPF_ALU64: ok = alu64(); break;
+    case BPF_JMP:  ok = jmp(); break;
+    case BPF_JMP32: ok = jmp32(); break;
     }
-    return false;
+    return ok;
 }
 
 void vm::addmem(memmap&& memmap) {

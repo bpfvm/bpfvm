@@ -81,7 +81,9 @@ int main(int argc, char** argv) {
     for(int i = optind; i < argc; i++) {
         options.argv.emplace_back(argv[i]);
     }
-    options.envp.emplace_back(std::string("HOME=") + getcwd(nullptr, 0));
+    char* cwd = getcwd(nullptr, 0);
+    options.envp.emplace_back(std::string("HOME=") + cwd);
+    free(cwd);
     const char* dir = dirname((char*)elf_file_path);
     options.envp.emplace_back(std::string("PATH=") + dir);
     umask(0);

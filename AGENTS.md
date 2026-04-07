@@ -20,6 +20,7 @@
 - `cmake -S . -B build && cmake --build build` — configure and build `bpfvm` and `bpfvm_test`.
 - `./build/bpfvm <elf-file>` — run the VM on a BPF ELF file.
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
+- `cd build && ctest` — run all CTest tests (see below).
 - `make -C test` — build BPF test programs into `.out` files using `clang` and `bpf-ld`.
 - `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
 
@@ -33,6 +34,15 @@
 - Unit tests live in `insn_test.cpp` and are built into `bpfvm_test`.
 - BPF test programs live in `test/` and produce `.out` binaries; keep filenames aligned (`test_foo.c` -> `test_foo.out`).
 - No coverage requirement is defined; add focused tests for new VM instructions or syscalls.
+
+### CTest Cases
+CMake registers the following CTest cases under the `BUILD_TESTING` option (run with `cd build && ctest`):
+
+1. **`unit_tests`** — Runs the `bpfvm_test` executable (instruction-level unit tests from `insn_test.cpp`).
+2. **`bpf_programs_build`** — Invokes `make -C test` to compile all BPF test programs (`test/*.c` → `test/*.out`). Marked as a fixture (`FIXTURES_SETUP bpf_programs_built`); all subsequent BPF program tests depend on it automatically.
+3. **`test_*` series** — Auto-discovered from `test/test_*.c` files. Each test case runs `bpfvm <program>.out` via the `cmake/RunBpfProgram.cmake` script and checks the exit code against the expected value (default 0). Helper programs listed in `BPF_TEST_HELPERS` (e.g., `test_arg`, `test_cloexec_child`) are skipped and do not generate standalone test cases.
+
+**Adding a new BPF test case:** Simply create a `test/test_<name>.c` file; CTest will auto-discover and register it. If the program is a helper (invoked by other tests rather than run independently), add it to the `BPF_TEST_HELPERS` list in `CMakeLists.txt`.
 
 ## Syscall Implementation & C Library Wrappers
 - Syscall handling is decoupled from the VM via the abstract `SyscallHandler` interface (defined in `insn.h`), with `PosixSyscall` (`posix_syscall.cpp`) as the main implementation and `EmptySyscall` (`empty_syscall.h`) as a stub for testing.
