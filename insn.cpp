@@ -953,12 +953,17 @@ bool vm::step() {
     for(;;) {
         auto* block = jit_->compile(pc);
         if(!block) break;
+        jit_->stats.jit_block_runs++;
         int count = ((int(*)(vm*))block->code)(this);
+        int n = count > 0 ? count : (count < 0 ? -count : 0);
+        jit_->stats.jit_insns += n;
+        jit_->stats.total_insns += n;
         if(count > 0) { pc += count; continue; }  // next block
         if(count < 0) { pc++; continue; }  // branch taken, pc already set by JIT
         // count == 0: safepoint triggered in JIT, fall through to interpreter
         break;
     }
+    jit_->stats.total_insns++;
     // Safepoint check
     uint32_t f = flags.load(std::memory_order_acquire);
     if((f & (VM_EXITED | VM_KILLED | VM_STOPPED)) ||
@@ -1109,6 +1114,7 @@ uint64_t vm::run() {
         pc++;
     }
     if(options.sys) options.sys->fini(shared_from_this());
+    JitCompiler::dump_stats(jit_->stats);
     flags.fetch_or(VM_EXITED, std::memory_order_release);
     pthread_cond_broadcast(&exit_cv);
     return r(0);

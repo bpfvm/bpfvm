@@ -20,6 +20,20 @@ struct JitBlock {
     size_t code_size;    // mmap'd size
 };
 
+struct JitStats {
+    uint64_t total_insns = 0;       // 总执行指令数（JIT + 解释器）
+    uint64_t jit_insns = 0;         // JIT 执行的指令数
+    uint64_t jit_compiles = 0;      // 编译的 block 数量
+    uint64_t jit_compiled_insns = 0; // 编译的指令总数（所有 block 的 insn_count 之和）
+    uint64_t jit_block_runs = 0;    // JIT block 被调用次数
+    // Block 终止原因统计
+    uint64_t term_call = 0;         // 遇到 CALL 指令
+    uint64_t term_exit = 0;         // 遇到 EXIT 指令
+    uint64_t term_ja = 0;           // 遇到 JA 指令
+    uint64_t term_max_block = 0;    // 达到最大 block 大小 (512)
+    uint64_t term_unsupported = 0;  // 不支持的指令或非法寄存器
+};
+
 #if defined(__x86_64__)
 
 // ---------------------------------------------------------------------------
@@ -250,6 +264,10 @@ public:
     // Compile or find a block of consecutive ALU/ALU64 instructions starting at pc.
     // Returns nullptr if first instruction is not ALU/ALU64.
     JitBlock* compile(const bpf_insn* pc);
+
+    JitStats stats;
+
+    static void dump_stats(const JitStats& s);
 private:
     // vm field offsets (defined in jit.cpp via offsetof)
     static const size_t off_reg_;
@@ -292,6 +310,8 @@ private:
 class JitCompiler {
 public:
     JitBlock* compile(const bpf_insn*) { return nullptr; }
+    JitStats stats;
+    static void dump_stats(const JitStats& s);
 };
 
 #endif // __x86_64__

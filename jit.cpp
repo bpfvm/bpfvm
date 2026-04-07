@@ -4,6 +4,9 @@
 
 #include "jit.h"
 
+#include <cstdlib>
+#include <cstdio>
+
 #if defined(__x86_64__)
 
 #include "insn.h"
@@ -1397,8 +1400,10 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
     // ── Scan and emit ────────────────────────────────────────────────────
     // Emit consecutive JIT-able instructions (ALU/ALU64/LD/LDX/ST/STX).
     int count = 0;
+    bool hit_max = false;
     const int MAX_BLOCK = 512;
-    for (const bpf_insn* p = pc; count < MAX_BLOCK; ) {
+    const bpf_insn* p = pc;
+    for (; count < MAX_BLOCK; ) {
         uint8_t cls = p->code & 0x07;
         bool emitted = false;
 
@@ -1443,10 +1448,27 @@ JitBlock* JitCompiler::compile(const bpf_insn* pc) {
         }
 
         if (!emitted) break;
+        if (count >= MAX_BLOCK) { hit_max = true; break; }
     }
 done:
 
     if (count == 0) return nullptr;
+
+    // Track block termination reason
+    if (hit_max) {
+        stats.term_max_block++;
+    } else {
+        uint8_t cls = p->code & 0x07;
+        uint8_t op = p->code & 0xf0;
+        if (cls == BPF_JMP) {
+            if (op == BPF_CALL) stats.term_call++;
+            else if (op == BPF_EXIT) stats.term_exit++;
+            else if (op == BPF_JA) stats.term_ja++;
+            else stats.term_unsupported++;
+        } else {
+            stats.term_unsupported++;
+        }
+    }
 
     // ── Success epilogue ──────────────────────────────────────────────────
     // mov EAX, count    ; return value = number of BPF instructions executed
@@ -1494,7 +1516,28 @@ done:
         return nullptr;
     }
 
+    stats.jit_compiles++;
+    stats.jit_compiled_insns += count;
     return &blocks_.emplace(pc, JitBlock{code_mem, count, alloc_size}).first->second;
 }
 
 #endif // __x86_64__
+
+void JitCompiler::dump_stats(const JitStats& s) {
+    if (!getenv("JIT_DEBUG")) return;
+    double pct = s.total_insns ? (100.0 * s.jit_insns / s.total_insns) : 0.0;
+    fprintf(stderr, "[JIT] 总指令条数: %lu\n", s.total_insns);
+    fprintf(stderr, "[JIT] JIT执行条数: %lu (%.1f%%)\n", s.jit_insns, pct);
+    fprintf(stderr, "[JIT] JIT编译block数: %lu\n", s.jit_compiles);
+    fprintf(stderr, "[JIT] JIT执行block次数: %lu\n", s.jit_block_runs);
+    if (s.jit_compiles) {
+        fprintf(stderr, "[JIT] 编译时平均block大小: %.1f条\n",
+                (double)s.jit_compiled_insns / s.jit_compiles);
+    }
+    if (s.jit_block_runs) {
+        fprintf(stderr, "[JIT] 运行时平均每次执行: %.1f条\n",
+                (double)s.jit_insns / s.jit_block_runs);
+    }
+    fprintf(stderr, "[JIT] Block终止原因: CALL=%lu EXIT=%lu JA=%lu MAX_BLOCK=%lu UNSUPPORTED=%lu\n",
+            s.term_call, s.term_exit, s.term_ja, s.term_max_block, s.term_unsupported);
+}
