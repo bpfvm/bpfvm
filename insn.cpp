@@ -7,6 +7,19 @@
 
 #include "jit.h"
 
+#if defined(__x86_64__)
+#include "jit_compiler.h"
+#include "x86_emitter.h"
+using JitCompilerImpl = JitCompiler<X86Emitter>;
+#else
+class StubJitCompiler : public JitCompilerBase {
+public:
+    JitFunction* compile(vm*, const bpf_insn*) override { return nullptr; }
+    static void dump_stats(const JitStats&) {}
+};
+using JitCompilerImpl = StubJitCompiler;
+#endif
+
 #include <libelf.h>
 #include <gelf.h>
 #include <unistd.h>
@@ -1113,13 +1126,13 @@ uint64_t vm::unmmu(const void* addr) {
 }
 
 uint64_t vm::run() {
-    if(!jit_) jit_ = std::make_unique<JitCompiler>();
+    if(!jit_) jit_ = std::make_unique<JitCompilerImpl>();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
         pc++;
     }
     if(options.sys) options.sys->fini(shared_from_this());
-    JitCompiler::dump_stats(jit_->stats);
+    JitCompilerImpl::dump_stats(jit_->stats);
     flags.fetch_or(VM_EXITED, std::memory_order_release);
     pthread_cond_broadcast(&exit_cv);
     return r(0);

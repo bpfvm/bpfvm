@@ -157,7 +157,8 @@ struct memmap {
 };
 
 class vm;
-class JitCompiler;
+class JitCompilerBase;
+template<typename T> class JitCompiler;
 class SyscallHandler{
 protected:
     static auto& maps(vm* v);
@@ -207,7 +208,7 @@ class vm: public std::enable_shared_from_this<vm> {
     std::atomic<bool> signal_pending{false};
     size_t signal_depth = 0;
 
-    std::unique_ptr<JitCompiler> jit_;
+    std::unique_ptr<JitCompilerBase> jit_;
 
     bool ld();
     bool ldx();
@@ -224,7 +225,7 @@ class vm: public std::enable_shared_from_this<vm> {
     }
 
     friend class SyscallHandler;
-    friend class JitCompiler;
+    template<typename T> friend class JitCompiler;
     void log_mem_violation(const char* type, uint64_t addr);
     bool safepoint();
     struct Token { explicit Token() = default; };
