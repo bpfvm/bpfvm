@@ -31,46 +31,116 @@ void Emitter::emit64(uint64_t v) {
 }
 
 void Emitter::load_r64(uint8_t dst, int32_t disp) {
-    // MOV r64, QWORD PTR [RBX+disp32]
-    emit8(0x48);
+    // MOV r64, QWORD PTR [RBP+disp32]
+    uint8_t rex = 0x48;
+    if (dst >= 8) rex |= 0x04;  // REX.R for R8-R15
+    emit8(rex);
     emit8(0x8B);
-    emit8(modrm(2, dst, X86::RBX));
+    emit8(modrm(2, dst & 7, X86::RBP));
     emit32(disp);
 }
 
 void Emitter::store_r64(int32_t disp, uint8_t src) {
-    // MOV QWORD PTR [RBX+disp32], r64
-    emit8(0x48);
+    // MOV QWORD PTR [RBP+disp32], r64
+    uint8_t rex = 0x48;
+    if (src >= 8) rex |= 0x04;  // REX.R for R8-R15
+    emit8(rex);
     emit8(0x89);
-    emit8(modrm(2, src, X86::RBX));
+    emit8(modrm(2, src & 7, X86::RBP));
     emit32(disp);
 }
 
 void Emitter::load_r32(uint8_t dst, int32_t disp) {
-    // MOV r32, DWORD PTR [RBX+disp32]  (zero-extends to 64 bits)
+    // MOV r32, DWORD PTR [RBP+disp32]  (zero-extends to 64 bits)
     emit8(0x8B);
-    emit8(modrm(2, dst, X86::RBX));
+    emit8(modrm(2, dst, X86::RBP));
     emit32(disp);
 }
 
 // ---------------------------------------------------------------------------
-// SIB-addressed operations: [RBX + RCX + disp32]
+// SIB-addressed operations: [RBP + RDI + disp32]
+// RDI is used as the TLB index register, freeing RCX for operands.
+// SIB byte: scale=0, index=RDI(7), base=RBP(5) → 0x3D
 // ---------------------------------------------------------------------------
 
 void Emitter::sib_op_rax(uint8_t opcode, int32_t disp) {
-    emit8(0x48); emit8(opcode); emit8(0x84); emit8(0x0B); emit32(disp);
+    emit8(0x48); emit8(opcode); emit8(0x84); emit8(0x3D); emit32(disp);
 }
 
 void Emitter::sib_op_rdx(uint8_t opcode, int32_t disp) {
-    emit8(0x48); emit8(opcode); emit8(0x94); emit8(0x0B); emit32(disp);
+    emit8(0x48); emit8(opcode); emit8(0x94); emit8(0x3D); emit32(disp);
 }
 
 void Emitter::sib_test_dword(int32_t disp, uint32_t imm) {
-    emit8(0xF7); emit8(0x84); emit8(0x0B); emit32(disp); emit32(imm);
+    emit8(0xF7); emit8(0x84); emit8(0x3D); emit32(disp); emit32(imm);
 }
 
 void Emitter::sib_cmp_byte(int32_t disp, uint8_t imm) {
-    emit8(0x80); emit8(0xBC); emit8(0x0B); emit32(disp); emit8(imm);
+    emit8(0x80); emit8(0xBC); emit8(0x3D); emit32(disp); emit8(imm);
+}
+
+// ---------------------------------------------------------------------------
+// BPF register access
+// ---------------------------------------------------------------------------
+
+void Emitter::load_bpf(uint8_t bpf_reg, uint8_t x86_dst, size_t off_reg) {
+    if (bpf_reg >= 6 && bpf_reg <= 9) {
+        // r6-r9: cached in R12-R15 (callee-saved, always valid)
+        uint8_t host = BPF_CALLEE_REG[bpf_reg - 6];
+        if (host != x86_dst) {
+            mov_r64(x86_dst, host);
+        }
+    } else {
+        // r0-r5, r10: always load from vm->reg[] memory
+        load_r64(x86_dst, (int32_t)(off_reg + bpf_reg * 8));
+    }
+}
+
+void Emitter::store_bpf_wt(uint8_t bpf_reg, uint8_t x86_src, size_t off_reg) {
+    // Write-through for r0-r5: store directly to vm->reg[] memory.
+    store_r64((int32_t)(off_reg + bpf_reg * 8), x86_src);
+}
+
+void Emitter::store_bpf_wt32(uint8_t bpf_reg, uint8_t x86_src, size_t off_reg) {
+    // 32-bit write-through: zero-extend x86_src to 64 bits, then store to vm->reg[].
+    // mov r32, r32 clears upper 32 bits of the 64-bit register.
+    {
+        uint8_t rex = 0x40;
+        if (x86_src >= 8) rex |= 0x05;  // REX.R + REX.B (same register in both fields)
+        if (rex != 0x40) emit8(rex);     // only emit REX if needed for extended registers
+        emit8(0x89);  // MOV r/m32, r32
+        emit8(modrm(3, x86_src & 7, x86_src & 7));
+    }
+    // Now the full 64-bit register is zero-extended; store the qword
+    store_r64((int32_t)(off_reg + bpf_reg * 8), x86_src);
+}
+
+void Emitter::store_bpf_lazy(uint8_t bpf_reg, uint8_t x86_src) {
+    // Lazy store for r6-r9: write to R12-R15 only, no memory write.
+    // Caller must ensure flush_r6_r9() is called before any path that
+    // reads vm->reg[6-9] (safepoints, push_frame, syscalls, JIT exit).
+    uint8_t host = BPF_CALLEE_REG[bpf_reg - 6];
+    if (host != x86_src) {
+        mov_r64(host, x86_src);
+    }
+}
+
+void Emitter::flush_r6_r9(size_t off_reg) {
+    // Unconditionally spill R12-R15 to vm->reg[6-9].
+    for (int i = 0; i < 4; i++) {
+        store_r64((int32_t)(off_reg + (i + 6) * 8), BPF_CALLEE_REG[i]);
+    }
+}
+
+void Emitter::mov_r64(uint8_t dst, uint8_t src) {
+    // mov r64, r64  (48 89 /r with modrm(mod=3, reg=src, rm=dst))
+    // For R8-R15 (extended): needs REX.R (0x4C) if src >= 8, REX.B (0x49) if dst >= 8
+    uint8_t rex = 0x48;
+    if (src >= 8) rex |= 0x04;  // REX.R
+    if (dst >= 8) rex |= 0x01;  // REX.B
+    emit8(rex);
+    emit8(0x89);  // MOV r/m64, r64
+    emit8(modrm(3, src & 7, dst & 7));
 }
 
 // --- ALU64 reg,reg ---
@@ -158,7 +228,7 @@ void Emitter::mov_rax_imm64(uint64_t val) {
 // --- MOV immediate to memory ---
 
 void Emitter::store_imm64(int32_t disp, int32_t imm) {
-    emit8(0x48); emit8(0xC7); emit8(modrm(2, 0, X86::RBX));
+    emit8(0x48); emit8(0xC7); emit8(modrm(2, 0, X86::RBP));
     emit32(disp); emit32(imm);
 }
 
@@ -173,7 +243,7 @@ void Emitter::store_imm32_zext(int32_t disp, int32_t imm) {
 
 // --- Common register-to-register MOVs ---
 
-void Emitter::mov_rdi_rbx()  { emit8(0x48); emit8(0x89); emit8(0xDF); }
+void Emitter::mov_rdi_rbp()  { emit8(0x48); emit8(0x89); emit8(0xEF); }
 void Emitter::mov_rsi_rax()  { emit8(0x48); emit8(0x89); emit8(0xC6); }
 void Emitter::mov_rdx_rax()  { emit8(0x48); emit8(0x89); emit8(0xC2); }
 
@@ -185,28 +255,15 @@ void Emitter::test_al_al()   { emit8(0x84); emit8(0xC0); }
 
 // --- Prologue / epilogue ---
 
-void Emitter::push_rbx() { emit8(0x53); }
-void Emitter::pop_rbx()  { emit8(0x5B); }
-void Emitter::mov_rbx_rdi() { emit8(0x48); emit8(0x89); emit8(0xFB); }
+void Emitter::push_rbp() { emit8(0x55); }
+void Emitter::pop_rbp()  { emit8(0x5D); }
+void Emitter::mov_rbp_rdi() { emit8(0x48); emit8(0x89); emit8(0xFD); }
 
 void Emitter::call_helper(void* addr) {
-    // Emit a CALL rel32 placeholder (5 bytes).  The rel32 displacement is
-    // patched by patch_calls() after all code has been emitted.
-    size_t off = buf_.size();
-    emit8(0xE8); emit32(0);  // call rel32 (placeholder)
-    pending_calls_.push_back({off, addr});
-}
-
-void Emitter::ret_int(int val) {
-    emit8(0xB8); emit32(val);
-    emit8(0x5B);  // pop rbx
-    emit8(0xC3);  // ret
-}
-
-void Emitter::ret_zero() {
-    emit8(0x31); emit8(0xC0);  // xor eax, eax
-    emit8(0x5B);
-    emit8(0xC3);
+    // movabs r10, addr  (49 BA imm64) — load 64-bit helper address into R10
+    emit8(0x49); emit8(0xBA); emit64((uint64_t)(uintptr_t)addr);
+    // call r10           (41 FF D2)   — indirect call through R10
+    emit8(0x41); emit8(0xFF); emit8(0xD2);
 }
 
 // --- Patching ---
@@ -221,29 +278,6 @@ void Emitter::patch_rel32(size_t inst_offset, size_t target_offset) {
 void Emitter::patch_jmp_rel32(size_t inst_offset, size_t target_offset) {
     uint32_t rel = (uint32_t)(target_offset - (inst_offset + 5));
     memcpy(buf_.data() + inst_offset + 1, &rel, 4);
-}
-
-// ---------------------------------------------------------------------------
-// Patch deferred CALL rel32 sites to point directly to helper addresses.
-//
-// Called after mmap allocates the final code region.  Each pending call is
-// patched with rel32 = helper_addr - (code_base + call_offset + 5).
-// Returns false if any displacement overflows signed 32-bit range.
-// ---------------------------------------------------------------------------
-bool Emitter::patch_calls(void* code_base) {
-    for (auto& pc : pending_calls_) {
-        // Address of the instruction *following* the CALL (= call_site + 5)
-        auto next_ip = (uintptr_t)code_base + pc.call_offset + 5;
-        auto target  = (uintptr_t)pc.helper;
-        int64_t disp = (int64_t)target - (int64_t)next_ip;
-        if (disp < INT32_MIN || disp > INT32_MAX) {
-            return false;  // beyond ±2GB — reject JIT compilation
-        }
-        uint32_t rel = (uint32_t)(int32_t)disp;
-        memcpy(buf_.data() + pc.call_offset + 1, &rel, 4);
-    }
-    pending_calls_.clear();
-    return true;
 }
 
 #endif // __x86_64__

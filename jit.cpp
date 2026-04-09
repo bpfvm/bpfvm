@@ -19,7 +19,7 @@
 // Arithmetic helpers for DIV/MOD (called from JIT-generated code)
 //
 // Called via System V AMD64 ABI: arg1=RDI, arg2=RSI, arg3=RDX; return in RAX.
-// RBX is callee-saved per ABI, so vm* survives every helper call.
+// RBP is callee-saved per ABI, so vm* survives every helper call.
 //
 // Why helpers for DIV/MOD?
 //   - BPF divide-by-zero → result = 0 (not #DE fault).
@@ -115,13 +115,17 @@ bool JitCompiler::helper_do_syscall(vm* v, uint32_t call_id) {
     bool ok = v->do_syscall(call_id);
     if (!ok) {
         v->flags.fetch_or(vm::VM_EXITED, std::memory_order_release);
+        // Advance pc past the CALL instruction so that any interpreter
+        // resumption starts at the right place (matching the interpreter's
+        // post-step pc++).
+        if (v->pc == saved_pc) v->pc++;
         return false;
     }
-    // If the syscall handler changed pc (e.g. longjmp), return false to abort JIT.
-    // step() will detect the pc change and return to run(), which re-enters JIT
-    // at the new pc. No need to permanently disable JIT — cached functions remain
-    // valid since they are stateless (all VM state lives in the vm struct).
     if (v->pc != saved_pc) {
+        // The syscall changed pc (e.g. longjmp).  In the interpreter, pc
+        // points to the CALL instruction and the loop's post-step pc++
+        // advances past it.  The JIT has no post-step pc++, so advance here.
+        v->pc++;
         return false;
     }
     // A syscall may have set flags (e.g. kill(SIGSTOP) sets VM_STOPPED) or
@@ -129,10 +133,9 @@ bool JitCompiler::helper_do_syscall(vm* v, uint32_t call_id) {
     // For pending signals, do NOT abort here — let the JIT continue executing
     // the next BPF instructions (which will save r0 to a callee-saved register)
     // and deliver the signal at the next safepoint (back-edge or function boundary).
-    // Aborting here would cause the prologue safepoint of the continuation function
-    // to clobber r0 (caller-saved) before the BPF code can save it.
     uint32_t f = v->flags.load(std::memory_order_acquire);
     if (f & (vm::VM_EXITED | vm::VM_KILLED | vm::VM_STOPPED)) {
+        v->pc++;  // advance past CALL before aborting
         return false;
     }
     return true;
@@ -365,6 +368,28 @@ void JitCompiler::emit_helper_call(Emitter& e, void* helper, int32_t dst_disp) {
 // TLB memory access helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TLB memory access: inline fast path + slow path
+// ---------------------------------------------------------------------------
+// The fast path (TLB hit) and slow path (C helper) are both emitted inline.
+// RDI is used as the TLB index register, keeping RCX free for ALU operands.
+// Store instructions pre-load src into RBX (callee-saved, survives helper).
+//
+// Layout:
+//   load guest addr → RAX; apply BPF offset
+//   compute TLB index in RDI
+//   bounds check: JB .slow
+//   bounds check: JA .slow
+//   (write: permission + CoW check: JZ/JNE .slow)
+//   TLB hit: RAX = host ptr
+//   JMP .done
+// .slow:
+//   call helper_mmu[_w](vm*, guest_addr, size)
+//   test rax, rax; jz .vm_exit
+// .done:
+//   <load/store code emitted by caller>
+// ---------------------------------------------------------------------------
+
 MemAccessContext JitCompiler::begin_mem_access(Emitter& e, int32_t base_disp,
                                                int16_t offset, int access_size, bool is_write) {
     MemAccessContext ctx{};
@@ -377,14 +402,15 @@ MemAccessContext JitCompiler::begin_mem_access(Emitter& e, int32_t base_disp,
     }
 
     // --- Inline TLB lookup (fast path) ---
+    // Uses RDI as the TLB index register, keeping RCX free for operands.
 
     // Compute TLB index: ((addr >> 20) & 0xF) * 32 = (addr >> 15) & 0x1F0
-    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC1);                   // mov rcx, rax
-    e.emit8(0x48); e.emit8(0xC1); e.emit8(0xE9); e.emit8(15);     // shr rcx, 15
-    e.emit8(0x81); e.emit8(0xE1); e.emit32(0x1F0);                 // and ecx, 0x1F0
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0xC7);                   // mov rdi, rax
+    e.emit8(0x48); e.emit8(0xC1); e.emit8(0xEF); e.emit8(15);     // shr rdi, 15
+    e.emit8(0x81); e.emit8(0xE7); e.emit32(0x1F0);                 // and edi, 0x1F0
 
     // Bounds check 1: addr >= entry.guest_base
-    e.sib_op_rax(0x3B, tlb_off);                                    // cmp rax, [rbx+rcx+tlb_off]
+    e.sib_op_rax(0x3B, tlb_off);                                    // cmp rax, [rbp+rdi+tlb_off]
     ctx.miss_jumps.push_back(e.size());
     e.emit8(0x0F); e.emit8(0x82); e.emit32(0);                     // JB .slow
 
@@ -392,7 +418,7 @@ MemAccessContext JitCompiler::begin_mem_access(Emitter& e, int32_t base_disp,
     // lea rdx, [rax + size]
     e.emit8(0x48); e.emit8(0x8D); e.emit8(0x90);                   // lea rdx, [rax + disp32]
     e.emit32((uint32_t)access_size);
-    e.sib_op_rdx(0x3B, tlb_off + 8);                                // cmp rdx, [rbx+rcx+tlb_off+8]
+    e.sib_op_rdx(0x3B, tlb_off + 8);                                // cmp rdx, [rbp+rdi+tlb_off+8]
     ctx.miss_jumps.push_back(e.size());
     e.emit8(0x0F); e.emit8(0x87); e.emit32(0);                     // JA .slow
 
@@ -409,8 +435,8 @@ MemAccessContext JitCompiler::begin_mem_access(Emitter& e, int32_t base_disp,
     }
 
     // TLB hit: host_ptr = host_base + (addr - guest_base)
-    e.sib_op_rax(0x2B, tlb_off);                                    // sub rax, [rbx+rcx+tlb_off]
-    e.sib_op_rax(0x03, tlb_off + 16);                               // add rax, [rbx+rcx+tlb_off+16]
+    e.sib_op_rax(0x2B, tlb_off);                                    // sub rax, [rbp+rdi+tlb_off]
+    e.sib_op_rax(0x03, tlb_off + 16);                               // add rax, [rbp+rdi+tlb_off+16]
 
     // JMP .done (rel32 placeholder — patched by finish_mem_access)
     ctx.done_jmp = e.size();
@@ -418,7 +444,7 @@ MemAccessContext JitCompiler::begin_mem_access(Emitter& e, int32_t base_disp,
 
     // --- Slow path: TLB miss — call C helper ---
     ctx.slow_start = e.size();
-    e.mov_rdi_rbx();                                                 // mov rdi, rbx (vm*)
+    e.mov_rdi_rbp();                                                 // mov rdi, rbp (vm*)
     e.mov_rsi_rax();                                                 // mov rsi, rax (guest addr)
     e.emit8(0xBA); e.emit32((uint32_t)access_size);                 // mov edx, size
     e.call_helper(is_write ? (void*)&JitCompiler::helper_mmu_w
@@ -461,16 +487,26 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
     bool is_x = (insn->code & 0x08) == BPF_X;
     uint8_t op = insn->code & 0xf0;
     int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
-    int32_t src_disp = off_reg_ + insn->src_reg * 8;
 
-    // Helper lambdas to select 64/32 bit variants
+    // Helper lambdas for register-cached load
     auto load_dst = [&]() {
-        if constexpr (Is64) e.load_r64(X86::RAX, dst_disp);
-        else                e.load_r32(X86::RAX, dst_disp);
+        e.load_bpf(insn->dst_reg, X86::RAX, off_reg_);
     };
     auto load_src = [&]() {
-        if constexpr (Is64) e.load_r64(X86::RCX, src_disp);
-        else                e.load_r32(X86::RCX, src_disp);
+        e.load_bpf(insn->src_reg, X86::RCX, off_reg_);
+    };
+    // Store result back (write-through for r0-r5, lazy for r6-r9)
+    auto store_dst = [&]() {
+        if (insn->dst_reg < 6) {
+            if constexpr (Is64) e.store_bpf_wt(insn->dst_reg, X86::RAX, off_reg_);
+            else                e.store_bpf_wt32(insn->dst_reg, X86::RAX, off_reg_);
+        } else {
+            if constexpr (!Is64) {
+                // ALU32: zero-extend before lazy store (mov eax, eax clears upper 32 bits)
+                e.emit8(0x89); e.emit8(0xC0);  // mov eax, eax
+            }
+            e.store_bpf_lazy(insn->dst_reg, X86::RAX);
+        }
     };
 
     // ── MOV (off == 0) ──
@@ -481,11 +517,26 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
             if (is_x && insn->dst_reg == insn->src_reg) return true;
         }
         if (is_x) {
-            load_src();
-            e.store_r64(dst_disp, X86::RCX);
+            e.load_bpf(insn->src_reg, X86::RCX, off_reg_);
+            if (insn->dst_reg < 6) {
+                if constexpr (Is64) e.store_bpf_wt(insn->dst_reg, X86::RCX, off_reg_);
+                else                e.store_bpf_wt32(insn->dst_reg, X86::RCX, off_reg_);
+            } else {
+                if constexpr (!Is64) {
+                    // ALU32: zero-extend RCX before lazy store
+                    e.emit8(0x89); e.emit8(0xC9);  // mov ecx, ecx
+                }
+                e.store_bpf_lazy(insn->dst_reg, X86::RCX);
+            }
         } else {
             if constexpr (Is64) e.store_imm64(dst_disp, insn->imm);
             else                e.store_imm32_zext(dst_disp, insn->imm);
+            // For r6-r9: also sync the cached R12-R15 register.
+            // (For r0-r5 the memory write above is sufficient.)
+            if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
+                e.load_r64(X86::RAX, dst_disp);
+                e.mov_r64(BPF_CALLEE_REG[insn->dst_reg - 6], X86::RAX);
+            }
         }
         return true;
     }
@@ -494,14 +545,14 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
     if (op == BPF_NEG) {
         load_dst();
         if constexpr (Is64) e.neg64(); else e.neg32();
-        e.store_r64(dst_disp, X86::RAX);
+        store_dst();
         return true;
     }
 
     // ── MOV with sign-extension (off != 0) ──
     if (op == BPF_MOV) {
         if (is_x) {
-            e.load_r64(X86::RAX, src_disp);
+            e.load_bpf(insn->src_reg, X86::RAX, off_reg_);
         } else {
             e.emit8(0x48); e.emit8(0xB8); e.emit64((uint64_t)(int64_t)insn->imm); // movabs rax, imm64
         }
@@ -519,23 +570,15 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
             default: return false;
             }
         }
-        e.store_r64(dst_disp, X86::RAX);
+        store_dst();
         return true;
     }
 
     // ── END (byte-swap / zero-extend) ──
     if (op == BPF_END) {
-        // BPF_K le64 is a no-op on native little-endian
-        if (!is_x && insn->imm == 64)
-            return true;
-
-        if (is_x) {
-            // BPF_X = big-endian byte swap
-            if constexpr (Is64) {
-                e.load_r64(X86::RAX, dst_disp);
-            } else {
-                e.load_r32(X86::RAX, dst_disp);
-            }
+        if constexpr (Is64) {
+            // ALU64 BPF_END: always bswap (regardless of BPF_X / BPF_K)
+            load_dst();
             switch (insn->imm) {
             case 16:
                 e.emit8(0x66); e.emit8(0xC1); e.emit8(0xC0); e.emit8(0x08); // rol ax, 8
@@ -545,25 +588,43 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
                 e.emit8(0x0F); e.emit8(0xC8);                               // bswap eax
                 break;
             case 64:
-                if constexpr (!Is64) return false;                            // ALU32 has no 64-bit bswap
                 e.emit8(0x48); e.emit8(0x0F); e.emit8(0xC8);               // bswap rax
                 break;
             default: return false;
             }
         } else {
-            // BPF_K = little-endian zero-extend / truncate
-            switch (insn->imm) {
-            case 16:
-                e.load_r32(X86::RAX, dst_disp);
-                e.emit8(0x25); e.emit32(0xFFFF);                             // and eax, 0xFFFF
-                break;
-            case 32:
-                e.load_r32(X86::RAX, dst_disp);                            // zero-extends to 64
-                break;
-            default: return false;
+            // ALU32 BPF_END: BPF_X = big-endian byte swap, BPF_K = LE zero-extend
+            if (!is_x && insn->imm == 64) return true;  // le64 no-op
+
+            if (is_x) {
+                load_dst();
+                switch (insn->imm) {
+                case 16:
+                    e.emit8(0x66); e.emit8(0xC1); e.emit8(0xC0); e.emit8(0x08); // rol ax, 8
+                    e.emit8(0x0F); e.emit8(0xB7); e.emit8(0xC0);                // movzx eax, ax
+                    break;
+                case 32:
+                    e.emit8(0x0F); e.emit8(0xC8);                               // bswap eax
+                    break;
+                case 64: return false;  // ALU32 has no 64-bit bswap
+                default: return false;
+                }
+            } else {
+                // BPF_K = little-endian zero-extend / truncate
+                switch (insn->imm) {
+                case 16:
+                    load_dst();
+                    e.emit8(0x25); e.emit32(0xFFFF);                             // and eax, 0xFFFF
+                    break;
+                case 32:
+                    load_dst();
+                    e.emit8(0x89); e.emit8(0xC0);  // mov eax, eax — zero-extends to 64
+                    break;
+                default: return false;
+                }
             }
         }
-        e.store_r64(dst_disp, X86::RAX);
+        store_dst();
         return true;
     }
 
@@ -609,6 +670,8 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
         }
         e.emit8(0xBA); e.emit32((uint32_t)(int32_t)insn->off); // mov edx, off
         emit_helper_call(e, Is64 ? (void*)jit_div64 : (void*)jit_div32, dst_disp);
+        // Result is in RAX; use store_dst() to handle r6-r9 lazy cache correctly
+        store_dst();
         return true;
     }
     case BPF_MOD: {
@@ -617,12 +680,13 @@ bool JitCompiler::emit_alu(Emitter& e, const bpf_insn* insn) {
         }
         e.emit8(0xBA); e.emit32((uint32_t)(int32_t)insn->off); // mov edx, off
         emit_helper_call(e, Is64 ? (void*)jit_mod64 : (void*)jit_mod32, dst_disp);
+        store_dst();
         return true;
     }
     default: return false;
     }
 
-    e.store_r64(dst_disp, X86::RAX);
+    store_dst();
     return true;
 }
 
@@ -640,11 +704,14 @@ bool JitCompiler::emit_ld(Emitter& e, const bpf_insn* insn) {
     if (mode != BPF_IMM || size != BPF_DW) return false;
     if (insn->dst_reg >= 10) return false;
 
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     uint64_t imm64 = (uint64_t)(uint32_t)(insn + 1)->imm << 32 | (uint32_t)insn->imm;
 
     e.emit8(0x48); e.emit8(0xB8); e.emit64(imm64);
-    e.store_r64(dst_disp, X86::RAX);
+    if (insn->dst_reg < 6) {
+        e.store_bpf_wt(insn->dst_reg, X86::RAX, off_reg_);
+    } else {
+        e.store_bpf_lazy(insn->dst_reg, X86::RAX);
+    }
     return true;
 }
 
@@ -660,7 +727,6 @@ bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
     if (mode == BPF_MEMSX && size_field == BPF_DW) return false;
     if (insn->dst_reg >= 10) return false;
 
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     int32_t src_disp = off_reg_ + insn->src_reg * 8;
     int access_size;
     switch (size_field) {
@@ -669,6 +735,11 @@ bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
     case BPF_H:  access_size = 2; break;
     case BPF_B:  access_size = 1; break;
     default: return false;
+    }
+
+    // Flush src_reg (base address) to vm->reg[] if it's r6-r9 (unconditional)
+    if (insn->src_reg >= 6 && insn->src_reg <= 9) {
+        e.store_r64((int32_t)(off_reg_ + insn->src_reg * 8), BPF_CALLEE_REG[insn->src_reg - 6]);
     }
 
     auto ctx = begin_mem_access(e, src_disp, insn->off, access_size, /*is_write=*/false);
@@ -689,7 +760,11 @@ bool JitCompiler::emit_ldx(Emitter& e, const bpf_insn* insn,
         }
     }
 
-    e.store_r64(dst_disp, X86::RAX);
+    if (insn->dst_reg < 6) {
+        e.store_bpf_wt(insn->dst_reg, X86::RAX, off_reg_);
+    } else {
+        e.store_bpf_lazy(insn->dst_reg, X86::RAX);
+    }
     finish_mem_access(e, ctx, abort_patches, bpf_index);
     return true;
 }
@@ -712,6 +787,11 @@ bool JitCompiler::emit_st(Emitter& e, const bpf_insn* insn,
     case BPF_H:  access_size = 2; break;
     case BPF_B:  access_size = 1; break;
     default: return false;
+    }
+
+    // Flush dst_reg (base address) to vm->reg[] if it's r6-r9 (unconditional)
+    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
+        e.store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
     }
 
     auto ctx = begin_mem_access(e, dst_disp, insn->off, access_size, /*is_write=*/true);
@@ -738,7 +818,6 @@ bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
     if (mode == BPF_ATOMIC) return emit_stx_atomic(e, insn, abort_patches, bpf_index);
     if (mode != BPF_MEM) return false;
 
-    int32_t src_disp = off_reg_ + insn->src_reg * 8;
     int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     int access_size;
     switch (size_field) {
@@ -749,15 +828,26 @@ bool JitCompiler::emit_stx(Emitter& e, const bpf_insn* insn,
     default: return false;
     }
 
+    // Flush dst_reg (base address) to vm->reg[] if it's r6-r9.
+    // Must be unconditional — compile-time dirty flags don't reflect runtime state.
+    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
+        e.store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
+    }
+
+    // Pre-load src_reg into RBX before TLB lookup.  RBX is callee-saved,
+    // so it survives the C helper call in the slow path without reload.
+    // For r6-r9 this reads directly from R12-R15 — no memory round-trip.
+    e.load_bpf(insn->src_reg, X86::RBX, off_reg_);
+
     auto ctx = begin_mem_access(e, dst_disp, insn->off, access_size, /*is_write=*/true);
 
-    e.load_r64(X86::RCX, src_disp);
+    // RBX holds src_reg (callee-saved, survives both fast and slow paths).
 
     switch (size_field) {
-    case BPF_DW: e.emit8(0x48); e.emit8(0x89); e.emit8(0x08); break;
-    case BPF_W:  e.emit8(0x89); e.emit8(0x08); break;
-    case BPF_H:  e.emit8(0x66); e.emit8(0x89); e.emit8(0x08); break;
-    case BPF_B:  e.emit8(0x88); e.emit8(0x08); break;
+    case BPF_DW: e.emit8(0x48); e.emit8(0x89); e.emit8(0x18); break;  // mov [rax], rbx
+    case BPF_W:  e.emit8(0x89); e.emit8(0x18); break;                  // mov [rax], ebx
+    case BPF_H:  e.emit8(0x66); e.emit8(0x89); e.emit8(0x18); break;  // mov [rax], bx
+    case BPF_B:  e.emit8(0x88); e.emit8(0x18); break;                  // mov [rax], bl
     }
 
     finish_mem_access(e, ctx, abort_patches, bpf_index);
@@ -774,15 +864,22 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
     if (size_field != BPF_DW && size_field != BPF_W) return false;
 
     int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
-    int32_t src_disp = off_reg_ + insn->src_reg * 8;
-    int32_t r0_disp  = off_reg_;
     bool is_dw = (size_field == BPF_DW);
     int access_size = is_dw ? 8 : 4;
+
+    // Flush dst_reg (base address) to vm->reg[] if it's r6-r9 (unconditional)
+    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
+        e.store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
+    }
+
+    // Pre-load src_reg into RBX before TLB lookup (same as emit_stx).
+    // RBX is callee-saved, so it survives the C helper call without reload.
+    e.load_bpf(insn->src_reg, X86::RBX, off_reg_);
 
     auto ctx = begin_mem_access(e, dst_disp, insn->off, access_size, /*is_write=*/true);
 
     e.mov_rdx_rax();
-    e.load_r64(X86::RCX, src_disp);
+    // RBX holds src_reg (callee-saved, survives both fast and slow paths).
 
     int32_t op = insn->imm;
 
@@ -793,24 +890,30 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
                             : ((op & ~BPF_FETCH) == BPF_AND) ? 0x21
                             : 0x31;
 
-        e.load_r64(X86::RDI, r0_disp);  // save r(0)
-
+        // CAS loop: atomically compute *[RDX] = old OP src, return old in RAX.
+        // r(0) is write-through (lives in memory), CMPXCHG's use of RAX doesn't
+        // affect it, so no save/restore needed.
+        // Registers: RDX=host addr, RBX=src, RAX=old value, RCX=new value (temp).
         size_t loop_start = e.size();
 
+        // mov rax, [rdx]  — load current memory value
         if (is_dw) {
             e.emit8(0x48); e.emit8(0x8B); e.emit8(0x02);
         } else {
             e.emit8(0x8B); e.emit8(0x02);
         }
 
+        // mov rcx, rax  — copy current value
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x89); e.emit8(0xC7);
+        e.emit8(0x89); e.emit8(0xC1);                               // mov rcx, rax
+        // OP rcx, rbx   — new_value = current OP src
         if (is_dw) e.emit8(0x48);
-        e.emit8(alu_opcode); e.emit8(0xCF);
+        e.emit8(alu_opcode); e.emit8(0xD9);                         // OP rcx, rbx
 
+        // LOCK CMPXCHG [RDX], RCX — if *[RDX]==RAX then *[RDX]=RCX else RAX=*[RDX]
         e.emit8(0xF0);
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x3A);
+        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x0A);               // LOCK CMPXCHG [RDX], RCX
 
         e.emit8(0x75);
         e.emit8(0);  // rel8 placeholder
@@ -818,8 +921,12 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
         int8_t rel = (int8_t)(loop_start - loop_end);
         e.data()[loop_end - 1] = (uint8_t)rel;
 
-        e.store_r64(r0_disp, X86::RDI);  // restore r(0) first
-        e.store_r64(src_disp, X86::RCX);  // then write FETCH result (may overlap r0)
+        // After CAS success, RAX = old memory value — this is the FETCH result.
+        if (insn->src_reg < 6) {
+            e.store_bpf_wt(insn->src_reg, X86::RAX, off_reg_);
+        } else {
+            e.store_bpf_lazy(insn->src_reg, X86::RAX);
+        }
 
         finish_mem_access(e, ctx, abort_patches, bpf_index);
         return true;
@@ -829,13 +936,17 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
     case BPF_ADD | BPF_FETCH:
         e.emit8(0xF0);
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x0F); e.emit8(0xC1); e.emit8(0x0A);  // LOCK XADD [RDX], RCX
-        e.store_r64(src_disp, X86::RCX);
+        e.emit8(0x0F); e.emit8(0xC1); e.emit8(0x1A);  // LOCK XADD [RDX], RBX
+        if (insn->src_reg < 6) {
+            e.store_bpf_wt(insn->src_reg, X86::RBX, off_reg_);
+        } else {
+            e.store_bpf_lazy(insn->src_reg, X86::RBX);
+        }
         break;
     case BPF_ADD:
         e.emit8(0xF0);
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x01); e.emit8(0x0A);  // LOCK ADD [RDX], RCX
+        e.emit8(0x01); e.emit8(0x1A);  // LOCK ADD [RDX], RBX
         break;
 
     case BPF_OR:
@@ -846,22 +957,26 @@ bool JitCompiler::emit_stx_atomic(Emitter& e, const bpf_insn* insn,
                        : 0x31;
         e.emit8(0xF0);
         if (is_dw) e.emit8(0x48);
-        e.emit8(opcode); e.emit8(0x0A);
+        e.emit8(opcode); e.emit8(0x1A);                               // LOCK OP [RDX], RBX
         break;
     }
 
     case BPF_XCHG:
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x87); e.emit8(0x0A);
-        e.store_r64(src_disp, X86::RCX);
+        e.emit8(0x87); e.emit8(0x1A);                                  // XCHG [RDX], RBX
+        if (insn->src_reg < 6) {
+            e.store_bpf_wt(insn->src_reg, X86::RBX, off_reg_);
+        } else {
+            e.store_bpf_lazy(insn->src_reg, X86::RBX);
+        }
         break;
 
     case BPF_CMPXCHG:
-        e.load_r64(X86::RAX, r0_disp);
+        e.load_r64(X86::RAX, (int32_t)(off_reg_ + 0 * 8));  // load r(0) from memory
         e.emit8(0xF0);
         if (is_dw) e.emit8(0x48);
-        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x0A);
-        e.store_r64(r0_disp, X86::RAX);
+        e.emit8(0x0F); e.emit8(0xB1); e.emit8(0x1A);                  // LOCK CMPXCHG [RDX], RBX
+        e.store_bpf_wt(0, X86::RAX, off_reg_);
         break;
 
     default:
@@ -882,8 +997,6 @@ bool JitCompiler::emit_jmp(Emitter& e, const bpf_insn* insn, int current_index,
                             std::vector<JumpPlaceholder>& placeholders) {
     uint8_t op = insn->code & 0xf0;
     bool is_x = (insn->code & 0x08) == BPF_X;
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
-    int32_t src_disp = off_reg_ + insn->src_reg * 8;
 
     if constexpr (Is64) {
         if (op == BPF_JA || op == BPF_CALL || op == BPF_EXIT) return false;
@@ -910,12 +1023,10 @@ bool JitCompiler::emit_jmp(Emitter& e, const bpf_insn* insn, int current_index,
     }
 
     auto load_dst = [&]() {
-        if constexpr (Is64) e.load_r64(X86::RAX, dst_disp);
-        else                e.load_r32(X86::RAX, dst_disp);
+        e.load_bpf(insn->dst_reg, X86::RAX, off_reg_);
     };
     auto load_src = [&]() {
-        if constexpr (Is64) e.load_r64(X86::RCX, src_disp);
-        else                e.load_r32(X86::RCX, src_disp);
+        e.load_bpf(insn->src_reg, X86::RCX, off_reg_);
     };
 
     load_dst();
@@ -980,25 +1091,40 @@ void JitCompiler::emit_ja32(Emitter& e, const bpf_insn* insn, int current_index,
 
 void JitCompiler::emit_call_syscall(Emitter& e, const bpf_insn* insn, int current_index,
                                       const bpf_insn* entry_pc,
-                                      std::vector<AbortPatchInfo>& abort_patches) {
+                                      size_t vm_exit_offset) {
+    // Flush r6-r9 before syscall: do_syscall may trigger signal handling
+    // (e.g. handle_signals → push_frame) which reads vm->reg[6..9].
+    e.flush_r6_r9(off_reg_);
     // Update vm::pc to the current BPF instruction's host address.
-    // This ensures syscall handlers (e.g. setjmp) see the correct pc.
-    // movabs rax, instruction_host_addr
+    // This ensures syscall handlers (e.g. setjmp, fork) see the correct pc.
     const bpf_insn* insn_host = entry_pc + current_index;
     e.mov_rax_imm64((uint64_t)(uintptr_t)insn_host);
-    // mov [rbx + off_pc_], rax
-    e.emit8(0x48); e.emit8(0x89); e.emit8(0x83); e.emit32((uint32_t)off_pc_);
-    // mov rdi, rbx  (vm*)
-    e.mov_rdi_rbx();
+    // mov [rbp + off_pc_], rax
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0x85); e.emit32((uint32_t)off_pc_);
+    // mov rdi, rbp  (vm*)
+    e.mov_rdi_rbp();
     // mov esi, imm32 (call_id)
     e.emit8(0xBE); e.emit32((uint32_t)insn->imm);
     // call jit_do_syscall
     e.call_helper((void*)&JitCompiler::helper_do_syscall);
     // test al, al
     e.test_al_al();
-    // jz .vm_exit
-    abort_patches.push_back({e.size(), current_index});
-    e.emit8(0x0F); e.emit8(0x84); e.emit32(0);
+    // jz .vm_exit — jump directly to .vm_exit (NOT .flush_and_exit), because
+    // the syscall may have modified vm->reg[6-9] via longjmp or signal delivery;
+    // writing stale R12-R15 back would overwrite the correct values.
+    size_t jz_off = e.size();
+    e.emit8(0x0F); e.emit8(0x84); e.emit32(0);  // JZ rel32
+    uint32_t rel = (uint32_t)(vm_exit_offset - (jz_off + 6));
+    memcpy(e.data() + jz_off + 2, &rel, 4);
+
+    // Syscall returned true (continue). Reload R12-R15 from vm->reg[6-9]
+    // because the syscall may have triggered signal delivery which called
+    // push_frame(signal=true), modifying vm->reg[6-9].
+    e.load_r64(X86::R12, (int32_t)(off_reg_ + 6 * 8));
+    e.load_r64(X86::R13, (int32_t)(off_reg_ + 7 * 8));
+    e.load_r64(X86::R14, (int32_t)(off_reg_ + 8 * 8));
+    e.load_r64(X86::R15, (int32_t)(off_reg_ + 9 * 8));
+    // R12-R15 now match vm->reg[]
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,12 +1137,15 @@ void JitCompiler::emit_call_bpf(Emitter& e, const bpf_insn* insn, int current_in
                                   size_t vm_exit_offset,
                                   std::vector<AbortPatchInfo>& abort_patches) {
     // push_frame(ret_gpa)
-    // mov rdi, rbx
-    e.mov_rdi_rbx();
+    // Flush r6-r9 before push_frame (which reads vm->reg[6..10])
+    e.flush_r6_r9(off_reg_);
+    // mov rdi, rbp
+    e.mov_rdi_rbp();
     // movabs rsi, ret_gpa
     e.emit8(0x48); e.emit8(0xBE); e.emit64(ret_gpa);
     // call jit_push_frame
     e.call_helper((void*)&JitCompiler::helper_push_frame);
+    // Helper call clobbers caller-saved registers
     // test al, al
     e.test_al_al();
     // jz .vm_exit
@@ -1026,8 +1155,8 @@ void JitCompiler::emit_call_bpf(Emitter& e, const bpf_insn* insn, int current_in
     // Set vm::pc to callee entry.
     const bpf_insn* callee_pc = entry_pc + current_index + 1 + insn->imm;
     e.mov_rax_imm64((uint64_t)(uintptr_t)callee_pc);
-    // mov [rbx + off_pc_], rax
-    e.emit8(0x48); e.emit8(0x89); e.emit8(0x83); e.emit32((uint32_t)off_pc_);
+    // mov [rbp + off_pc_], rax
+    e.emit8(0x48); e.emit8(0x89); e.emit8(0x85); e.emit32((uint32_t)off_pc_);
 
     // Exit JIT — step() will re-enter JIT for the callee.
     size_t jmp_off = e.size();
@@ -1043,13 +1172,14 @@ void JitCompiler::emit_call_bpf(Emitter& e, const bpf_insn* insn, int current_in
 void JitCompiler::emit_call_indirect(Emitter& e, const bpf_insn* insn, int current_index,
                                       uint64_t ret_gpa,
                                       std::vector<AbortPatchInfo>& abort_patches) {
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
-    // mov rdi, rbx           (1st arg: vm*)
-    e.mov_rdi_rbx();
+    // Flush r6-r9 (push_frame reads vm->reg[])
+    e.flush_r6_r9(off_reg_);
+    // mov rdi, rbp           (1st arg: vm*)
+    e.mov_rdi_rbp();
     // movabs rsi, ret_gpa    (2nd arg: guest return address)
     e.emit8(0x48); e.emit8(0xBE); e.emit64(ret_gpa);
-    // mov rdx, [rbx + dst_disp]  (3rd arg: target = r(dst_reg))
-    e.load_r64(X86::RDX, dst_disp);
+    // Load target register value (use cache-aware load for r6-r9)
+    e.load_bpf(insn->dst_reg, X86::RDX, off_reg_);
     // call jit_call_indirect
     e.call_helper((void*)&JitCompiler::helper_call_indirect);
     // Helper always returns false (0) — unconditionally abort JIT.
@@ -1065,9 +1195,17 @@ void JitCompiler::emit_call_indirect(Emitter& e, const bpf_insn* insn, int curre
 // ---------------------------------------------------------------------------
 
 void JitCompiler::emit_exit(Emitter& e, size_t vm_exit_offset) {
+    // Unconditionally flush r6-r9 before pop_frame.
+    // pop_frame reads vm->reg[6..9] to save them in the stack frame.
+    // We cannot rely on compile-time dirty flags here because at runtime
+    // any code path may have modified R12-R15 since the last flush.
+    e.store_r64((int32_t)(off_reg_ + 6 * 8), X86::R12);
+    e.store_r64((int32_t)(off_reg_ + 7 * 8), X86::R13);
+    e.store_r64((int32_t)(off_reg_ + 8 * 8), X86::R14);
+    e.store_r64((int32_t)(off_reg_ + 9 * 8), X86::R15);
     // call jit_pop_frame(vm*) — returns guest return address in RAX
-    // mov rdi, rbx
-    e.mov_rdi_rbx();
+    // mov rdi, rbp
+    e.mov_rdi_rbp();
     // call jit_pop_frame
     e.call_helper((void*)&JitCompiler::helper_pop_frame);
     e.test_rax_rax();
@@ -1076,8 +1214,8 @@ void JitCompiler::emit_exit(Emitter& e, size_t vm_exit_offset) {
     e.emit8(0x0F); e.emit8(0x85); e.emit32(0);  // JNZ rel32
 
     // Stack bottom (rax == 0): set VM_EXITED flag so step() returns false.
-    // lock or dword [rbx + off_flags_], 1
-    e.emit8(0xF0); e.emit8(0x83); e.emit8(0x8B);
+    // lock or dword [rbp + off_flags_], 1
+    e.emit8(0xF0); e.emit8(0x83); e.emit8(0x8D);
     e.emit32((uint32_t)off_flags_);
     e.emit8(0x01);
     // jmp .vm_exit
@@ -1091,8 +1229,8 @@ void JitCompiler::emit_exit(Emitter& e, size_t vm_exit_offset) {
     rel = (uint32_t)(has_ret_target - (has_ret_jcc + 6));
     memcpy(e.data() + has_ret_jcc + 2, &rel, 4);
 
-    // mov rdi, rbx (vm*)
-    e.mov_rdi_rbx();
+    // mov rdi, rbp (vm*)
+    e.mov_rdi_rbp();
     e.mov_rsi_rax();
     // call jit_return_to_caller — sets vm::pc
     e.call_helper((void*)&JitCompiler::helper_return_to_caller);
@@ -1107,39 +1245,72 @@ void JitCompiler::emit_exit(Emitter& e, size_t vm_exit_offset) {
 // compile() sub-methods
 // ---------------------------------------------------------------------------
 
-// Emit prologue, .vm_exit block, .entry label, and entry safepoint.
+// Emit prologue, .vm_exit block, .flush_and_exit, .entry label, and entry safepoint.
 // Returns the offset of .vm_exit for use by abort patches.
-size_t JitCompiler::emit_prologue(Emitter& e, std::vector<AbortPatchInfo>& abort_patches) {
-    // push rbx              (53)
-    e.push_rbx();
-    // After step()'s CALL: RSP ≡ 8 mod 16.  push rbx → RSP ≡ 0 mod 16.
-    // This is 16-byte aligned, correct for System V ABI before CALL instructions.
-    // mov rbx, rdi          (48 89 FB)
-    e.mov_rbx_rdi();
+// Returns flush_and_exit_offset separately via out parameter.
+size_t JitCompiler::emit_prologue(Emitter& e, std::vector<AbortPatchInfo>& abort_patches,
+                                    size_t& flush_and_exit_offset) {
+    // push rbp; push rbx; push r12; push r13; push r14; push r15; sub rsp, 8
+    // 6 pushes from RSP≡8mod16 → RSP≡8mod16; sub 8 → RSP≡0mod16 (aligned)
+    e.push_rbp();
+    e.emit8(0x53);                      // push rbx
+    e.emit8(0x41); e.emit8(0x54);  // push r12
+    e.emit8(0x41); e.emit8(0x55);  // push r13
+    e.emit8(0x41); e.emit8(0x56);  // push r14
+    e.emit8(0x41); e.emit8(0x57);  // push r15
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xEC); e.emit8(0x08);  // sub rsp, 8
+    // mov rbp, rdi          (48 89 FD)
+    e.mov_rbp_rdi();
+    // Load r6-r9 from vm->reg[] into R12-R15
+    e.load_r64(X86::R12, (int32_t)(off_reg_ + 6 * 8));
+    e.load_r64(X86::R13, (int32_t)(off_reg_ + 7 * 8));
+    e.load_r64(X86::R14, (int32_t)(off_reg_ + 8 * 8));
+    e.load_r64(X86::R15, (int32_t)(off_reg_ + 9 * 8));
     // jmp .entry            (E9 rel32)
     e.jmp_rel32();
     size_t entry_jmp_offset = e.size() - 5;
 
-    // .vm_exit: simple epilogue (no RBP, no nested CALL depth to unwind)
+    // .vm_exit: simple epilogue
     size_t vm_exit_offset = e.size();
-    // pop rbx               (5B)
-    e.emit8(0x5B);
-    // mov eax, -1           (B8 FF FF FF FF) — return -1 (abort)
+    // add rsp, 8; pop r15; pop r14; pop r13; pop r12; pop rbx; pop rbp
+    e.emit8(0x48); e.emit8(0x83); e.emit8(0xC4); e.emit8(0x08);  // add rsp, 8
+    e.emit8(0x41); e.emit8(0x5F);  // pop r15
+    e.emit8(0x41); e.emit8(0x5E);  // pop r14
+    e.emit8(0x41); e.emit8(0x5D);  // pop r13
+    e.emit8(0x41); e.emit8(0x5C);  // pop r12
+    e.emit8(0x5B);                  // pop rbx
+    e.emit8(0x5D);                  // pop rbp
+    // mov eax, -1
     e.emit8(0xB8); e.emit32(-1);
-    // ret                   (C3)
+    // ret
     e.emit8(0xC3);
+
+    // .flush_and_exit: spill r6-r9 then jump to .vm_exit
+    flush_and_exit_offset = e.size();
+    e.store_r64((int32_t)(off_reg_ + 6 * 8), X86::R12);
+    e.store_r64((int32_t)(off_reg_ + 7 * 8), X86::R13);
+    e.store_r64((int32_t)(off_reg_ + 8 * 8), X86::R14);
+    e.store_r64((int32_t)(off_reg_ + 9 * 8), X86::R15);
+    // jmp .vm_exit
+    size_t jmp_off = e.size();
+    e.emit8(0xE9); e.emit32(0);
+    uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
+    memcpy(e.data() + jmp_off + 1, &rel, 4);
 
     // .entry
     size_t entry_offset = e.size();
     e.patch_jmp_rel32(entry_jmp_offset, entry_offset);
 
-    // Safepoint at entry
-    e.mov_rdi_rbx();
+    // Safepoint at entry: flush r6-r9 (signal may read vm->reg[]), invalidate r0-r5
+    e.flush_r6_r9(off_reg_);
+    e.mov_rdi_rbp();
     e.call_helper((void*)&JitCompiler::helper_safepoint);
     e.test_eax_eax();
     // jnz .vm_exit
     abort_patches.push_back({e.size(), -1});
     e.emit8(0x0F); e.emit8(0x85); e.emit32(0);  // JNE rel32
+
+    // After safepoint call (which clobbers caller-saved), invalidate r0-r5
 
     return vm_exit_offset;
 }
@@ -1200,7 +1371,7 @@ bool JitCompiler::emit_instruction(Emitter& e, vm* v, const bpf_insn* entry_pc, 
                 emit_call_indirect(e, insn, i, ret_gpa, abort_patches);
                 compiled_count++;
             } else if (insn->src_reg == 0) {
-                emit_call_syscall(e, insn, i, entry_pc, abort_patches);
+                emit_call_syscall(e, insn, i, entry_pc, vm_exit_offset);
                 compiled_count++;
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa = v->unmmu(entry_pc + i + 1);
@@ -1246,12 +1417,6 @@ void* JitCompiler::finalize_code(Emitter& e) {
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code_mem == MAP_FAILED) return nullptr;
 
-    // Patch CALL rel32 sites now that we know the final code address.
-    if (!e.patch_calls(code_mem)) {
-        munmap(code_mem, alloc_size);
-        return nullptr;  // helper beyond ±2GB — reject JIT
-    }
-
     memcpy(code_mem, e.data(), code_size);
     if (mprotect(code_mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(code_mem, alloc_size);
@@ -1268,7 +1433,9 @@ JitFunction* JitCompiler::compile(vm* v, const bpf_insn* entry_pc) {
     if (!enabled_) return nullptr;
     auto it = functions_.find(entry_pc);
     if (it != functions_.end()) return &it->second;
-    if (failed_.count(entry_pc)) return nullptr;
+    if (failed_.count(entry_pc)) {
+        return nullptr;
+    }
 
     auto compile_start = std::chrono::high_resolution_clock::now();
     auto record_compile_time = [&] {
@@ -1305,7 +1472,8 @@ JitFunction* JitCompiler::compile(vm* v, const bpf_insn* entry_pc) {
     std::vector<AbortPatchInfo> abort_patches;
     std::vector<uint32_t> pc_offsets(num_insns, UINT32_MAX);
 
-    size_t vm_exit_offset = emit_prologue(e, abort_patches);
+    size_t flush_and_exit_offset = 0;
+    size_t vm_exit_offset = emit_prologue(e, abort_patches, flush_and_exit_offset);
 
     // Emit all reachable instructions
     int compiled_count = 0;
@@ -1315,7 +1483,8 @@ JitFunction* JitCompiler::compile(vm* v, const bpf_insn* entry_pc) {
 
         // Safepoint at back-edge targets (loop headers)
         if (back_edge_targets[i]) {
-            e.mov_rdi_rbx();
+            e.flush_r6_r9(off_reg_);
+            e.mov_rdi_rbp();
             e.call_helper((void*)&JitCompiler::helper_safepoint);
             e.test_eax_eax();
             abort_patches.push_back({e.size(), i});
@@ -1347,9 +1516,9 @@ JitFunction* JitCompiler::compile(vm* v, const bpf_insn* entry_pc) {
         }
     }
 
-    // Patch abort jumps to .vm_exit
+    // Patch abort jumps to .flush_and_exit (which flushes r6-r9 before .vm_exit)
     for (auto& ap : abort_patches) {
-        e.patch_rel32(ap.jump_offset, vm_exit_offset);
+        e.patch_rel32(ap.jump_offset, flush_and_exit_offset);
     }
 
     // Finalize

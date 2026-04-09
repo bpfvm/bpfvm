@@ -1057,6 +1057,99 @@ void test_syscall_waitpid_any_no_child_wnohang() {
 }
 
 
+// Test atomic64 OR with FETCH:
+// Memory = 0xFF00, r2 = 0x0F0F → mem becomes 0xFF0F, r2 gets old value 0xFF00
+void test_atomic64_or_fetch() {
+    std::cout << "--- Running Test: test_atomic64_or_fetch ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    unsigned char* data_mem = nullptr;
+    add_data_mem(*ebpf_vm, 0x2000, 16, &data_mem);
+
+    *(uint64_t*)data_mem = 0xFF00;
+
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, 0x2000 },
+        { 0, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0x0F0F },
+        { BPF_STX | BPF_ATOMIC | BPF_DW, 1, 2, 0, BPF_OR | BPF_FETCH },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+
+    bool success = (ret == 0xFF00) && (*(uint64_t*)data_mem == 0xFF0F);
+    if (!success) {
+        fprintf(stderr, "  FAIL: ret=0x%lx (expected 0xFF00), mem=0x%lx (expected 0xFF0F)\n",
+                ret, *(uint64_t*)data_mem);
+    }
+    print_test_result("test_atomic64_or_fetch", success);
+    assert(success);
+}
+
+// Test atomic64 AND with FETCH:
+// Memory = 0xFF0F, r2 = 0x0FFF → mem becomes 0x0F0F, r2 gets old value 0xFF0F
+void test_atomic64_and_fetch() {
+    std::cout << "--- Running Test: test_atomic64_and_fetch ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    unsigned char* data_mem = nullptr;
+    add_data_mem(*ebpf_vm, 0x2000, 16, &data_mem);
+
+    *(uint64_t*)data_mem = 0xFF0F;
+
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, 0x2000 },
+        { 0, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0x0FFF },
+        { BPF_STX | BPF_ATOMIC | BPF_DW, 1, 2, 0, BPF_AND | BPF_FETCH },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+
+    bool success = (ret == 0xFF0F) && (*(uint64_t*)data_mem == 0x0F0F);
+    if (!success) {
+        fprintf(stderr, "  FAIL: ret=0x%lx (expected 0xFF0F), mem=0x%lx (expected 0x0F0F)\n",
+                ret, *(uint64_t*)data_mem);
+    }
+    print_test_result("test_atomic64_and_fetch", success);
+    assert(success);
+}
+
+// Test atomic64 XOR with FETCH:
+// Memory = 0xFF00, r2 = 0x0FF0 → mem becomes 0xF0F0, r2 gets old value 0xFF00
+void test_atomic64_xor_fetch() {
+    std::cout << "--- Running Test: test_atomic64_xor_fetch ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    unsigned char* data_mem = nullptr;
+    add_data_mem(*ebpf_vm, 0x2000, 16, &data_mem);
+
+    *(uint64_t*)data_mem = 0xFF00;
+
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, 0x2000 },
+        { 0, 0, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0x0FF0 },
+        { BPF_STX | BPF_ATOMIC | BPF_DW, 1, 2, 0, BPF_XOR | BPF_FETCH },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    assert(load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)));
+    uint64_t ret = ebpf_vm->run(&option);
+
+    bool success = (ret == 0xFF00) && (*(uint64_t*)data_mem == 0xF0F0);
+    if (!success) {
+        fprintf(stderr, "  FAIL: ret=0x%lx (expected 0xFF00), mem=0x%lx (expected 0xF0F0)\n",
+                ret, *(uint64_t*)data_mem);
+    }
+    print_test_result("test_atomic64_xor_fetch", success);
+    assert(success);
+}
+
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
 
@@ -1121,6 +1214,11 @@ int main() {
     test_syscall_waitpid_self();
     test_syscall_waitpid_any_twice();
     test_syscall_waitpid_any_no_child_wnohang();
+
+    // Atomic FETCH OR/AND/XOR Tests
+    test_atomic64_or_fetch();
+    test_atomic64_and_fetch();
+    test_atomic64_xor_fetch();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

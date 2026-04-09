@@ -43,30 +43,61 @@ struct JitFunction;
 //   - Handles VM exit flags (VM_EXITED, VM_KILLED)
 //   - Falls through to interpreter on compilation failure
 //
+// Memory access: inline TLB fast/slow paths
+// -------------------------------------------
+// TLB lookups use an inline fast path (bounds check + hit → host pointer).
+// On TLB miss, a Jcc jumps to an inline slow path that calls the C helper
+// (helper_mmu/helper_mmu_w), checks for null, and falls through to the
+// load/store code.  RDI is used as the TLB index register, keeping RCX
+// free for store operands:
+//
+//   [fast path: TLB check → hit → host ptr in RAX]
+//   JMP .done
+//   [slow path: call helper → null check → reload RCX if needed]
+//   .done:
+//   [load/store using RAX]
+//
 // Register mapping
 // ----------------
 // BPF has 11 logical registers (r0–r10).  They are stored in the vm::reg[]
-// array in host memory.  The JIT does NOT maintain a permanent mapping between
-// BPF registers and x86 registers; instead each instruction is compiled as a
-// load–operate–store sequence using the following scratch registers:
+// array in host memory.
 //
-//   x86 reg  | role inside JIT block
+// r6–r9 are cached in x86 callee-saved registers R12–R15 for the duration
+// of a JIT function.  Writes go only to R12–R15 (lazy); they are flushed to
+// vm->reg[] before any C call that may read them (safepoint, push_frame,
+// syscall) and before JIT function exit.
+//
+// r0–r5 are NOT cached.  Each BPF instruction loads them from vm->reg[] into
+// RAX/RCX scratch registers, operates, and stores the result back.  This is
+// because TLB lookups and C helper calls freely clobber caller-saved registers
+// (RAX, RCX, RDX, RSI, RDI, R8), making cache tracking fragile.
+//
+// r10 (stack pointer) is never cached; always loaded from vm->reg[10].
+//
+//   x86 reg  | role
 //   ---------+--------------------------------------------------
-//   RBX      | vm* pointer (callee-saved; set in prologue, live throughout)
-//   RAX      | dst operand (loaded from reg[dst], result written back)
-//   RCX      | src operand (loaded from reg[src] when BPF_X)
-//             | also shift count (x86 requires shift amount in CL)
-//   RDX      | 3rd argument to helper functions (e.g. insn->off for div/mod)
-//   RDI      | 1st argument when calling a C helper (= vm*)
-//   RSI      | 2nd argument when calling a C helper
-//
-// BPF reg n is at: [RBX + offsetof(vm, reg) + n*8]
+//   RAX      | scratch: dst operand, return value, guest address
+//   RCX      | scratch: src operand, shift count (CL)
+//   RDX      | scratch: 3rd helper argument, TLB bounds check
+//   RBX      | store source operand (callee-saved, survives helper calls)
+//   RSP      | stack pointer (hardware)
+//   RBP      | vm* pointer (callee-saved, live throughout)
+//   RSI      | scratch: 2nd System V argument
+//   RDI      | scratch: TLB index register, 1st System V argument
+//   R8       | scratch
+//   R9       | unused
+//   R10      | scratch: indirect call target (call_helper)
+//   R11      | unused
+//   R12      | BPF r6 cache (callee-saved, lazy flush)
+//   R13      | BPF r7 cache (callee-saved, lazy flush)
+//   R14      | BPF r8 cache (callee-saved, lazy flush)
+//   R15      | BPF r9 cache (callee-saved, lazy flush)
 //
 // JIT function calling convention
 // -------------------------------
 // Each compiled function has the signature:  int jit_func(vm* v)
 //   - Called with vm* in RDI (System V AMD64 ABI).
-//   - Prologue: push RBX; mov RBX, RDI; JMP .entry
+//   - Prologue: push RBP; mov RBP, RDI; JMP .entry
 //     .entry: safepoint + BPF instruction code
 //   - Returns -1 on all exits (vm_exit label)
 //   - step() checks vm::flags and vm::pc to determine next action
@@ -104,26 +135,38 @@ struct JitFunction;
 
 // x86_64 register encoding (ModRM rm/reg field values)
 namespace X86 {
-    constexpr uint8_t RAX = 0;  // scratch: dst value, return value
-    constexpr uint8_t RCX = 1;  // scratch: src value, shift count (CL)
+    constexpr uint8_t RAX = 0;  // scratch: dst operand, return value
+    constexpr uint8_t RCX = 1;  // scratch: src operand, shift count (CL)
     constexpr uint8_t RDX = 2;  // scratch: 3rd helper argument
-    constexpr uint8_t RBX = 3;  // vm* pointer — callee-saved, live throughout
+    constexpr uint8_t RBX = 3;  // store source operand (callee-saved)
     constexpr uint8_t RSP = 4;
-    constexpr uint8_t RBP = 5;
-    constexpr uint8_t RSI = 6;  // 2nd System V arg register
-    constexpr uint8_t RDI = 7;  // 1st System V arg register
+    constexpr uint8_t RBP = 5;  // vm* pointer — callee-saved, live throughout
+    constexpr uint8_t RSI = 6;  // scratch: 2nd System V argument
+    constexpr uint8_t RDI = 7;  // scratch: 1st System V argument
+    constexpr uint8_t R8  = 8;  // scratch
+    constexpr uint8_t R9  = 9;
+    constexpr uint8_t R10 = 10; // scratch: indirect call target (call_helper)
+    constexpr uint8_t R11 = 11;
+    constexpr uint8_t R12 = 12; // BPF r6 (callee-saved, lazy flush)
+    constexpr uint8_t R13 = 13; // BPF r7 (callee-saved, lazy flush)
+    constexpr uint8_t R14 = 14; // BPF r8 (callee-saved, lazy flush)
+    constexpr uint8_t R15 = 15; // BPF r9 (callee-saved, lazy flush)
 }
+
+// BPF r6-r9 → x86 callee-saved register mapping (only r6-r9 are cached)
+constexpr uint8_t BPF_R6_X86 = X86::R12;
+constexpr uint8_t BPF_R7_X86 = X86::R13;
+constexpr uint8_t BPF_R8_X86 = X86::R14;
+constexpr uint8_t BPF_R9_X86 = X86::R15;
+
+// Indexed lookup for r6-r9: BPF_CALLEE_REG[bpf_reg - 6]
+constexpr uint8_t BPF_CALLEE_REG[4] = { X86::R12, X86::R13, X86::R14, X86::R15 };
 
 // ---------------------------------------------------------------------------
 // Emitter: low-level x86_64 code generation
 // ---------------------------------------------------------------------------
 class Emitter {
     std::vector<uint8_t> buf_;
-    struct PendingCall {
-        size_t call_offset;  // offset of the CALL rel32 instruction
-        void* helper;        // target helper address
-    };
-    std::vector<PendingCall> pending_calls_;
 public:
     void emit8(uint8_t v) { buf_.push_back(v); }
     void emit16(uint16_t v);
@@ -134,18 +177,40 @@ public:
         return (mod << 6) | ((reg & 7) << 3) | (rm & 7);
     }
 
-    // mov r64, [rbx + disp32]
+    // mov r64, [rbp + disp32]
     void load_r64(uint8_t dst, int32_t disp);
-    // mov [rbx + disp32], r64
+    // mov [rbp + disp32], r64
     void store_r64(int32_t disp, uint8_t src);
-    // mov r32, [rbx + disp32]  (zero-extends to 64 bits)
+    // mov r32, [rbp + disp32]  (zero-extends to 64 bits)
     void load_r32(uint8_t dst, int32_t disp);
 
-    // SIB-addressed operations: [RBX + RCX + disp32]
+    // SIB-addressed operations: [RBP + RDI + disp32]
+    // RDI is used as the TLB index register, keeping RCX free for operands.
     void sib_op_rax(uint8_t opcode, int32_t disp);
     void sib_op_rdx(uint8_t opcode, int32_t disp);
     void sib_test_dword(int32_t disp, uint32_t imm);
     void sib_cmp_byte(int32_t disp, uint8_t imm);
+
+    // BPF register access:
+    // load_bpf: load BPF register value into x86 dst register.
+    //   r0-r5, r10: load from vm->reg[] memory.
+    //   r6-r9: mov from cached R12-R15.
+    void load_bpf(uint8_t bpf_reg, uint8_t x86_dst, size_t off_reg);
+
+    // store_bpf_wt: write-through store for r0-r5 (writes to vm->reg[] memory).
+    void store_bpf_wt(uint8_t bpf_reg, uint8_t x86_src, size_t off_reg);
+
+    // store_bpf_wt32: 32-bit write-through store (zero-extends, writes to vm->reg[]).
+    void store_bpf_wt32(uint8_t bpf_reg, uint8_t x86_src, size_t off_reg);
+
+    // store_bpf_lazy: lazy store for r6-r9 (writes to R12-R15 only, no memory).
+    void store_bpf_lazy(uint8_t bpf_reg, uint8_t x86_src);
+
+    // flush_r6_r9: unconditionally spill R12-R15 to vm->reg[6-9].
+    void flush_r6_r9(size_t off_reg);
+
+    // General reg-to-reg MOV (64-bit)
+    void mov_r64(uint8_t dst, uint8_t src);
 
     // CMP / TEST: compare and test (for conditional jumps)
     void cmp64();
@@ -195,15 +260,12 @@ public:
     void store_imm64(int32_t disp, int32_t imm);
     void store_imm32_zext(int32_t disp, int32_t imm);
 
-    // Helper call: emit CALL rel32 (5 bytes), patched by patch_calls() after mmap.
+    // Helper call: movabs r10, addr; call r10 (13 bytes).
+    // Uses an indirect call via R10 to avoid ±2GB distance limitations.
     void call_helper(void* addr);
 
-    // Patch all deferred CALL rel32 sites given the final code base address.
-    // Returns false if any helper is beyond ±2GB (caller should reject the JIT).
-    bool patch_calls(void* code_base);
-
     // Common register-to-register MOVs
-    void mov_rdi_rbx();    // mov rdi, rbx  (48 89 DF) — 1st arg = vm*
+    void mov_rdi_rbp();    // mov rdi, rbp  (48 89 EF) — 1st arg = vm*
     void mov_rsi_rax();    // mov rsi, rax  (48 89 C6) — 2nd arg = rax
     void mov_rdx_rax();    // mov rdx, rax  (48 89 C2) — 3rd arg = rax
 
@@ -212,14 +274,12 @@ public:
     void test_eax_eax();   // test eax, eax (85 C0)    — zero check (32-bit)
     void test_al_al();     // test al, al   (84 C0)    — bool check
 
-    // Save/restore vm* (rbx)
-    void push_rbx();
-    void pop_rbx();
-    void mov_rbx_rdi();
+    // Save/restore vm* (rbp)
+    void push_rbp();
+    void pop_rbp();
+    void mov_rbp_rdi();
 
     // Control flow
-    void ret_int(int val);
-    void ret_zero();
 
     size_t size() const { return buf_.size(); }
     uint8_t* data() { return buf_.data(); }
@@ -249,14 +309,23 @@ struct AbortPatchInfo {
     int bpf_index;            // BPF instruction index that may trigger abort
 };
 
-// Context for inline TLB memory access: begin_mem_access() fills this,
-// the caller emits the actual load/store, then finish_mem_access() patches.
+// Context for inline TLB memory access: begin_mem_access() emits the
+// fast-path TLB lookup and the slow-path C helper call inline.  On TLB hit,
+// RAX = host pointer.  On miss, the slow path calls helper_mmu[_w] and
+// falls through with RAX = host pointer (or jumps to vm_exit on null).
+// The caller emits the actual load/store after begin_mem_access returns,
+// then calls finish_mem_access to patch jump targets.
+//
+// RDI is used as the TLB index register, keeping RCX free for operands.
+// For store instructions, RBX is pre-loaded with the source value before
+// begin_mem_access.  RBX is callee-saved, so it survives the helper call
+// on both fast and slow paths without any reload.
 struct MemAccessContext {
     std::vector<size_t> miss_jumps;   // TLB miss Jcc offsets → .slow
     std::vector<size_t> abort_jumps;  // null-pointer Jcc offsets → .vm_exit
-    size_t slow_start;   // offset of .slow label
-    size_t done_offset;  // offset of .done label (after load/store code)
-    size_t done_jmp;     // offset of JMP .done (fast path) — needs patching
+    size_t slow_start = 0;            // offset of .slow label
+    size_t done_offset = 0;           // offset of .done label (after load/store code)
+    size_t done_jmp = 0;              // offset of JMP .done (fast path) — needs patching
 };
 
 // ---------------------------------------------------------------------------
@@ -328,6 +397,7 @@ private:
     // Returns a vector<bool> indexed by BPF instruction offset from start.
     // seg_limit is the max number of instructions in the segment (bounds check).
     // back_edge_targets is filled with indices that are backward jump targets.
+    // jump_targets is filled with indices that are any jump target (forward or backward).
     // func_size is set to the function extent (one past max reachable index).
     std::vector<bool> discover_reachable(const bpf_insn* start, int seg_limit,
                                          std::vector<bool>& back_edge_targets,
@@ -361,7 +431,7 @@ private:
     // CALL variants
     void emit_call_syscall(Emitter& e, const bpf_insn* insn, int current_index,
                          const bpf_insn* entry_pc,
-                           std::vector<AbortPatchInfo>& abort_patches);
+                           size_t vm_exit_offset);
     void emit_call_bpf(Emitter& e, const bpf_insn* insn, int current_index,
                        uint64_t ret_gpa,
                        const bpf_insn* entry_pc,
@@ -377,14 +447,17 @@ private:
     // Helper call (div/mod/etc.)
     void emit_helper_call(Emitter& e, void* helper, int32_t dst_disp);
 
-    // TLB memory access helpers: begin loads address + TLB lookup, finish patches jumps.
+    // TLB memory access: begin emits inline fast path (TLB hit → RAX = host ptr)
+    // and inline slow path (C helper call).  finish patches jump targets.
+    // RDI is used as TLB index; RBX holds store source (callee-saved, survives helper).
     MemAccessContext begin_mem_access(Emitter& e, int32_t base_disp,
                                       int16_t offset, int access_size, bool is_write);
     void finish_mem_access(Emitter& e, MemAccessContext& ctx,
                             std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
     // compile() sub-methods
-    size_t emit_prologue(Emitter& e, std::vector<AbortPatchInfo>& abort_patches);
+    size_t emit_prologue(Emitter& e, std::vector<AbortPatchInfo>& abort_patches,
+                         size_t& flush_and_exit_offset);
     bool emit_instruction(Emitter& e, vm* v, const bpf_insn* entry_pc, int i,
                           size_t vm_exit_offset,
                           std::vector<JumpPlaceholder>& placeholders,
