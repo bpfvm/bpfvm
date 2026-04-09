@@ -16,12 +16,8 @@ add_compile_options(-Wall -Wextra -fPIC -fno-omit-frame-pointer)
 
 include_directories(${LIBELF_INCLUDE_DIRS})
 link_directories(${LIBELF_LIBRARY_DIRS})
-add_executable(bpfvm main.cpp insn.cpp posix_syscall.cpp jit_compiler.cpp x86_emitter.cpp)
-target_link_libraries(bpfvm ${LIBELF_LIBRARIES})
 
-
-add_executable(bpfvm_test insn.cpp posix_syscall.cpp insn_test.cpp jit_compiler.cpp x86_emitter.cpp)
-target_link_libraries(bpfvm_test ${LIBELF_LIBRARIES})
+add_subdirectory(src)
 
 if(BUILD_TESTING)
     add_test(NAME unit_tests COMMAND bpfvm_test)
