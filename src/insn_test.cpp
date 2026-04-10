@@ -543,6 +543,36 @@ void test_alu32_movsx16_reg() {
     assert(success);
 }
 
+// Test: MOV32 X must not clobber the source register's upper 32 bits
+void test_alu32_mov_reg_preserves_src() {
+    std::cout << "--- Running Test: test_alu32_mov_reg_preserves_src ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    // Pre-set r1 with a 64-bit value whose upper 32 bits are non-zero
+    ebpf_vm->r(1) = 0xDEADBEEF12345678ULL;
+    // Pre-set r2 with a different 64-bit value (will be overwritten)
+    ebpf_vm->r(2) = 0xAAAAAAAABBBBBBBBULL;
+    bpf_insn instructions[] = {
+        // mov32 r2, r1  — should: r2 = zero_extend(low32(r1)) = 0x12345678
+        //                  must NOT touch r1
+        { BPF_ALU | BPF_MOV | BPF_X, 2, 1, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },   // mov r0, r2 (return dst)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+
+    bool dst_ok = (ebpf_vm->r(2) == 0x12345678ULL);
+    bool src_ok = (ebpf_vm->r(1) == 0xDEADBEEF12345678ULL);
+    bool ret_ok = (ret == 0x12345678ULL);
+
+    if (!dst_ok) fprintf(stderr, "  r2 expected 0x12345678, got 0x%lx\n", ebpf_vm->r(2));
+    if (!src_ok) fprintf(stderr, "  r1 expected 0xDEADBEEF12345678, got 0x%lx (SOURCE CLOBBERED!)\n", ebpf_vm->r(1));
+
+    bool success = dst_ok && src_ok && ret_ok;
+    print_test_result("test_alu32_mov_reg_preserves_src", success);
+    assert(success);
+}
+
 // --- JMP Tests ---
 void test_jmp_ja() {
     std::cout << "--- Running Test: test_jmp_ja ---" << std::endl;
@@ -780,6 +810,64 @@ void test_call_pseudo_func() {
     // Expected: r1 = 20 (initial) -> helper adds 5 (r1=25) -> returns -> main adds 200 (r1=225)
     bool success = (ebpf_vm->r(1) == 225 && ret == 225);
     print_test_result("test_call_pseudo_func", success);
+    assert(success);
+}
+
+// Test: BPF_CALL | BPF_X with r5 as target register.
+// This catches a JIT bug where emit_call_indirect loads the target addr
+// into RDX (which is mapped to BPF r5), then flush_to_vm() writes that
+// clobbered RDX back into vm->reg[5], corrupting r5's original value.
+// The callee reads r5 via vm->reg[5], so if the flush overwrote it with
+// the call target address, the callee will see the wrong value.
+void test_call_indirect_r5() {
+    std::cout << "--- Running Test: test_call_indirect_r5 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    uint64_t helper_paddr = 0x2000;
+
+    // Main: set r1=100, r5=42, load helper addr into r5... wait—
+    // We need r5 to hold both the call target AND a meaningful value
+    // that the callee should NOT see. The bug is: when dst_reg != 5,
+    // load_bpf(dst_reg, RDX) clobbers r5. So use a different register
+    // (e.g., r3) as the call target, and set r5 to a known value that
+    // the callee should be able to read correctly.
+    //
+    // Scenario: r5 = 42, r3 = helper_paddr, call r3.
+    // The callee adds r5 to r1 and returns. If r5 was clobbered to
+    // helper_paddr by the JIT bug, the result will be wrong.
+
+    bpf_insn main_instructions[] = {
+        // r1 = 100
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 100 },
+        // r5 = 42
+        { BPF_ALU64 | BPF_MOV | BPF_K, 5, 0, 0, 42 },
+        // r3 = helper_paddr (lddw)
+        { BPF_LD | BPF_IMM | BPF_DW, 3, 0, 0, (int32_t)(helper_paddr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(helper_paddr >> 32) },
+        // call r3 (indirect call, dst_reg=3)
+        { BPF_JMP | BPF_CALL | BPF_X, 3, 0, 0, 0 },
+        // After return: r0 should be r1+r5 = 100+42 = 142 (set by callee)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    // Callee: r0 = r1 + r5, then exit
+    bpf_insn helper_func_code[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },   // mov r0, r1
+        { BPF_ALU64 | BPF_ADD | BPF_X, 0, 5, 0, 0 },   // add r0, r5
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn)); assert(ok); }
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, helper_func_code, sizeof(helper_func_code) / sizeof(bpf_insn), helper_paddr); assert(ok); }
+
+    uint64_t ret = ebpf_vm->run(&option);
+
+    // Expected: 100 + 42 = 142
+    // Bug would produce: 100 + 0x2000 = 8292 (r5 clobbered to helper_paddr)
+    bool success = (ret == 142);
+    if (!success) {
+        fprintf(stderr, "  expected 142, got %lu (r5 may have been clobbered to call target)\n", ret);
+    }
+    print_test_result("test_call_indirect_r5", success);
     assert(success);
 }
 
@@ -1184,6 +1272,7 @@ int main() {
     test_alu32_sub_reg();
     test_alu32_movsx8_reg();
     test_alu32_movsx16_reg();
+    test_alu32_mov_reg_preserves_src();
 
     // JMP Tests
     test_jmp_ja();
@@ -1204,6 +1293,7 @@ int main() {
     // Function Call Tests
     test_call_relative();
     test_call_pseudo_func();
+    test_call_indirect_r5();
 
     // Syscall Tests
     test_syscall_clock_gettime();

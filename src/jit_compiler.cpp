@@ -313,7 +313,6 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
 
 template<typename EmitterT>
 bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, vm* v, const bpf_insn* entry_pc, int i,
-                                               size_t vm_exit_offset,
                                                std::vector<JumpPlaceholder>& placeholders,
                                                std::vector<AbortPatchInfo>& abort_patches,
                                                int& compiled_count) {
@@ -364,20 +363,20 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, vm* v, const bpf_insn*
         } else if (op == BPF_CALL) {
             if (is_x) {
                 uint64_t ret_gpa = v->unmmu(entry_pc + i + 1);
-                e.emit_call_indirect(insn, i, ret_gpa, abort_patches);
+                e.emit_call_indirect(insn, ret_gpa);
                 compiled_count++;
             } else if (insn->src_reg == 0) {
-                e.emit_call_syscall(insn, i, entry_pc, vm_exit_offset);
+                e.emit_call_syscall(insn, i, entry_pc);
                 compiled_count++;
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa = v->unmmu(entry_pc + i + 1);
-                e.emit_call_bpf(insn, i, ret_gpa, entry_pc, vm_exit_offset, abort_patches);
+                e.emit_call_bpf(insn, i, ret_gpa, entry_pc);
                 compiled_count++;
             } else {
                 return false;
             }
         } else if (op == BPF_EXIT) {
-            e.emit_exit(vm_exit_offset);
+            e.emit_exit();
             compiled_count++;
         } else {
             if (!e.emit_jmp(insn, i, true, placeholders)) return false;
@@ -475,7 +474,7 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
     std::vector<AbortPatchInfo> abort_patches;
     std::vector<uint32_t> pc_offsets(num_insns, UINT32_MAX);
 
-    auto [vm_exit_offset, flush_and_exit_offset] = e.emit_prologue(abort_patches);
+    size_t flush_and_exit_offset = e.emit_prologue();
 
     int compiled_count = 0;
     for (int i = 0; i < num_insns; i++) {
@@ -484,10 +483,10 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
 
         // Safepoint at back-edge targets (loop headers)
         if (back_edge_targets[i]) {
-            e.emit_safepoint(abort_patches, i);
+            e.emit_safepoint();
         }
 
-        if (!emit_instruction(e, v, entry_pc, i, vm_exit_offset,
+        if (!emit_instruction(e, v, entry_pc, i,
                               placeholders, abort_patches, compiled_count)) {
             failed_.insert(entry_pc);
             record_compile_time();

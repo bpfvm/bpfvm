@@ -25,7 +25,7 @@ class vm;
 // produce a clear error message indicating which requirement is not met.
 // ---------------------------------------------------------------------------
 template<typename T>
-concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx, size_t vm_exit_off,
+concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
                               std::vector<JumpPlaceholder>& jmps,
                               std::vector<AbortPatchInfo>& aborts,
                               uint64_t gpa, const HelperTable& helpers,
@@ -35,8 +35,8 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx, size_t vm_exi
     e.set_helpers(helpers);
 
     // Prologue / safepoint
-    { e.emit_prologue(aborts) } -> std::same_as<PrologueResult>;
-    e.emit_safepoint(aborts, idx);
+    { e.emit_prologue() } -> std::same_as<size_t>;
+    e.emit_safepoint();
 
     // BPF instruction emission
     e.emit_alu(insn, true);
@@ -47,10 +47,10 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx, size_t vm_exi
     e.emit_jmp(insn, idx, true, jmps);
     e.emit_ja(insn, idx, jmps);
     e.emit_ja32(insn, idx, jmps);
-    e.emit_call_syscall(insn, idx, entry_pc, vm_exit_off);
-    e.emit_call_bpf(insn, idx, gpa, entry_pc, vm_exit_off, aborts);
-    e.emit_call_indirect(insn, idx, gpa, aborts);
-    e.emit_exit(vm_exit_off);
+    e.emit_call_syscall(insn, idx, entry_pc);
+    e.emit_call_bpf(insn, idx, gpa, entry_pc);
+    e.emit_call_indirect(insn, gpa);
+    e.emit_exit();
 
     // Buffer access
     { e.size() } -> std::same_as<size_t>;
@@ -106,7 +106,6 @@ private:
 
     // Emit a single BPF instruction. Returns false if cannot be compiled.
     bool emit_instruction(EmitterT& e, vm* v, const bpf_insn* entry_pc, int i,
-                          size_t vm_exit_offset,
                           std::vector<JumpPlaceholder>& placeholders,
                           std::vector<AbortPatchInfo>& abort_patches,
                           int& compiled_count);

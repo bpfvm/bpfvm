@@ -85,14 +85,6 @@ struct HelperTable {
 };
 
 // ---------------------------------------------------------------------------
-// PrologueResult — returned by emitter's emit_prologue()
-// ---------------------------------------------------------------------------
-struct PrologueResult {
-    size_t vm_exit_offset;
-    size_t flush_and_exit_offset;
-};
-
-// ---------------------------------------------------------------------------
 // Base class for JIT compilers — virtual dispatch only for compile()
 // ---------------------------------------------------------------------------
 class JitCompilerBase {

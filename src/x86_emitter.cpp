@@ -1,6 +1,11 @@
 //
 // x86_emitter.cpp — x86_64-specific JIT code emission implementation.
 //
+// 寄存器分配方案详见 x86_emitter.h 顶部注释。
+// 核心思路：全部 11 个 BPF 寄存器都映射到 x86 物理寄存器，
+// ALU/分支指令在纯寄存器之间操作，只在调用 helper 函数时
+// 才与 vm->reg[] 内存交互。
+//
 
 #include "x86_emitter.h"
 
@@ -27,87 +32,125 @@ void X86Emitter::set_helpers(const HelperTable& h) {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level x86_64 emission: memory access
+// Low-level x86_64 emission: memory access [RBP + disp32]
 // ---------------------------------------------------------------------------
 
 void X86Emitter::load_r64(uint8_t dst, int32_t disp) {
-    uint8_t rex = 0x48;
-    if (dst >= 8) rex |= 0x04;
-    emit8(rex);
+    // mov dst, [rbp + disp32]
+    uint8_t r = rex(true, dst >= 8, false, false);
+    emit8(r);
     emit8(0x8B);
     emit8(modrm(2, dst & 7, X86::RBP));
     emit32(disp);
 }
 
 void X86Emitter::store_r64(int32_t disp, uint8_t src) {
-    uint8_t rex = 0x48;
-    if (src >= 8) rex |= 0x04;
-    emit8(rex);
+    // mov [rbp + disp32], src
+    uint8_t r = rex(true, src >= 8, false, false);
+    emit8(r);
     emit8(0x89);
     emit8(modrm(2, src & 7, X86::RBP));
     emit32(disp);
 }
 
 // ---------------------------------------------------------------------------
-// SIB-addressed operations: [RBP + RDI + disp32]
+// SIB-addressed operations: [RBP + R11 + disp32]
+// R11 用作 TLB 索引寄存器（scratch 寄存器，替代旧方案中的 RDI）
+//
+// SIB 编码：
+//   ModRM = mod:10 reg:xxx rm:100 (SIB follows)
+//   SIB   = scale:00 index:R11(011) base:RBP(101)
+//   R11 >= 8，所以需要 REX.X 位
 // ---------------------------------------------------------------------------
 
 void X86Emitter::sib_op_rax(uint8_t opcode, int32_t disp) {
-    emit8(0x48); emit8(opcode); emit8(0x84); emit8(0x3D); emit32(disp);
-}
-
-void X86Emitter::sib_op_rdx(uint8_t opcode, int32_t disp) {
-    emit8(0x48); emit8(opcode); emit8(0x94); emit8(0x3D); emit32(disp);
+    // op rax, [rbp + r11 + disp32]
+    // REX.W=1, REX.X=1 (R11 index): 0x4A
+    emit8(0x4A); emit8(opcode);
+    emit8(0x84);  // ModRM: mod=10, reg=RAX(0), rm=100(SIB)
+    emit8(0x1D);  // SIB: scale=00, index=R11(011), base=RBP(101)
+    emit32(disp);
 }
 
 void X86Emitter::sib_test_dword(int32_t disp, uint32_t imm) {
-    emit8(0xF7); emit8(0x84); emit8(0x3D); emit32(disp); emit32(imm);
+    // test dword [rbp + r11 + disp32], imm32
+    // REX.X=1 for R11: 0x42
+    emit8(0x42);
+    emit8(0xF7);
+    emit8(0x84);  // ModRM: mod=10, reg=0(test), rm=100(SIB)
+    emit8(0x1D);  // SIB: scale=00, index=R11(011), base=RBP(101)
+    emit32(disp);
+    emit32(imm);
 }
 
 void X86Emitter::sib_cmp_byte(int32_t disp, uint8_t imm) {
-    emit8(0x80); emit8(0xBC); emit8(0x3D); emit32(disp); emit8(imm);
+    // cmp byte [rbp + r11 + disp32], imm8
+    emit8(0x42);
+    emit8(0x80);
+    emit8(0xBC);  // ModRM: mod=10, reg=7(cmp), rm=100(SIB)
+    emit8(0x1D);  // SIB: scale=00, index=R11(011), base=RBP(101)
+    emit32(disp);
+    emit8(imm);
 }
 
 // ---------------------------------------------------------------------------
-// BPF register access
+// BPF register access — 全部 BPF 寄存器都在 x86 物理寄存器中
 // ---------------------------------------------------------------------------
 
 void X86Emitter::load_bpf(uint8_t bpf_reg, uint8_t x86_dst) {
-    if (bpf_reg >= 6 && bpf_reg <= 9) {
-        uint8_t host = BPF_CALLEE_REG[bpf_reg - 6];
-        if (host != x86_dst) {
-            mov_r64(x86_dst, host);
-        }
-    } else {
-        load_r64(x86_dst, (int32_t)(off_reg_ + bpf_reg * 8));
+    uint8_t mapped = BPF_REG_MAP[bpf_reg];
+    if (mapped != x86_dst) {
+        mov_r64(x86_dst, mapped);
     }
 }
 
-void X86Emitter::store_bpf_wt(uint8_t bpf_reg, uint8_t x86_src) {
-    store_r64((int32_t)(off_reg_ + bpf_reg * 8), x86_src);
-}
-
-void X86Emitter::store_bpf_wt32(uint8_t bpf_reg, uint8_t x86_src) {
-    // Zero-extend 32-bit value in register, then do 64-bit store.
-    // Cannot use 32-bit MOV to memory because that only writes 32 bits,
-    // leaving the upper 32 bits of the 64-bit slot with stale data.
-    // mov r32, r32 (zero-extends to 64 bits) + store_r64
-    if (x86_src >= 8) emit8(0x45);  // REX.RB: 32-bit self-move for extended reg
-    emit8(0x89);
-    emit8(modrm(3, x86_src & 7, x86_src & 7));
-    store_r64((int32_t)(off_reg_ + bpf_reg * 8), x86_src);
-}
-
-void X86Emitter::store_bpf_lazy(uint8_t bpf_reg, uint8_t x86_src) {
-    uint8_t host = BPF_CALLEE_REG[bpf_reg - 6];
-    if (host != x86_src) {
-        mov_r64(host, x86_src);
+void X86Emitter::store_bpf(uint8_t bpf_reg, uint8_t x86_src, bool is_64) {
+    uint8_t mapped = BPF_REG_MAP[bpf_reg];
+    if (!is_64) {
+        // 32 位结果需要零扩展到 64 位：mov r32, r32
+        mov_r32(x86_src, x86_src);
+    }
+    if (mapped != x86_src) {
+        mov_r64(mapped, x86_src);
     }
 }
 
-void X86Emitter::flush_r6_r9() {
-    for (int i = 0; i < 4; i++) {
-        store_r64((int32_t)(off_reg_ + (i + 6) * 8), BPF_CALLEE_REG[i]);
+// ---------------------------------------------------------------------------
+// Register flush/reload — 与 vm->reg[] 内存交互
+// ---------------------------------------------------------------------------
+
+void X86Emitter::flush_to_vm() {
+    // 写回全部 10 个可写 BPF 寄存器到 vm->reg[]（r10 只读，不写回）
+    for (int i = 0; i < 10; i++) {
+        store_r64((int32_t)(off_reg_ + i * 8), BPF_REG_MAP[i]);
+    }
+}
+
+void X86Emitter::reload_from_vm() {
+    // 从 vm->reg[] 加载全部 10 个可写 BPF 寄存器
+    for (int i = 0; i < 10; i++) {
+        load_r64(BPF_REG_MAP[i], (int32_t)(off_reg_ + i * 8));
+    }
+}
+
+void X86Emitter::reload_caller_saved() {
+    // 只加载 r0-r5（callee-saved 的 r6-r9 在 CALL 后自动存活）
+    for (int i = 0; i < BPF_CALLER_SAVED_COUNT; i++) {
+        load_r64(BPF_CALLER_SAVED_X86[i], (int32_t)(off_reg_ + i * 8));
+    }
+}
+
+void X86Emitter::spill_caller_saved() {
+    // push r0-r5 的 x86 寄存器到栈（TLB miss 慢速路径用）
+    for (int i = 0; i < BPF_CALLER_SAVED_COUNT; i++) {
+        push_reg(BPF_CALLER_SAVED_X86[i]);
+    }
+}
+
+void X86Emitter::restore_caller_saved() {
+    // pop 恢复 r0-r5（反向顺序）
+    for (int i = BPF_CALLER_SAVED_COUNT - 1; i >= 0; i--) {
+        pop_reg(BPF_CALLER_SAVED_X86[i]);
     }
 }
 
@@ -116,15 +159,25 @@ void X86Emitter::flush_r6_r9() {
 // ---------------------------------------------------------------------------
 
 void X86Emitter::mov_r64(uint8_t dst, uint8_t src) {
-    uint8_t rex = 0x48;
-    if (src >= 8) rex |= 0x04;
-    if (dst >= 8) rex |= 0x01;
-    emit8(rex);
+    // mov dst, src (64-bit)
+    uint8_t r = rex(true, src >= 8, false, dst >= 8);
+    emit8(r);
     emit8(0x89);
     emit8(modrm(3, src & 7, dst & 7));
 }
 
-// --- ALU64 reg,reg ---
+void X86Emitter::mov_r32(uint8_t dst, uint8_t src) {
+    // mov r32, r32 (zero-extends to 64-bit)
+    // 需要 REX 前缀仅当使用了 R8-R15
+    if (src >= 8 || dst >= 8) {
+        uint8_t r = rex(false, src >= 8, false, dst >= 8);
+        emit8(r);
+    }
+    emit8(0x89);
+    emit8(modrm(3, src & 7, dst & 7));
+}
+
+// --- ALU64 reg,reg (operate on RAX with RCX as source) ---
 
 void X86Emitter::add64()  { emit8(0x48); emit8(0x01); emit8(0xC8); }
 void X86Emitter::sub64()  { emit8(0x48); emit8(0x29); emit8(0xC8); }
@@ -138,7 +191,7 @@ void X86Emitter::shl64_cl() { emit8(0x48); emit8(0xD3); emit8(0xE0); }
 void X86Emitter::shr64_cl() { emit8(0x48); emit8(0xD3); emit8(0xE8); }
 void X86Emitter::sar64_cl() { emit8(0x48); emit8(0xD3); emit8(0xF8); }
 
-// --- ALU64 reg,imm32 ---
+// --- ALU64 reg,imm32 (operate on RAX) ---
 
 void X86Emitter::add64_imm(int32_t imm)  { emit8(0x48); emit8(0x05); emit32(imm); }
 void X86Emitter::sub64_imm(int32_t imm)  { emit8(0x48); emit8(0x2D); emit32(imm); }
@@ -180,7 +233,7 @@ void X86Emitter::sar32_imm(uint8_t c) { emit8(0xC1); emit8(0xF8); emit8(c); }
 
 void X86Emitter::mul32_imm(int32_t imm) { emit8(0x69); emit8(0xC0); emit32(imm); }
 
-// --- CMP / TEST ---
+// --- CMP / TEST (RAX vs RCX or immediate) ---
 
 void X86Emitter::cmp64()          { emit8(0x48); emit8(0x39); emit8(0xC8); }
 void X86Emitter::cmp64_imm(int32_t imm) { emit8(0x48); emit8(0x3D); emit32(imm); }
@@ -203,6 +256,7 @@ void X86Emitter::mov_rax_imm64(uint64_t val) {
 }
 
 void X86Emitter::store_imm64(int32_t disp, int32_t imm) {
+    // mov qword [rbp + disp32], imm32 (sign-extended)
     emit8(0x48); emit8(0xC7); emit8(modrm(2, 0, X86::RBP));
     emit32(disp); emit32(imm);
 }
@@ -211,19 +265,19 @@ void X86Emitter::store_imm32_zext(int32_t disp, int32_t imm) {
     if (imm >= 0) {
         store_imm64(disp, imm);
     } else {
+        // 负的 imm32 不能用 sign-extended store（结果是负数），
+        // 先 mov eax, imm32（零扩展），再 store
         emit8(0xB8); emit32(imm);
         store_r64(disp, X86::RAX);
     }
 }
 
 void X86Emitter::call_helper(void* addr) {
-    emit8(0x49); emit8(0xBA); emit64((uint64_t)(uintptr_t)addr);
-    emit8(0x41); emit8(0xFF); emit8(0xD2);
+    // mov r11, imm64; call r11
+    // 使用 R11 作为间接调用跳板（R11 是 scratch 寄存器）
+    emit8(0x49); emit8(0xBB); emit64((uint64_t)(uintptr_t)addr);
+    emit8(0x41); emit8(0xFF); emit8(0xD3);  // call r11
 }
-
-void X86Emitter::mov_rdi_rbp()  { emit8(0x48); emit8(0x89); emit8(0xEF); }
-void X86Emitter::mov_rsi_rax()  { emit8(0x48); emit8(0x89); emit8(0xC6); }
-void X86Emitter::mov_rdx_rax()  { emit8(0x48); emit8(0x89); emit8(0xC2); }
 
 void X86Emitter::test_rax_rax() { emit8(0x48); emit8(0x85); emit8(0xC0); }
 void X86Emitter::test_eax_eax() { emit8(0x85); emit8(0xC0); }
@@ -233,13 +287,25 @@ void X86Emitter::test_al_al()   { emit8(0x84); emit8(0xC0); }
 
 void X86Emitter::push_rbp() { emit8(0x55); }
 void X86Emitter::pop_rbp()  { emit8(0x5D); }
-void X86Emitter::mov_rbp_rdi() { emit8(0x48); emit8(0x89); emit8(0xFD); }
+
+void X86Emitter::push_reg(uint8_t r) {
+    if (r >= 8) emit8(0x41);
+    emit8(0x50 + (r & 7));
+}
+
+void X86Emitter::pop_reg(uint8_t r) {
+    if (r >= 8) emit8(0x41);
+    emit8(0x58 + (r & 7));
+}
 
 // ---------------------------------------------------------------------------
-// Helper call (div/mod/etc.)
+// Helper call (div/mod): 将 RAX/RCX 映射到 System V ABI 参数位置
 // ---------------------------------------------------------------------------
 
 void X86Emitter::emit_helper_call(void* helper) {
+    // 入口假设：RAX=被除数, RCX=除数, EDX=off (已由调用方设置)
+    // System V ABI: RDI=arg1, RSI=arg2, RDX=arg3
+    // 但 RDI=BPF r3, RSI=BPF r4 — 调用 helper 前必须已 spill
     emit8(0x48); emit8(0x89); emit8(0xC7);  // mov rdi, rax
     emit8(0x48); emit8(0x89); emit8(0xCE);  // mov rsi, rcx
     call_helper(helper);
@@ -247,28 +313,39 @@ void X86Emitter::emit_helper_call(void* helper) {
 
 // ---------------------------------------------------------------------------
 // Inline TLB fast path + slow path
+//
+// 快速路径：查 TLB，命中则直接得到 host 指针
+// 慢速路径：push/pop caller-saved 寄存器，调用 helper_mmu
+// R11 用作 TLB 索引寄存器（替代旧方案中的 RDI）
 // ---------------------------------------------------------------------------
 
-MemAccessContext X86Emitter::begin_mem_access(int32_t base_disp,
+MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
                                                int16_t offset, int access_size, bool is_write) {
     MemAccessContext ctx{};
     int32_t tlb_off = (int32_t)off_tlb_;
 
-    // Load guest address into RAX and apply BPF offset
-    load_r64(X86::RAX, base_disp);
+    // Load guest address into RAX from the mapped x86 register, then apply BPF offset
+    if (base_x86_reg != X86::RAX) {
+        mov_r64(X86::RAX, base_x86_reg);
+    }
     if (offset != 0) {
         emit8(0x48); emit8(0x05); emit32((uint32_t)(int32_t)offset); // add rax, offset
     }
 
-    // Compute TLB index: ((addr >> 20) & (TLB_SIZE-1)) * sizeof(TlbEntry)
-    emit8(0x48); emit8(0x89); emit8(0xC7);                   // mov rdi, rax
-    emit8(0x48); emit8(0xC1); emit8(0xEF); emit8(20);        // shr rdi, 20
-    emit8(0x81); emit8(0xE7); emit32(TLB_SIZE - 1);          // and edi, (TLB_SIZE-1)
+    // Compute TLB index into R11: ((addr >> 20) & (TLB_SIZE-1)) * sizeof(TlbEntry)
+    // mov r11, rax
+    emit8(0x49); emit8(0x89); emit8(0xC3);
+    // shr r11, 20
+    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(20);
+    // and r11d, (TLB_SIZE-1)
+    emit8(0x41); emit8(0x81); emit8(0xE3); emit32(TLB_SIZE - 1);
+    // shl r11d, shift  (TlbEntry size is power of 2)
     if constexpr ((sizeof(TlbEntry) & (sizeof(TlbEntry) - 1)) == 0) {
         constexpr int shift = __builtin_ctz(sizeof(TlbEntry));
-        emit8(0xC1); emit8(modrm(3, 4, X86::RDI)); emit8(shift); // shl edi, shift
+        emit8(0x41); emit8(0xC1); emit8(0xE3); emit8(shift);
     } else {
-        emit8(0x69); emit8(0xFF); emit32(sizeof(TlbEntry));   // imul edi, edi, sizeof(TlbEntry)
+        // imul r11d, r11d, sizeof(TlbEntry)
+        emit8(0x45); emit8(0x69); emit8(0xDB); emit32(sizeof(TlbEntry));
     }
 
     constexpr int32_t off_guest_base = (int32_t)offsetof(TlbEntry, guest_base);
@@ -278,14 +355,19 @@ MemAccessContext X86Emitter::begin_mem_access(int32_t base_disp,
     constexpr int32_t off_cow        = (int32_t)offsetof(TlbEntry, cow);
 
     // Bounds check 1: addr >= entry.guest_base
-    sib_op_rax(0x3B, tlb_off + off_guest_base);              // cmp rax, guest_base
+    sib_op_rax(0x3B, tlb_off + off_guest_base);              // cmp rax, [rbp+r11+guest_base]
     ctx.miss_jumps.push_back(size());
     emit8(0x0F); emit8(0x82); emit32(0);                     // JB .slow
 
     // Bounds check 2: addr + size <= entry.guest_end
-    emit8(0x48); emit8(0x8D); emit8(0x90);                   // lea rdx, [rax + disp32]
+    // 使用 RCX（scratch）而非 RDX（BPF r5），避免破坏 BPF 寄存器
+    emit8(0x48); emit8(0x8D); emit8(0x88);                   // lea rcx, [rax + disp32]
     emit32((uint32_t)access_size);
-    sib_op_rdx(0x3B, tlb_off + off_guest_end);               // cmp rdx, guest_end
+    // cmp rcx, [rbp + r11 + guest_end]
+    emit8(0x4A); emit8(0x3B);
+    emit8(0x8C);  // ModRM: mod=10, reg=RCX(1), rm=100(SIB)
+    emit8(0x1D);  // SIB: scale=00, index=R11(011), base=RBP(101)
+    emit32(tlb_off + off_guest_end);
     ctx.miss_jumps.push_back(size());
     emit8(0x0F); emit8(0x87); emit32(0);                     // JA .slow
 
@@ -311,10 +393,20 @@ MemAccessContext X86Emitter::begin_mem_access(int32_t base_disp,
 
     // --- Slow path: TLB miss ---
     ctx.slow_start = size();
-    mov_rdi_rbp();                                                 // mov rdi, rbp (vm*)
-    mov_rsi_rax();                                                 // mov rsi, rax (guest addr)
-    emit8(0xBA); emit32((uint32_t)access_size);                 // mov edx, size
+
+    // 保存 caller-saved 的 BPF 寄存器（callee-saved 自动存活）
+    spill_caller_saved();
+
+    // 设置 System V ABI 参数：RDI=vm*, RSI=guest_addr, EDX=size
+    mov_r64(X86::RDI, X86::RBP);                             // mov rdi, rbp
+    // RAX 里的 guest addr 已经被 spill_caller_saved 的 push 指令破坏了？
+    // 不会：RAX 是 scratch，不在 caller-saved 列表中，push 不影响它
+    mov_r64(X86::RSI, X86::RAX);                             // mov rsi, rax
+    emit8(0xBA); emit32((uint32_t)access_size);              // mov edx, size
     call_helper(is_write ? helpers_.mmu_w : helpers_.mmu);
+
+    // 恢复 caller-saved 的 BPF 寄存器
+    restore_caller_saved();
 
     // Test for null (memory violation)
     test_rax_rax();
@@ -346,12 +438,15 @@ void X86Emitter::finish_mem_access(MemAccessContext& ctx,
 
 // ---------------------------------------------------------------------------
 // ALU (unified for ALU64 and ALU32)
+//
+// 操作流程：load_bpf(dst→RAX), load_bpf(src→RCX), ALU, store_bpf(dst←RAX)
+// 由于所有 BPF 寄存器都在 x86 物理寄存器中，load_bpf/store_bpf
+// 只是 reg-to-reg mov（或 nop）。
 // ---------------------------------------------------------------------------
 
 bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
     bool is_x = (insn->code & 0x08) == BPF_X;
     uint8_t op = insn->code & 0xf0;
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
 
     auto load_dst = [&]() {
         load_bpf(insn->dst_reg, X86::RAX);
@@ -360,15 +455,7 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
         load_bpf(insn->src_reg, X86::RCX);
     };
     auto store_dst = [&]() {
-        if (insn->dst_reg < 6) {
-            if (is_64) store_bpf_wt(insn->dst_reg, X86::RAX);
-            else       store_bpf_wt32(insn->dst_reg, X86::RAX);
-        } else {
-            if (!is_64) {
-                emit8(0x89); emit8(0xC0);  // mov eax, eax
-            }
-            store_bpf_lazy(insn->dst_reg, X86::RAX);
-        }
+        store_bpf(insn->dst_reg, X86::RAX, is_64);
     };
 
     // ── MOV (off == 0) ──
@@ -377,22 +464,27 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
             if (is_x && insn->dst_reg == insn->src_reg) return true;
         }
         if (is_x) {
-            load_bpf(insn->src_reg, X86::RCX);
-            if (insn->dst_reg < 6) {
-                if (is_64) store_bpf_wt(insn->dst_reg, X86::RCX);
-                else       store_bpf_wt32(insn->dst_reg, X86::RCX);
-            } else {
-                if (!is_64) {
-                    emit8(0x89); emit8(0xC9);  // mov ecx, ecx
-                }
-                store_bpf_lazy(insn->dst_reg, X86::RCX);
+            // 直接从源 BPF 寄存器 mov 到目标 BPF 寄存器
+            uint8_t src_x86 = BPF_REG_MAP[insn->src_reg];
+            uint8_t dst_x86 = BPF_REG_MAP[insn->dst_reg];
+            if (!is_64) {
+                // 32-bit mov: 拷贝低 32 位并零扩展到 64 位，源寄存器不受影响
+                mov_r32(dst_x86, src_x86);
+            } else if (dst_x86 != src_x86) {
+                mov_r64(dst_x86, src_x86);
             }
         } else {
-            if (is_64) store_imm64(dst_disp, insn->imm);
-            else       store_imm32_zext(dst_disp, insn->imm);
-            if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
-                load_r64(X86::RAX, dst_disp);
-                mov_r64(BPF_CALLEE_REG[insn->dst_reg - 6], X86::RAX);
+            // MOV immediate: 需要先写到内存再加载到映射寄存器
+            // 或者直接 mov imm 到映射寄存器
+            uint8_t dst_x86 = BPF_REG_MAP[insn->dst_reg];
+            if (is_64) {
+                // mov rax, sign-extended imm32; mov dst, rax
+                emit8(0x48); emit8(0xC7); emit8(0xC0); emit32(insn->imm);
+                mov_r64(dst_x86, X86::RAX);
+            } else {
+                // 32-bit: mov eax, imm32 (zero-extends); then mov to dst
+                emit8(0xB8); emit32(insn->imm);
+                mov_r64(dst_x86, X86::RAX);
             }
         }
         return true;
@@ -520,11 +612,18 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
         break;
     case BPF_MUL:  is_x ? (is_64 ? mul64() : mul32()) : (is_64 ? mul64_imm(insn->imm) : mul32_imm(insn->imm)); break;
     case BPF_DIV: {
+        // DIV/MOD 需要调用 helper 函数，必须先保存 caller-saved
+        // 但 emit_helper_call 会覆盖 RDI/RSI（BPF r3/r4），
+        // 而 RAX/RCX 已经被 load_dst/load_src 设置好了。
+        // 直接 spill/restore caller-saved 寄存器。
         if (!is_x) {
-            emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(insn->imm);
+            emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(insn->imm);  // mov rcx, imm32
         }
-        emit8(0xBA); emit32((uint32_t)(int32_t)insn->off);
+        // 保存 caller-saved BPF 寄存器到栈
+        spill_caller_saved();
+        emit8(0xBA); emit32((uint32_t)(int32_t)insn->off);  // mov edx, off
         emit_helper_call(is_64 ? helpers_.div64 : helpers_.div32);
+        restore_caller_saved();
         store_dst();
         return true;
     }
@@ -532,8 +631,10 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
         if (!is_x) {
             emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(insn->imm);
         }
+        spill_caller_saved();
         emit8(0xBA); emit32((uint32_t)(int32_t)insn->off);
         emit_helper_call(is_64 ? helpers_.mod64 : helpers_.mod32);
+        restore_caller_saved();
         store_dst();
         return true;
     }
@@ -550,18 +651,16 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
 
 bool X86Emitter::emit_ld(const bpf_insn* insn) {
     uint8_t mode = insn->code & 0xe0;
-    uint8_t size = insn->code & 0x18;
-    if (mode != BPF_IMM || size != BPF_DW) return false;
+    uint8_t sz = insn->code & 0x18;
+    if (mode != BPF_IMM || sz != BPF_DW) return false;
     if (insn->dst_reg >= 10) return false;
 
     uint64_t imm64 = (uint64_t)(uint32_t)(insn + 1)->imm << 32 | (uint32_t)insn->imm;
+    uint8_t dst_x86 = BPF_REG_MAP[insn->dst_reg];
 
+    // mov rax, imm64; mov dst_x86, rax
     emit8(0x48); emit8(0xB8); emit64(imm64);
-    if (insn->dst_reg < 6) {
-        store_bpf_wt(insn->dst_reg, X86::RAX);
-    } else {
-        store_bpf_lazy(insn->dst_reg, X86::RAX);
-    }
+    mov_r64(dst_x86, X86::RAX);
     return true;
 }
 
@@ -577,7 +676,6 @@ bool X86Emitter::emit_ldx(const bpf_insn* insn,
     if (mode == BPF_MEMSX && size_field == BPF_DW) return false;
     if (insn->dst_reg >= 10) return false;
 
-    int32_t src_disp = off_reg_ + insn->src_reg * 8;
     int access_size;
     switch (size_field) {
     case BPF_DW: access_size = 8; break;
@@ -587,13 +685,10 @@ bool X86Emitter::emit_ldx(const bpf_insn* insn,
     default: return false;
     }
 
-    // Flush src_reg (base address) if it's r6-r9
-    if (insn->src_reg >= 6 && insn->src_reg <= 9) {
-        store_r64((int32_t)(off_reg_ + insn->src_reg * 8), BPF_CALLEE_REG[insn->src_reg - 6]);
-    }
+    // 直接从 BPF 源寄存器的映射 x86 寄存器读取基地址，不走内存
+    auto ctx = begin_mem_access(BPF_REG_MAP[insn->src_reg], insn->off, access_size, /*is_write=*/false);
 
-    auto ctx = begin_mem_access(src_disp, insn->off, access_size, /*is_write=*/false);
-
+    // RAX = host pointer, 从 [RAX] 加载值
     if (mode == BPF_MEM) {
         switch (size_field) {
         case BPF_DW: emit8(0x48); emit8(0x8B); emit8(0x00); break;
@@ -610,11 +705,8 @@ bool X86Emitter::emit_ldx(const bpf_insn* insn,
         }
     }
 
-    if (insn->dst_reg < 6) {
-        store_bpf_wt(insn->dst_reg, X86::RAX);
-    } else {
-        store_bpf_lazy(insn->dst_reg, X86::RAX);
-    }
+    // 将结果从 RAX 移到目标 BPF 寄存器的映射
+    mov_r64(BPF_REG_MAP[insn->dst_reg], X86::RAX);
     finish_mem_access(ctx, abort_patches, bpf_index);
     return true;
 }
@@ -629,7 +721,6 @@ bool X86Emitter::emit_st(const bpf_insn* insn,
     uint8_t size_field = insn->code & 0x18;
     if (mode != BPF_MEM) return false;
 
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     int access_size;
     switch (size_field) {
     case BPF_DW: access_size = 8; break;
@@ -639,12 +730,9 @@ bool X86Emitter::emit_st(const bpf_insn* insn,
     default: return false;
     }
 
-    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
-        store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
-    }
+    auto ctx = begin_mem_access(BPF_REG_MAP[insn->dst_reg], insn->off, access_size, /*is_write=*/true);
 
-    auto ctx = begin_mem_access(dst_disp, insn->off, access_size, /*is_write=*/true);
-
+    // [RAX] = immediate
     switch (size_field) {
     case BPF_DW: emit8(0x48); emit8(0xC7); emit8(0x00); emit32(insn->imm); break;
     case BPF_W:  emit8(0xC7); emit8(0x00); emit32(insn->imm); break;
@@ -667,7 +755,6 @@ bool X86Emitter::emit_stx(const bpf_insn* insn,
     if (mode == BPF_ATOMIC) return emit_stx_atomic(insn, abort_patches, bpf_index);
     if (mode != BPF_MEM) return false;
 
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     int access_size;
     switch (size_field) {
     case BPF_DW: access_size = 8; break;
@@ -677,19 +764,19 @@ bool X86Emitter::emit_stx(const bpf_insn* insn,
     default: return false;
     }
 
-    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
-        store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
-    }
+    // 基址和源值都在 BPF 映射的 x86 寄存器中，begin_mem_access 只踩 RAX/RCX/R11
+    // BPF 寄存器映射不使用这三个，所以源值寄存器安全
+    auto ctx = begin_mem_access(BPF_REG_MAP[insn->dst_reg], insn->off, access_size, /*is_write=*/true);
 
-    load_bpf(insn->src_reg, X86::RBX);
+    // 将源值从映射寄存器加载到 RCX
+    load_bpf(insn->src_reg, X86::RCX);
 
-    auto ctx = begin_mem_access(dst_disp, insn->off, access_size, /*is_write=*/true);
-
+    // [RAX] = RCX (source value)
     switch (size_field) {
-    case BPF_DW: emit8(0x48); emit8(0x89); emit8(0x18); break;
-    case BPF_W:  emit8(0x89); emit8(0x18); break;
-    case BPF_H:  emit8(0x66); emit8(0x89); emit8(0x18); break;
-    case BPF_B:  emit8(0x88); emit8(0x18); break;
+    case BPF_DW: emit8(0x48); emit8(0x89); emit8(0x08); break;  // mov [rax], rcx
+    case BPF_W:  emit8(0x89); emit8(0x08); break;                // mov [rax], ecx
+    case BPF_H:  emit8(0x66); emit8(0x89); emit8(0x08); break;   // mov [rax], cx
+    case BPF_B:  emit8(0x88); emit8(0x08); break;                // mov [rax], cl
     }
 
     finish_mem_access(ctx, abort_patches, bpf_index);
@@ -705,116 +792,119 @@ bool X86Emitter::emit_stx_atomic(const bpf_insn* insn,
     uint8_t size_field = insn->code & 0x18;
     if (size_field != BPF_DW && size_field != BPF_W) return false;
 
-    int32_t dst_disp = off_reg_ + insn->dst_reg * 8;
     bool is_dw = (size_field == BPF_DW);
     int access_size = is_dw ? 8 : 4;
 
-    if (insn->dst_reg >= 6 && insn->dst_reg <= 9) {
-        store_r64((int32_t)(off_reg_ + insn->dst_reg * 8), BPF_CALLEE_REG[insn->dst_reg - 6]);
-    }
+    auto ctx = begin_mem_access(BPF_REG_MAP[insn->dst_reg], insn->off, access_size, /*is_write=*/true);
 
-    load_bpf(insn->src_reg, X86::RBX);
+    // 从映射寄存器加载源值到 RCX（BPF 映射寄存器在 begin_mem_access 后安全）
+    load_bpf(insn->src_reg, X86::RCX);
 
-    auto ctx = begin_mem_access(dst_disp, insn->off, access_size, /*is_write=*/true);
+    // RDX = host pointer (save RAX which holds host ptr)
+    // 注意：RDX 是 BPF r5 的映射！但这里我们正在做原子操作，
+    // 而 RDX 在 begin_mem_access 的 bounds check 中已经被 lea rdx, [rax+size] 踩了。
+    // 需要用另一个 scratch 寄存器保存 host ptr。
+    // 用 R11 (scratch) 保存 host pointer
+    emit8(0x49); emit8(0x89); emit8(0xC3);  // mov r11, rax
 
-    mov_rdx_rax();
+    // 保存 RDX (BPF r5) 到 vm->reg[5] — CAS 循环会用 RDX 做临时寄存器
+    store_r64((int32_t)(off_reg_ + 5 * 8), X86::RDX);
 
-    int32_t op = insn->imm;
+    int32_t atom_op = insn->imm;
+    bool ok = true;
 
-    if (op == (BPF_OR  | BPF_FETCH) ||
-        op == (BPF_AND | BPF_FETCH) ||
-        op == (BPF_XOR | BPF_FETCH)) {
-        uint8_t alu_opcode = ((op & ~BPF_FETCH) == BPF_OR)  ? 0x09
-                            : ((op & ~BPF_FETCH) == BPF_AND) ? 0x21
+    if (atom_op == (BPF_OR  | BPF_FETCH) ||
+        atom_op == (BPF_AND | BPF_FETCH) ||
+        atom_op == (BPF_XOR | BPF_FETCH)) {
+        uint8_t alu_opcode = ((atom_op & ~BPF_FETCH) == BPF_OR)  ? 0x09
+                            : ((atom_op & ~BPF_FETCH) == BPF_AND) ? 0x21
                             : 0x31;
 
+        // CAS loop: load current, compute new, cmpxchg
         size_t loop_start = size();
 
+        // mov rax, [r11]
         if (is_dw) {
-            emit8(0x48); emit8(0x8B); emit8(0x02);
+            emit8(0x49); emit8(0x8B); emit8(0x03);
         } else {
-            emit8(0x8B); emit8(0x02);
+            emit8(0x41); emit8(0x8B); emit8(0x03);
         }
 
+        // mov rdx, rax (save old value, use RDX as temp — it will be restored later)
+        // 注意：这里会覆盖 BPF r5(RDX)，但原子 FETCH 操作后会把旧值写入 src_reg
         if (is_dw) emit8(0x48);
-        emit8(0x89); emit8(0xC1);
+        emit8(0x89); emit8(0xC2);  // mov rdx, rax
+        // alu rdx, rcx (compute new value)
         if (is_dw) emit8(0x48);
-        emit8(alu_opcode); emit8(0xD9);
+        emit8(alu_opcode); emit8(0xCA);  // op rdx, rcx
 
+        // lock cmpxchg [r11], rdx
         emit8(0xF0);
-        if (is_dw) emit8(0x48);
-        emit8(0x0F); emit8(0xB1); emit8(0x0A);
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(0x0F); emit8(0xB1); emit8(0x13);  // cmpxchg [r11], rdx
 
+        // jnz loop
         emit8(0x75);
         emit8(0);
         auto loop_end = size();
         int8_t rel = (int8_t)(loop_start - loop_end);
         data()[loop_end - 1] = (uint8_t)rel;
 
-        if (insn->src_reg < 6) {
-            store_bpf_wt(insn->src_reg, X86::RAX);
-        } else {
-            store_bpf_lazy(insn->src_reg, X86::RAX);
-        }
-
-        finish_mem_access(ctx, abort_patches, bpf_index);
-        return true;
-    }
-
-    switch (op) {
+        // FETCH: 将旧值 (RAX) 写入 src_reg
+        store_bpf(insn->src_reg, X86::RAX, true);
+    } else switch (atom_op) {
     case BPF_ADD | BPF_FETCH:
+        // lock xadd [r11], rcx
         emit8(0xF0);
-        if (is_dw) emit8(0x48);
-        emit8(0x0F); emit8(0xC1); emit8(0x1A);
-        if (insn->src_reg < 6) {
-            store_bpf_wt(insn->src_reg, X86::RBX);
-        } else {
-            store_bpf_lazy(insn->src_reg, X86::RBX);
-        }
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(0x0F); emit8(0xC1); emit8(0x0B);  // xadd [r11], rcx
+        store_bpf(insn->src_reg, X86::RCX, true);
         break;
     case BPF_ADD:
+        // lock add [r11], rcx
         emit8(0xF0);
-        if (is_dw) emit8(0x48);
-        emit8(0x01); emit8(0x1A);
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(0x01); emit8(0x0B);  // add [r11], rcx
         break;
 
     case BPF_OR:
     case BPF_AND:
     case BPF_XOR: {
-        uint8_t opcode = (op == BPF_OR) ? 0x09
-                       : (op == BPF_AND) ? 0x21
+        uint8_t opcode = (atom_op == BPF_OR) ? 0x09
+                       : (atom_op == BPF_AND) ? 0x21
                        : 0x31;
         emit8(0xF0);
-        if (is_dw) emit8(0x48);
-        emit8(opcode); emit8(0x1A);
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(opcode); emit8(0x0B);  // op [r11], rcx
         break;
     }
 
     case BPF_XCHG:
-        if (is_dw) emit8(0x48);
-        emit8(0x87); emit8(0x1A);
-        if (insn->src_reg < 6) {
-            store_bpf_wt(insn->src_reg, X86::RBX);
-        } else {
-            store_bpf_lazy(insn->src_reg, X86::RBX);
-        }
+        // xchg [r11], rcx
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(0x87); emit8(0x0B);  // xchg [r11], rcx
+        store_bpf(insn->src_reg, X86::RCX, true);
         break;
 
     case BPF_CMPXCHG:
-        load_r64(X86::RAX, (int32_t)(off_reg_ + 0 * 8));
+        // RAX = BPF r0 for cmpxchg
+        load_bpf(0, X86::RAX);
         emit8(0xF0);
-        if (is_dw) emit8(0x48);
-        emit8(0x0F); emit8(0xB1); emit8(0x1A);
-        store_bpf_wt(0, X86::RAX);
+        if (is_dw) emit8(0x49); else emit8(0x41);
+        emit8(0x0F); emit8(0xB1); emit8(0x0B);  // lock cmpxchg [r11], rcx
+        // 结果回写 r0
+        store_bpf(0, X86::RAX, true);
         break;
 
     default:
-        finish_mem_access(ctx, abort_patches, bpf_index);
-        return false;
+        ok = false;
+        break;
     }
 
+    // 统一恢复 RDX (BPF r5) 并完成内存访问
+    load_r64(X86::RDX, (int32_t)(off_reg_ + 5 * 8));
     finish_mem_access(ctx, abort_patches, bpf_index);
-    return true;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -898,52 +988,69 @@ void X86Emitter::emit_ja32(const bpf_insn* insn, int current_index,
 
 // ---------------------------------------------------------------------------
 // CALL syscall (src_reg==0)
+//
+// Syscall 可能读写任意 BPF 寄存器，所以需要完整 flush + reload。
 // ---------------------------------------------------------------------------
 
 void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
-                                      const bpf_insn* entry_pc,
-                                      size_t vm_exit_offset) {
-    flush_r6_r9();
+                                      const bpf_insn* entry_pc) {
+    // 完整 flush 所有 BPF 寄存器到 vm->reg[]
+    flush_to_vm();
+
+    // 保存当前 pc 到 vm->pc
     const bpf_insn* insn_host = entry_pc + current_index;
     mov_rax_imm64((uint64_t)(uintptr_t)insn_host);
-    emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);
-    mov_rdi_rbp();
-    emit8(0xBE); emit32((uint32_t)insn->imm);
+    emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
+
+    // 调用 helper_do_syscall(vm*, call_id)
+    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
+    emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
     call_helper(helpers_.do_syscall);
+
+    // 检查返回值
     test_al_al();
     size_t jz_off = size();
-    emit8(0x0F); emit8(0x84); emit32(0);  // JZ rel32
+    emit8(0x0F); emit8(0x84); emit32(0);  // JZ .vm_exit
     uint32_t rel = (uint32_t)(vm_exit_offset - (jz_off + 6));
     memcpy(data() + jz_off + 2, &rel, 4);
 
-    // Reload r6-r9 from memory
-    load_r64(X86::R12, (int32_t)(off_reg_ + 6 * 8));
-    load_r64(X86::R13, (int32_t)(off_reg_ + 7 * 8));
-    load_r64(X86::R14, (int32_t)(off_reg_ + 8 * 8));
-    load_r64(X86::R15, (int32_t)(off_reg_ + 9 * 8));
+    // 完整 reload 所有 BPF 寄存器（syscall 可能改了任意寄存器）
+    reload_from_vm();
 }
 
 // ---------------------------------------------------------------------------
 // CALL BPF-to-BPF (src_reg==1)
+//
+// 目标函数需要从 vm->reg[] 读取参数，所以需要完整 flush。
+// 编译完成后跳回 vm_exit，让 step() 循环重新编译目标函数。
 // ---------------------------------------------------------------------------
 
 void X86Emitter::emit_call_bpf(const bpf_insn* insn, int current_index,
                                   uint64_t ret_gpa,
-                                  const bpf_insn* entry_pc,
-                                  size_t vm_exit_offset,
-                                  std::vector<AbortPatchInfo>& abort_patches) {
-    flush_r6_r9();
-    mov_rdi_rbp();
-    emit8(0x48); emit8(0xBE); emit64(ret_gpa);
+                                  const bpf_insn* entry_pc) {
+    // flush_to_vm 已经将所有寄存器写回 vm->reg[]，
+    // 后续不能再走 flush_and_exit（会把被 CALL 踩掉的垃圾值写回），
+    // 所有跳转都直接到 vm_exit。
+    flush_to_vm();
+
+    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
+    emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
     call_helper(helpers_.push_frame);
     test_al_al();
-    abort_patches.push_back({size(), current_index});
-    emit8(0x0F); emit8(0x84); emit32(0);
+    // push_frame 失败 → 直接跳 vm_exit
+    size_t jz_off = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                      // JZ .vm_exit
+    {
+        uint32_t rel = (uint32_t)(vm_exit_offset - (jz_off + 6));
+        memcpy(data() + jz_off + 2, &rel, 4);
+    }
 
+    // 设置 pc 指向被调函数
     const bpf_insn* callee_pc = entry_pc + current_index + 1 + insn->imm;
     mov_rax_imm64((uint64_t)(uintptr_t)callee_pc);
     emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);
 
+    // 跳到 vm_exit（让 step() 循环重新进入 JIT）
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
     uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
@@ -954,32 +1061,40 @@ void X86Emitter::emit_call_bpf(const bpf_insn* insn, int current_index,
 // CALL indirect (BPF_CALL | BPF_X)
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_call_indirect(const bpf_insn* insn, int current_index,
-                                      uint64_t ret_gpa,
-                                      std::vector<AbortPatchInfo>& abort_patches) {
-    flush_r6_r9();
-    mov_rdi_rbp();
-    emit8(0x48); emit8(0xBE); emit64(ret_gpa);
-    load_bpf(insn->dst_reg, X86::RDX);
+void X86Emitter::emit_call_indirect(const bpf_insn* insn,
+                                      uint64_t ret_gpa) {
+    // 先 flush 全部寄存器到 vm->reg[]，再从内存读取目标地址到 RDX。
+    // 不能在 flush 前 load_bpf(dst_reg, RDX)，否则会覆盖 BPF r5 的值。
+    flush_to_vm();
+    load_r64(X86::RDX, (int32_t)(off_reg_ + insn->dst_reg * 8));
+
+    mov_r64(X86::RDI, X86::RBP);
+    emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
     call_helper(helpers_.call_indirect);
-    test_al_al();
-    abort_patches.push_back({size(), current_index});
-    emit8(0x0F); emit8(0x84); emit32(0);
+    // helper_call_indirect 成功和失败都返回 false → 总是退出 JIT
+    // 直接跳 vm_exit（flush 已经做过了）
+    size_t jmp_off = size();
+    emit8(0xE9); emit32(0);
+    uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
+    memcpy(data() + jmp_off + 1, &rel, 4);
 }
 
 // ---------------------------------------------------------------------------
 // EXIT
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_exit(size_t vm_exit_offset) {
-    flush_r6_r9();
-    mov_rdi_rbp();
+void X86Emitter::emit_exit() {
+    flush_to_vm();
+
+    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
     call_helper(helpers_.pop_frame);
+
     test_rax_rax();
     size_t has_ret_jcc = size();
-    emit8(0x0F); emit8(0x85); emit32(0);  // JNZ rel32
+    emit8(0x0F); emit8(0x85); emit32(0);  // JNZ .has_ret_addr
 
     // Stack bottom: set VM_EXITED flag
+    // lock or dword [rbp + off_flags], VM_EXITED(1)
     emit8(0xF0); emit8(0x83); emit8(0x8D);
     emit32((uint32_t)off_flags_);
     emit8(0x01);
@@ -988,14 +1103,15 @@ void X86Emitter::emit_exit(size_t vm_exit_offset) {
     uint32_t rel = (uint32_t)(vm_exit_offset - (stack_bottom_jmp + 5));
     memcpy(data() + stack_bottom_jmp + 1, &rel, 4);
 
-    // .has_ret_addr
+    // .has_ret_addr: return to caller
     size_t has_ret_target = size();
     rel = (uint32_t)(has_ret_target - (has_ret_jcc + 6));
     memcpy(data() + has_ret_jcc + 2, &rel, 4);
 
-    mov_rdi_rbp();
-    mov_rsi_rax();
+    mov_r64(X86::RDI, X86::RBP);
+    mov_r64(X86::RSI, X86::RAX);                              // mov rsi, rax (return addr)
     call_helper(helpers_.return_to_caller);
+
     size_t exit_jmp = size();
     emit8(0xE9); emit32(0);
     rel = (uint32_t)(vm_exit_offset - (exit_jmp + 5));
@@ -1004,75 +1120,147 @@ void X86Emitter::emit_exit(size_t vm_exit_offset) {
 
 // ---------------------------------------------------------------------------
 // Prologue
+//
+// 入口：RDI = vm* 指针
+// 保存 callee-saved 寄存器，从 vm->reg[] 加载全部 BPF 寄存器，
+// 执行入口 safepoint 检查。
 // ---------------------------------------------------------------------------
 
-PrologueResult X86Emitter::emit_prologue(std::vector<AbortPatchInfo>& abort_patches) {
-    push_rbp();
-    emit8(0x53);                      // push rbx
-    emit8(0x41); emit8(0x54);  // push r12
-    emit8(0x41); emit8(0x55);  // push r13
-    emit8(0x41); emit8(0x56);  // push r14
-    emit8(0x41); emit8(0x57);  // push r15
+size_t X86Emitter::emit_prologue() {
+    // 保存 callee-saved 寄存器
+    push_rbp();                               // push rbp
+    push_reg(X86::RBX);                       // push rbx
+    push_reg(X86::R12);                       // push r12
+    push_reg(X86::R13);                       // push r13
+    push_reg(X86::R14);                       // push r14
+    push_reg(X86::R15);                       // push r15
+    // 对齐栈到 16 字节（6 pushes + return addr = 56 bytes, +8 = 64）
     emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);  // sub rsp, 8
-    mov_rbp_rdi();
-    // Load r6-r9 from vm->reg[]
-    load_r64(X86::R12, (int32_t)(off_reg_ + 6 * 8));
-    load_r64(X86::R13, (int32_t)(off_reg_ + 7 * 8));
-    load_r64(X86::R14, (int32_t)(off_reg_ + 8 * 8));
-    load_r64(X86::R15, (int32_t)(off_reg_ + 9 * 8));
+
+    // RBP = vm* 指针
+    mov_r64(X86::RBP, X86::RDI);             // mov rbp, rdi
+
+    // 从 vm->reg[] 加载全部 11 个 BPF 寄存器
+    for (int i = 0; i < 11; i++) {
+        load_r64(BPF_REG_MAP[i], (int32_t)(off_reg_ + i * 8));
+    }
+
     // jmp .entry
     jmp_rel32();
     size_t entry_jmp_offset = size() - 5;
 
-    // .vm_exit
-    size_t vm_exit_offset = size();
+    // .vm_exit: 恢复 callee-saved 并返回
+    vm_exit_offset = size();
     emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);  // add rsp, 8
-    emit8(0x41); emit8(0x5F);  // pop r15
-    emit8(0x41); emit8(0x5E);  // pop r14
-    emit8(0x41); emit8(0x5D);  // pop r13
-    emit8(0x41); emit8(0x5C);  // pop r12
-    emit8(0x5B);                  // pop rbx
-    emit8(0x5D);                  // pop rbp
-    emit8(0xB8); emit32(-1);    // mov eax, -1
-    emit8(0xC3);                  // ret
+    pop_reg(X86::R15);                        // pop r15
+    pop_reg(X86::R14);                        // pop r14
+    pop_reg(X86::R13);                        // pop r13
+    pop_reg(X86::R12);                        // pop r12
+    pop_reg(X86::RBX);                        // pop rbx
+    pop_rbp();                                // pop rbp
+    emit8(0xB8); emit32(-1);                  // mov eax, -1
+    emit8(0xC3);                              // ret
 
-    // .flush_and_exit
+    // .flush_and_exit: 将全部 BPF 寄存器写回 vm->reg[]，然后跳到 .vm_exit
+    //
+    // 到达此处的路径要求：x86 中的 BPF 寄存器值是有效的。
+    // 典型场景：memory abort（TLB miss 后 null 返回、bounds check 失败等）。
+    // 对于 helper CALL 后的路径（safepoint 等），caller-saved 寄存器已被踩掉，
+    // 这些路径必须在 CALL 前 flush，然后直接跳 vm_exit，不经过此处。
     size_t flush_and_exit_offset = size();
-    store_r64((int32_t)(off_reg_ + 6 * 8), X86::R12);
-    store_r64((int32_t)(off_reg_ + 7 * 8), X86::R13);
-    store_r64((int32_t)(off_reg_ + 8 * 8), X86::R14);
-    store_r64((int32_t)(off_reg_ + 9 * 8), X86::R15);
+    for (int i = 0; i < 10; i++) {
+        store_r64((int32_t)(off_reg_ + i * 8), BPF_REG_MAP[i]);
+    }
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
     uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
     memcpy(data() + jmp_off + 1, &rel, 4);
 
-    // .entry
+    // .entry: 入口 safepoint
     size_t entry_offset = size();
     patch_jmp_rel32(entry_jmp_offset, entry_offset);
 
-    // Safepoint at entry
-    flush_r6_r9();
-    mov_rdi_rbp();
+    // Safepoint at entry: 必须先 flush 所有寄存器（信号处理器可能读取）
+    flush_to_vm();
+    mov_r64(X86::RDI, X86::RBP);             // mov rdi, rbp
     call_helper(helpers_.safepoint);
     test_eax_eax();
-    abort_patches.push_back({size(), -1});
-    emit8(0x0F); emit8(0x85); emit32(0);  // JNE rel32
+    // Safepoint 失败 → 直接跳 vm_exit（不走 flush_and_exit，因为 flush 已做过，
+    // 而且信号处理器可能已修改 vm->reg[]，不能再用 x86 寄存器覆盖）
+    size_t sp_jne = size();
+    emit8(0x0F); emit8(0x85); emit32(0);     // JNE .vm_exit
+    {
+        uint32_t sp_rel = (uint32_t)(vm_exit_offset - (sp_jne + 6));
+        memcpy(data() + sp_jne + 2, &sp_rel, 4);
+    }
 
-    return {vm_exit_offset, flush_and_exit_offset};
+    // Safepoint 返回后 reload caller-saved（callee-saved 自动存活）
+    reload_caller_saved();
+
+    return flush_and_exit_offset;
 }
 
 // ---------------------------------------------------------------------------
 // Safepoint (at loop back-edge targets)
+//
+// 循环回边处插入安全点，让 VM 有机会处理信号和检查中止标志。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_safepoint(std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
-    flush_r6_r9();
-    mov_rdi_rbp();
+void X86Emitter::emit_safepoint() {
+    // 快速路径：内联检查 vm->flags 和 vm->signal_pending
+    // 避免每次循环回边都做 flush_to_vm + call 的开销
+    //
+    // 内存布局（insn.h）：
+    //   std::atomic<uint32_t> flags;         // off_flags_ + 0, 4 bytes
+    //   std::atomic<bool>     signal_pending; // off_flags_ + 4, 1 byte
+    //
+    // 用一条 64 位 test 同时检查两者：
+    //   test qword [rbp + off_flags_], (flags_mask | signal_pending_mask)
+    //   flags 在低 32 位，signal_pending 在第 5 字节（bit 32-39）
+    //
+    //   flags 需要检查的值：0x7 (VM_EXITED | VM_STOPPED | VM_KILLED)
+    //   signal_pending 非零 = bit 32 置位（bool 为 1）
+    //   合并为 64 位掩码：0x00000001'00000007
+
+    // test qword [rbp + off_flags_], imm32 (sign-extended to 64-bit)
+    // 但 0x100000007 > 32 位，test r/m64, imm32 只能表示 sign-extended imm32。
+    // 需要用 RAX 中转：mov rax, imm64; test [rbp+off_flags_], rax
+    emit8(0x48); emit8(0xB8); emit64(0x100000007ULL);  // mov rax, 0x1_0000_0007
+    // test qword [rbp + off_flags_], rax
+    emit8(0x48); emit8(0x85); emit8(modrm(2, X86::RAX, X86::RBP));
+    emit32((uint32_t)off_flags_);
+    size_t flags_jnz = size();
+    emit8(0x0F); emit8(0x85); emit32(0);     // JNZ .slow_safepoint
+
+    // 快速路径：无异常也无待处理信号，跳过
+    size_t fast_jmp = size();
+    emit8(0xE9); emit32(0);                  // JMP .done
+
+    // .slow_safepoint: flush 所有寄存器 + 调用 helper
+    size_t slow_start = size();
+    {
+        uint32_t rel = (uint32_t)(slow_start - (flags_jnz + 6));
+        memcpy(data() + flags_jnz + 2, &rel, 4);
+    }
+
+    flush_to_vm();
+    mov_r64(X86::RDI, X86::RBP);
     call_helper(helpers_.safepoint);
     test_eax_eax();
-    abort_patches.push_back({size(), bpf_index});
-    emit8(0x0F); emit8(0x85); emit32(0);  // JNE rel32
+    size_t sp_jne = size();
+    emit8(0x0F); emit8(0x85); emit32(0);     // JNE .vm_exit
+    {
+        uint32_t sp_rel = (uint32_t)(vm_exit_offset - (sp_jne + 6));
+        memcpy(data() + sp_jne + 2, &sp_rel, 4);
+    }
+    reload_caller_saved();
+
+    // .done
+    size_t done = size();
+    {
+        uint32_t rel = (uint32_t)(done - (fast_jmp + 5));
+        memcpy(data() + fast_jmp + 1, &rel, 4);
+    }
 }
 
 #endif // __x86_64__
