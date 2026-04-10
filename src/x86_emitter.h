@@ -97,8 +97,6 @@ private:
     // --- Memory access (frame-relative) ---
     void load_r64(uint8_t dst, int32_t disp);
     void store_r64(int32_t disp, uint8_t src);
-    void load_r32(uint8_t dst, int32_t disp);
-
     // --- SIB-addressed operations: [RBP + RDI + disp32] ---
     void sib_op_rax(uint8_t opcode, int32_t disp);
     void sib_op_rdx(uint8_t opcode, int32_t disp);

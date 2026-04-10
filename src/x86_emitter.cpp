@@ -48,12 +48,6 @@ void X86Emitter::store_r64(int32_t disp, uint8_t src) {
     emit32(disp);
 }
 
-void X86Emitter::load_r32(uint8_t dst, int32_t disp) {
-    emit8(0x8B);
-    emit8(modrm(2, dst, X86::RBP));
-    emit32(disp);
-}
-
 // ---------------------------------------------------------------------------
 // SIB-addressed operations: [RBP + RDI + disp32]
 // ---------------------------------------------------------------------------
@@ -266,38 +260,50 @@ MemAccessContext X86Emitter::begin_mem_access(int32_t base_disp,
         emit8(0x48); emit8(0x05); emit32((uint32_t)(int32_t)offset); // add rax, offset
     }
 
-    // Compute TLB index: ((addr >> 20) & 0xF) * 32 = (addr >> 15) & 0x1F0
+    // Compute TLB index: ((addr >> 20) & (TLB_SIZE-1)) * sizeof(TlbEntry)
     emit8(0x48); emit8(0x89); emit8(0xC7);                   // mov rdi, rax
-    emit8(0x48); emit8(0xC1); emit8(0xEF); emit8(15);     // shr rdi, 15
-    emit8(0x81); emit8(0xE7); emit32(0x1F0);                 // and edi, 0x1F0
+    emit8(0x48); emit8(0xC1); emit8(0xEF); emit8(20);        // shr rdi, 20
+    emit8(0x81); emit8(0xE7); emit32(TLB_SIZE - 1);          // and edi, (TLB_SIZE-1)
+    if constexpr ((sizeof(TlbEntry) & (sizeof(TlbEntry) - 1)) == 0) {
+        constexpr int shift = __builtin_ctz(sizeof(TlbEntry));
+        emit8(0xC1); emit8(modrm(3, 4, X86::RDI)); emit8(shift); // shl edi, shift
+    } else {
+        emit8(0x69); emit8(0xFF); emit32(sizeof(TlbEntry));   // imul edi, edi, sizeof(TlbEntry)
+    }
+
+    constexpr int32_t off_guest_base = (int32_t)offsetof(TlbEntry, guest_base);
+    constexpr int32_t off_guest_end  = (int32_t)offsetof(TlbEntry, guest_end);
+    constexpr int32_t off_host_base  = (int32_t)offsetof(TlbEntry, host_base);
+    constexpr int32_t off_flags      = (int32_t)offsetof(TlbEntry, flags);
+    constexpr int32_t off_cow        = (int32_t)offsetof(TlbEntry, cow);
 
     // Bounds check 1: addr >= entry.guest_base
-    sib_op_rax(0x3B, tlb_off);                                    // cmp rax, [rbp+rdi+tlb_off]
+    sib_op_rax(0x3B, tlb_off + off_guest_base);              // cmp rax, guest_base
     ctx.miss_jumps.push_back(size());
     emit8(0x0F); emit8(0x82); emit32(0);                     // JB .slow
 
     // Bounds check 2: addr + size <= entry.guest_end
     emit8(0x48); emit8(0x8D); emit8(0x90);                   // lea rdx, [rax + disp32]
     emit32((uint32_t)access_size);
-    sib_op_rdx(0x3B, tlb_off + 8);                                // cmp rdx, [rbp+rdi+tlb_off+8]
+    sib_op_rdx(0x3B, tlb_off + off_guest_end);               // cmp rdx, guest_end
     ctx.miss_jumps.push_back(size());
     emit8(0x0F); emit8(0x87); emit32(0);                     // JA .slow
 
     if (is_write) {
         // Write permission: flags & PF_W (0x2)
-        sib_test_dword(tlb_off + 24, 0x2);
+        sib_test_dword(tlb_off + off_flags, 0x2);
         ctx.miss_jumps.push_back(size());
         emit8(0x0F); emit8(0x84); emit32(0);                 // JZ .slow
 
-        // No CoW: !cow (byte at offset 28)
-        sib_cmp_byte(tlb_off + 28, 0);
+        // No CoW: !cow
+        sib_cmp_byte(tlb_off + off_cow, 0);
         ctx.miss_jumps.push_back(size());
         emit8(0x0F); emit8(0x85); emit32(0);                 // JNE .slow
     }
 
     // TLB hit: host_ptr = host_base + (addr - guest_base)
-    sib_op_rax(0x2B, tlb_off);                                    // sub rax, [rbp+rdi+tlb_off]
-    sib_op_rax(0x03, tlb_off + 16);                               // add rax, [rbp+rdi+tlb_off+16]
+    sib_op_rax(0x2B, tlb_off + off_guest_base);              // sub rax, guest_base
+    sib_op_rax(0x03, tlb_off + off_host_base);               // add rax, host_base
 
     // JMP .done (rel32 placeholder)
     ctx.done_jmp = size();

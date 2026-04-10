@@ -188,15 +188,18 @@ struct vmOptions {
     std::shared_ptr<SyscallHandler> sys;
 };
 
+struct TlbEntry {
+    uint64_t guest_base;
+    uint64_t guest_end;
+    unsigned char* host_base;
+    uint32_t flags;
+    bool cow;
+};
+constexpr size_t TLB_SIZE = 16;
+static_assert((TLB_SIZE & (TLB_SIZE - 1)) == 0, "TLB_SIZE must be power of 2");
+
 class vm: public std::enable_shared_from_this<vm> {
-    struct TlbEntry {
-        uint64_t guest_base;
-        uint64_t guest_end;
-        unsigned char* host_base;
-        uint32_t flags;
-        bool cow;
-    };
-    static constexpr size_t TLB_SIZE = 16;
+private:
     TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
     const bpf_insn* pc;
