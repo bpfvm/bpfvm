@@ -5,8 +5,8 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 
-#define MARKER_BEFORE "/tmp/test_sigstop_before"
-#define MARKER_AFTER  "/tmp/test_sigstop_after"
+#define MARKER_BEFORE "test_sigstop_before"
+#define MARKER_AFTER  "test_sigstop_after"
 
 static int file_exists(const char *path) {
     return access(path, 0) == 0;

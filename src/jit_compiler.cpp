@@ -11,6 +11,8 @@
 
 #if defined(__x86_64__)
 #include "x86_emitter.h"
+#elif defined(__aarch64__)
+#include "aarch64_emitter.h"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -420,6 +422,9 @@ void* JitCompiler<EmitterT>::finalize_code(EmitterT& e) {
         munmap(code_mem, alloc_size);
         return nullptr;
     }
+
+    // Flush instruction cache (required on AArch64 where icache != dcache)
+    __builtin___clear_cache((char*)code_mem, (char*)code_mem + code_size);
     return code_mem;
 }
 
@@ -561,4 +566,6 @@ void JitCompiler<EmitterT>::dump_stats(const JitStats& s) {
 
 #if defined(__x86_64__)
 template class JitCompiler<X86Emitter>;
+#elif defined(__aarch64__)
+template class JitCompiler<AArch64Emitter>;
 #endif

@@ -1,8 +1,13 @@
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_library(bpfvm_lib STATIC
     insn.cpp
     posix_syscall.cpp
     jit_compiler.cpp
     x86_emitter.cpp
+    aarch64_emitter.cpp
 )
 target_include_directories(bpfvm_lib PUBLIC ${CMAKE_SOURCE_DIR})
 

@@ -2,18 +2,25 @@
 
 ## Project Structure & Module Organization
 - `main.cpp`: VM entry point, command-line parsing, signal setup.
-- `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, and instruction definitions.
-- `insn.cpp`: BPF instruction execution (interpreter loop).
+- `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, TLB, and instruction definitions.
+- `insn.cpp`: BPF instruction execution (interpreter loop with JIT fallback).
 - `posix_syscall.h`, `posix_syscall.cpp`: full POSIX syscall implementation (`PosixSyscall` class), fd management, signal queue, process control.
 - `empty_syscall.h`: stub syscall handler (`EmptySyscall`) returning `-ENOSYS`, used for testing.
 - `insn_test.cpp`: unit tests for instruction execution, built into `bpfvm_test`.
+- `jit.h`: shared JIT data structures and type aliases.
+- `jit_compiler.h`, `jit_compiler.cpp`: architecture-independent JIT compiler template and implementation.
+- `jit_base_emitter.h`: architecture-independent code emission base class.
+- `x86_emitter.h`, `x86_emitter.cpp`: x86_64 JIT code emitter.
+- `aarch64_emitter.h`, `aarch64_emitter.cpp`: AArch64 JIT code emitter.
 - `include/`: BPF-facing headers (syscall IDs, POSIX types) used by guest programs.
+- `cmake/`: CMake helper scripts (e.g., `RunBpfProgram.cmake` for CTest integration).
+- `bpf-cc`: BPF compiler wrapper script used by `test/Makefile` and `build_root.sh`.
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
 - `root/`: demo rootfs output directory (binaries installed to `root/bin`).
 - `test/`: small BPF test programs (`.c`) and expected outputs (`.out`), built via a local Makefile.
-- `testdrivers/`, `test_support/`: PDCLib test drivers and helpers; treat as upstream-style fixtures.
+- `pdclib/test_support/`, `pdclib/build/test_support/testdrivers/`: PDCLib test drivers and helpers; treat as upstream-style fixtures.
 - `build/`: local build outputs (CMake and cross-build artifacts).
 
 ## Build, Test, and Development Commands
@@ -21,7 +28,7 @@
 - `./build/bpfvm <elf-file>` — run the VM on a BPF ELF file.
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
 - `cd build && ctest` — run all CTest tests (see below).
-- `make -C test` — build BPF test programs into `.out` files using `clang` and `bpf-ld`.
+- `make -C test` — build BPF test programs into `.out` files using `bpf-cc` and `bpf-ld`.
 - `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
 
 ## Coding Style & Naming Conventions
@@ -44,6 +51,19 @@ CMake registers the following CTest cases under the `BUILD_TESTING` option (run 
 
 **Adding a new BPF test case:** Simply create a `test/test_<name>.c` file; CTest will auto-discover and register it. If the program is a helper (invoked by other tests rather than run independently), add it to the `BPF_TEST_HELPERS` list in `CMakeLists.txt`.
 
+## JIT Compilation & Execution Model
+
+The VM uses a hybrid interpreter/JIT execution model:
+- **JIT-first**: hot functions are compiled to native code via `JitCompiler<EmitterT>`, with architecture-specific emitters for x86_64 and AArch64.
+- **Interpreter fallback**: single-step execution or JIT errors fall back to the interpreter loop in `insn.cpp`.
+- **TLB acceleration**: a software TLB caches guest-to-host address translations; misses go through `mmu_slow()` / `mmu_w_slow()`.
+- **CoW support**: memory mappings support copy-on-write semantics (for `fork`); write faults trigger page duplication.
+- **Signal-aware frames**: normal call frames are 64 bytes; signal frames are 128 bytes with additional saved state.
+
+### JIT Environment Variables
+- `JIT_ENABLE`: set to `0` to disable JIT and force interpreter-only execution; defaults to enabled (any other value or unset enables JIT).
+- `JIT_DEBUG`: set to any value to print JIT statistics (instruction counts, hit rate, compilation time) to stderr at VM exit.
+
 ## Syscall Implementation & C Library Wrappers
 - Syscall handling is decoupled from the VM via the abstract `SyscallHandler` interface (defined in `insn.h`), with `PosixSyscall` (`posix_syscall.cpp`) as the main implementation and `EmptySyscall` (`empty_syscall.h`) as a stub for testing.
 - Syscall IDs are defined in `include/bpf_call.h` and encoded via `BPF_CALL_BASE` / `BPF_CALL_ID()`; the VM dispatches them through the `SyscallHandler::syscall()` virtual method.
@@ -59,7 +79,7 @@ CMake registers the following CTest cases under the `BUILD_TESTING` option (run 
 
 ## Configuration & Dependencies
 - Requires `libelf` via `pkg-config` for the VM build.
-- BPF toolchain dependencies: `clang`, `bpf-objcopy`, and `bpf-ld` for `test/` programs.
+- BPF toolchain dependencies: `clang`, `bpf-objcopy`, and `bpf-ld` for `test/` programs. The `bpf-cc` wrapper script in the project root handles the standard compile flags and post-compilation `bpf-objcopy` workaround.
 
 ## Known Toolchain Issues
 - `bpf-ld` (binutils-bpf 2.44) may mis-merge string literals (off-by-one addresses in `.rodata`).

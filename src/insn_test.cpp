@@ -382,6 +382,30 @@ void test_alu_end_be16() {
     assert(success);
 }
 
+// Regression test: BPF_ALU END BE16 with non-zero upper 16 bits.
+// REV16 Wd, Wn swaps bytes in BOTH 16-bit halves. The JIT must mask
+// the result to 16 bits (AND #0xFFFF). Without the mask, bits [31:16]
+// contain the swapped upper half instead of zero.
+// Input:  r1 = 0xAABBCCDD
+// BE16:   should produce 0x000000000000DDCC (byte-swap lower 16 bits, zero-extend)
+// Bug:    produces       0x00000000BB AADDCC (upper half also swapped, not cleared)
+void test_alu_end_be16_upper_bits() {
+    std::cout << "--- Running Test: test_alu_end_be16_upper_bits ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, (int32_t)0xAABBCCDD }, // mov r1, 0xAABBCCDD
+        { BPF_ALU | BPF_END | BPF_X, 1, 0, 0, 16 },                     // be16 r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    // be16 takes lower 16 bits (0xCCDD), byte-swaps → 0xDDCC, zero-extends to 64 bits
+    bool success = (ret == 0xDDCC);
+    print_test_result("test_alu_end_be16_upper_bits", success);
+    assert(success);
+}
+
 void test_alu_end_be32() {
     std::cout << "--- Running Test: test_alu_end_be32 ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -956,7 +980,7 @@ void test_syscall_file_io() {
     memset(data, 0, data_size);
 
     char path[128];
-    snprintf(path, sizeof(path), "/tmp/bpfvm_syscall_test_%d.txt", getpid());
+    snprintf(path, sizeof(path), "bpfvm_syscall_test_%d.txt", getpid());
     unlink(path);
 
     size_t path_len = strlen(path) + 1;
@@ -1261,6 +1285,7 @@ int main() {
     test_alu_end_le32();
     test_alu_end_le64();
     test_alu_end_be16();
+    test_alu_end_be16_upper_bits();  // AArch64 JIT bug: REV16 must clear upper 16 bits
     test_alu_end_be32();
     test_alu_end_be64();
     test_alu64_end_bswap16();

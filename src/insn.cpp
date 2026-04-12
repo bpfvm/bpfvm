@@ -11,6 +11,10 @@
 #include "jit_compiler.h"
 #include "x86_emitter.h"
 using JitCompilerImpl = JitCompiler<X86Emitter>;
+#elif defined(__aarch64__)
+#include "jit_compiler.h"
+#include "aarch64_emitter.h"
+using JitCompilerImpl = JitCompiler<AArch64Emitter>;
 #else
 class StubJitCompiler : public JitCompilerBase {
 public:
@@ -34,7 +38,6 @@ using JitCompilerImpl = StubJitCompiler;
 #include <errno.h>
 #include <mutex>
 #include <time.h>
-#include <chrono>
 
 
 std::mutex log_mutex;
