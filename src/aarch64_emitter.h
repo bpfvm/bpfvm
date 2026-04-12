@@ -96,9 +96,6 @@ constexpr uint8_t BPF_CALLER_SAVED_ARM[BPF_CALLER_SAVED_COUNT] = {
 // ---------------------------------------------------------------------------
 class AArch64Emitter : public EmitterBase {
 public:
-    void set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags, size_t off_tlb);
-    void set_helpers(const HelperTable& h);
-
     // --- High-level BPF instruction emission ---
 
     size_t emit_prologue();
@@ -125,20 +122,11 @@ public:
     void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
     void emit_exit();
 
-    // --- AArch64-specific patching ---
-    void patch_rel32(size_t inst_offset, size_t target_offset);
-    void patch_jmp_rel32(size_t inst_offset, size_t target_offset);
+    // --- Patching (AArch64-specific: B.cond imm19, B imm26) ---
+    void patch_branch_cond(size_t inst_offset, size_t target_offset);
+    void patch_branch_uncond(size_t inst_offset, size_t target_offset);
 
 private:
-    // VM field offsets
-    size_t off_reg_ = 0;
-    size_t off_pc_ = 0;
-    size_t off_flags_ = 0;
-    size_t off_tlb_ = 0;
-
-    HelperTable helpers_;
-    size_t vm_exit_offset_ = 0;
-
     // --- Low-level instruction emission ---
     void emit_insn(uint32_t insn);
 
@@ -236,11 +224,6 @@ private:
                                       int access_size, bool is_write);
     void finish_mem_access(MemAccessContext& ctx,
                            std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
-
-    // Patch a B.cond at inst_offset to target
-    void patch_bcond(size_t inst_offset, size_t target_offset);
-    // Patch a B at inst_offset to target
-    void patch_b(size_t inst_offset, size_t target_offset);
 };
 
 // AArch64 condition codes

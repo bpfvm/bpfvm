@@ -89,10 +89,6 @@ constexpr uint8_t BPF_CALLER_SAVED_X86[BPF_CALLER_SAVED_COUNT] = {
 // ---------------------------------------------------------------------------
 class X86Emitter : public EmitterBase {
 public:
-    // VM state setup (call before each compilation session)
-    void set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags, size_t off_tlb);
-    void set_helpers(const HelperTable& h);
-
     // --- High-level BPF instruction emission ---
 
     size_t emit_prologue();
@@ -124,18 +120,11 @@ public:
     void finish_mem_access(MemAccessContext& ctx,
                            std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
+    // --- Patching (x86-specific: Jcc rel32, JMP rel32) ---
+    void patch_branch_cond(size_t inst_offset, size_t target_offset);
+    void patch_branch_uncond(size_t inst_offset, size_t target_offset);
+
 private:
-    // VM field offsets
-    size_t off_reg_ = 0;
-    size_t off_pc_ = 0;
-    size_t off_flags_ = 0;
-    size_t off_tlb_ = 0;
-
-    // Helper function pointers
-    HelperTable helpers_;
-
-    // vm_exit offset (set by emit_prologue, used by all emit_* methods)
-    size_t vm_exit_offset = 0;
 
     // --- ModRM ---
     static uint8_t modrm(uint8_t mod, uint8_t reg, uint8_t rm) {

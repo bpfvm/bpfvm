@@ -511,14 +511,14 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
         }
         size_t target = pc_offsets[ph.target_bpf_index];
         switch (ph.kind) {
-        case PlaceholderKind::Jcc:  e.patch_rel32(ph.patch_offset, target); break;
-        case PlaceholderKind::Jmp:  e.patch_jmp_rel32(ph.patch_offset, target); break;
+        case PlaceholderKind::Conditional:  e.patch_branch_cond(ph.patch_offset, target); break;
+        case PlaceholderKind::Unconditional:  e.patch_branch_uncond(ph.patch_offset, target); break;
         }
     }
 
     // Patch abort jumps to .flush_and_exit
     for (auto& ap : abort_patches) {
-        e.patch_rel32(ap.jump_offset, flush_and_exit_offset);
+        e.patch_branch_cond(ap.jump_offset, flush_and_exit_offset);
     }
 
     // Finalize

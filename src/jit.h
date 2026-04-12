@@ -17,8 +17,8 @@ class vm;
 // Jump / call placeholder for deferred patching
 // ---------------------------------------------------------------------------
 enum class PlaceholderKind : uint8_t {
-    Jcc,    // conditional jump Jcc rel32 (6 bytes, patch at offset+2)
-    Jmp,    // unconditional JMP rel32 (5 bytes, patch at offset+1)
+    Conditional,    // conditional branch placeholder
+    Unconditional,  // unconditional branch placeholder
 };
 
 struct JumpPlaceholder {

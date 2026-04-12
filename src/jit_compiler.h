@@ -57,8 +57,8 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     { e.data() } -> std::convertible_to<uint8_t*>;
 
     // Patching
-    e.patch_rel32(0u, 0u);
-    e.patch_jmp_rel32(0u, 0u);
+    e.patch_branch_cond(0u, 0u);
+    e.patch_branch_uncond(0u, 0u);
 };
 
 // ---------------------------------------------------------------------------

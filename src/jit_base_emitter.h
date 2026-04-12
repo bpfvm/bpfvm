@@ -8,12 +8,26 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "jit.h"
 
 class EmitterBase {
 protected:
     std::vector<uint8_t> buf_;
 
+    // VM field offsets (set via set_vm_offsets)
+    size_t off_reg_ = 0;
+    size_t off_pc_ = 0;
+    size_t off_flags_ = 0;
+    size_t off_tlb_ = 0;
+
+    // Helper function pointers (set via set_helpers)
+    HelperTable helpers_;
+
+    // vm_exit offset (set by emit_prologue, used by all emit_* methods)
+    size_t vm_exit_offset = 0;
+
 public:
+    // --- Byte emission ---
     void emit8(uint8_t v) { buf_.push_back(v); }
     void emit16(uint16_t v) {
         buf_.push_back(v & 0xFF);
@@ -33,16 +47,11 @@ public:
     size_t size() const { return buf_.size(); }
     uint8_t* data() { return buf_.data(); }
 
-    // Patch a Jcc rel32 at inst_offset (4-byte displacement at inst_offset+2)
-    void patch_rel32(size_t inst_offset, size_t target_offset) {
-        uint32_t rel = (uint32_t)(target_offset - (inst_offset + 6));
-        memcpy(buf_.data() + inst_offset + 2, &rel, 4);
+    // --- VM state setup (call before each compilation session) ---
+    void set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags, size_t off_tlb) {
+        off_reg_ = off_reg; off_pc_ = off_pc; off_flags_ = off_flags; off_tlb_ = off_tlb;
     }
-    // Patch a JMP/CALL rel32 at inst_offset (4-byte displacement at inst_offset+1)
-    void patch_jmp_rel32(size_t inst_offset, size_t target_offset) {
-        uint32_t rel = (uint32_t)(target_offset - (inst_offset + 5));
-        memcpy(buf_.data() + inst_offset + 1, &rel, 4);
-    }
+    void set_helpers(const HelperTable& h) { helpers_ = h; }
 };
 
 #endif // JIT_BASE_EMITTER_H

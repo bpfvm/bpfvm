@@ -17,18 +17,16 @@
 #include "insn.h"
 
 // ---------------------------------------------------------------------------
-// VM state setup
+// Patching: Jcc rel32 (6 bytes, disp at +2) and JMP rel32 (5 bytes, disp at +1)
 // ---------------------------------------------------------------------------
 
-void X86Emitter::set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags, size_t off_tlb) {
-    off_reg_ = off_reg;
-    off_pc_ = off_pc;
-    off_flags_ = off_flags;
-    off_tlb_ = off_tlb;
+void X86Emitter::patch_branch_cond(size_t off, size_t target) {
+    uint32_t rel = (uint32_t)(target - (off + 6));
+    memcpy(data() + off + 2, &rel, 4);
 }
-
-void X86Emitter::set_helpers(const HelperTable& h) {
-    helpers_ = h;
+void X86Emitter::patch_branch_uncond(size_t off, size_t target) {
+    uint32_t rel = (uint32_t)(target - (off + 5));
+    memcpy(data() + off + 1, &rel, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -422,14 +420,10 @@ void X86Emitter::finish_mem_access(MemAccessContext& ctx,
                                      std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
     // Patch miss jumps → .slow
     for (size_t off : ctx.miss_jumps) {
-        uint32_t rel = (uint32_t)(ctx.slow_start - (off + 6));
-        memcpy(data() + off + 2, &rel, 4);
+        patch_branch_cond(off, ctx.slow_start);
     }
     // Patch fast-path JMP → .done
-    {
-        uint32_t rel = (uint32_t)(ctx.done_offset - (ctx.done_jmp + 5));
-        memcpy(data() + ctx.done_jmp + 1, &rel, 4);
-    }
+    patch_branch_uncond(ctx.done_jmp, ctx.done_offset);
     // Record abort jumps for later patching to .vm_exit
     for (size_t off : ctx.abort_jumps) {
         abort_patches.push_back({off, bpf_index});
@@ -962,7 +956,7 @@ bool X86Emitter::emit_jmp(const bpf_insn* insn, int current_index, bool is_64,
     jcc_rel32(x86_cc);
 
     int target = current_index + 1 + insn->off;
-    placeholders.push_back({jcc_off, target, PlaceholderKind::Jcc});
+    placeholders.push_back({jcc_off, target, PlaceholderKind::Conditional});
     return true;
 }
 
@@ -975,7 +969,7 @@ void X86Emitter::emit_ja(const bpf_insn* insn, int current_index,
     size_t jmp_off = size();
     jmp_rel32();
     int target = current_index + 1 + insn->off;
-    placeholders.push_back({jmp_off, target, PlaceholderKind::Jmp});
+    placeholders.push_back({jmp_off, target, PlaceholderKind::Unconditional});
 }
 
 void X86Emitter::emit_ja32(const bpf_insn* insn, int current_index,
@@ -983,7 +977,7 @@ void X86Emitter::emit_ja32(const bpf_insn* insn, int current_index,
     size_t jmp_off = size();
     jmp_rel32();
     int target = current_index + 1 + insn->imm;
-    placeholders.push_back({jmp_off, target, PlaceholderKind::Jmp});
+    placeholders.push_back({jmp_off, target, PlaceholderKind::Unconditional});
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,8 +1005,7 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
     test_al_al();
     size_t jz_off = size();
     emit8(0x0F); emit8(0x84); emit32(0);  // JZ .vm_exit
-    uint32_t rel = (uint32_t)(vm_exit_offset - (jz_off + 6));
-    memcpy(data() + jz_off + 2, &rel, 4);
+    patch_branch_cond(jz_off, vm_exit_offset);
 
     // 完整 reload 所有 BPF 寄存器（syscall 可能改了任意寄存器）
     reload_from_vm();
@@ -1040,10 +1033,7 @@ void X86Emitter::emit_call_bpf(const bpf_insn* insn, int current_index,
     // push_frame 失败 → 直接跳 vm_exit
     size_t jz_off = size();
     emit8(0x0F); emit8(0x84); emit32(0);                      // JZ .vm_exit
-    {
-        uint32_t rel = (uint32_t)(vm_exit_offset - (jz_off + 6));
-        memcpy(data() + jz_off + 2, &rel, 4);
-    }
+    patch_branch_cond(jz_off, vm_exit_offset);
 
     // 设置 pc 指向被调函数
     const bpf_insn* callee_pc = entry_pc + current_index + 1 + insn->imm;
@@ -1053,8 +1043,7 @@ void X86Emitter::emit_call_bpf(const bpf_insn* insn, int current_index,
     // 跳到 vm_exit（让 step() 循环重新进入 JIT）
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
-    uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
-    memcpy(data() + jmp_off + 1, &rel, 4);
+    patch_branch_uncond(jmp_off, vm_exit_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1064,7 @@ void X86Emitter::emit_call_indirect(const bpf_insn* insn,
     // 直接跳 vm_exit（flush 已经做过了）
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
-    uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
-    memcpy(data() + jmp_off + 1, &rel, 4);
+    patch_branch_uncond(jmp_off, vm_exit_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,13 +1088,11 @@ void X86Emitter::emit_exit() {
     emit8(0x01);
     size_t stack_bottom_jmp = size();
     emit8(0xE9); emit32(0);
-    uint32_t rel = (uint32_t)(vm_exit_offset - (stack_bottom_jmp + 5));
-    memcpy(data() + stack_bottom_jmp + 1, &rel, 4);
+    patch_branch_uncond(stack_bottom_jmp, vm_exit_offset);
 
     // .has_ret_addr: return to caller
     size_t has_ret_target = size();
-    rel = (uint32_t)(has_ret_target - (has_ret_jcc + 6));
-    memcpy(data() + has_ret_jcc + 2, &rel, 4);
+    patch_branch_cond(has_ret_jcc, has_ret_target);
 
     mov_r64(X86::RDI, X86::RBP);
     mov_r64(X86::RSI, X86::RAX);                              // mov rsi, rax (return addr)
@@ -1114,8 +1100,7 @@ void X86Emitter::emit_exit() {
 
     size_t exit_jmp = size();
     emit8(0xE9); emit32(0);
-    rel = (uint32_t)(vm_exit_offset - (exit_jmp + 5));
-    memcpy(data() + exit_jmp + 1, &rel, 4);
+    patch_branch_uncond(exit_jmp, vm_exit_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,12 +1158,11 @@ size_t X86Emitter::emit_prologue() {
     }
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
-    uint32_t rel = (uint32_t)(vm_exit_offset - (jmp_off + 5));
-    memcpy(data() + jmp_off + 1, &rel, 4);
+    patch_branch_uncond(jmp_off, vm_exit_offset);
 
     // .entry: 入口 safepoint
     size_t entry_offset = size();
-    patch_jmp_rel32(entry_jmp_offset, entry_offset);
+    patch_branch_uncond(entry_jmp_offset, entry_offset);
 
     // Safepoint at entry: 必须先 flush 所有寄存器（信号处理器可能读取）
     flush_to_vm();
@@ -1189,10 +1173,7 @@ size_t X86Emitter::emit_prologue() {
     // 而且信号处理器可能已修改 vm->reg[]，不能再用 x86 寄存器覆盖）
     size_t sp_jne = size();
     emit8(0x0F); emit8(0x85); emit32(0);     // JNE .vm_exit
-    {
-        uint32_t sp_rel = (uint32_t)(vm_exit_offset - (sp_jne + 6));
-        memcpy(data() + sp_jne + 2, &sp_rel, 4);
-    }
+    patch_branch_cond(sp_jne, vm_exit_offset);
 
     // Safepoint 返回后 reload caller-saved（callee-saved 自动存活）
     reload_caller_saved();
@@ -1238,10 +1219,7 @@ void X86Emitter::emit_safepoint() {
 
     // .slow_safepoint: flush 所有寄存器 + 调用 helper
     size_t slow_start = size();
-    {
-        uint32_t rel = (uint32_t)(slow_start - (flags_jnz + 6));
-        memcpy(data() + flags_jnz + 2, &rel, 4);
-    }
+    patch_branch_cond(flags_jnz, slow_start);
 
     flush_to_vm();
     mov_r64(X86::RDI, X86::RBP);
@@ -1249,18 +1227,12 @@ void X86Emitter::emit_safepoint() {
     test_eax_eax();
     size_t sp_jne = size();
     emit8(0x0F); emit8(0x85); emit32(0);     // JNE .vm_exit
-    {
-        uint32_t sp_rel = (uint32_t)(vm_exit_offset - (sp_jne + 6));
-        memcpy(data() + sp_jne + 2, &sp_rel, 4);
-    }
+    patch_branch_cond(sp_jne, vm_exit_offset);
     reload_caller_saved();
 
     // .done
     size_t done = size();
-    {
-        uint32_t rel = (uint32_t)(done - (fast_jmp + 5));
-        memcpy(data() + fast_jmp + 1, &rel, 4);
-    }
+    patch_branch_uncond(fast_jmp, done);
 }
 
 #endif // __x86_64__
