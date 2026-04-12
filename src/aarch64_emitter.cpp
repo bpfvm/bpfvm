@@ -119,6 +119,11 @@ void AArch64Emitter::mul_reg(uint8_t d, uint8_t n, uint8_t m, bool is_64) {
     uint32_t sf = is_64 ? 1u : 0u;
     emit_insn((sf << 31) | (0x1Bu << 24) | ((uint32_t)m << 16) | (0x1Fu << 10) | ((uint32_t)n << 5) | rd(d));
 }
+void AArch64Emitter::msub_reg(uint8_t d, uint8_t n, uint8_t m, uint8_t a, bool is_64) {
+    uint32_t sf = is_64 ? 1u : 0u;
+    emit_insn((sf << 31) | (0x1Bu << 24) | ((uint32_t)m << 16) | (1u << 15)
+              | ((uint32_t)a << 10) | ((uint32_t)n << 5) | rd(d));
+}
 void AArch64Emitter::udiv_reg(uint8_t d, uint8_t n, uint8_t m, bool is_64) {
     emit_insn((is_64 ? 0x9AC00800u : 0x1AC00800u) | ((uint32_t)m << 16) | ((uint32_t)n << 5) | rd(d));
 }
@@ -595,14 +600,31 @@ bool AArch64Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
             mul_reg(X0, X0, X1, is_64);
         }
         break;
-    case BPF_DIV: case BPF_MOD: {
-        if (!is_x) mov_imm(X1, (uint64_t)(int64_t)insn->imm, is_64);
-        // X0 = dst, X1 = src. Set up X2 = off, then call helper(dst, src, off)
-        spill_caller_saved();
-        mov_imm(X2, (uint64_t)(int64_t)insn->off, true);
-        call_helper(op == BPF_DIV ? (is_64 ? helpers_.div64 : helpers_.div32)
-                                   : (is_64 ? helpers_.mod64 : helpers_.mod32));
-        restore_caller_saved();
+    case BPF_DIV: {
+        if (!is_x) {
+            if (insn->imm == 0) {
+                mov_imm(X0, 0, is_64);
+                store_dst();
+                return true;
+            }
+            mov_imm(X1, (uint64_t)(int64_t)insn->imm, is_64);
+        }
+        if (insn->off == 0) udiv_reg(X0, X0, X1, is_64);
+        else                sdiv_reg(X0, X0, X1, is_64);
+        store_dst();
+        return true;
+    }
+    case BPF_MOD: {
+        if (!is_x) {
+            if (insn->imm == 0) {
+                // mod by 0 = dst 不变
+                return true;
+            }
+            mov_imm(X1, (uint64_t)(int64_t)insn->imm, is_64);
+        }
+        if (insn->off == 0) udiv_reg(X2, X0, X1, is_64);
+        else                sdiv_reg(X2, X0, X1, is_64);
+        msub_reg(X0, X2, X1, X0, is_64);
         store_dst();
         return true;
     }

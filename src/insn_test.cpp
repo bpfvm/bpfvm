@@ -209,6 +209,295 @@ void test_alu64_mod_by_zero_imm() {
     assert(success);
 }
 
+// --- DIV/MOD register source tests ---
+
+void test_alu64_div_reg() {
+    std::cout << "--- Running Test: test_alu64_div_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(2) = 5;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 0, 0 },   // div r1, r2
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 20 && ret == 20);
+    print_test_result("test_alu64_div_reg", success);
+    assert(success);
+}
+
+void test_alu64_mod_reg() {
+    std::cout << "--- Running Test: test_alu64_mod_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(2) = 7;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 0, 0 },   // mod r1, r2
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 2 && ret == 2);
+    print_test_result("test_alu64_mod_reg", success);
+    assert(success);
+}
+
+void test_alu64_div_by_zero_reg() {
+    std::cout << "--- Running Test: test_alu64_div_by_zero_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(2) = 0;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 0, 0 },   // div r1, r2 (r2=0)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 0 && ret == 0);
+    print_test_result("test_alu64_div_by_zero_reg", success);
+    assert(success);
+}
+
+void test_alu64_mod_by_zero_reg() {
+    std::cout << "--- Running Test: test_alu64_mod_by_zero_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(2) = 0;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 0, 0 },   // mod r1, r2 (r2=0)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 100 && ret == 100);
+    print_test_result("test_alu64_mod_by_zero_reg", success);
+    assert(success);
+}
+
+// --- Signed DIV/MOD tests (off != 0) ---
+
+void test_alu64_div_signed_reg() {
+    std::cout << "--- Running Test: test_alu64_div_signed_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)(int64_t)-10;
+    ebpf_vm->r(2) = 3;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div r1, r2 (off=1)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == (uint64_t)(int64_t)-3 && ret == (uint64_t)(int64_t)-3);
+    print_test_result("test_alu64_div_signed_reg", success);
+    assert(success);
+}
+
+void test_alu64_mod_signed_reg() {
+    std::cout << "--- Running Test: test_alu64_mod_signed_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)(int64_t)-10;
+    ebpf_vm->r(2) = 3;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod r1, r2 (off=1)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == (uint64_t)(int64_t)-1 && ret == (uint64_t)(int64_t)-1);
+    print_test_result("test_alu64_mod_signed_reg", success);
+    assert(success);
+}
+
+void test_alu64_div_signed_by_zero_reg() {
+    std::cout << "--- Running Test: test_alu64_div_signed_by_zero_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 42;
+    ebpf_vm->r(2) = 0;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div r1, 0 → 0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 0 && ret == 0);
+    print_test_result("test_alu64_div_signed_by_zero_reg", success);
+    assert(success);
+}
+
+void test_alu64_mod_signed_by_zero_reg() {
+    std::cout << "--- Running Test: test_alu64_mod_signed_by_zero_reg ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 42;
+    ebpf_vm->r(2) = 0;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod r1, 0 → r1
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 42 && ret == 42);
+    print_test_result("test_alu64_mod_signed_by_zero_reg", success);
+    assert(success);
+}
+
+// --- INT_MIN / -1 edge case tests ---
+
+void test_alu64_div_intmin_neg1() {
+    std::cout << "--- Running Test: test_alu64_div_intmin_neg1 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)INT64_MIN;
+    ebpf_vm->r(2) = (uint64_t)(int64_t)-1;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div INT64_MIN, -1 → INT64_MIN
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == (uint64_t)INT64_MIN && ret == (uint64_t)INT64_MIN);
+    print_test_result("test_alu64_div_intmin_neg1", success);
+    assert(success);
+}
+
+void test_alu64_mod_intmin_neg1() {
+    std::cout << "--- Running Test: test_alu64_mod_intmin_neg1 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)INT64_MIN;
+    ebpf_vm->r(2) = (uint64_t)(int64_t)-1;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod INT64_MIN, -1 → 0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 0 && ret == 0);
+    print_test_result("test_alu64_mod_intmin_neg1", success);
+    assert(success);
+}
+
+void test_alu32_div_intmin_neg1() {
+    std::cout << "--- Running Test: test_alu32_div_intmin_neg1 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)(uint32_t)INT32_MIN;
+    ebpf_vm->r(2) = (uint64_t)(uint32_t)(uint32_t)-1;
+    bpf_insn instructions[] = {
+        { BPF_ALU | BPF_DIV | BPF_X, 1, 2, 1, 0 },     // 32-bit signed div INT32_MIN, -1 → INT32_MIN
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = ((uint32_t)ebpf_vm->r(1) == (uint32_t)INT32_MIN && (uint32_t)ret == (uint32_t)INT32_MIN);
+    print_test_result("test_alu32_div_intmin_neg1", success);
+    assert(success);
+}
+
+void test_alu32_mod_intmin_neg1() {
+    std::cout << "--- Running Test: test_alu32_mod_intmin_neg1 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = (uint64_t)(uint32_t)INT32_MIN;
+    ebpf_vm->r(2) = (uint64_t)(uint32_t)(uint32_t)-1;
+    bpf_insn instructions[] = {
+        { BPF_ALU | BPF_MOD | BPF_X, 1, 2, 1, 0 },     // 32-bit signed mod INT32_MIN, -1 → 0
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = ((uint32_t)ebpf_vm->r(1) == 0 && (uint32_t)ret == 0);
+    print_test_result("test_alu32_mod_intmin_neg1", success);
+    assert(success);
+}
+
+// --- r5 (RDX on x86) preservation test ---
+
+void test_alu64_div_preserves_r5() {
+    std::cout << "--- Running Test: test_alu64_div_preserves_r5 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(5) = 0xDEADBEEFCAFE1234ULL;  // r5 = RDX on x86
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, 5 },   // div r1, 5
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 20 && ret == 20 &&
+                    ebpf_vm->r(5) == 0xDEADBEEFCAFE1234ULL);
+    print_test_result("test_alu64_div_preserves_r5", success);
+    assert(success);
+}
+
+void test_alu64_mod_preserves_r5() {
+    std::cout << "--- Running Test: test_alu64_mod_preserves_r5 ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 100;
+    ebpf_vm->r(5) = 0xDEADBEEFCAFE1234ULL;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, 7 },   // mod r1, 7
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 2 && ret == 2 &&
+                    ebpf_vm->r(5) == 0xDEADBEEFCAFE1234ULL);
+    print_test_result("test_alu64_mod_preserves_r5", success);
+    assert(success);
+}
+
+// --- INT32_MIN power-of-2 optimization bug reproduction ---
+
+void test_alu64_div_imm_intmin() {
+    // imm = INT32_MIN (0x80000000) 是 2 的幂，会触发位移优化
+    // 但无符号除法的实际除数是符号扩展后的 0xFFFFFFFF80000000
+    // 正确: 0x100000000 / 0xFFFFFFFF80000000 = 0
+    // Bug:  0x100000000 >> 31 = 2
+    std::cout << "--- Running Test: test_alu64_div_imm_intmin ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 0x100000000ULL;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_DIV | BPF_K, 1, 0, 0, INT32_MIN },  // unsigned div r1, INT32_MIN
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 0 && ret == 0);
+    print_test_result("test_alu64_div_imm_intmin", success);
+    assert(success);
+}
+
+void test_alu64_mod_imm_intmin() {
+    // MOD 的 2 的幂优化: and64_imm(imm - 1) = and64_imm(0x7FFFFFFF)
+    // 正确: 0x100000000 % 0xFFFFFFFF80000000 = 0x100000000 (被除数 < 除数)
+    // Bug:  0x100000000 & 0x7FFFFFFF = 0
+    std::cout << "--- Running Test: test_alu64_mod_imm_intmin ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    ebpf_vm->r(1) = 0x100000000ULL;
+    bpf_insn instructions[] = {
+        { BPF_ALU64 | BPF_MOD | BPF_K, 1, 0, 0, INT32_MIN },  // unsigned mod r1, INT32_MIN
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ebpf_vm->r(1) == 0x100000000ULL && ret == 0x100000000ULL);
+    print_test_result("test_alu64_mod_imm_intmin", success);
+    assert(success);
+}
+
 void test_alu64_and_imm() {
     std::cout << "--- Running Test: test_alu64_and_imm ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -1273,6 +1562,22 @@ int main() {
     test_alu64_div_by_zero_imm();
     test_alu64_mod_imm();
     test_alu64_mod_by_zero_imm();
+    test_alu64_div_reg();
+    test_alu64_mod_reg();
+    test_alu64_div_by_zero_reg();
+    test_alu64_mod_by_zero_reg();
+    test_alu64_div_signed_reg();
+    test_alu64_mod_signed_reg();
+    test_alu64_div_signed_by_zero_reg();
+    test_alu64_mod_signed_by_zero_reg();
+    test_alu64_div_intmin_neg1();
+    test_alu64_mod_intmin_neg1();
+    test_alu32_div_intmin_neg1();
+    test_alu32_mod_intmin_neg1();
+    test_alu64_div_preserves_r5();
+    test_alu64_mod_preserves_r5();
+    test_alu64_div_imm_intmin();
+    test_alu64_mod_imm_intmin();
     test_alu64_and_imm();
     test_alu64_or_reg();
     test_alu64_lsh_imm();

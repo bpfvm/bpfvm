@@ -310,7 +310,134 @@ void X86Emitter::emit_helper_call(void* helper) {
 }
 
 // ---------------------------------------------------------------------------
-// Inline TLB fast path + slow path
+// Inline DIV/MOD — replace helper call with hardware DIV/IDIV + edge-case checks
+//
+// 入口假设：RAX = 被除数 (dst), RCX = 除数 (src)
+// RDX 映射到 BPF r5，需要保存/恢复。
+// DIV/IDIV 使用 RDX:RAX 作为被除数，商在 RAX，余数在 RDX。
+// ---------------------------------------------------------------------------
+//
+// 代码布局：
+//   [save RDX]
+//   test rcx, rcx; JZ .zero
+//   [signed: cmp rcx,-1; JNZ .do_div; cmp rax,INT_MIN; JNE .do_div; JMP .after_div]
+//   .do_div:
+//   [cqo|xor edx,edx]; [div|idiv] rcx
+//   [mod: mov rax, rdx]
+//   JMP .after_div
+//   .zero:
+//   [DIV: xor rax,rax | MOD: leave rax as-is (dst)]
+//   .after_div:
+//   [restore RDX]
+//
+
+void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
+    // 保存 BPF r5 (RDX) 到 vm->reg[5]
+    store_r64((int32_t)(off_reg_ + 5 * 8), X86::RDX);
+
+    // test rcx, rcx
+    if (is_64) emit8(0x48);
+    emit8(0x85); emit8(0xC9);
+    size_t jz_zero = size();
+    emit8(0x0F); emit8(0x84); emit32(0);  // JZ .zero
+
+    // --- Signed: INT_MIN / -1 overflow check ---
+    std::vector<size_t> to_do_div;  // 需要跳转到 .do_div 的 patch 点
+
+    if (!is_unsigned) {
+        // cmp rcx/ecx, -1（32 位时 ECX 是零扩展的，必须用 32 位比较）
+        if (is_64) {
+            emit8(0x48); emit8(0x83); emit8(0xF9); emit8(0xFF);  // cmp rcx, -1
+        } else {
+            emit8(0x83); emit8(0xF9); emit8(0xFF);  // cmp ecx, -1
+        }
+        to_do_div.push_back(size());
+        emit8(0x0F); emit8(0x85); emit32(0);  // JNZ .do_div
+
+        // 除数 == -1，检查被除数 == INT_MIN
+        if (is_64) {
+            // mov r11, INT64_MIN; cmp rax, r11
+            emit8(0x49); emit8(0xBB); emit64(0x8000000000000000ULL);
+            emit8(0x4C); emit8(0x39); emit8(0xD8);
+        } else {
+            // cmp eax, INT32_MIN (sign-extended imm32)
+            emit8(0x3D); emit32(0x80000000u);
+        }
+        to_do_div.push_back(size());
+        emit8(0x0F); emit8(0x85); emit32(0);  // JNE .do_div
+
+        // INT_MIN / -1: DIV 结果 = INT_MIN (已在 RAX), MOD 结果 = 0
+        if (is_mod) {
+            if (is_64) emit8(0x48);
+            emit8(0x31); emit8(0xC0);  // xor eax, eax
+        }
+        // 跳过实际除法
+        size_t jmp_over = size();
+        emit8(0xE9); emit32(0);  // JMP .after_div
+
+        // .do_div:
+        size_t do_div = size();
+        for (auto off : to_do_div) patch_branch_cond(off, do_div);
+
+        // sign-extend RAX → RDX:RAX (cqo/cdq)
+        if (is_64) emit8(0x48);
+        emit8(0x99);
+
+        // idiv rcx / idiv ecx
+        if (is_64) {
+            emit8(0x48); emit8(0xF7); emit8(0xF9);
+        } else {
+            emit8(0xF7); emit8(0xF9);
+        }
+
+        if (is_mod) {
+            if (is_64) emit8(0x48);
+            emit8(0x89); emit8(0xD0);  // mov rdx -> rax
+        }
+
+        // .after_div:
+        patch_branch_uncond(jmp_over, size());
+
+    } else {
+        // --- Unsigned: no INT_MIN/-1 check needed ---
+
+        // xor edx, edx (清零 RDX 作为无符号高位)
+        if (is_64) emit8(0x48);
+        emit8(0x31); emit8(0xD2);
+
+        // div rcx / div ecx
+        if (is_64) {
+            emit8(0x48); emit8(0xF7); emit8(0xF1);
+        } else {
+            emit8(0xF7); emit8(0xF1);
+        }
+
+        if (is_mod) {
+            if (is_64) emit8(0x48);
+            emit8(0x89); emit8(0xD0);  // mov rdx -> rax
+        }
+    }
+
+    // JMP .after_zero (skip .zero handler)
+    size_t jmp_after_zero = size();
+    emit8(0xE9); emit32(0);
+
+    // .zero: handle divide-by-zero
+    size_t zero_label = size();
+    patch_branch_cond(jz_zero, zero_label);
+    if (!is_mod) {
+        // DIV by zero: result = 0
+        if (is_64) emit8(0x48);
+        emit8(0x31); emit8(0xC0);  // xor eax, eax
+    }
+    // MOD by zero: result = original dst (RAX already holds it)
+
+    // .after_zero (= .done):
+    patch_branch_uncond(jmp_after_zero, size());
+
+    // 恢复 BPF r5 (RDX)
+    load_r64(X86::RDX, (int32_t)(off_reg_ + 5 * 8));
+}
 //
 // 快速路径：查 TLB，命中则直接得到 host 指针
 // 慢速路径：push/pop caller-saved 寄存器，调用 helper_mmu
@@ -606,29 +733,43 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
         break;
     case BPF_MUL:  is_x ? (is_64 ? mul64() : mul32()) : (is_64 ? mul64_imm(insn->imm) : mul32_imm(insn->imm)); break;
     case BPF_DIV: {
-        // DIV/MOD 需要调用 helper 函数，必须先保存 caller-saved
-        // 但 emit_helper_call 会覆盖 RDI/RSI（BPF r3/r4），
-        // 而 RAX/RCX 已经被 load_dst/load_src 设置好了。
-        // 直接 spill/restore caller-saved 寄存器。
         if (!is_x) {
+            // 除以常量 0：结果为 0
+            if (insn->imm == 0) {
+                if (is_64) emit8(0x48);
+                emit8(0x31); emit8(0xC0);  // xor eax, eax
+                store_dst();
+                return true;
+            }
+            // 无符号除以 2 的幂（正数）：用右移代替
+            if (insn->off == 0 && insn->imm > 0 && (insn->imm & (insn->imm - 1)) == 0) {
+                if (is_64) shr64_imm(__builtin_ctz(insn->imm));
+                else       shr32_imm(__builtin_ctz(insn->imm));
+                store_dst();
+                return true;
+            }
             emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(insn->imm);  // mov rcx, imm32
         }
-        // 保存 caller-saved BPF 寄存器到栈
-        spill_caller_saved();
-        emit8(0xBA); emit32((uint32_t)(int32_t)insn->off);  // mov edx, off
-        emit_helper_call(is_64 ? helpers_.div64 : helpers_.div32);
-        restore_caller_saved();
+        emit_inline_div(is_64, insn->off == 0, false);
         store_dst();
         return true;
     }
     case BPF_MOD: {
         if (!is_x) {
+            // 模常量 0：结果为 dst（不变，RAX 已有 dst 值）
+            if (insn->imm == 0) {
+                return true;
+            }
+            // 无符号模 2 的幂（正数）：用 AND 掩码代替
+            if (insn->off == 0 && insn->imm > 0 && (insn->imm & (insn->imm - 1)) == 0) {
+                if (is_64) and64_imm(insn->imm - 1);
+                else       and32_imm(insn->imm - 1);
+                store_dst();
+                return true;
+            }
             emit8(0x48); emit8(0xC7); emit8(0xC1); emit32(insn->imm);
         }
-        spill_caller_saved();
-        emit8(0xBA); emit32((uint32_t)(int32_t)insn->off);
-        emit_helper_call(is_64 ? helpers_.mod64 : helpers_.mod32);
-        restore_caller_saved();
+        emit_inline_div(is_64, insn->off == 0, true);
         store_dst();
         return true;
     }

@@ -145,6 +145,7 @@ private:
     void orr_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void eor_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void mul_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
+    void msub_reg(uint8_t dst, uint8_t src1, uint8_t src2, uint8_t acc, bool is_64 = true);
     void sdiv_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void udiv_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void neg_reg(uint8_t dst, uint8_t src, bool is_64 = true);

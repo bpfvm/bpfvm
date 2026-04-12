@@ -78,10 +78,6 @@ struct HelperTable {
     void* return_to_caller = nullptr;
     void* mmu = nullptr;
     void* mmu_w = nullptr;
-    void* div64 = nullptr;
-    void* div32 = nullptr;
-    void* mod64 = nullptr;
-    void* mod32 = nullptr;
 };
 
 // ---------------------------------------------------------------------------

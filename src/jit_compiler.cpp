@@ -16,50 +16,6 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Arithmetic helpers for DIV/MOD (called from JIT-generated code)
-// ---------------------------------------------------------------------------
-
-uint64_t jit_div64(uint64_t dst, uint64_t src, int16_t off) {
-    if (off == 0) {
-        return src ? dst / src : 0;
-    }
-    if (!src) return 0;
-    auto sd = (int64_t)src;
-    return (sd == -1 && (int64_t)dst == INT64_MIN)
-        ? (uint64_t)INT64_MIN : (uint64_t)((int64_t)dst / sd);
-}
-
-uint64_t jit_mod64(uint64_t dst, uint64_t src, int16_t off) {
-    if (off == 0) {
-        return src ? dst % src : dst;
-    }
-    if (!src) return dst;
-    auto sd = (int64_t)src;
-    return (sd == -1 && (int64_t)dst == INT64_MIN)
-        ? 0 : (uint64_t)((int64_t)dst % sd);
-}
-
-uint32_t jit_div32(uint32_t dst, uint32_t src, int16_t off) {
-    if (off == 0) {
-        return src ? dst / src : 0;
-    }
-    if (!src) return 0;
-    auto sd = (int32_t)src;
-    return (sd == -1 && (int32_t)dst == INT32_MIN)
-        ? (uint32_t)INT32_MIN : (uint32_t)((int32_t)dst / sd);
-}
-
-uint32_t jit_mod32(uint32_t dst, uint32_t src, int16_t off) {
-    if (off == 0) {
-        return src ? dst % src : dst;
-    }
-    if (!src) return dst;
-    auto sd = (int32_t)src;
-    return (sd == -1 && (int32_t)dst == INT32_MIN)
-        ? 0 : (uint32_t)((int32_t)dst % sd);
-}
-
-// ---------------------------------------------------------------------------
 // JitCompiler implementation
 // ---------------------------------------------------------------------------
 
@@ -185,10 +141,6 @@ HelperTable JitCompiler<EmitterT>::make_helper_table() const {
     h.return_to_caller = (void*)&helper_return_to_caller;
     h.mmu = (void*)&helper_mmu;
     h.mmu_w = (void*)&helper_mmu_w;
-    h.div64 = (void*)jit_div64;
-    h.div32 = (void*)jit_div32;
-    h.mod64 = (void*)jit_mod64;
-    h.mod32 = (void*)jit_mod32;
     return h;
 }
 

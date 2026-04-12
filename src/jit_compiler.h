@@ -117,14 +117,4 @@ private:
     HelperTable make_helper_table() const;
 };
 
-// ---------------------------------------------------------------------------
-// Arithmetic helpers for DIV/MOD (called from JIT-generated code)
-// These are free functions, not template methods.
-// ---------------------------------------------------------------------------
-
-uint64_t jit_div64(uint64_t dst, uint64_t src, int16_t off);
-uint64_t jit_mod64(uint64_t dst, uint64_t src, int16_t off);
-uint32_t jit_div32(uint32_t dst, uint32_t src, int16_t off);
-uint32_t jit_mod32(uint32_t dst, uint32_t src, int16_t off);
-
 #endif // JIT_COMPILER_H

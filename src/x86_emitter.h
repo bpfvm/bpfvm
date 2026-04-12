@@ -160,6 +160,9 @@ private:
     void spill_caller_saved();    // push r0-r5 到 x86 栈（TLB miss 快速保存）
     void restore_caller_saved();  // pop 恢复 r0-r5（反向顺序）
 
+    // --- Inline DIV/MOD ---
+    void emit_inline_div(bool is_64, bool is_unsigned, bool is_mod);
+
     // --- Register-to-register ---
     void mov_r64(uint8_t dst, uint8_t src);
     void mov_r32(uint8_t dst, uint8_t src);  // 32-bit mov (zero-extends to 64)
