@@ -332,27 +332,30 @@ void X86Emitter::emit_helper_call(void* helper) {
 //
 
 void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
-    // 保存 BPF r5 (RDX) 到 vm->reg[5]
-    store_r64((int32_t)(off_reg_ + 5 * 8), X86::RDX);
+    // 保存 BPF r5 (RDX)：用 push/pop 代替 store/load vm->reg[5]，
+    // 栈顶几乎必然在 L1 cache，且各只需 1-2 字节编码。
+    push_reg(X86::RDX);
 
-    // test rcx, rcx
+    // 分支布局：热路径（除数非零）fall-through，冷路径（除零/溢出）跳出。
+    //
+    // test rcx, rcx; JZ .zero
     if (is_64) emit8(0x48);
     emit8(0x85); emit8(0xC9);
     size_t jz_zero = size();
-    emit8(0x0F); emit8(0x84); emit32(0);  // JZ .zero
-
-    // --- Signed: INT_MIN / -1 overflow check ---
-    std::vector<size_t> to_do_div;  // 需要跳转到 .do_div 的 patch 点
+    emit8(0x0F); emit8(0x84); emit32(0);  // JZ .zero (cold)
 
     if (!is_unsigned) {
-        // cmp rcx/ecx, -1（32 位时 ECX 是零扩展的，必须用 32 位比较）
+        // --- Signed: INT_MIN / -1 overflow check ---
+        // 热路径 fall-through 到 .do_div，溢出跳出。
+
+        // cmp rcx/ecx, -1
         if (is_64) {
             emit8(0x48); emit8(0x83); emit8(0xF9); emit8(0xFF);  // cmp rcx, -1
         } else {
             emit8(0x83); emit8(0xF9); emit8(0xFF);  // cmp ecx, -1
         }
-        to_do_div.push_back(size());
-        emit8(0x0F); emit8(0x85); emit32(0);  // JNZ .do_div
+        size_t jnz_do_div = size();
+        emit8(0x0F); emit8(0x85); emit32(0);  // JNZ .do_div (likely)
 
         // 除数 == -1，检查被除数 == INT_MIN
         if (is_64) {
@@ -363,21 +366,22 @@ void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
             // cmp eax, INT32_MIN (sign-extended imm32)
             emit8(0x3D); emit32(0x80000000u);
         }
-        to_do_div.push_back(size());
-        emit8(0x0F); emit8(0x85); emit32(0);  // JNE .do_div
+        size_t jne_do_div = size();
+        emit8(0x0F); emit8(0x85); emit32(0);  // JNE .do_div (likely)
 
         // INT_MIN / -1: DIV 结果 = INT_MIN (已在 RAX), MOD 结果 = 0
         if (is_mod) {
             if (is_64) emit8(0x48);
             emit8(0x31); emit8(0xC0);  // xor eax, eax
         }
-        // 跳过实际除法
-        size_t jmp_over = size();
-        emit8(0xE9); emit32(0);  // JMP .after_div
+        // 跳过实际除法，直接到 .done
+        size_t jmp_done = size();
+        emit8(0xE9); emit32(0);  // JMP .done (cold)
 
-        // .do_div:
+        // .do_div: 热路径汇合点
         size_t do_div = size();
-        for (auto off : to_do_div) patch_branch_cond(off, do_div);
+        patch_branch_cond(jnz_do_div, do_div);
+        patch_branch_cond(jne_do_div, do_div);
 
         // sign-extend RAX → RDX:RAX (cqo/cdq)
         if (is_64) emit8(0x48);
@@ -392,14 +396,15 @@ void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
 
         if (is_mod) {
             if (is_64) emit8(0x48);
-            emit8(0x89); emit8(0xD0);  // mov rdx -> rax
+            emit8(0x89); emit8(0xD0);  // mov rax, rdx
         }
 
-        // .after_div:
-        patch_branch_uncond(jmp_over, size());
+        // .done: 热路径直接 fall-through 到恢复 RDX
+        // patch 溢出路径的 JMP → .done
+        patch_branch_uncond(jmp_done, size());
 
     } else {
-        // --- Unsigned: no INT_MIN/-1 check needed ---
+        // --- Unsigned: 热路径 fall-through，无溢出检查 ---
 
         // xor edx, edx (清零 RDX 作为无符号高位)
         if (is_64) emit8(0x48);
@@ -414,15 +419,15 @@ void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
 
         if (is_mod) {
             if (is_64) emit8(0x48);
-            emit8(0x89); emit8(0xD0);  // mov rdx -> rax
+            emit8(0x89); emit8(0xD0);  // mov rax, rdx
         }
     }
 
-    // JMP .after_zero (skip .zero handler)
-    size_t jmp_after_zero = size();
-    emit8(0xE9); emit32(0);
+    // 热路径 fall-through 到此，跳过 .zero 冷路径
+    size_t jmp_restore = size();
+    emit8(0xE9); emit32(0);  // JMP .restore
 
-    // .zero: handle divide-by-zero
+    // .zero: handle divide-by-zero (cold path)
     size_t zero_label = size();
     patch_branch_cond(jz_zero, zero_label);
     if (!is_mod) {
@@ -431,12 +436,11 @@ void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
         emit8(0x31); emit8(0xC0);  // xor eax, eax
     }
     // MOD by zero: result = original dst (RAX already holds it)
+    // fall through to .restore
 
-    // .after_zero (= .done):
-    patch_branch_uncond(jmp_after_zero, size());
-
-    // 恢复 BPF r5 (RDX)
-    load_r64(X86::RDX, (int32_t)(off_reg_ + 5 * 8));
+    // .restore: 恢复 BPF r5 (RDX)
+    patch_branch_uncond(jmp_restore, size());
+    pop_reg(X86::RDX);
 }
 //
 // 快速路径：查 TLB，命中则直接得到 host 指针
@@ -1201,7 +1205,7 @@ void X86Emitter::emit_call_indirect(const bpf_insn* insn,
     mov_r64(X86::RDI, X86::RBP);
     emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
     call_helper(helpers_.call_indirect);
-    // helper_call_indirect 成功和失败都返回 false → 总是退出 JIT
+    // helper_call_indirect 执行后总是需要退出 JIT（pc 已改变或 VM 被终止）
     // 直接跳 vm_exit（flush 已经做过了）
     size_t jmp_off = size();
     emit8(0xE9); emit32(0);
@@ -1284,7 +1288,6 @@ size_t X86Emitter::emit_prologue() {
     pop_reg(X86::R12);                        // pop r12
     pop_reg(X86::RBX);                        // pop rbx
     pop_rbp();                                // pop rbp
-    emit8(0xB8); emit32(-1);                  // mov eax, -1
     emit8(0xC3);                              // ret
 
     // .flush_and_exit: 将全部 BPF 寄存器写回 vm->reg[]，然后跳到 .vm_exit

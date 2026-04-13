@@ -972,11 +972,11 @@ bool vm::step() {
         if(!func) break;
         jit_->stats.jit_func_runs++;
         const bpf_insn* pc_before = pc;
-        ((int(*)(vm*))func->code)(this);
+        ((void(*)(vm*))func->code)(this);
         jit_->stats.jit_insns += func->insn_count;
         jit_->stats.total_insns += func->insn_count;
-        // result == -1: JIT aborted (safepoint, syscall failure, pc changed, etc.)
-        // Check if it's a real VM exit or something recoverable.
+        // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
+        // (safepoint, syscall, pc changed, etc.)
         uint32_t f = flags.load(std::memory_order_acquire);
         if(f & (VM_EXITED | VM_KILLED)) {
             return false;

@@ -92,17 +92,16 @@ bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
 }
 
 template<typename EmitterT>
-bool JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target) {
+void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target) {
     if (!v->push_frame(ret_gpa)) {
-        return false;
+        return;
     }
     void* host = v->mmu(target);
     if (!host) {
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
-        return false;
+        return;
     }
     v->pc = (const bpf_insn*)host;
-    return false;
 }
 
 template<typename EmitterT>
@@ -370,13 +369,16 @@ void* JitCompiler<EmitterT>::finalize_code(EmitterT& e) {
     if (code_mem == MAP_FAILED) return nullptr;
 
     memcpy(code_mem, e.data(), code_size);
+
+    // Flush instruction cache before removing write permission.
+    // On AArch64, dc cvau (data cache clean) may require write access on
+    // some security-hardened kernels, so do this while pages are still RW.
+    __builtin___clear_cache((char*)code_mem, (char*)code_mem + code_size);
+
     if (mprotect(code_mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(code_mem, alloc_size);
         return nullptr;
     }
-
-    // Flush instruction cache (required on AArch64 where icache != dcache)
-    __builtin___clear_cache((char*)code_mem, (char*)code_mem + code_size);
     return code_mem;
 }
 

@@ -94,7 +94,7 @@ private:
     static bool helper_push_frame(vm* v, uint64_t ret_addr);
     static uint64_t helper_pop_frame(vm* v);
     static bool helper_do_syscall(vm* v, uint32_t call_id);
-    static bool helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target);
+    static void helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target);
     static int helper_return_to_caller(vm* v, uint64_t ret_gpa);
     static void* helper_mmu(vm* v, uint64_t addr, uint64_t size);
     static void* helper_mmu_w(vm* v, uint64_t addr, uint64_t size);
