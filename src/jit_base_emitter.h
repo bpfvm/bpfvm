@@ -19,6 +19,10 @@ protected:
     size_t off_pc_ = 0;
     size_t off_flags_ = 0;
     size_t off_tlb_ = 0;
+    size_t off_insn_count_ = 0;
+    size_t off_insn_limit_ = 0;
+    bool insn_count_enabled_ = false;
+    bool budget_enabled_ = false;
 
     // Helper function pointers (set via set_helpers)
     HelperTable helpers_;
@@ -48,8 +52,15 @@ public:
     uint8_t* data() { return buf_.data(); }
 
     // --- VM state setup (call before each compilation session) ---
-    void set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags, size_t off_tlb) {
-        off_reg_ = off_reg; off_pc_ = off_pc; off_flags_ = off_flags; off_tlb_ = off_tlb;
+    void set_vm_offsets(size_t off_reg, size_t off_pc, size_t off_flags,
+                        size_t off_tlb) {
+        off_reg_ = off_reg; off_pc_ = off_pc; off_flags_ = off_flags;
+        off_tlb_ = off_tlb;
+    }
+    void set_budget(size_t off_insn_count, size_t off_insn_limit,
+                    bool insn_count_enabled, bool budget_enabled) {
+        off_insn_count_ = off_insn_count; off_insn_limit_ = off_insn_limit;
+        insn_count_enabled_ = insn_count_enabled; budget_enabled_ = budget_enabled;
     }
     void set_helpers(const HelperTable& h) { helpers_ = h; }
 };

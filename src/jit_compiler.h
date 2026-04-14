@@ -32,11 +32,12 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
                               const bpf_insn* entry_pc) {
     // VM state setup
     e.set_vm_offsets(0u, 0u, 0u, 0u);
+    e.set_budget(0u, 0u, false, false);
     e.set_helpers(helpers);
 
     // Prologue / safepoint
     { e.emit_prologue() } -> std::same_as<size_t>;
-    e.emit_safepoint();
+    e.emit_safepoint(0u);
 
     // BPF instruction emission
     e.emit_alu(insn, true);
@@ -76,14 +77,14 @@ public:
     // Returns nullptr if the instruction cannot be JIT-compiled.
     JitFunction* compile(vm* v, const bpf_insn* pc) override;
 
-    static void dump_stats(const JitStats& s);
-
 private:
     // VM field offsets
     static const size_t off_reg_;
     static const size_t off_pc_;
     static const size_t off_flags_;
     static const size_t off_tlb_;
+    static const size_t off_insn_count_;
+    static const size_t off_insn_limit_;
 
     std::unordered_map<const bpf_insn*, JitFunction> functions_;
     std::unordered_set<const bpf_insn*> failed_;
@@ -102,6 +103,7 @@ private:
     // Pre-scan: discover all reachable BPF instructions via BFS.
     std::vector<bool> discover_reachable(const bpf_insn* start, int seg_limit,
                                          std::vector<bool>& back_edge_targets,
+                                         std::vector<uint32_t>& loop_body_sizes,
                                          int& func_size);
 
     // Emit a single BPF instruction. Returns false if cannot be compiled.

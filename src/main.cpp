@@ -14,6 +14,7 @@ static struct option long_options[] = {
     {"verbose", no_argument, nullptr, 'v'},
     {"breakpoint", required_argument, nullptr, 'b'},
     {"step", no_argument, nullptr, 's'},
+    {"insn-limit", required_argument, nullptr, 'l'},
     {nullptr, 0, nullptr, 0}
 };
 
@@ -26,7 +27,7 @@ int main(int argc, char** argv) {
     options.sys = std::make_shared<PosixSyscall>();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vb:s", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vb:sl:", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options.verbose = true;
@@ -37,16 +38,20 @@ int main(int argc, char** argv) {
         case 's':
             options.step_run = true;
             break;
+        case 'l':
+            options.insn_limit = std::stoull(optarg, nullptr, 0);
+            break;
         default:
-            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] <elf-file>" << std::endl;
+            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] <elf-file>" << std::endl;
             return 1;
         }
     }
 
     if (optind >= argc) {
-        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] <elf-file>" << std::endl;
+        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] <elf-file>" << std::endl;
         return 1;
     }
+
     const char* elf_file_path = realpath(argv[optind], nullptr);
     if(elf_file_path == nullptr) {
         std::cerr << "Failed to resolve path: " << argv[optind] << std::endl;

@@ -1331,29 +1331,43 @@ size_t X86Emitter::emit_prologue() {
 // 循环回边处插入安全点，让 VM 有机会处理信号和检查中止标志。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_safepoint() {
-    // 快速路径：内联检查 vm->flags 和 vm->signal_pending
-    // 避免每次循环回边都做 flush_to_vm + call 的开销
-    //
-    // 内存布局（insn.h）：
-    //   std::atomic<uint32_t> flags;         // off_flags_ + 0, 4 bytes
-    //   std::atomic<bool>     signal_pending; // off_flags_ + 4, 1 byte
-    //
-    // 用一条 64 位 test 同时检查两者：
-    //   test qword [rbp + off_flags_], (flags_mask | signal_pending_mask)
-    //   flags 在低 32 位，signal_pending 在第 5 字节（bit 32-39）
-    //
-    //   flags 需要检查的值：0x7 (VM_EXITED | VM_STOPPED | VM_KILLED)
-    //   signal_pending 非零 = bit 32 置位（bool 为 1）
-    //   合并为 64 位掩码：0x00000001'00000007
+void X86Emitter::emit_safepoint(uint32_t loop_body_size) {
+    if (insn_count_enabled_) {
+        // --- 指令计数递增 ---
+        // mov rax, qword [rbp + off_insn_count_]
+        emit8(0x48); emit8(0x8B); emit8(modrm(2, X86::RAX, X86::RBP));
+        emit32((uint32_t)off_insn_count_);
+        // add rax, loop_body_size
+        add64_imm((int32_t)loop_body_size);
+        // mov qword [rbp + off_insn_count_], rax
+        emit8(0x48); emit8(0x89); emit8(modrm(2, X86::RAX, X86::RBP));
+        emit32((uint32_t)off_insn_count_);
 
-    // test qword [rbp + off_flags_], imm32 (sign-extended to 64-bit)
-    // 但 0x100000007 > 32 位，test r/m64, imm32 只能表示 sign-extended imm32。
-    // 需要用 RAX 中转：mov rax, imm64; test [rbp+off_flags_], rax
-    emit8(0x48); emit8(0xB8); emit64(0x100000007ULL);  // mov rax, 0x1_0000_0007
-    // test qword [rbp + off_flags_], rax
-    emit8(0x48); emit8(0x85); emit8(modrm(2, X86::RAX, X86::RBP));
-    emit32((uint32_t)off_flags_);
+        if (budget_enabled_) {
+            // --- 预算检查 ---
+            // cmp rax, qword [rbp + off_insn_limit_]
+            emit8(0x48); emit8(0x3B); emit8(modrm(2, X86::RAX, X86::RBP));
+            emit32((uint32_t)off_insn_limit_);
+            size_t budget_ok_jb = size();
+            emit8(0x0F); emit8(0x82); emit32(0);  // JB .check_flags (count < limit)
+
+            // .budget_exceeded: lock or dword [rbp + off_flags_], VM_BUDGET_EXCEEDED(0x10)
+            emit8(0xF0); emit8(0x83); emit8(modrm(2, 1, X86::RBP));
+            emit32((uint32_t)off_flags_);
+            emit8(0x10);
+            // jmp .vm_exit
+            size_t budget_exit_jmp = size();
+            emit8(0xE9); emit32(0);
+            patch_branch_uncond(budget_exit_jmp, vm_exit_offset);
+
+            // .check_flags:
+            patch_branch_cond(budget_ok_jb, size());
+        }
+    }
+
+    // 快速路径：cmp dword [rbp + off_flags_], 0
+    emit8(0x83); emit8(modrm(2, 7, X86::RBP)); emit32((uint32_t)off_flags_);
+    emit8(0x00);
     size_t flags_jnz = size();
     emit8(0x0F); emit8(0x85); emit32(0);     // JNZ .slow_safepoint
 

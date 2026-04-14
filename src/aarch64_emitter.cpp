@@ -1008,32 +1008,58 @@ size_t AArch64Emitter::emit_prologue() {
 // Safepoint (at loop back-edge targets)
 // ---------------------------------------------------------------------------
 
-void AArch64Emitter::emit_safepoint() {
-    // Memory layout at off_flags_:
-    //   +0: std::atomic<uint32_t> flags       (VM_EXITED|VM_STOPPED|VM_KILLED = 0x7)
-    //   +4: std::atomic<bool> signal_pending
-    // One 64-bit load grabs both fields.
+void AArch64Emitter::emit_safepoint(uint32_t loop_body_size) {
+    if (insn_count_enabled_) {
+        // --- 指令计数递增 ---
+        // X0 = insn_count, X1 = loop_body_size
+        ldr_imm(X0, X28, (int32_t)off_insn_count_, true);
+        add_imm(X0, X0, (int64_t)loop_body_size, true);
+        str_imm(X0, X28, (int32_t)off_insn_count_, true);
 
-    ldr_imm(X0, X28, (int32_t)off_flags_, true);  // X0 = {signal_pending[63:32], flags[31:0]}
+        if (budget_enabled_) {
+            // --- 预算检查 ---
+            // X1 = insn_limit
+            ldr_imm(X1, X28, (int32_t)off_insn_limit_, true);
+            cmp_reg(X0, X1, true);  // compare insn_count vs insn_limit
+            size_t budget_ok_b = size();
+            b_cond(ARMCond::CC);  // B.CC .check_flags (unsigned below, count < limit)
 
-    // Check flags & 7 — tst does not clobber X0, so we can reuse it below
-    mov_imm(X1, 7, false);
-    tst_reg(X0, X1, false);
-    size_t slow_patch1 = size();
-    b_cond(ARMCond::NE);
+            // .budget_exceeded: atomically set VM_BUDGET_EXCEEDED flag
+            // Use LDAXR/STLXR loop to avoid clobbering concurrent flag writes
+            // (e.g. VM_KILLED from another thread). Matches x86's `lock or`.
+            // LDAXR/STLXR don't support offset addressing, so compute &flags in X2 first.
+            add_imm(X2, X28, (int64_t)off_flags_, true);  // X2 = &vm->flags
+            const uint32_t ldaxr_w = 0x885FFC00u;  // LDAXR Wt, [Xn]
+            const uint32_t stlxr_w = 0x8800FC00u;  // STLXR Ws, Wt, [Xn]
+            size_t retry = size();
+            emit_insn(ldaxr_w | ((uint32_t)X2 << 5) | rd(X0));    // LDAXR W0, [X2]
+            // 用 X15 做 ORR 的 scratch，避免 orr_imm 内部 clobber X2（X2 存着 flags 地址）
+            mov_imm(X15, vm::VM_BUDGET_EXCEEDED, false);
+            orr_reg(X0, X0, X15, false);                           // W0 |= VM_BUDGET_EXCEEDED
+            // X1 is reused as the exclusive store status register (Ws)
+            emit_insn(stlxr_w | ((uint32_t)X1 << 16) | ((uint32_t)X2 << 5) | rd(X0));  // STLXR W1, W0, [X2]
+            cbnz(X1, false);
+            patch_branch_cond(size() - 4, retry);  // retry if exclusive store failed
+            size_t budget_exit = size();
+            b_uncond();
+            patch_branch_uncond(budget_exit, vm_exit_offset);
 
-    // Check signal_pending: shift bit 32 down to bit 0
-    lsr_imm(X0, X0, 32, true);
-    size_t slow_patch2 = size();
-    cbnz(X0, true);
+            // .check_flags:
+            patch_branch_cond(budget_ok_b, size());
+        }
+    }
+
+    // flags 非零即进入慢路径
+    ldr_imm(X0, X28, (int32_t)off_flags_, false);  // W0 = flags (32-bit load)
+    size_t slow_patch = size();
+    cbnz(X0, false);  // CBNZ W0, .slow_safepoint
 
     // Fast path: all clear
     size_t fast_jmp = size(); b_uncond();
 
     // .slow_safepoint
     size_t slow = size();
-    patch_branch_cond(slow_patch1, slow);
-    patch_branch_cond(slow_patch2, slow);
+    patch_branch_cond(slow_patch, slow);
 
     flush_to_vm();
     mov_reg(X0, X28, true);

@@ -29,6 +29,10 @@ template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_flags_          = offsetof(vm, flags);
 template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_tlb_            = offsetof(vm, tlb);
+template<typename EmitterT>
+const size_t JitCompiler<EmitterT>::off_insn_count_     = offsetof(vm, insn_count);
+template<typename EmitterT>
+const size_t JitCompiler<EmitterT>::off_insn_limit_     = offsetof(vm, options) + offsetof(vmOptions, insn_limit);
 #pragma GCC diagnostic pop
 
 template<typename EmitterT>
@@ -150,13 +154,16 @@ HelperTable JitCompiler<EmitterT>::make_helper_table() const {
 template<typename EmitterT>
 std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
     const bpf_insn* start, int seg_limit,
-    std::vector<bool>& back_edge_targets, int& func_size)
+    std::vector<bool>& back_edge_targets,
+    std::vector<uint32_t>& loop_body_sizes,
+    int& func_size)
 {
     func_size = 0;
     if (seg_limit <= 0) return {};
 
     std::vector<bool> reachable(seg_limit, false);
     back_edge_targets.assign(seg_limit, false);
+    std::vector<int> max_back_edge_src(seg_limit, -1);
     int max_reached = -1;
 
     std::queue<int> q;
@@ -165,6 +172,17 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
             reachable[idx] = true;
             if (idx > max_reached) max_reached = idx;
             q.push(idx);
+        }
+    };
+
+    // 记录从 i 到 target 的跳转：标记回边并更新循环体大小估计
+    auto jump = [&](int i, int target) {
+        if (target >= 0 && target < seg_limit) {
+            if (target <= i) {
+                back_edge_targets[target] = true;
+                if (i > max_back_edge_src[target]) max_back_edge_src[target] = i;
+            }
+            enqueue(target);
         }
     };
 
@@ -189,37 +207,21 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
 
         case BPF_JMP:
             if (op == BPF_JA) {
-                int target = i + 1 + insn->off;
-                if (target >= 0 && target < seg_limit) {
-                    if (target <= i) back_edge_targets[target] = true;
-                    enqueue(target);
-                }
+                jump(i, i + 1 + insn->off);
             } else if (op == BPF_CALL) {
                 enqueue(next);
             } else if (op == BPF_EXIT) {
             } else {
-                int target = i + 1 + insn->off;
-                if (target >= 0 && target < seg_limit) {
-                    if (target <= i) back_edge_targets[target] = true;
-                    enqueue(target);
-                }
+                jump(i, i + 1 + insn->off);
                 enqueue(next);
             }
             break;
 
         case BPF_JMP32:
             if (op == BPF_JA) {
-                int target = i + 1 + insn->imm;
-                if (target >= 0 && target < seg_limit) {
-                    if (target <= i) back_edge_targets[target] = true;
-                    enqueue(target);
-                }
+                jump(i, i + 1 + insn->imm);
             } else {
-                int target = i + 1 + insn->off;
-                if (target >= 0 && target < seg_limit) {
-                    if (target <= i) back_edge_targets[target] = true;
-                    enqueue(target);
-                }
+                jump(i, i + 1 + insn->off);
                 enqueue(next);
             }
             break;
@@ -245,6 +247,14 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
 
     reachable.resize(func_size);
     back_edge_targets.resize(func_size);
+
+    // 计算每个回边目标的循环体大小
+    loop_body_sizes.assign(func_size, 1);
+    for (int i = 0; i < func_size; i++) {
+        if (back_edge_targets[i] && max_back_edge_src[i] >= 0) {
+            loop_body_sizes[i] = max_back_edge_src[i] - i + 1;
+        }
+    }
 
     for (int i = 0; i < func_size - 1; i++) {
         if (reachable[i]) {
@@ -419,13 +429,17 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
 
     // Discover reachable instructions via BFS
     std::vector<bool> back_edge_targets;
+    std::vector<uint32_t> loop_body_sizes;
     int num_insns = 0;
-    auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, num_insns);
+    auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, loop_body_sizes, num_insns);
     if (reachable.empty() || num_insns <= 0) { record_compile_time(); return nullptr; }
 
     // Set up emitter
+    bool insn_count_enabled = getenv("BPF_DEBUG") || v->options.insn_limit != 0;
+    bool budget_enabled = v->options.insn_limit != 0;
     EmitterT e;
     e.set_vm_offsets(off_reg_, off_pc_, off_flags_, off_tlb_);
+    e.set_budget(off_insn_count_, off_insn_limit_, insn_count_enabled, budget_enabled);
     e.set_helpers(make_helper_table());
 
     // Emit code
@@ -442,7 +456,7 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
 
         // Safepoint at back-edge targets (loop headers)
         if (back_edge_targets[i]) {
-            e.emit_safepoint();
+            e.emit_safepoint(loop_body_sizes[i]);
         }
 
         if (!emit_instruction(e, v, entry_pc, i,
@@ -489,29 +503,6 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
     func.pc_offsets = std::move(pc_offsets);
     record_compile_time();
     return &func;
-}
-
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
-
-template<typename EmitterT>
-void JitCompiler<EmitterT>::dump_stats(const JitStats& s) {
-    if (!getenv("JIT_DEBUG")) return;
-    double pct = s.total_insns ? (100.0 * s.jit_insns / s.total_insns) : 0.0;
-    fprintf(stderr, "[JIT] 总指令条数: %lu\n", s.total_insns);
-    fprintf(stderr, "[JIT] JIT执行条数: %lu (%.1f%%)\n", s.jit_insns, pct);
-    fprintf(stderr, "[JIT] JIT编译函数数: %lu\n", s.jit_compiles);
-    fprintf(stderr, "[JIT] JIT执行函数次数: %lu\n", s.jit_func_runs);
-    if (s.jit_compiles) {
-        fprintf(stderr, "[JIT] 编译时平均函数大小: %.1f条\n",
-                (double)s.jit_compiled_insns / s.jit_compiles);
-    }
-    if (s.jit_func_runs) {
-        fprintf(stderr, "[JIT] 运行时平均每次执行: %.1f条\n",
-                (double)s.jit_insns / s.jit_func_runs);
-    }
-    fprintf(stderr, "[JIT] 编译耗时: %.1fms\n", s.compile_ns / 1e6);
 }
 
 // ---------------------------------------------------------------------------

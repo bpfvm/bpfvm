@@ -164,7 +164,6 @@ protected:
     static auto& maps(vm* v);
     static auto& options(vm* v);
     static auto& flags(vm* v);
-    static auto& signal_pending(vm* v);
     static auto& signal_depth(vm* v);
     static auto& pc(vm* v);
 public:
@@ -183,6 +182,7 @@ struct vmOptions {
     uint64_t breakpoint = 0;
     bool step_run = false;
     bool raw_stack = false;
+    uint64_t insn_limit = 0;  // 0 = 无限制
     std::vector<std::string> argv;
     std::vector<std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
@@ -208,8 +208,9 @@ private:
     pthread_mutex_t exit_mutex;
     pthread_cond_t exit_cv;
     std::atomic<uint32_t> flags{0};
-    std::atomic<bool> signal_pending{false};
     size_t signal_depth = 0;
+    uint64_t insn_count = 0;              // 已执行指令计数（JIT+解释器共用，单线程访问）
+    uint64_t interp_insns = 0;            // 解释器执行的指令数
 
     std::unique_ptr<JitCompilerBase> jit_;
 
@@ -237,6 +238,8 @@ public:
     static constexpr uint32_t VM_EXITED = 0x1;
     static constexpr uint32_t VM_STOPPED = 0x2;
     static constexpr uint32_t VM_KILLED = 0x4;
+    static constexpr uint32_t VM_SIGNAL_PENDING = 0x8;
+    static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
 
     vm(Token);
     ~vm();
@@ -262,12 +265,12 @@ public:
 
     uint64_t run();
     uint64_t run(const vmOptions* options);
+    void dump_stats() const;
 };
 
 inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
 inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
-inline auto& SyscallHandler::signal_pending(vm* v) { return v->signal_pending; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
 inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 

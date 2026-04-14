@@ -92,7 +92,7 @@ public:
     // --- High-level BPF instruction emission ---
 
     size_t emit_prologue();
-    void emit_safepoint();
+    void emit_safepoint(uint32_t loop_body_size);
 
     bool emit_alu(const bpf_insn* insn, bool is_64);
     bool emit_ld(const bpf_insn* insn);

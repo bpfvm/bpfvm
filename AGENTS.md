@@ -62,7 +62,11 @@ The VM uses a hybrid interpreter/JIT execution model:
 
 ### JIT Environment Variables
 - `JIT_ENABLE`: set to `0` to disable JIT and force interpreter-only execution; defaults to enabled (any other value or unset enables JIT).
-- `JIT_DEBUG`: set to any value to print JIT statistics (instruction counts, hit rate, compilation time) to stderr at VM exit.
+- `BPF_DEBUG`: set to any value to print VM execution statistics (instruction counts, JIT compilation info, timing) to stderr at VM exit. Also enables instruction counting in JIT-compiled code.
+
+### Instruction Budget
+- The `--insn-limit N` (`-l N`) command-line option sets an upper bound on the total number of instructions the VM may execute (interpreter + JIT combined). When the limit is reached, the VM sets the `VM_BUDGET_EXCEEDED` flag, prints a diagnostic to stderr, and exits with code 255.
+- In JIT code, the budget check is embedded in loop-header safepoints; the loop body size is estimated during compilation and added to `insn_count` at each back-edge.
 
 ## Syscall Implementation & C Library Wrappers
 - Syscall handling is decoupled from the VM via the abstract `SyscallHandler` interface (defined in `insn.h`), with `PosixSyscall` (`posix_syscall.cpp`) as the main implementation and `EmptySyscall` (`empty_syscall.h`) as a stub for testing.

@@ -58,8 +58,6 @@ struct JitFunction {
 // JitStats
 // ---------------------------------------------------------------------------
 struct JitStats {
-    uint64_t total_insns = 0;
-    uint64_t jit_insns = 0;
     uint64_t jit_compiles = 0;
     uint64_t jit_compiled_insns = 0;
     uint64_t jit_func_runs = 0;

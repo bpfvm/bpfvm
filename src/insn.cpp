@@ -19,7 +19,6 @@ using JitCompilerImpl = JitCompiler<AArch64Emitter>;
 class StubJitCompiler : public JitCompilerBase {
 public:
     JitFunction* compile(vm*, const bpf_insn*) override { return nullptr; }
-    static void dump_stats(const JitStats&) {}
 };
 using JitCompilerImpl = StubJitCompiler;
 #endif
@@ -937,14 +936,17 @@ bool vm::alu() {
 
 
 bool vm::safepoint() {
-    if(!options.sys->handle_signals(this)) {
-        //be killed
-        return false;
+    // 仅在非信号上下文中处理新信号，避免信号处理嵌套
+    if(signal_depth == 0) {
+        if(!options.sys->handle_signals(this)) {
+            //be killed
+            return false;
+        }
     }
 
     while(true) {
         uint32_t f = flags.load(std::memory_order_acquire);
-        if(f & (VM_EXITED | VM_KILLED)) {
+        if(f & (VM_EXITED | VM_KILLED | VM_BUDGET_EXCEEDED)) {
             if (f & VM_KILLED) {
                 r(0) = 128 + SIGKILL;
             }
@@ -973,12 +975,10 @@ bool vm::step() {
         jit_->stats.jit_func_runs++;
         const bpf_insn* pc_before = pc;
         ((void(*)(vm*))func->code)(this);
-        jit_->stats.jit_insns += func->insn_count;
-        jit_->stats.total_insns += func->insn_count;
         // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
         // (safepoint, syscall, pc changed, etc.)
         uint32_t f = flags.load(std::memory_order_acquire);
-        if(f & (VM_EXITED | VM_KILLED)) {
+        if(f & (VM_EXITED | VM_KILLED | VM_BUDGET_EXCEEDED)) {
             return false;
         }
         // JIT aborted but VM isn't exiting.  If syscall/signal/call/exit changed pc
@@ -991,11 +991,20 @@ bool vm::step() {
         // interpreter for one step to report the error.
         break;
     }
-    jit_->stats.total_insns++;
-    // Safepoint check
+    // 解释器执行一条指令
+    interp_insns++;
+    // 指令计数递增 + 预算检查
+    uint64_t cnt = ++insn_count;
+    if(options.insn_limit != 0 && cnt >= options.insn_limit) {
+        flags.fetch_or(VM_BUDGET_EXCEEDED, std::memory_order_release);
+        std::cerr << "Instruction budget exceeded (" << cnt
+                  << " >= " << options.insn_limit << ") at PC 0x"
+                  << std::hex << unmmu(pc) << std::dec << std::endl;
+        return false;
+    }
+    // Safepoint check: flags 非零即需要处理
     uint32_t f = flags.load(std::memory_order_acquire);
-    if((f & (VM_EXITED | VM_KILLED | VM_STOPPED)) ||
-       (signal_depth == 0 && signal_pending.load(std::memory_order_relaxed))) {
+    if(f) {
         if(!safepoint()) {
             return false;
         }
@@ -1128,6 +1137,21 @@ uint64_t vm::unmmu(const void* addr) {
     return 0;
 }
 
+void vm::dump_stats() const {
+    if (!getenv("BPF_DEBUG")) return;
+    fprintf(stderr, "[BPF] 执行指令数: %" PRIu64 "\n", insn_count);
+    fprintf(stderr, "[BPF] 解释器执行指令数: %" PRIu64 "\n", interp_insns);
+    auto& s = jit_->stats;
+    if (s.jit_compiles) {
+        fprintf(stderr, "[BPF] JIT编译函数数: %" PRIu64 "\n", s.jit_compiles);
+        fprintf(stderr, "[BPF] JIT编译指令数: %" PRIu64 "\n", s.jit_compiled_insns);
+        fprintf(stderr, "[BPF] JIT执行函数次数: %" PRIu64 "\n", s.jit_func_runs);
+        fprintf(stderr, "[BPF] 编译时平均函数大小: %.1f条\n",
+                (double)s.jit_compiled_insns / s.jit_compiles);
+        fprintf(stderr, "[BPF] 编译耗时: %.1fms\n", s.compile_ns / 1e6);
+    }
+}
+
 uint64_t vm::run() {
     if(!jit_) jit_ = std::make_unique<JitCompilerImpl>();
     if(options.sys) options.sys->init(shared_from_this());
@@ -1135,7 +1159,10 @@ uint64_t vm::run() {
         pc++;
     }
     if(options.sys) options.sys->fini(shared_from_this());
-    JitCompilerImpl::dump_stats(jit_->stats);
+    dump_stats();
+    if(flags.load(std::memory_order_acquire) & VM_BUDGET_EXCEEDED) {
+        r(0) = 255;
+    }
     flags.fetch_or(VM_EXITED, std::memory_order_release);
     pthread_cond_broadcast(&exit_cv);
     return r(0);
@@ -1143,6 +1170,8 @@ uint64_t vm::run() {
 
 uint64_t vm::run(const vmOptions* options) {
     this->options = *options;
+    insn_count = 0;
+    interp_insns = 0;
     if(options->verbose) {
         printf("entry: 0x%lx\n", options->entry);
     }
