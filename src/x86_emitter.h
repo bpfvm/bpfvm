@@ -109,9 +109,8 @@ public:
                    std::vector<JumpPlaceholder>& placeholders);
 
     void emit_call_syscall(const bpf_insn* insn, int current_index,
-                           const bpf_insn* entry_pc);
-    void emit_call_bpf(const bpf_insn* insn, int current_index,
-                       uint64_t ret_gpa, const bpf_insn* entry_pc);
+                           uint64_t entry_gpa);
+    void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa);
     void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
     void emit_exit();
 

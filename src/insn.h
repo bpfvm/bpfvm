@@ -202,7 +202,7 @@ class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
-    const bpf_insn* pc;
+    uint64_t pc;
     uint64_t reg[11];
     std::list<memmap> maps;
     pthread_mutex_t exit_mutex;
@@ -214,14 +214,14 @@ private:
 
     std::unique_ptr<JitCompilerBase> jit_;
 
-    bool ld();
-    bool ldx();
-    bool st();
-    bool stx();
-    bool alu();
-    bool alu64();
-    bool jmp();
-    bool jmp32();
+    bool ld(const bpf_insn* cur);
+    bool ldx(const bpf_insn* cur);
+    bool st(const bpf_insn* cur);
+    bool stx(const bpf_insn* cur);
+    bool alu(const bpf_insn* cur);
+    bool alu64(const bpf_insn* cur);
+    bool jmp(const bpf_insn* cur);
+    bool jmp32(const bpf_insn* cur);
     bool step();
 
     bool do_syscall(uint32_t call) {
@@ -250,7 +250,6 @@ public:
     // Slow path: linear scan maps + fill TLB (no TLB lookup).  Called by JIT on miss.
     void* mmu_slow(uint64_t addr, size_t size);
     void* mmu_w_slow(uint64_t addr, size_t size);
-    uint64_t unmmu(const void* addr);
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
     bool wait_for_exit(int timeout_ms);

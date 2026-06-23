@@ -1132,13 +1132,13 @@ void X86Emitter::emit_ja32(const bpf_insn* insn, int current_index,
 // ---------------------------------------------------------------------------
 
 void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
-                                      const bpf_insn* entry_pc) {
+                                      uint64_t entry_gpa) {
     // 完整 flush 所有 BPF 寄存器到 vm->reg[]
     flush_to_vm();
 
-    // 保存当前 pc 到 vm->pc
-    const bpf_insn* insn_host = entry_pc + current_index;
-    mov_rax_imm64((uint64_t)(uintptr_t)insn_host);
+    // 保存当前 pc（guest 地址）到 vm->pc
+    uint64_t insn_gpa = entry_gpa + (uint64_t)current_index * sizeof(bpf_insn);
+    mov_rax_imm64(insn_gpa);
     emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
 
     // 调用 helper_do_syscall(vm*, call_id)
@@ -1163,27 +1163,17 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
 // 编译完成后跳回 vm_exit，让 step() 循环重新编译目标函数。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_call_bpf(const bpf_insn* insn, int current_index,
-                                  uint64_t ret_gpa,
-                                  const bpf_insn* entry_pc) {
+void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa) {
     // flush_to_vm 已经将所有寄存器写回 vm->reg[]，
     // 后续不能再走 flush_and_exit（会把被 CALL 踩掉的垃圾值写回），
     // 所有跳转都直接到 vm_exit。
     flush_to_vm();
 
+    // helper_call_bpf(vm*, ret_gpa, callee_gpa): push_frame + v->pc = mmu(callee_gpa)
     mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
     emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
-    call_helper(helpers_.push_frame);
-    test_al_al();
-    // push_frame 失败 → 直接跳 vm_exit
-    size_t jz_off = size();
-    emit8(0x0F); emit8(0x84); emit32(0);                      // JZ .vm_exit
-    patch_branch_cond(jz_off, vm_exit_offset);
-
-    // 设置 pc 指向被调函数
-    const bpf_insn* callee_pc = entry_pc + current_index + 1 + insn->imm;
-    mov_rax_imm64((uint64_t)(uintptr_t)callee_pc);
-    emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);
+    emit8(0x48); emit8(0xBA); emit64(callee_gpa);             // mov rdx, callee_gpa
+    call_helper(helpers_.call_bpf);
 
     // 跳到 vm_exit（让 step() 循环重新进入 JIT）
     size_t jmp_off = size();

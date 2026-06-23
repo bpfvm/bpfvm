@@ -54,7 +54,7 @@ JitCompiler<EmitterT>::~JitCompiler() {
 
 template<typename EmitterT>
 int JitCompiler<EmitterT>::helper_safepoint(vm* v) {
-    const bpf_insn* saved_pc = v->pc;
+    uint64_t saved_pc = v->pc;
     if (!v->safepoint()) {
         return 1;
     }
@@ -76,20 +76,20 @@ uint64_t JitCompiler<EmitterT>::helper_pop_frame(vm* v) {
 
 template<typename EmitterT>
 bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
-    const bpf_insn* saved_pc = v->pc;
+    uint64_t saved_pc = v->pc;
     bool ok = v->do_syscall(call_id);
     if (!ok) {
         v->flags.fetch_or(vm::VM_EXITED, std::memory_order_release);
-        if (v->pc == saved_pc) v->pc++;
+        if (v->pc == saved_pc) v->pc += sizeof(bpf_insn);
         return false;
     }
     if (v->pc != saved_pc) {
-        v->pc++;
+        v->pc += sizeof(bpf_insn);
         return false;
     }
     uint32_t f = v->flags.load(std::memory_order_acquire);
     if (f & (vm::VM_EXITED | vm::VM_KILLED | vm::VM_STOPPED)) {
-        v->pc++;
+        v->pc += sizeof(bpf_insn);
         return false;
     }
     return true;
@@ -100,22 +100,36 @@ void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64
     if (!v->push_frame(ret_gpa)) {
         return;
     }
-    void* host = v->mmu(target);
-    if (!host) {
+    if (!v->mmu(target)) {
+        v->log_mem_violation("call", target);
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
         return;
     }
-    v->pc = (const bpf_insn*)host;
+    v->pc = target;
+}
+
+template<typename EmitterT>
+void JitCompiler<EmitterT>::helper_call_bpf(vm* v, uint64_t ret_gpa, uint64_t callee_gpa) {
+    if (!v->push_frame(ret_gpa)) {
+        v->flags.fetch_or(vm::VM_EXITED, std::memory_order_release);
+        return;
+    }
+    if (!v->mmu(callee_gpa)) {
+        v->log_mem_violation("call", callee_gpa);
+        v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
+        return;
+    }
+    v->pc = callee_gpa;
 }
 
 template<typename EmitterT>
 int JitCompiler<EmitterT>::helper_return_to_caller(vm* v, uint64_t ret_gpa) {
-    void* host = v->mmu(ret_gpa);
-    if (!host) {
+    if (!v->mmu(ret_gpa)) {
+        v->log_mem_violation("return", ret_gpa);
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
         return -1;
     }
-    v->pc = (const bpf_insn*)host;
+    v->pc = ret_gpa;
     return 0;
 }
 
@@ -141,6 +155,7 @@ HelperTable JitCompiler<EmitterT>::make_helper_table() const {
     h.pop_frame = (void*)&helper_pop_frame;
     h.do_syscall = (void*)&helper_do_syscall;
     h.call_indirect = (void*)&helper_call_indirect;
+    h.call_bpf = (void*)&helper_call_bpf;
     h.return_to_caller = (void*)&helper_return_to_caller;
     h.mmu = (void*)&helper_mmu;
     h.mmu_w = (void*)&helper_mmu_w;
@@ -275,7 +290,7 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
 // ---------------------------------------------------------------------------
 
 template<typename EmitterT>
-bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, vm* v, const bpf_insn* entry_pc, int i,
+bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_pc, uint64_t entry_gpa, int i,
                                                std::vector<JumpPlaceholder>& placeholders,
                                                std::vector<AbortPatchInfo>& abort_patches,
                                                int& compiled_count) {
@@ -325,15 +340,16 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, vm* v, const bpf_insn*
             compiled_count++;
         } else if (op == BPF_CALL) {
             if (is_x) {
-                uint64_t ret_gpa = v->unmmu(entry_pc + i + 1);
+                uint64_t ret_gpa = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
                 e.emit_call_indirect(insn, ret_gpa);
                 compiled_count++;
             } else if (insn->src_reg == 0) {
-                e.emit_call_syscall(insn, i, entry_pc);
+                e.emit_call_syscall(insn, i, entry_gpa);
                 compiled_count++;
             } else if (insn->src_reg == 1) {
-                uint64_t ret_gpa = v->unmmu(entry_pc + i + 1);
-                e.emit_call_bpf(insn, i, ret_gpa, entry_pc);
+                uint64_t ret_gpa    = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
+                uint64_t callee_gpa = entry_gpa + (uint64_t)(i + 1 + insn->imm) * sizeof(bpf_insn);
+                e.emit_call_bpf(ret_gpa, callee_gpa);
                 compiled_count++;
             } else {
                 return false;
@@ -397,11 +413,11 @@ void* JitCompiler<EmitterT>::finalize_code(EmitterT& e) {
 // ---------------------------------------------------------------------------
 
 template<typename EmitterT>
-JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
+JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     if (!enabled_) return nullptr;
-    auto it = functions_.find(entry_pc);
+    auto it = functions_.find(gpa);
     if (it != functions_.end()) return &it->second;
-    if (failed_.count(entry_pc)) {
+    if (failed_.count(gpa)) {
         return nullptr;
     }
 
@@ -411,9 +427,10 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
             std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - compile_start).count();
     };
 
-    // Find code segment end
-    uint64_t entry_gpa = v->unmmu(entry_pc);
-    if (!entry_gpa) return nullptr;
+    // gpa 是 guest 入口地址；编译期需要 host 指针遍历指令，mmu 取一次（编译期无 CoW）
+    const bpf_insn* entry_pc = (const bpf_insn*)v->mmu(gpa);
+    if (!entry_pc) return nullptr;
+    uint64_t entry_gpa = gpa;
 
     const bpf_insn* seg_end = nullptr;
     for (auto& m : v->maps) {
@@ -459,21 +476,21 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
             e.emit_safepoint(loop_body_sizes[i]);
         }
 
-        if (!emit_instruction(e, v, entry_pc, i,
+        if (!emit_instruction(e, entry_pc, entry_gpa, i,
                               placeholders, abort_patches, compiled_count)) {
-            failed_.insert(entry_pc);
+            failed_.insert(gpa);
             record_compile_time();
             return nullptr;
         }
     }
 
-    if (compiled_count == 0) { failed_.insert(entry_pc); record_compile_time(); return nullptr; }
+    if (compiled_count == 0) { failed_.insert(gpa); record_compile_time(); return nullptr; }
 
     // Patch jump placeholders
     for (auto& ph : placeholders) {
         if (ph.target_bpf_index < 0 || ph.target_bpf_index >= num_insns ||
             pc_offsets[ph.target_bpf_index] == UINT32_MAX) {
-            failed_.insert(entry_pc);
+            failed_.insert(gpa);
             record_compile_time();
             return nullptr;
         }
@@ -495,11 +512,11 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, const bpf_insn* entry_pc) {
 
     stats.jit_compiles++;
     stats.jit_compiled_insns += compiled_count;
-    auto& func = functions_[entry_pc];
+    auto& func = functions_[gpa];
     func.code = code_mem;
     func.insn_count = compiled_count;
     func.code_size = (e.size() + 4095) & ~(size_t)4095;
-    func.entry_pc = entry_pc;
+    func.gpa = gpa;
     func.pc_offsets = std::move(pc_offsets);
     record_compile_time();
     return &func;

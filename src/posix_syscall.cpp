@@ -224,7 +224,7 @@ bool PosixSyscall::handle_signals(vm* v) {
     if(options(v).verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
-               id(), sig, static_cast<unsigned long>(handler), v->unmmu(pc(v)));
+               id(), sig, static_cast<unsigned long>(handler), pc(v));
     }
     if(handler == sig_ign) {
         return true;
@@ -250,17 +250,16 @@ bool PosixSyscall::handle_signals(vm* v) {
         }
     }
 
-    const bpf_insn* handler_pc = (const bpf_insn*)v->mmu(handler);
-    if(handler_pc == nullptr) {
+    if(!v->mmu(handler)) {
         v->r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
         return do_exit(v);
     }
-    if(!v->push_frame(v->unmmu(pc(v)), true)) {
+    if(!v->push_frame(pc(v), true)) {
         v->r(1) = 128 + static_cast<uint64_t>(SIGBUS);
         return do_exit(v);
     }
     v->r(1) = static_cast<uint64_t>(sig);
-    pc(v) = handler_pc;
+    pc(v) = handler;
     return true;
 }
 
@@ -801,8 +800,7 @@ bool PosixSyscall::do_execve(vm* v) {
         v->r(0) = -E2BIG;
         return true;
     }
-    const bpf_insn* new_pc = (const bpf_insn*)fresh->mmu(entry);
-    if(new_pc == nullptr) {
+    if(!fresh->mmu(entry)) {
         v->r(0) = -ENOEXEC;
         return true;
     }
@@ -831,9 +829,9 @@ bool PosixSyscall::do_execve(vm* v) {
     fds.swap(new_fds);
     v->r(1) = fresh->r(1);
     v->r(10) = STACK_BASE + STACK_SIZE - 8;
-    pc(v) = new_pc;
+    pc(v) = entry;
     v->push_frame(0);
-    pc(v)--;
+    pc(v) -= sizeof(bpf_insn);
     v->r(0) = 0;
     return true;
 }
@@ -892,13 +890,12 @@ bool PosixSyscall::do_fork(vm* v) {
     }
     child->r(0) = 0;
 
-    uint64_t pc_addr = v->unmmu(pc(v));
-    const bpf_insn* child_pc = (const bpf_insn*)child->mmu(pc_addr);
-    if(child_pc == nullptr) {
+    uint64_t pc_addr = pc(v);
+    if(!child->mmu(pc_addr)) {
         v->r(0) = -EFAULT;
         return true;
     }
-    pc(child.get()) = child_pc + 1;
+    pc(child.get()) = pc_addr + sizeof(bpf_insn);
     pthread_attr_t attr;
     pthread_t worker;
     int rc = pthread_attr_init(&attr);
@@ -1234,7 +1231,10 @@ bool PosixSyscall::do_readdir(vm* v) {
         return true;
     }
     memset(out_entry, 0, sizeof(*out_entry));
-    strncpy(out_entry->d_name, ent->d_name, sizeof(out_entry->d_name) - 1);
+    // 已 memset 整块清零，d_name 尾部为 '\0'；用 strnlen+memcpy 拷贝实际长度，
+    // 避免 strncpy 在源串恰好填满时的 -Wstringop-truncation 告警（语义不变）。
+    size_t name_len = strnlen(ent->d_name, sizeof(out_entry->d_name) - 1);
+    memcpy(out_entry->d_name, ent->d_name, name_len);
 #ifdef _DIRENT_HAVE_D_TYPE
     out_entry->d_type = ent->d_type;
 #else
@@ -1633,7 +1633,7 @@ bool PosixSyscall::do_setjmp(vm* v) {
     env[2] = v->r(8);
     env[3] = v->r(9);
     env[4] = v->r(10);
-    env[5] = v->unmmu(pc(v));
+    env[5] = pc(v);
     env[6] = signal_depth(v);
     v->r(0) = 0;
     return true;
@@ -1654,7 +1654,7 @@ bool PosixSyscall::do_longjmp(vm* v) {
     v->r(10) = env[4];
     uint64_t saved_pc = env[5];
     signal_depth(v) = static_cast<size_t>(env[6]);
-    pc(v) = (const bpf_insn*)v->mmu(saved_pc);
+    pc(v) = saved_pc;
     // pc points to syscall instruction.
     // loop increments pc.
     // next instruction is executed.

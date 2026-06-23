@@ -885,10 +885,10 @@ void AArch64Emitter::emit_ja32(const bpf_insn* insn, int cur, std::vector<JumpPl
 // CALL / EXIT
 // ---------------------------------------------------------------------------
 
-void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, const bpf_insn* entry_pc) {
+void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t entry_gpa) {
     flush_to_vm();
-    // Save pc
-    mov_imm(X0, (uint64_t)(uintptr_t)(entry_pc + cur), true);
+    // Save pc (guest address)
+    mov_imm(X0, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
     str_imm(X0, X28, (int32_t)off_pc_, true);
     // Call helper_do_syscall(vm*, call_id)
     mov_reg(X0, X28, true);
@@ -900,16 +900,13 @@ void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, const bpf_
     reload_from_vm();
 }
 
-void AArch64Emitter::emit_call_bpf(const bpf_insn* insn, int cur, uint64_t ret_gpa, const bpf_insn* entry_pc) {
+void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa) {
     flush_to_vm();
+    // helper_call_bpf(vm*, ret_gpa, callee_gpa): push_frame + v->pc = mmu(callee_gpa)
     mov_reg(X0, X28, true);
     mov_imm(X1, ret_gpa, true);
-    call_helper(helpers_.push_frame);
-    cbz(X0, false);
-    patch_branch_cond(size() - 4, vm_exit_offset);
-    // Set pc to callee
-    mov_imm(X0, (uint64_t)(uintptr_t)(entry_pc + cur + 1 + insn->imm), true);
-    str_imm(X0, X28, (int32_t)off_pc_, true);
+    mov_imm(X2, callee_gpa, true);
+    call_helper(helpers_.call_bpf);
     // Jump to vm_exit
     size_t off = size(); b_uncond();
     patch_branch_uncond(off, vm_exit_offset);

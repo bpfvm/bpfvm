@@ -439,66 +439,60 @@ uint64_t vm::pop_frame() {
     return ret_addr;
 }
 
-bool vm::jmp() {
-    uint64_t src = (pc->code & 0x08) == BPF_X ? r(pc->src_reg) : pc->imm;
-    switch (pc->code & 0xf0) {
+bool vm::jmp(const bpf_insn* cur) {
+    uint64_t src = (cur->code & 0x08) == BPF_X ? r(cur->src_reg) : cur->imm;
+    switch (cur->code & 0xf0) {
     case BPF_JA:
-        pc += pc->off;
+        pc += (int64_t)cur->off * sizeof(bpf_insn);
         break;
     case BPF_JEQ:
-        if (r(pc->dst_reg) == src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) == src) { 
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGT:
-        if (r(pc->dst_reg) > src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) > src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGE:
-        if (r(pc->dst_reg) >= src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) >= src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSET:
-        if (r(pc->dst_reg) & src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) & src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JNE:
-        if (r(pc->dst_reg) != src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) != src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGT:
-        if ((int64_t)r(pc->dst_reg) > (int64_t)src) {
-            pc += pc->off;
+        if ((int64_t)r(cur->dst_reg) > (int64_t)src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGE:
-        if ((int64_t)r(pc->dst_reg) >= (int64_t)src) {
-            pc += pc->off;
+        if ((int64_t)r(cur->dst_reg) >= (int64_t)src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_CALL:
-        if((pc->code & 0x08) == BPF_X) {
-            if(!push_frame(unmmu(pc + 1))) {
+        if((cur->code & 0x08) == BPF_X) {
+            if(!push_frame(pc + sizeof(bpf_insn))) {
                 return false;
             }
-            uint64_t target = r(pc->dst_reg);
-            pc = (const bpf_insn*)mmu(target);
-            if(pc == nullptr) {
-                log_mem_violation("call", target);
+            pc = r(cur->dst_reg) - sizeof(bpf_insn);
+        }else if(cur->src_reg == 0) {
+            return do_syscall(cur->imm);
+        }else if(cur->src_reg == 1) {
+            if(!push_frame(pc + sizeof(bpf_insn))) {
                 return false;
             }
-            pc--;
-        }else if(pc->src_reg == 0) {
-            return do_syscall(pc->imm);
-        }else if(pc->src_reg == 1) {
-            if(!push_frame(unmmu(pc + 1))) {
-                return false;
-            }
-            pc += pc->imm;
+            pc += (int64_t)cur->imm * sizeof(bpf_insn);
         }
         break;
     case BPF_EXIT:
@@ -508,78 +502,73 @@ bool vm::jmp() {
             //到栈底了
             return false;
         }
-        pc = (const bpf_insn*)mmu(ret);
-        if(pc == nullptr) {
-            log_mem_violation("return", ret);
-            return false;
-        }
-        pc--; // counter loop increment
+        pc = ret - sizeof(bpf_insn);  // run() 循环的 pc+=sizeof(bpf_insn) 会落到 ret
         break;
     }
     case BPF_JLT:
-        if (r(pc->dst_reg) < src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) < src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JLE:
-        if (r(pc->dst_reg) <= src) {
-            pc += pc->off;
+        if (r(cur->dst_reg) <= src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLT:
-        if ((int64_t)r(pc->dst_reg) < (int64_t)src) {
-            pc += pc->off;
+        if ((int64_t)r(cur->dst_reg) < (int64_t)src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLE:
-        if ((int64_t)r(pc->dst_reg) <= (int64_t)src) {
-            pc += pc->off;
+        if ((int64_t)r(cur->dst_reg) <= (int64_t)src) {
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     }
     return true;
 }
 
-bool vm::jmp32() {
-    uint32_t src = (pc->code & 0x08) == BPF_X ? (uint32_t)r(pc->src_reg) : pc->imm;
-    auto dst = (uint32_t)r(pc->dst_reg);
-    switch (pc->code & 0xf0) {
+bool vm::jmp32(const bpf_insn* cur) {
+    uint32_t src = (cur->code & 0x08) == BPF_X ? (uint32_t)r(cur->src_reg) : cur->imm;
+    auto dst = (uint32_t)r(cur->dst_reg);
+    switch (cur->code & 0xf0) {
     case BPF_JA:
-        pc += pc->imm;
+        pc += (int64_t)cur->imm * sizeof(bpf_insn);
         break;
     case BPF_JEQ:
         if (dst == src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGT:
         if (dst > src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGE:
         if (dst >= src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSET:
         if (dst & src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JNE:
         if (dst != src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGT:
         if ((int32_t)dst > (int32_t)src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGE:
         if ((int32_t)dst >= (int32_t)src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_CALL:
@@ -587,22 +576,22 @@ bool vm::jmp32() {
         return false;
     case BPF_JLT:
         if (dst < src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JLE:
         if (dst <= src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLT:
         if ((int32_t)dst < (int32_t)src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLE:
         if ((int32_t)dst <= (int32_t)src) {
-            pc += pc->off;
+            pc += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     }
@@ -611,7 +600,7 @@ bool vm::jmp32() {
 
 
 void vm::log_mem_violation(const char* type, uint64_t addr) {
-    std::cerr << "Memory access violation at PC 0x" << std::hex << unmmu(pc)
+    std::cerr << "Memory access violation at PC 0x" << std::hex << pc
               << ": invalid " << type << " at address 0x" << addr << std::dec << std::endl;
     std::cerr << "Current memory maps:" << std::endl;
     for(const auto& map : maps) {
@@ -628,52 +617,57 @@ void vm::wakeup() {
 
 
 
-bool vm::ld() {
-    if(pc->dst_reg >= 10) {
+bool vm::ld(const bpf_insn* cur) {
+    if(cur->dst_reg >= 10) {
         return false;
     }
-    r(pc->dst_reg) = (uint64_t)(pc+1)->imm << 32 | (uint32_t)pc->imm;
-    pc++;
+    // lddw 是宽指令（占 2 个 bpf_insn 槽），第二个槽也必须在合法映射内
+    if(!mmu(pc + 2 * sizeof(bpf_insn))) {
+        log_mem_violation("lddw second slot", pc + 2 * sizeof(bpf_insn));
+        return false;
+    }
+    r(cur->dst_reg) = (uint64_t)(cur+1)->imm << 32 | (uint32_t)cur->imm;
+    pc += sizeof(bpf_insn);  // 跳过第二槽；run() 循环再 +=sizeof(bpf_insn)，共两槽
     return true;
 }
 
-bool vm::ldx() {
-    if(pc->dst_reg >= 10) {
+bool vm::ldx(const bpf_insn* cur) {
+    if(cur->dst_reg >= 10) {
         return false;
     }
-    uint64_t target_addr = r(pc->src_reg) + pc->off;
+    uint64_t target_addr = r(cur->src_reg) + cur->off;
     void* addr = mmu(target_addr);
     if (addr == nullptr) {
         log_mem_violation("read", target_addr);
         return false;
     }
-    if((pc->code & 0xe0) == BPF_MEM) {
-        switch(pc->code & 0x18) {
+    if((cur->code & 0xe0) == BPF_MEM) {
+        switch(cur->code & 0x18) {
         case BPF_DW:
-            r(pc->dst_reg) = *(uint64_t*)addr;
+            r(cur->dst_reg) = *(uint64_t*)addr;
             break;
         case BPF_W:
-            r(pc->dst_reg) = *(uint32_t*)addr;
+            r(cur->dst_reg) = *(uint32_t*)addr;
             break;
         case BPF_H:
-            r(pc->dst_reg) = *(uint16_t*)addr;
+            r(cur->dst_reg) = *(uint16_t*)addr;
             break;
         case BPF_B:
-            r(pc->dst_reg) = *(uint8_t*)addr;
+            r(cur->dst_reg) = *(uint8_t*)addr;
             break;
         }
-    }else if((pc->code & 0xe0) == BPF_MEMSX) {
-        switch(pc->code & 0x18) {
+    }else if((cur->code & 0xe0) == BPF_MEMSX) {
+        switch(cur->code & 0x18) {
         case BPF_DW:
             return false;
         case BPF_W:
-            r(pc->dst_reg) = *(int32_t*)addr;
+            r(cur->dst_reg) = *(int32_t*)addr;
             break;
         case BPF_H:
-            r(pc->dst_reg) = *(int16_t*)addr;
+            r(cur->dst_reg) = *(int16_t*)addr;
             break;
         case BPF_B:
-            r(pc->dst_reg) = *(int8_t*)addr;
+            r(cur->dst_reg) = *(int8_t*)addr;
             break;
         }
     }else {
@@ -682,25 +676,25 @@ bool vm::ldx() {
     return true;
 }
 
-bool vm::st() {
-    uint64_t target_addr = r(pc->dst_reg) + pc->off;
+bool vm::st(const bpf_insn* cur) {
+    uint64_t target_addr = r(cur->dst_reg) + cur->off;
     void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
         log_mem_violation("write", target_addr);
         return false;
     }
-    switch (pc->code & 0x18) {
+    switch (cur->code & 0x18) {
     case BPF_DW:
-        *(uint64_t*)addr = pc->imm;
+        *(uint64_t*)addr = cur->imm;
         break;
     case BPF_W:
-        *(uint32_t*)addr = pc->imm;
+        *(uint32_t*)addr = cur->imm;
         break;
     case BPF_H:
-        *(uint16_t*)addr = pc->imm;
+        *(uint16_t*)addr = cur->imm;
         break;
     case BPF_B:
-        *(uint8_t*)addr = pc->imm;
+        *(uint8_t*)addr = cur->imm;
         break;
     }
     return true;
@@ -729,51 +723,51 @@ static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
     return true;
 }
 
-bool vm::stx() {
-    if((pc->code & 0xe0) == BPF_ATOMIC) {
-        uint64_t target_addr = r(pc->dst_reg) + pc->off;
+bool vm::stx(const bpf_insn* cur) {
+    if((cur->code & 0xe0) == BPF_ATOMIC) {
+        uint64_t target_addr = r(cur->dst_reg) + cur->off;
         void* addr = mmu_w(target_addr);
         if(addr == nullptr) {
             log_mem_violation("atomic", target_addr);
             return false;
         }
-        switch(pc->code & 0x18) {
-        case BPF_DW: return do_atomic((uint64_t*)addr, pc->imm, r(pc->src_reg), r(0));
-        case BPF_W:  return do_atomic((uint32_t*)addr, pc->imm, r(pc->src_reg), r(0));
+        switch(cur->code & 0x18) {
+        case BPF_DW: return do_atomic((uint64_t*)addr, cur->imm, r(cur->src_reg), r(0));
+        case BPF_W:  return do_atomic((uint32_t*)addr, cur->imm, r(cur->src_reg), r(0));
         default:     return false;
         }
     }
-    uint64_t target_addr = r(pc->dst_reg) + pc->off;
+    uint64_t target_addr = r(cur->dst_reg) + cur->off;
     void* addr = mmu_w(target_addr);
     if (addr == nullptr) {
         log_mem_violation("write", target_addr);
         return false;
     }
-    switch (pc->code & 0x18) {
+    switch (cur->code & 0x18) {
     case BPF_DW:
-        *(uint64_t*)addr = r(pc->src_reg);
+        *(uint64_t*)addr = r(cur->src_reg);
         break;
     case BPF_W:
-        *(uint32_t*)addr = r(pc->src_reg);
+        *(uint32_t*)addr = r(cur->src_reg);
         break;
     case BPF_H:
-        *(uint16_t*)addr = r(pc->src_reg);
+        *(uint16_t*)addr = r(cur->src_reg);
         break;
     case BPF_B:
-        *(uint8_t*)addr = r(pc->src_reg);
+        *(uint8_t*)addr = r(cur->src_reg);
         break;
     }
     return true;
 }
 
-bool vm::alu64() {
-    if(pc->dst_reg >= 10) {
+bool vm::alu64(const bpf_insn* cur) {
+    if(cur->dst_reg >= 10) {
         return false;
     }
-    uint64_t src = (pc->code & 0x08) == BPF_X ? r(pc->src_reg) : (uint64_t)(int64_t)pc->imm;
+    uint64_t src = (cur->code & 0x08) == BPF_X ? r(cur->src_reg) : (uint64_t)(int64_t)cur->imm;
     int64_t signed_src = static_cast<int64_t>(src);
-    auto& dst = r(pc->dst_reg);
-    switch (pc->code & 0xf0) {
+    auto& dst = r(cur->dst_reg);
+    switch (cur->code & 0xf0) {
     case BPF_ADD:
         dst += src;
         break;
@@ -784,7 +778,7 @@ bool vm::alu64() {
         dst *= src;
         break;
     case BPF_DIV:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = (src != 0) ? (dst / src) : 0;
         }else {
             dst = (src == 0) ? 0 : ((signed_src == -1 && (int64_t)dst == INT64_MIN) ? INT64_MIN : ((int64_t)dst / signed_src));
@@ -806,7 +800,7 @@ bool vm::alu64() {
         dst = -(int64_t)dst;
         break;
     case BPF_MOD:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = (src != 0) ? (dst % src) : dst;
         } else {
             dst = (src == 0) ? dst : ((signed_src == -1 && (int64_t)dst == INT64_MIN) ? 0 : ((int64_t)dst % signed_src));
@@ -816,13 +810,13 @@ bool vm::alu64() {
         dst ^= src;
         break;
     case BPF_MOV:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = src;
-        }else if(pc->off == 8) {
+        }else if(cur->off == 8) {
             dst = (int8_t)src;
-        }else if(pc->off == 16) {
+        }else if(cur->off == 16) {
             dst = (int16_t)src;
-        }else if(pc->off == 32) {
+        }else if(cur->off == 32) {
             dst = (int32_t)src;
         }
         break;
@@ -830,7 +824,7 @@ bool vm::alu64() {
         dst = (int64_t)dst >> (src & 0x3f);
         break;
     case BPF_END:
-        switch(pc->imm) {
+        switch(cur->imm) {
         case 16:
             dst = __builtin_bswap16((uint16_t)dst);
             break;
@@ -848,14 +842,14 @@ bool vm::alu64() {
     return true;
 }
 
-bool vm::alu() {
-    if(pc->dst_reg >= 10) {
+bool vm::alu(const bpf_insn* cur) {
+    if(cur->dst_reg >= 10) {
         return false;
     }
-    uint32_t src = (pc->code & 0x08) == BPF_X ? (uint32_t)r(pc->src_reg) : pc->imm;
+    uint32_t src = (cur->code & 0x08) == BPF_X ? (uint32_t)r(cur->src_reg) : cur->imm;
     int32_t signed_src = static_cast<int32_t>(src);
-    auto dst = (uint32_t)r(pc->dst_reg);
-    switch (pc->code & 0xf0) {
+    auto dst = (uint32_t)r(cur->dst_reg);
+    switch (cur->code & 0xf0) {
     case BPF_ADD:
         dst += src;
         break;
@@ -866,7 +860,7 @@ bool vm::alu() {
         dst *= src;
         break;
     case BPF_DIV:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = (src != 0) ? ((uint32_t)dst / src) : 0;
         }else {
             dst = (src == 0) ? 0 : ((signed_src == -1 && (int32_t)dst == INT32_MIN) ? INT32_MIN : ((int32_t)dst / signed_src));
@@ -888,7 +882,7 @@ bool vm::alu() {
         dst = -(int32_t)dst;
         break;
     case BPF_MOD:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = (src != 0) ? ((uint32_t)dst % src) : (uint32_t)dst;
         } else {
             dst = (src == 0) ? (uint32_t)dst : ((signed_src == -1 && (int32_t)dst == INT32_MIN) ? 0 : ((int32_t)dst % signed_src));
@@ -898,11 +892,11 @@ bool vm::alu() {
         dst ^= src;
         break;
     case BPF_MOV:
-        if(pc->off == 0) {
+        if(cur->off == 0) {
             dst = src;
-        }else if(pc->off == 8) {
+        }else if(cur->off == 8) {
             dst = (int8_t)src;
-        }else if(pc->off == 16) {
+        }else if(cur->off == 16) {
             dst = (int16_t)src;
         }
         break;
@@ -910,26 +904,26 @@ bool vm::alu() {
         dst = (int32_t)dst >> (src & 0x1f);
         break;
     case BPF_END:
-        if((pc->code & 0x08) == BPF_X) {
+        if((cur->code & 0x08) == BPF_X) {
             // BE: host byte order -> big endian (byte swap on little-endian host)
-            switch(pc->imm) {
-            case 16: r(pc->dst_reg) = __builtin_bswap16((uint16_t)dst); return true;
-            case 32: r(pc->dst_reg) = __builtin_bswap32(dst); return true;
-            case 64: r(pc->dst_reg) = __builtin_bswap64(r(pc->dst_reg)); return true;
+            switch(cur->imm) {
+            case 16: r(cur->dst_reg) = __builtin_bswap16((uint16_t)dst); return true;
+            case 32: r(cur->dst_reg) = __builtin_bswap32(dst); return true;
+            case 64: r(cur->dst_reg) = __builtin_bswap64(r(cur->dst_reg)); return true;
             default: return false;
             }
         } else {
             // LE: host byte order -> little endian (no-op on little-endian host, just zero-extend)
-            switch(pc->imm) {
-            case 16: r(pc->dst_reg) = (uint16_t)dst; return true;
-            case 32: r(pc->dst_reg) = (uint32_t)dst; return true;
+            switch(cur->imm) {
+            case 16: r(cur->dst_reg) = (uint16_t)dst; return true;
+            case 32: r(cur->dst_reg) = (uint32_t)dst; return true;
             case 64: return true;
             default: return false;
             }
         }
     }
     // clear high 32 bits
-    r(pc->dst_reg) = (uint64_t)dst;
+    r(cur->dst_reg) = (uint64_t)dst;
     return true;
 }
 
@@ -973,7 +967,7 @@ bool vm::step() {
         auto* func = jit_->compile(this, pc);
         if(!func) break;
         jit_->stats.jit_func_runs++;
-        const bpf_insn* pc_before = pc;
+        uint64_t pc_before = pc;
         ((void(*)(vm*))func->code)(this);
         // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
         // (safepoint, syscall, pc changed, etc.)
@@ -997,7 +991,7 @@ bool vm::step() {
         flags.fetch_or(VM_BUDGET_EXCEEDED, std::memory_order_release);
         std::cerr << "Instruction budget exceeded (" << cnt
                   << " >= " << options.insn_limit << ") at PC 0x"
-                  << std::hex << unmmu(pc) << std::dec << std::endl;
+                  << std::hex << pc << std::dec << std::endl;
         return false;
     }
     // Safepoint check: flags 非零即需要处理
@@ -1005,13 +999,17 @@ bool vm::step() {
     if(f && !safepoint()) {
         return false;
     }
-    uint64_t addr = unmmu(pc);
+    const bpf_insn* cur = (const bpf_insn*)mmu(pc);
+    if(!cur) {
+        log_mem_violation("exec", pc);
+        return false;
+    }
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] ", options.sys->id());
-        dump(addr, pc);
+        dump(pc, cur);
     }
-    if(options.step_run || (options.breakpoint && options.breakpoint == addr)) {
+    if(options.step_run || (options.breakpoint && options.breakpoint == pc)) {
 #if defined(__x86_64__) || defined(__i386__)
         asm volatile("int3");
 #elif defined(__aarch64__)
@@ -1019,15 +1017,15 @@ bool vm::step() {
 #endif
     }
     bool ok = false;
-    switch(pc->code & 0x07) {
-    case BPF_LD:   ok = ld(); break;
-    case BPF_LDX:  ok = ldx(); break;
-    case BPF_ST:   ok = st(); break;
-    case BPF_STX:  ok = stx(); break;
-    case BPF_ALU:  ok = alu(); break;
-    case BPF_ALU64: ok = alu64(); break;
-    case BPF_JMP:  ok = jmp(); break;
-    case BPF_JMP32: ok = jmp32(); break;
+    switch(cur->code & 0x07) {
+    case BPF_LD:   ok = ld(cur); break;
+    case BPF_LDX:  ok = ldx(cur); break;
+    case BPF_ST:   ok = st(cur); break;
+    case BPF_STX:  ok = stx(cur); break;
+    case BPF_ALU:  ok = alu(cur); break;
+    case BPF_ALU64: ok = alu64(cur); break;
+    case BPF_JMP:  ok = jmp(cur); break;
+    case BPF_JMP32: ok = jmp32(cur); break;
     }
     return ok;
 }
@@ -1124,15 +1122,6 @@ void* vm::mmu_w_slow(uint64_t addr, size_t size) {
     return nullptr;
 }
 
-uint64_t vm::unmmu(const void* addr) {
-    for(const auto& map: maps) {
-        if(addr >= map.data.get() && addr < map.data.get() + map.size) {
-            return map.paddr + ((unsigned char*)addr - map.data.get());
-        }
-    }
-    return 0;
-}
-
 void vm::dump_stats() const {
     if (!getenv("BPF_DEBUG")) return;
     fprintf(stderr, "[BPF] 执行指令数: %" PRIu64 "\n", insn_count);
@@ -1152,7 +1141,7 @@ uint64_t vm::run() {
     if(!jit_) jit_ = std::make_unique<JitCompilerImpl>();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
-        pc++;
+        pc += sizeof(bpf_insn);
     }
     if(options.sys) options.sys->fini(shared_from_this());
     dump_stats();
@@ -1176,7 +1165,11 @@ uint64_t vm::run(const vmOptions* options) {
         return 0;
     }
     flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
-    pc = (const bpf_insn*)mmu(options->entry);
+    pc = options->entry;
+    if(!mmu(pc)) {
+        std::cerr << "[run] pc is null after mmu(entry)\n";
+        return 0;
+    }
     push_frame(0);
     return run();
 }
