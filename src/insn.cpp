@@ -978,17 +978,15 @@ bool vm::step() {
         // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
         // (safepoint, syscall, pc changed, etc.)
         uint32_t f = flags.load(std::memory_order_acquire);
-        if(f & (VM_EXITED | VM_KILLED | VM_BUDGET_EXCEEDED)) {
+        if(f && !safepoint()) {
             return false;
         }
-        // JIT aborted but VM isn't exiting.  If syscall/signal/call/exit changed pc
-        // (e.g. longjmp, signal handler, BPF CALL, BPF EXIT), pc has been updated.
-        // Continue in the JIT loop without returning to run().
+        // safepoint 已处理信号/stop 等可恢复事件且未请求退出。若期间 pc 被改
+        // (longjmp、信号处理、BPF CALL/EXIT 等)，则继续 JIT 循环；否则说明 JIT
+        // 在无 flag 的情况下中止（如内存违例），落到解释器单步以报告错误。
         if(pc != pc_before) {
             continue;
         }
-        // Otherwise (e.g. memory violation with no flags set), fall through to
-        // interpreter for one step to report the error.
         break;
     }
     // 解释器执行一条指令
@@ -1004,10 +1002,8 @@ bool vm::step() {
     }
     // Safepoint check: flags 非零即需要处理
     uint32_t f = flags.load(std::memory_order_acquire);
-    if(f) {
-        if(!safepoint()) {
-            return false;
-        }
+    if(f && !safepoint()) {
+        return false;
     }
     uint64_t addr = unmmu(pc);
     if(options.verbose) {
