@@ -257,6 +257,7 @@ public:
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();
+    void clear_jit_cache();
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];

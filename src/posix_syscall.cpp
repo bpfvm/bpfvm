@@ -806,6 +806,10 @@ bool PosixSyscall::do_execve(vm* v) {
     }
     maps(v).swap(maps(fresh.get()));
     v->flush_tlb();
+    // execve 替换了整个 guest 地址空间：旧程序编译的 JIT 函数全部失效。
+    // 且新旧程序共享相同的 guest 地址区间（都从 0x400000 链接），必须清空缓存，
+    // 否则会误命中旧程序的编译产物。
+    v->clear_jit_cache();
 
     decltype(signal_actions) new_actions{};
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));

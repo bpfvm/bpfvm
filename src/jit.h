@@ -86,6 +86,7 @@ class JitCompilerBase {
 public:
     virtual ~JitCompilerBase() = default;
     virtual JitFunction* compile(vm* v, uint64_t gpa) = 0;
+    virtual void clear() {}  // 失效所有已编译的 JIT 缓存（execve 等替换地址空间后必须调用）
     JitStats stats;
 };
 

@@ -1055,6 +1055,10 @@ void vm::flush_tlb() {
     memset(tlb, 0, sizeof(tlb));
 }
 
+void vm::clear_jit_cache() {
+    if(jit_) jit_->clear();
+}
+
 void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow

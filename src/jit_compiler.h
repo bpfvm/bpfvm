@@ -77,6 +77,7 @@ public:
     // Compile or find a JIT function starting at pc.
     // Returns nullptr if the instruction cannot be JIT-compiled.
     JitFunction* compile(vm* v, uint64_t gpa) override;
+    void clear() override { functions_.clear(); failed_.clear(); }
 
 private:
     // VM field offsets
