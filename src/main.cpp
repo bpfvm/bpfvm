@@ -92,6 +92,13 @@ int main(int argc, char** argv) {
     free(cwd);
     const char* dir = dirname((char*)elf_file_path);
     options.envp.emplace_back(std::string("PATH=") + dir);
+    // 仅透传 BPF_ 开头的宿主环境变量（如 BPF_TEST_VARIANT、BPF_LIB_PATH），
+    // 避免把宿主侧的敏感变量（TOKEN*、*_SECRET 等）泄漏进 guest envp。
+    extern char **environ;
+    for (char **e = environ; *e; e++) {
+        std::string s(*e);
+        if (s.rfind("BPF_", 0) == 0) options.envp.emplace_back(s);
+    }
     umask(0);
     std::cout<<(int)vm->run(&options)<<std::endl;
     free((void*)elf_file_path);

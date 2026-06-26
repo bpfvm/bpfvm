@@ -31,19 +31,20 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
-    function(add_bpf_program_test name expected_exit)
-        add_test(
-            NAME ${name}
+    # test_name / program / lib_path / variant / jit_env
+    # 每个用例一个 ctest 条目，内部串行跑 4 变体（静态/动态 × JIT 开/关）。
+    # 不同用例之间由 ctest -j 并发；同用例变体串行，不冲突文件。
+    function(add_bpf_program_test name)
+        add_test(NAME ${name}
             COMMAND ${CMAKE_COMMAND}
                 -DBPFVM=$<TARGET_FILE:bpfvm>
-                -DPROGRAM=${CMAKE_SOURCE_DIR}/test/${name}.out
-                -DEXPECTED_EXIT=${expected_exit}
+                -DNAME=${name}
                 -DWORKDIR=${CMAKE_SOURCE_DIR}
-                -P ${CMAKE_SOURCE_DIR}/cmake/RunBpfProgram.cmake
-        )
+                -P ${CMAKE_SOURCE_DIR}/cmake/RunBpfProgram.cmake)
         set_tests_properties(${name} PROPERTIES
             FIXTURES_REQUIRED bpf_programs_built
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            TIMEOUT 300
         )
     endfunction()
 
@@ -61,7 +62,6 @@ if(BUILD_TESTING)
             continue()
         endif()
 
-        set(expected_exit 0)
-        add_bpf_program_test(${test_name} ${expected_exit})
+        add_bpf_program_test(${test_name})
     endforeach()
 endif()

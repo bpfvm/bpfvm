@@ -1,4 +1,7 @@
+test/*.a
+test/*.so
 test/*.out
+test/*.linked
 build/
 root/
 

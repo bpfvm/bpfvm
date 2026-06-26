@@ -24,7 +24,7 @@
 *   **C++ 编译器**: 支持 C++20 标准 (推荐 Clang 或 GCC)。
 *   **CMake**: 3.16 或更高版本。
 *   **libelf**: 用于 ELF 文件解析 (`libelf-dev` 或 `elfutils-libelf-devel`)。
-*   **BPF 工具链**: 用于编译 Guest 程序 (`clang >= 19`, `binutils-bpf >= 2.44`)。
+*   **BPF 工具链**: `clang >= 19` 编译 Guest 程序，`bpfvm-ld`（本项目自带）链接。无需 `binutils-bpf`。
 
 ### 编译虚拟机
 
@@ -115,10 +115,27 @@ VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp
 3.  **变长参数 (Varargs)**: 不支持标准的 C 变长参数机制。
     *   *解决方案*: 使用 PDCLib 提供的 `PDCLIB_MAKE_VA_LIST` 宏来构建伪参数列表。
 
-## 已知问题
+## 工具链
 
-*   **工具链问题**: `bpf-ld` (binutils-bpf 2.44) 可能会错误合并 `.rodata` 中的字符串字面量。
-    *   *临时解决*: 使用 `bpf-objcopy` 修改段标志。也可以使用仓库内 `bpf-cc` 包装器编译（自动对 `.o` 应用 `bpf-objcopy` 修正段标志）。
+本项目自带 BPF 链接器 `bpfvm-ld`（`src/ld_main.cpp`），完全替代 `binutils-bpf` `bpf-ld`。
+
+```bash
+# 编译（clang 直接，无 wrapper）
+clang -target bpf -mcpu=v4 -O1 -nostdinc -fno-builtin \
+      -isystem libc/include -isystem include -g \
+      foo.c -c -o foo.o
+
+# 链接（三种模式）
+bpfvm-ld -static foo.o -l:libpdclib.a -o foo.linked        # 静态：自包含 ET_EXEC
+bpfvm-ld --shared --soname libc.so libpdclib.a -o libc.so  # 共享库：PIE .so
+bpfvm-ld foo.o -l libc.so -o foo.linked                    # 动态（默认）：PIE + DT_NEEDED
+
+# 运行
+bpfvm foo.linked    # 或 foo.dyn
+```
+
+`bpfvm-ld` 兼容 clang/gcc 风格命令行（接受 `-target`、`-Wl,...`、`-isystem` 等），可作为 autoconf 项目的 `CCLD`。
+
 
 ## 许可证
 

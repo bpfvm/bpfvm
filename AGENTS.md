@@ -4,6 +4,9 @@
 - `main.cpp`: VM entry point, command-line parsing, signal setup.
 - `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, TLB, and instruction definitions.
 - `insn.cpp`: BPF instruction execution (interpreter loop with JIT fallback).
+- `elf_loader.h`, `elf_loader.cpp`: BPF ELF loading and library search (shared by `bpfvm` runtime and `bpfvm-ld`); runtime `.rela.dyn`/`.rela.plt` processing and PIE address allocation.
+- `elf_linker.h`, `elf_linker.cpp`: offline BPF linker core (static / shared / dynamic modes); segment layout, relocations, PLT/GOT synthesis.
+- `ld_main.cpp`: `bpfvm-ld` CLI (argument parsing, `-l`/`-L` resolution, mode dispatch).
 - `posix_syscall.h`, `posix_syscall.cpp`: full POSIX syscall implementation (`PosixSyscall` class), fd management, signal queue, process control.
 - `empty_syscall.h`: stub syscall handler (`EmptySyscall`) returning `-ENOSYS`, used for testing.
 - `insn_test.cpp`: unit tests for instruction execution, built into `bpfvm_test`.
@@ -14,7 +17,7 @@
 - `aarch64_emitter.h`, `aarch64_emitter.cpp`: AArch64 JIT code emitter.
 - `include/`: BPF-facing headers (syscall IDs, POSIX types) used by guest programs.
 - `cmake/`: CMake helper scripts (e.g., `RunBpfProgram.cmake` for CTest integration).
-- `bpf-cc`: BPF compiler wrapper script used by `test/Makefile` and `build_root.sh`.
+- `bpfvm-ld`: BPF linker (replaces `binutils-bpf` `bpf-ld`); see `src/ld_main.cpp`.
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
@@ -28,7 +31,7 @@
 - `./build/bpfvm <elf-file>` — run the VM on a BPF ELF file.
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
 - `cd build && ctest` — run all CTest tests (see below).
-- `make -C test` — build BPF test programs into `.out` files using `bpf-cc` and `bpf-ld`.
+- `make -C test` — build BPF test programs into `.out` files using `clang` and `bpfvm-ld`.
 - `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
 
 ## Coding Style & Naming Conventions
@@ -57,7 +60,7 @@ The VM uses a hybrid interpreter/JIT execution model:
 - **JIT-first**: hot functions are compiled to native code via `JitCompiler<EmitterT>`, with architecture-specific emitters for x86_64 and AArch64.
 - **Interpreter fallback**: single-step execution or JIT errors fall back to the interpreter loop in `insn.cpp`.
 - **TLB acceleration**: a software TLB caches guest-to-host address translations; misses go through `mmu_slow()` / `mmu_w_slow()`.
-- **CoW support**: memory mappings support copy-on-write semantics (for `fork`); write faults trigger page duplication.
+- **CoW support**: memory mappings support copy-on-write semantics (for `fork`); write faults trigger segment duplication.
 - **Signal-aware frames**: normal call frames are 64 bytes; signal frames are 128 bytes with additional saved state.
 
 ### JIT Environment Variables
@@ -83,12 +86,26 @@ The VM uses a hybrid interpreter/JIT execution model:
 
 ## Configuration & Dependencies
 - Requires `libelf` via `pkg-config` for the VM build.
-- BPF toolchain dependencies: `clang`, `bpf-objcopy`, and `bpf-ld` for `test/` programs. The `bpf-cc` wrapper script in the project root handles the standard compile flags and post-compilation `bpf-objcopy` workaround.
+- BPF toolchain: `clang` (>= 19) compiles `.c` → `.o`; `bpfvm-ld` (built from `src/ld_main.cpp`) links `.o` + archives into self-contained ET_EXEC or PIE ET_DYN; `bpfvm` runs the result. No `binutils-bpf` or `bpf-ld`.
 
-## Known Toolchain Issues
-- `bpf-ld` (binutils-bpf 2.44) may mis-merge string literals (off-by-one addresses in `.rodata`).
-- Workaround: strip merge flags on `.rodata.str1.1` with `bpf-objcopy --set-section-flags .rodata.str1.1=alloc,readonly,data`.
-- Debian bug report: `https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1126689`.
+## BPF Linker (`bpfvm-ld`)
+The project ships its own BPF linker `bpfvm-ld` that fully replaces `binutils-bpf` `bpf-ld`. Three modes (share the same `Linker` core), aligned with standard `ld` defaults:
+
+- **Static** (`-static`): merges `.o` + archives into a self-contained ET_EXEC (fixed address). Example: `bpfvm-ld -static foo.o -l:libpdclib.a -o foo.linked`.
+- **Shared library** (`-shared` / `--shared`): builds a `.so` from an archive, exports its GLOBAL symbol table, PIE (p_vaddr=0, loadable at any address). Example: `bpfvm-ld --shared --soname libc.so libpdclib.a -o libc.so`.
+- **Dynamic executable** (default): builds a PIE ET_DYN that references `.so` dependencies via `DT_NEEDED`. Cross-module function calls go through PLT/GOT; cross-module data references are recorded in `.rela.dyn`. At runtime `bpfvm` allocates load addresses and applies relocations. Example: `bpfvm-ld foo.o -l libc.so -o foo.linked`.
+
+All three modes emit **three permission-separated `PT_LOAD` segments** (W^X), classified from section flags by `layout_segments` (`src/elf_linker.cpp`):
+- `text` (`SHF_EXECINSTR`) → `PF_R|PF_X` (read-only + executable)
+- `rodata` (read-only data) → `PF_R`
+- `data` + `.bss` (`SHF_WRITE`) → `PF_R|PF_W`; `.bss` is `SHT_NOBITS`, so `p_memsz > p_filesz` and is zero-filled at load
+
+Segments are page-aligned and non-overlapping in the guest address space.
+
+Entry symbol defaults to `_start` (standard `ld` behavior); override with `-e <name>` / `--entry <name>`.
+
+## Historical Note
+Earlier versions depended on `binutils-bpf` `bpf-ld`, which had a `.rodata.str1.1` merge bug (Debian #1126689). `bpfvm-ld` makes this workaround unnecessary.
 
 ## BPF Architecture Constraints & Developer Guide
 

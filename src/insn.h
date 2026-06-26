@@ -4,6 +4,8 @@
 
 #ifndef INSN_H
 #define INSN_H
+#include "elf_loader.h"
+
 #include <list>
 #include <stdint.h>
 #include <stdlib.h>
@@ -124,37 +126,6 @@ For load and store instructions the 8-bit 'code' field is divided as:
 #define BPF_FETCH   0x01
 #define BPF_XCHG    (0xe0 | BPF_FETCH)
 #define BPF_CMPXCHG (0xf0 | BPF_FETCH)
-
-// Used as both the unique_ptr deleter (for owned mmap memory) and the shared_ptr deleter
-// (for CoW pages shared between parent and child VMs).  The single `owned` flag controls
-// whether munmap is called, so both roles use the exact same codepath.
-struct DataDeleter {
-    size_t size = 0;
-    bool owned = false;
-    DataDeleter() = default;
-    DataDeleter(size_t sz, bool own) : size(sz), owned(own) {}
-    void operator()(unsigned char* p) {
-        if (owned && p && p != (unsigned char*)MAP_FAILED)
-            munmap(p, size);
-    }
-};
-
-struct memmap {
-    std::unique_ptr<unsigned char, DataDeleter> data{nullptr, DataDeleter{0, false}};
-    size_t size = 0;
-    uint64_t paddr = 0;
-    uint32_t flags = 0;
-    // non-null: CoW page shared across VMs; DataDeleter owns the actual munmap call.
-    // Use std::get_deleter<DataDeleter>(cow_data) to access/disarm the deleter.
-    std::shared_ptr<unsigned char> cow_data;
-    memmap() = default;
-    memmap(memmap&&) = default;
-    ~memmap() = default;
-    void set_data(unsigned char* p, size_t sz, bool own = true) {
-        data = std::unique_ptr<unsigned char, DataDeleter>(p, DataDeleter{sz, own});
-    }
-    static memmap static_map(void* addr, size_t size, uint64_t paddr);
-};
 
 class vm;
 class JitCompilerBase;

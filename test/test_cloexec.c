@@ -23,12 +23,19 @@ int main(int argc, char** argv) {
     snprintf(fd1_str, sizeof(fd1_str), "%d", fd_cloexec);
     snprintf(fd2_str, sizeof(fd2_str), "%d", fd_keep);
 
-    char *const new_argv[] = { "test/test_cloexec_child.out", fd1_str, fd2_str, NULL };
+    /* 按 BPF_TEST_VARIANT 选择 child 变体（.out / .linked） */
+    const char *variant = getenv("BPF_TEST_VARIANT");
+    if (!variant || !*variant) variant = "out";
+    char target[128];
+    snprintf(target, sizeof(target), "test/test_cloexec_child.%s", variant);
+
+    char *const new_argv[] = { target, fd1_str, fd2_str, NULL };
     char *const new_envp[] = { NULL };
 
-    printf("Parent: fd_cloexec=%d, fd_keep=%d. Executing child...\n", fd_cloexec, fd_keep);
+    printf("Parent: fd_cloexec=%d, fd_keep=%d. Executing child %s...\n",
+           fd_cloexec, fd_keep, target);
 
-    execve("test/test_cloexec_child.out", new_argv, new_envp);
+    execve(target, new_argv, new_envp);
 
     // Should not reach here
     printf("Parent: Execve failed: %s\n", strerror(errno));

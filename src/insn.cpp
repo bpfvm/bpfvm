@@ -6,6 +6,8 @@
 #include <iostream>
 
 #include "jit.h"
+#include <algorithm>
+#include <cstring>
 
 #if defined(__x86_64__)
 #include "jit_compiler.h"
@@ -40,15 +42,6 @@ using JitCompilerImpl = StubJitCompiler;
 
 
 std::mutex log_mutex;
-
-memmap memmap::static_map(void* addr, size_t size, uint64_t paddr) {
-    memmap map;
-    map.size = size;
-    map.set_data((unsigned char*)addr, size, false);
-    map.paddr = paddr;
-    map.flags = PF_R;
-    return map;
-}
 
 
 
@@ -221,94 +214,7 @@ std::shared_ptr<vm> vm::create() {
 }
 
 uint64_t vm::load_elf(const char* elf_file_path) {
-    uint64_t entry = 0;
-    int fd = -1;
-    Elf* elf = nullptr;
-
-    if (elf_version(EV_CURRENT) == EV_NONE) {
-        std::cerr << "Failed to initialize libelf: " << elf_errmsg(-1) << std::endl;
-        goto out;
-    }
-
-    fd = open(elf_file_path, O_RDONLY);
-    if(fd < 0) {
-        std::cerr << "Failed to open: "<<elf_file_path<<": " << strerror(errno) << std::endl;
-        goto out;
-    }
-
-    elf = elf_begin(fd, ELF_C_READ, nullptr);
-    if(elf == nullptr) {
-        std::cerr << "Failed to open ELF file: " << elf_errmsg(-1) << std::endl;
-        goto out;
-    }
-
-    if(elf_kind(elf) != ELF_K_ELF) {
-        std::cerr << "Not an ELF file" << std::endl;
-        goto out;
-    }
-
-    GElf_Ehdr ehdr;
-    if(gelf_getehdr(elf, &ehdr) != &ehdr) {
-        std::cerr << "Failed to get ELF header: " << elf_errmsg(-1) << std::endl;
-        goto out;
-    }
-
-    if(ehdr.e_type != ET_EXEC) {
-        std::cerr << "Not an executable ELF file: " << elf_file_path << " type: " << ehdr.e_type << std::endl;
-        goto out;
-    }
-
-    if(ehdr.e_machine != 0xf7) {
-        std::cerr << "Not an bpf ELF file: " << elf_file_path << " machine: " << ehdr.e_machine << std::endl;
-        goto out;
-    }
-
-    for(size_t i = 0; i < ehdr.e_phnum; i++) {
-        GElf_Phdr phdr;
-        if(gelf_getphdr(elf, i, &phdr) != &phdr) {
-            std::cerr << "Failed to get program header: " << elf_errmsg(-1) << std::endl;
-            goto out;
-        }
-        if(phdr.p_type != PT_LOAD) {
-            continue;
-        }
-
-        memmap map;
-        map.paddr = phdr.p_vaddr;
-        map.size = phdr.p_memsz;
-        if(phdr.p_flags & PF_W) {
-            auto* raw = (unsigned char*)mmap(nullptr, map.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if(raw == MAP_FAILED) {
-                std::cerr << "Failed to mmap section: " << strerror(errno) << std::endl;
-                goto out;
-            }
-            map.set_data(raw, map.size);
-            if(pread(fd, map.data.get(), phdr.p_filesz, phdr.p_offset) != (ssize_t)phdr.p_filesz) {
-                std::cerr << "Failed to read section: " << strerror(errno) << std::endl;
-                goto out;
-            }
-        }else {
-            auto* raw = (unsigned char*)mmap(nullptr, map.size, PROT_READ, MAP_PRIVATE, fd, phdr.p_offset);
-            if(raw == MAP_FAILED) {
-                std::cerr << "Failed to mmap section: " << strerror(errno) << std::endl;
-                goto out;
-            }
-            map.set_data(raw, map.size);
-        }
-        map.flags = phdr.p_flags;
-        addmem(std::move(map));
-    }
-
-    entry = ehdr.e_entry;
-
-out:
-    if(elf != nullptr) {
-        elf_end(elf);
-    }
-    if(fd >= 0) {
-        close(fd);
-    }
-    return entry;
+    return ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); });
 }
 
 /*

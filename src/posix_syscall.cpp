@@ -1376,7 +1376,12 @@ bool PosixSyscall::do_utimensat(vm* v) {
             v->r(0) = -EBADF;
             return true;
         }
+        // utimensat(2) 允许 path=NULL（配合 AT_EMPTY_PATH 作用于 fd 自身），
+        // 但 glibc 头声明为 nonnull，编译器误报，这里局部抑制。
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
         rc = utimensat(it->second->fd, has_path ? path.c_str() : nullptr, times_ptr, flags);
+#pragma GCC diagnostic pop
     }
 
     if(rc == -1) {
