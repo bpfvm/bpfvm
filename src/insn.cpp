@@ -508,12 +508,57 @@ bool vm::jmp32(const bpf_insn* cur) {
 void vm::log_mem_violation(const char* type, uint64_t addr) {
     std::cerr << "Memory access violation at PC 0x" << std::hex << pc
               << ": invalid " << type << " at address 0x" << addr << std::dec << std::endl;
+
+    // 寄存器转储
+    std::cerr << "Registers:" << std::hex;
+    for (int i = 0; i < 11; i++) {
+        if (i % 4 == 0) std::cerr << "\n  ";
+        std::cerr << "r" << std::dec << i << "=0x" << std::hex << reg[i] << "  " << std::dec;
+    }
+    std::cerr << std::endl;
+
+    // 调用栈回溯：沿 frame 链向上遍历
+    // 正常帧: flags[0] r6..r9[1..4] old_r10[5] ret_addr[6]
+    // 信号帧: flags[0] r0..r9[1..10] old_r10[11] ret_addr[12]
+    std::cerr << "Call stack:" << std::hex;
+    uint64_t cur_sp = r(10);
+    uint64_t cur_pc = pc;
+    int depth = 0;
+    constexpr int MAX_FRAMES = 64;
+    while (cur_sp != 0 && depth < MAX_FRAMES) {
+        std::cerr << "\n  #" << std::dec << depth << " pc=0x" << std::hex << cur_pc
+                  << " sp=0x" << cur_sp << std::dec;
+        uint64_t* frame_base = (uint64_t*)mmu(cur_sp, sizeof(uint64_t) * 16);
+        if (!frame_base) {
+            std::cerr << " (frame unreadable at 0x" << std::hex << cur_sp << ")" << std::dec;
+            break;
+        }
+        bool is_signal = frame_base[0] != 0;
+        uint64_t old_sp   = is_signal ? frame_base[11] : frame_base[5];
+        uint64_t ret_addr = is_signal ? frame_base[12] : frame_base[6];
+        std::cerr << (is_signal ? " [signal]" : "");
+        if (old_sp == 0 || old_sp <= cur_sp || ret_addr == 0) {
+            // 到达栈底
+            break;
+        }
+        cur_sp = old_sp;
+        cur_pc = ret_addr;
+        depth++;
+    }
+    std::cerr << std::dec << std::endl;
+
     std::cerr << "Current memory maps:" << std::endl;
     for(const auto& map : maps) {
+        // 权限符号化（PF_R=0x4, PF_W=0x2, PF_X=0x1），形如 /proc/<pid>/maps 的 rwx
+        char perm[4];
+        perm[0] = (map.flags & PF_R) ? 'r' : '-';
+        perm[1] = (map.flags & PF_W) ? 'w' : '-';
+        perm[2] = (map.flags & PF_X) ? 'x' : '-';
+        perm[3] = '\0';
         std::cerr << "  Start: 0x" << std::hex << map.paddr
                   << " End: 0x" << (map.paddr + map.size)
                   << " Size: 0x" << map.size
-                  << " Flags: " << map.flags << std::dec << std::endl;
+                  << " Flags: " << perm << std::dec << std::endl;
     }
 }
 
