@@ -6,8 +6,10 @@
 #include <iostream>
 
 #include "jit.h"
+#include "include/auxv.h"
 #include <algorithm>
 #include <cstring>
+#include <sys/random.h>
 
 #if defined(__x86_64__)
 #include "jit_compiler.h"
@@ -1180,27 +1182,43 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         strings_bytes += env.size() + 1;
     }
 
-    // Stack layout at STACK_BASE (low to high):
-    // +------------------+
-    // | argc             |
-    // +------------------+
-    // | argv[0] ptr       |
-    // | argv[1] ptr       |
-    // | ...               |
-    // | argv[argc-1] ptr  |
-    // | NULL              |
-    // +------------------+
-    // | envp[0] ptr       |
-    // | envp[1] ptr       |
-    // | ...               |
-    // | envp[envc-1] ptr  |
-    // | NULL              |
-    // +------------------+
-    // | argv/env strings  |
-    // +------------------+
-    size_t header_qwords = 1 + (argv.size() + 1) + (envp.size() + 1);
+    // 附加 auxv 载荷字符串：
+    //   - AT_PLATFORM 指向的 "bpf"（含 '\0'）
+    //   - AT_RANDOM 指向的 16 字节随机数据
+    static const char kPlatform[] = "bpf";
+    const size_t platform_bytes = sizeof(kPlatform); // 含 '\0'
+    constexpr size_t kRandomBytes = 16;
+
+    // auxv 条目（type/val 成对的 uint64）；指针型字段稍后回填。
+    struct AuxEntry { uint64_t type; uint64_t val; };
+    AuxEntry auxv[] = {
+        {AT_PAGESZ,   4096},
+        {AT_CLKTCK,   100},
+        {AT_UID,      0},
+        {AT_EUID,     0},
+        {AT_GID,      0},
+        {AT_EGID,     0},
+        {AT_SECURE,   0},
+        {AT_PLATFORM, 0},   // 回填
+        {AT_EXECFN,   0},   // 回填
+        {AT_RANDOM,   0},   // 回填
+        {AT_NULL,     0},
+    };
+    const size_t aux_qwords = sizeof(auxv) / sizeof(*auxv) * 2;
+
+    // Stack layout at STACK_BASE (low to high)：
+    //   argc
+    //   argv[0..argc-1] 指针
+    //   NULL
+    //   envp[0..envc-1] 指针
+    //   NULL
+    //   auxv[]  （每个条目 2×uint64，以 {AT_NULL,0} 结尾）
+    //   argv/env 字符串
+    //   "bpf\0" 平台串
+    //   16 字节随机数据（AT_RANDOM）
+    size_t header_qwords = 1 + (argv.size() + 1) + (envp.size() + 1) + aux_qwords;
     size_t header_bytes = header_qwords * sizeof(uint64_t);
-    size_t total_bytes = header_bytes + strings_bytes;
+    size_t total_bytes = header_bytes + strings_bytes + platform_bytes + kRandomBytes;
     if(total_bytes > STACK_SIZE) {
         std::cerr << "Stack arguments exceed stack size" << std::endl;
         return false;
@@ -1226,6 +1244,45 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         cursor += len;
     }
     header[env_base + envp.size()] = 0;
+
+    // auxv 紧跟在 envp 的 NULL 之后。
+    size_t aux_base = env_base + envp.size() + 1;
+
+    // AT_PLATFORM 指向的 "bpf\0"
+    size_t platform_off = cursor;
+    memcpy(stack_base + cursor, kPlatform, platform_bytes);
+    cursor += platform_bytes;
+
+    // AT_EXECFN：复用 argv[0] 的指针；无 argv 时回退到 AT_PLATFORM 串。
+    uint64_t execfn_ptr = (!argv.empty()) ? header[1] : (STACK_BASE + platform_off);
+
+    // AT_RANDOM 指向的 16 字节随机数据
+    ssize_t got = getrandom(stack_base + cursor, kRandomBytes, 0);
+    if(got != (ssize_t)kRandomBytes) {
+        std::cerr << "Failed to get random bytes for AT_RANDOM" << std::endl;
+        return false;
+    }
+
+    // 写入 auxv 条目并回填指针型字段
+    for(size_t i = 0; i < sizeof(auxv) / sizeof(*auxv); ++i) {
+        uint64_t type = auxv[i].type;
+        uint64_t val  = auxv[i].val;
+        switch(type) {
+        case AT_PLATFORM:
+            val = STACK_BASE + platform_off;
+            break;
+        case AT_EXECFN:
+            val = execfn_ptr;
+            break;
+        case AT_RANDOM:
+            val = STACK_BASE + cursor;
+            break;
+        default:
+            break;
+        }
+        header[aux_base + i * 2]     = type;
+        header[aux_base + i * 2 + 1] = val;
+    }
 
     reg[1] = STACK_BASE;
     return true;

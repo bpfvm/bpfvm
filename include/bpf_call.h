@@ -55,6 +55,18 @@ enum bpf_syscall_id {
     BPF_SYS_CLOCK_GETTIME,
     BPF_SYS_TRUNCATE,
     BPF_SYS_FTRUNCATE,
+    BPF_SYS_MPROTECT,       // mprotect(addr, len, prot)
+    BPF_SYS_READV,          // readv(fd, iov, iovcnt)
+    BPF_SYS_WRITEV,         // writev(fd, iov, iovcnt)
+    BPF_SYS_PREAD,          // pread(fd, buf, count, off)
+    BPF_SYS_PWRITE,         // pwrite(fd, buf, count, off)
+    BPF_SYS_GETRANDOM,      // getrandom(buf, buflen, flags)
+    BPF_SYS_GETDENTS64,     // 64 位目录项读取，musl readdir 走此路
+    BPF_SYS_SET_TID_ADDRESS,// set_tid_address(tidptr) — 后续 futex/线程退出清零点
+    BPF_SYS_EXIT_GROUP,     // 进程退出（无线程时等价于 exit）
+    BPF_SYS_MADVISE,        // madvise — 不实现，返回 -ENOSYS
+    BPF_SYS_SCHED_YIELD,    // sched_yield() — 让出执行（JIT 安全点）
+    BPF_SYS_GETTID,         // gettid()
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -100,5 +112,17 @@ enum bpf_syscall_id {
 #define BPF_CALL_CLOCK_GETTIME BPF_CALL_ID(BPF_SYS_CLOCK_GETTIME)
 #define BPF_CALL_TRUNCATE  BPF_CALL_ID(BPF_SYS_TRUNCATE)
 #define BPF_CALL_FTRUNCATE BPF_CALL_ID(BPF_SYS_FTRUNCATE)
+#define BPF_CALL_MPROTECT  BPF_CALL_ID(BPF_SYS_MPROTECT)
+#define BPF_CALL_READV     BPF_CALL_ID(BPF_SYS_READV)
+#define BPF_CALL_WRITEV    BPF_CALL_ID(BPF_SYS_WRITEV)
+#define BPF_CALL_PREAD     BPF_CALL_ID(BPF_SYS_PREAD)
+#define BPF_CALL_PWRITE    BPF_CALL_ID(BPF_SYS_PWRITE)
+#define BPF_CALL_GETRANDOM BPF_CALL_ID(BPF_SYS_GETRANDOM)
+#define BPF_CALL_GETDENTS64 BPF_CALL_ID(BPF_SYS_GETDENTS64)
+#define BPF_CALL_SET_TID_ADDRESS BPF_CALL_ID(BPF_SYS_SET_TID_ADDRESS)
+#define BPF_CALL_EXIT_GROUP BPF_CALL_ID(BPF_SYS_EXIT_GROUP)
+#define BPF_CALL_MADVISE   BPF_CALL_ID(BPF_SYS_MADVISE)
+#define BPF_CALL_SCHED_YIELD BPF_CALL_ID(BPF_SYS_SCHED_YIELD)
+#define BPF_CALL_GETTID    BPF_CALL_ID(BPF_SYS_GETTID)
 
 #endif //BPF_CALL_H

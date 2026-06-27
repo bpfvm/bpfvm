@@ -6,6 +6,7 @@ namespace bpf{
     #include "include/sys/stat.h"
     #include "include/dirent.h"
     #include "include/termios.h"
+    #include "include/sys/uio.h"
 }
 
 #include <errno.h>
@@ -24,6 +25,10 @@ namespace bpf{
 #include <filesystem>
 #include <signal.h>
 #include <pthread.h>
+#include <sys/random.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sched.h>
 
 #undef sa_handler
 #undef sa_sigaction
@@ -1672,6 +1677,258 @@ bool PosixSyscall::do_longjmp(vm* v) {
     return true;
 }
 
+bool PosixSyscall::do_mprotect(vm* v) {
+    uint64_t addr = v->r(1);
+    size_t len = arg_size(v->r(2));
+    int prot = arg_s32(v->r(3));
+
+    // 查找一个完整覆盖 [addr, addr+len) 的映射；跨映射返回 ENOMEM，
+    // 与 Linux 语义保持一致（mprotect 不跨 VMA）。
+    for(auto& m : maps(v)) {
+        if(m.paddr > addr || (addr + len) > m.paddr + m.size) {
+            continue;
+        }
+        // 代码段不允许改权限：避免去 PF_X 后绕过宿主保护、加 W 后打宿主只读页。
+        if(m.flags & PF_X) {
+            v->r(0) = -EACCES;
+            return true;
+        }
+        // 计算新的 PF_* 位，仅替换 PF_R|PF_W|PF_X 三位，保留其它元信息。
+        constexpr uint32_t kProtMask = PF_R | PF_W | PF_X;
+        uint32_t new_flags = m.flags & ~kProtMask;
+        if(prot & PROT_READ)  new_flags |= PF_R;
+        if(prot & PROT_WRITE) new_flags |= PF_W;
+        if(prot & PROT_EXEC)  new_flags |= PF_X;
+
+        // 只对 VM 自有（host mmap 分配）的内存调用宿主 mprotect，让堆保护生效；
+        // 借用区（static_map / fork 子 VM / ELF 共享段）的 host_base 不保证按页
+        // 对齐也不归本进程拥有，直接动宿主页保护可能误伤邻近内存或返回 EINVAL。
+        // guest 视角的权限校验由 mmu/mmu_w 走 m.flags 实现，更新 flags 即足够。
+        if(m.data.get_deleter().owned) {
+            unsigned char* host_base = m.data.get() + (addr - m.paddr);
+            if(mprotect(host_base, len, prot) == -1) {
+                v->r(0) = -errno;
+                return true;
+            }
+        }
+
+        m.flags = new_flags;
+        v->flush_tlb();
+        v->r(0) = 0;
+        return true;
+    }
+    v->r(0) = -ENOMEM;
+    return true;
+}
+
+bool PosixSyscall::do_readv(vm* v) {
+    auto it = fds.find(arg_s32(v->r(1)));
+    if(it == fds.end()) {
+        v->r(0) = -EBADF;
+        return true;
+    }
+    int iovcnt = arg_s32(v->r(3));
+    if(iovcnt <= 0) {
+        v->r(0) = (iovcnt == 0) ? 0 : -EINVAL;
+        return true;
+    }
+    auto guest_vec = static_cast<bpf::iovec*>(v->mmu(v->r(2), sizeof(bpf::iovec) * iovcnt));
+    if(guest_vec == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    // 把 guest 的 iov 翻译成宿主 iovec：iov_base 走 mmu_w 转成 host 指针。
+    // 这样宿主 readv 一次性按 iov 顺序填充，跨 iov 的短读/EOF 语义与内核一致。
+    std::vector<iovec> host_vec;
+    host_vec.reserve(iovcnt);
+    for(int i = 0; i < iovcnt; ++i) {
+        size_t len = (size_t)guest_vec[i].iov_len;
+        if(len == 0) continue;
+        void* buf = v->mmu_w((uint64_t)guest_vec[i].iov_base, len);
+        if(buf == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+        host_vec.push_back({buf, len});
+    }
+    if(host_vec.empty()) {
+        v->r(0) = 0;
+        return true;
+    }
+    ssize_t rc = readv(it->second->fd, host_vec.data(), (int)host_vec.size());
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_writev(vm* v) {
+    auto it = fds.find(arg_s32(v->r(1)));
+    if(it == fds.end()) {
+        v->r(0) = -EBADF;
+        return true;
+    }
+    int iovcnt = arg_s32(v->r(3));
+    if(iovcnt <= 0) {
+        v->r(0) = (iovcnt == 0) ? 0 : -EINVAL;
+        return true;
+    }
+    auto guest_vec = static_cast<bpf::iovec*>(v->mmu(v->r(2), sizeof(bpf::iovec) * iovcnt));
+    if(guest_vec == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    // 把 guest 的 iov 翻译成宿主 iovec：iov_base 走 mmu 转成 host 指针（只读即可）。
+    // 这样宿主 writev 一次性按 iov 顺序输出，短写语义与内核一致。
+    std::vector<iovec> host_vec;
+    host_vec.reserve(iovcnt);
+    for(int i = 0; i < iovcnt; ++i) {
+        size_t len = (size_t)guest_vec[i].iov_len;
+        if(len == 0) continue;
+        void* buf = v->mmu((uint64_t)guest_vec[i].iov_base, len);
+        if(buf == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+        host_vec.push_back({buf, len});
+    }
+    if(host_vec.empty()) {
+        v->r(0) = 0;
+        return true;
+    }
+    ssize_t rc = writev(it->second->fd, host_vec.data(), (int)host_vec.size());
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_pread(vm* v) {
+    auto it = fds.find(arg_s32(v->r(1)));
+    if(it == fds.end()) {
+        v->r(0) = -EBADF;
+        return true;
+    }
+    size_t count = arg_size(v->r(3));
+    void* buf = v->mmu_w(v->r(2), count);
+    if(buf == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    off_t off = (off_t)v->r(4);
+    ssize_t rc = pread(it->second->fd, buf, count, off);
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_pwrite(vm* v) {
+    auto it = fds.find(arg_s32(v->r(1)));
+    if(it == fds.end()) {
+        v->r(0) = -EBADF;
+        return true;
+    }
+    size_t count = arg_size(v->r(3));
+    void* buf = v->mmu(v->r(2), count);
+    if(buf == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    off_t off = (off_t)v->r(4);
+    ssize_t rc = pwrite(it->second->fd, buf, count, off);
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_getrandom(vm* v) {
+    size_t buflen = arg_size(v->r(2));
+    if(buflen == 0) {
+        v->r(0) = 0;
+        return true;
+    }
+    void* buf = v->mmu_w(v->r(1), buflen);
+    if(buf == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    unsigned int flags = (unsigned int)arg_u32(v->r(3));
+    ssize_t rc = getrandom(buf, buflen, flags);
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_getdents64(vm* v) {
+    auto it = fds.find(arg_s32(v->r(1)));
+    if(it == fds.end()) {
+        v->r(0) = -EBADF;
+        return true;
+    }
+    size_t count = arg_size(v->r(3));
+    if(count == 0) {
+        v->r(0) = -EINVAL;
+        return true;
+    }
+    void* buf = v->mmu_w(v->r(2), count);
+    if(buf == nullptr) {
+        v->r(0) = -EFAULT;
+        return true;
+    }
+    int rc = (int)::syscall(SYS_getdents64, it->second->fd, buf, (int)count);
+    if(rc < 0) {
+        v->r(0) = -errno;
+        return true;
+    }
+    v->r(0) = (uint64_t)rc;
+    return true;
+}
+
+bool PosixSyscall::do_set_tid_address(vm* v) {
+    tid_address_ = v->r(1);
+    // 单线程下 tid_clear 由 host 线程退出处理；当前没有 fork-futex 模型，
+    // 这里返回 PID，让 musl __init_libc 认为 tid_address 已注册即可。
+    v->r(0) = pid;
+    return true;
+}
+
+bool PosixSyscall::do_exit_group(vm* v) {
+    // 无线程组：与 BPF_SYS_EXIT 行为一致。
+    v->r(0) = (uint64_t)arg_s32(v->r(1));
+    return false;
+}
+
+bool PosixSyscall::do_madvise(vm* v) {
+    // 主要用于 malloc MADV_DONTNEED；缺省语义可忽略。
+    v->r(0) = 0;
+    return true;
+}
+
+bool PosixSyscall::do_sched_yield(vm* v) {
+    sched_yield();
+    v->r(0) = 0;
+    return true;
+}
+
+bool PosixSyscall::do_gettid(vm* v) {
+    // 单线程进程语义下 gettid == getpid；fork 出去的子 VM 也是各自独立单线程，
+    // 同样满足 gettid==getpid。
+    v->r(0) = pid;
+    return true;
+}
 
 bool PosixSyscall::syscall(vm* v, uint32_t call) {
     uint32_t sys_id = call;
@@ -1722,6 +1979,19 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_SETJMP:        return do_setjmp(v);
     case BPF_SYS_LONGJMP:       return do_longjmp(v);
     case BPF_SYS_CLOCK_GETTIME: return do_clock_gettime(v);
+    // —— musl/libc 兼容性补充 ——
+    case BPF_SYS_MPROTECT:       return do_mprotect(v);
+    case BPF_SYS_READV:          return do_readv(v);
+    case BPF_SYS_WRITEV:         return do_writev(v);
+    case BPF_SYS_PREAD:          return do_pread(v);
+    case BPF_SYS_PWRITE:         return do_pwrite(v);
+    case BPF_SYS_GETRANDOM:      return do_getrandom(v);
+    case BPF_SYS_GETDENTS64:     return do_getdents64(v);
+    case BPF_SYS_SET_TID_ADDRESS:return do_set_tid_address(v);
+    case BPF_SYS_EXIT_GROUP:     return do_exit_group(v);
+    case BPF_SYS_MADVISE:        return do_madvise(v);
+    case BPF_SYS_SCHED_YIELD:    return do_sched_yield(v);
+    case BPF_SYS_GETTID:         return do_gettid(v);
     default:
         fprintf(stderr, "unsupported func: 0x%x\n", call);
         v->r(0) = -ENOSYS;

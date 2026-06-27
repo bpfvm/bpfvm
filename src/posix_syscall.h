@@ -56,6 +56,8 @@ class PosixSyscall: public SyscallHandler{
     pthread_t tid = 0;
     std::array<signal_action, NSIG> signal_actions{};
     MpscQueue pending_signals;
+    // set_tid_address 设置；用于 musl __init_libc。当前无线程，仅存储，不做 futex 唤醒。
+    uint64_t tid_address_ = 0;
 
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
@@ -118,6 +120,18 @@ public:
     bool do_umask(vm* v);
     bool do_setjmp(vm* v);
     bool do_longjmp(vm* v);
+    bool do_mprotect(vm* v);
+    bool do_readv(vm* v);
+    bool do_writev(vm* v);
+    bool do_pread(vm* v);
+    bool do_pwrite(vm* v);
+    bool do_getrandom(vm* v);
+    bool do_getdents64(vm* v);
+    bool do_set_tid_address(vm* v);
+    bool do_exit_group(vm* v);
+    bool do_madvise(vm* v);
+    bool do_sched_yield(vm* v);
+    bool do_gettid(vm* v);
 };
 
 #endif

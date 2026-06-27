@@ -13,6 +13,9 @@
 
 #ifndef BPF_NO_SYSCALL
 __attribute__((noreturn)) void _exit(int status);
+__attribute__((noreturn)) void exit_group(int status);
+int set_tid_address(int *tidptr);
+pid_t gettid(void);
 int execve(const char* pathname, char* const argv[], char* const envp[]);
 int execvp(const char *file, char *const argv[]);
 int execv(const char *path, char *const argv[]);
@@ -29,6 +32,8 @@ int pipe2(int pipefd[2], int flags);
 int close(int fd);
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
+ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 int truncate(const char *pathname, off_t length);
 int ftruncate(int fd, off_t length);
 int unlink(const char *pathname);
