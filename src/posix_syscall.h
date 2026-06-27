@@ -106,9 +106,6 @@ public:
     bool do_pipe2(vm* v);
     bool do_fchdir(vm* v);
     bool do_getcwd(vm* v);
-    bool do_fdopendir(vm* v);
-    bool do_readdir(vm* v);
-    bool do_closedir(vm* v);
     bool do_fstatat(vm* v);
     bool do_fchmodat(vm* v);
     bool do_utimensat(vm* v);

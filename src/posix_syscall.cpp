@@ -4,7 +4,6 @@ namespace bpf{
     #define BPF_NO_SYSCALL
     #include "include/signal.h"
     #include "include/sys/stat.h"
-    #include "include/dirent.h"
     #include "include/termios.h"
     #include "include/sys/uio.h"
 }
@@ -17,7 +16,6 @@ namespace bpf{
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <termios.h>
-#include <dirent.h>
 #include <memory>
 #include <time.h>
 #include <string.h>
@@ -1189,92 +1187,6 @@ bool PosixSyscall::do_getcwd(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_fdopendir(vm* v) {
-    int fd = arg_s32(v->r(1));
-    auto out_dir = static_cast<bpf::DIR*>(v->mmu_w(v->r(2), sizeof(bpf::DIR)));
-    if(out_dir == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
-    }
-    auto it = fds.find(fd);
-    if(it == fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
-    }
-    it->second->cloexec = true;
-    DIR* dir = fdopendir(it->second->fd);
-    if(dir == nullptr) {
-        v->r(0) = -errno;
-        return true;
-    }
-    out_dir->handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dir));
-    out_dir->fd = fd;
-    v->r(0) = 0;
-    return true;
-}
-
-bool PosixSyscall::do_readdir(vm* v) {
-    auto dirp = static_cast<bpf::DIR*>(v->mmu(v->r(1)));
-    if(dirp == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
-    }
-    auto out_entry = static_cast<bpf::dirent*>(v->mmu_w(v->r(2), sizeof(bpf::dirent)));
-    if(out_entry == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
-    }
-    if(dirp->handle == 0) {
-        v->r(0) = -EBADF;
-        return true;
-    }
-    DIR* dir = reinterpret_cast<DIR*>(static_cast<uintptr_t>(dirp->handle));
-    errno = 0;
-    struct dirent* ent = readdir(dir);
-    if(ent == nullptr) {
-        if(errno != 0) {
-            v->r(0) = -errno;
-        } else {
-            v->r(0) = 0;
-        }
-        return true;
-    }
-    memset(out_entry, 0, sizeof(*out_entry));
-    // 已 memset 整块清零，d_name 尾部为 '\0'；用 strnlen+memcpy 拷贝实际长度，
-    // 避免 strncpy 在源串恰好填满时的 -Wstringop-truncation 告警（语义不变）。
-    size_t name_len = strnlen(ent->d_name, sizeof(out_entry->d_name) - 1);
-    memcpy(out_entry->d_name, ent->d_name, name_len);
-#ifdef _DIRENT_HAVE_D_TYPE
-    out_entry->d_type = ent->d_type;
-#else
-    out_entry->d_type = DT_UNKNOWN;
-#endif
-    v->r(0) = 1;
-    return true;
-}
-
-bool PosixSyscall::do_closedir(vm* v) {
-    auto dirp = static_cast<bpf::DIR*>(v->mmu_w(v->r(1), sizeof(bpf::DIR)));
-    if(dirp == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
-    }
-    if(dirp->handle == 0) {
-        v->r(0) = -EBADF;
-        return true;
-    }
-    DIR* dir = reinterpret_cast<DIR*>(static_cast<uintptr_t>(dirp->handle));
-    if(closedir(dir) == -1) {
-        v->r(0) = -errno;
-        return true;
-    }
-    fds.erase(dirp->fd);
-    dirp->fd = -1;
-    dirp->handle = 0;
-    v->r(0) = 0;
-    return true;
-}
-
 bool PosixSyscall::do_fstatat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
@@ -1964,9 +1876,6 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_PIPE2:         return do_pipe2(v);
     case BPF_SYS_FCHDIR:        return do_fchdir(v);
     case BPF_SYS_GETCWD:        return do_getcwd(v);
-    case BPF_SYS_FDOPENDIR:     return do_fdopendir(v);
-    case BPF_SYS_READDIR:       return do_readdir(v);
-    case BPF_SYS_CLOSEDIR:      return do_closedir(v);
     case BPF_SYS_FSTATAT:       return do_fstatat(v);
     case BPF_SYS_FCHMODAT:      return do_fchmodat(v);
     case BPF_SYS_UTIMENSAT:     return do_utimensat(v);
