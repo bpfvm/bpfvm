@@ -76,38 +76,49 @@ static int check_copy_after_original(int expect, va_list ap) {
     return sum == expect;
 }
 
+/* 变参包装：用标准的 va_start 构造 va_list，转交给上面的 helper。
+ * （BpfWideArgs pass 自动把变参函数改写成定参 + lower va intrinsic） */
+static int fmt_check(const char *fmt, const char *expect, ...) {
+    va_list ap;
+    va_start(ap, expect);
+    int r = check_format(fmt, expect, ap);
+    va_end(ap);
+    return r;
+}
+
+static int sum_check(int expect, ...) {
+    va_list ap;
+    va_start(ap, expect);
+    int r = check_sum(expect, ap);
+    va_end(ap);
+    return r;
+}
+
+static int copy_after_advance_check(int expect, ...) {
+    va_list ap;
+    va_start(ap, expect);
+    int r = check_copy_after_advance(expect, ap);
+    va_end(ap);
+    return r;
+}
+
+static int copy_after_original_check(int expect, ...) {
+    va_list ap;
+    va_start(ap, expect);
+    int r = check_copy_after_original(expect, ap);
+    va_end(ap);
+    return r;
+}
+
 int main(void) {
     int ok = 1;
 
-    {
-        PDCLIB_MAKE_VA_LIST(_ap, "world", 42);
-        va_list ap = _ap;
-        ok &= check_format("hello %s %d", "hello world 42", ap);
-    }
+    ok &= fmt_check("hello %s %d", "hello world 42", "world", 42);
+    ok &= fmt_check("[%s] %d %s", "[va_copy] 7 ok", "va_copy", 7, "ok");
 
-    {
-        PDCLIB_MAKE_VA_LIST(_ap, "va_copy", 7, "ok");
-        va_list ap = _ap;
-        ok &= check_format("[%s] %d %s", "[va_copy] 7 ok", ap);
-    }
-
-    {
-        PDCLIB_MAKE_VA_LIST(_ap, 1, 2, 3, 4, 5, 0);
-        va_list ap = _ap;
-        ok &= check_sum(15, ap);
-    }
-
-    {
-        PDCLIB_MAKE_VA_LIST(_ap, 10, 20, 30, 40, 0);
-        va_list ap = _ap;
-        ok &= check_copy_after_advance(90, ap);
-    }
-
-    {
-        PDCLIB_MAKE_VA_LIST(_ap, 3, 6, 9, 12, 0);
-        va_list ap = _ap;
-        ok &= check_copy_after_original(30, ap);
-    }
+    ok &= sum_check(15, 1, 2, 3, 4, 5, 0);
+    ok &= copy_after_advance_check(90, 10, 20, 30, 40, 0);
+    ok &= copy_after_original_check(30, 3, 6, 9, 12, 0);
 
     printf("va_copy: %s\n", ok ? "ok" : "failed");
     return ok ? 0 : 1;

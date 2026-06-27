@@ -18,24 +18,9 @@ int execvp(const char *file, char *const argv[]);
 int execv(const char *path, char *const argv[]);
 int execvp(const char *file, char *const argv[]);
 
-int _execl(const char *path, _PDCLIB_va_list ap);
-int _execle(const char *path, _PDCLIB_va_list ap);
-int _execlp(const char *file, _PDCLIB_va_list ap);
-
-#define execl(path, ...) ({ \
-    PDCLIB_MAKE_VA_LIST(ap, ##__VA_ARGS__); \
-    _execl(path, ap); \
-})
-
-#define execle(path, ...) ({ \
-    PDCLIB_MAKE_VA_LIST(ap, ##__VA_ARGS__); \
-    _execle(path, ap); \
-})
-
-#define execlp(file, ...) ({ \
-    PDCLIB_MAKE_VA_LIST(ap, ##__VA_ARGS__); \
-    _execlp(file, ap); \
-})
+int execl(const char *path, const char *arg, ...);
+int execle(const char *path, const char *arg, ...);
+int execlp(const char *file, const char *arg, ...);
 
 int dup(int fd);
 int dup2(int oldfd, int newfd);

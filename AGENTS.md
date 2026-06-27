@@ -18,6 +18,7 @@
 - `include/`: BPF-facing headers (syscall IDs, POSIX types) used by guest programs.
 - `cmake/`: CMake helper scripts (e.g., `RunBpfProgram.cmake` for CTest integration).
 - `bpfvm-ld`: BPF linker (replaces `binutils-bpf` `bpf-ld`); see `src/ld_main.cpp`.
+- `BpfWideArgs.cpp`: LLVM pass plugin that lifts the BPF limit (loaded via `clang -fpass-plugin=...`).
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
@@ -121,58 +122,82 @@ The BPF architecture **does not support floating-point arithmetic** (float, doub
 
 ### 2. Function Call Conventions
 
-**Constraint:**
-The BPF calling convention has strict limits:
-1.  **Argument Count:** A function cannot take more than **5 arguments**.
-2.  **Return Values:** A function **cannot return a structure** (struct). It can only return scalar values (integers, pointers) that fit in a register.
+**Constraint (native BPF ABI):**
+The native BPF calling convention has three strict limits:
+1.  **Argument Count:** a function cannot take more than **5 arguments** (`"stack arguments are not supported"`).
+2.  **Struct Returns:** a function **cannot return a structure** (struct) — the backend rejects the `sret` attribute (`"aggregate returns are not supported"`).
+3.  **Variadic Functions:** the backend rejects any variadic function (`isVarArg = true`) at the ISel stage (`"variadic functions are not supported"`, `BPFISelLowering.cpp`). This also covers non-variadic functions that use `va_arg`/`va_copy` intrinsics (e.g. `vfprintf`, which takes a `va_list` parameter).
 
-**Solution: Force Inline**
-For logic that requires more than 5 arguments or needs to return complex data structures, bypass the calling convention by inlining the function.
+**Solution: BpfWideArgs pass**
+This project ships an LLVM pass plugin (`src/BpfWideArgs.cpp`) that transparently lifts **all three** limits at compile time, so you can write **standard C** with arbitrary numbers of arguments, struct returns, and `...` variadic functions. It is auto-built into `build/libBpfWideArgs.so` when LLVM dev headers are present, and auto-injected by `bpf-toolchain.cmake` / `test/Makefile`.
 
-Use the `always_inline` attribute to force the compiler to expand the function body at the call site:
+**How it works** (see `src/BpfWideArgs.cpp`) — the three transforms are independent and composable (e.g. a 6-arg function returning a struct is supported):
+*   **>5 arguments:** the pass packs the 5th argument onward into a `__bpf_pack_<func>` struct, passed via a pointer in `r5`. The caller allocates the struct on the stack (re-entrancy/recursive safe); the callee loads the extra args at entry. Thus registers `r1`–`r4` hold the first four scalar args, and `r5` is the pack pointer.
+*   **Struct returns:** LLVM already lowers `struct` returns to the `sret` pointer convention (`void f(ptr sret, ...)`); the pass simply strips the `sret` attribute the BPF backend rejects. Semantics are unchanged.
+*   **Variadic functions** — clang's native `VoidPtrBuiltinVaList` is used, where `va_list` is a single `void*` pointing at the first vararg:
+    *   **Callee rewrite:** `R f(T0..Tn, ...)` → `R f(T0..Tn, ptr __va_base)`. `__va_base` points to a caller-allocated memory region holding the varargs. Function prototypes (declarations) are rewritten the same way.
+    *   **Caller rewrite:** each call site allocates a `__bpf_vapack_<func>` struct on the entry stack (packed, each slot sized by `allocSize(T)`), stores the variadic arguments into it, and passes its address as `__va_base`.
+    *   **Intrinsic lowering** (applied to *all* functions, not just variadic ones):
+        *   `va_start(ap)` → `store __va_base, ap`
+        *   `va_arg(ap, T)` → `load T, ptr ap; ap += allocSize(T)`
+        *   `va_copy(d, s)` → `*d = *s` (copy the pointer value)
+        *   `va_end(ap)` → no-op
+
+### 3. Historical / Optional Alternatives
+
+The approaches below predate or work around the `BpfWideArgs` pass. They are kept for reference and for the case where the pass is disabled (targeting the native BPF ABI directly).
+
+#### Force inline (optional fallback when the pass is off)
+Bypass the argument-count / struct-return limits by inlining the function so the call convention is never exercised:
 
 ```c
 #define BPF_INLINE __attribute__((always_inline)) inline
 
-// Example: Function with > 5 args
+// Example: function with > 5 args
 BPF_INLINE void complex_logic(int a, int b, int c, int d, int e, int f) {
     // Implementation gets inlined, avoiding the 5-reg limit
 }
 ```
 
-### 3. Variadic Functions (Varargs)
+#### Hand-built pseudo-`va_list`
+Varargs can be emulated entirely in the headers with a pseudo-`va_list` that the caller assembles by hand at each call site. The pass supersedes the technique; this section is kept for reference.
 
-**Constraint:**
-The architecture **does not support standard C variadic functions** (e.g., `void func(const char* fmt, ...)`). The underlying stack layout and register passing mechanisms do not support `va_list`.
-
-**Solution: PDCLIB_MAKE_VA_LIST**
-Use the existing `PDCLIB_MAKE_VA_LIST` macro provided by `pdclib` (via `<stdarg.h>`). This macro facilitates the creation of a pseudo-`va_list` by allocating an array on the stack and populating it with arguments.
-
-**PDCLIB Implementation Details:**
-*   **`va_list` Structure:** Defined in `_PDCLIB_config.h` as:
+*   **Define `va_list` as a struct**:
     ```c
     typedef struct {
         int pos;
         unsigned long long* data;
-    } _PDCLIB_va_list;
+    } _va_list;
     ```
-*   **Mechanism:** `PDCLIB_MAKE_VA_LIST(name, args...)` creates a local `uint64_t` array, initializes the `va_list` struct to point to it, and fills the array with the provided arguments.
+    `pos` was a running index and `data` pointed at a caller-allocated `uint64_t[]` array holding the varargs.
+*   **Counting the arguments:** the array length and the per-slot fill loop are driven by a preprocessor argument counter (`___bpf_narg`), so the caller never writes the count by hand. It is the classic offset-placeholder trick — a leading dummy argument, then a reverse-numbered list, and `N` lands on the right slot:
+    ```c
+    #define ___bpf_nth(_, _1, _2, _3, _4, _5, _6, _7, _8, _9, _a, _b, _c, N, ...) N
+    #define ___bpf_narg(...) \
+        ___bpf_nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+    // ___bpf_narg(a, b)        → 2
+    // ___bpf_narg(a, b, c, d)  → 4
+    ```
+    `___bpf_apply(fn, N)` then selects the matching overload, so `___bpf_fill(arr, a, b, c)` expands to `___bpf_fill3(arr, 0, a, b, c)` (one `___bpf_fillN` overload exists per arity, up to 12). The same counter also sizes the array itself: `unsigned long long data[___bpf_narg(args)]`.
+*   **Building a list at the call site:** a helper macro allocates a local `uint64_t[]` (sized by `___bpf_narg`), fills it one argument per slot via `___bpf_fill`, and initialises the struct to point at it. Expanded by hand it looks like:
+    ```c
+    uint64_t ap_data[2] = { (uint64_t)(uintptr_t)"world", 42 };
+    _va_list ap = { .pos = 0, .data = ap_data };
+    ```
+*   **Access macros** walk the array:
+    *   `_va_arg(ap, type)` → `{ ap.pos++; (type)ap.data[ap.pos-1]; }`
+    *   `_va_copy(dest, src)` → `dest = src` (struct copy, so both share the array)
+    *   `_va_end(ap)` → no-op
+    *   `_va_start` was intentionally disabled (BPF had no `...` functions to start from).
+*   **Usage pattern:** declare the *backend* function taking a real `va_list`, and wrap it in a statement-expression macro that built the pseudo-`va_list` at each call site:
+    ```c
+    int my_vprintf(const char *format, va_list ap);   // backend, takes va_list
 
-**Implementation Example:**
-
-```c
-#include <stdarg.h>
-
-// Backend function accepting the struct
-int my_vprintf(const char *format, va_list ap);
-
-// Macro wrapper
-#define my_printf(fmt, ...) \
-    ({\
-        PDCLIB_MAKE_VA_LIST(ap, ##__VA_ARGS__); \
+    #define my_printf(fmt, ...) ({ \
+        /* build ap: local uint64_t[] + init _va_list */ \
         my_vprintf(fmt, ap); \
     })
-```
+    ```
 
 ## PDCLib Build & Installation
 

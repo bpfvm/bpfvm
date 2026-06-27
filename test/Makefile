@@ -14,6 +14,12 @@ CC_FLAGS := -std=c11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 \
             -nostdinc -fno-builtin \
             -isystem ../libc/include/ -isystem ../include -g
 
+# BpfWideArgs pass 插件：突破 BPF 5 参数限制 + 返回结构体支持。
+WIDEARGS := $(wildcard ../build/libBpfWideArgs.so)
+ifneq ($(WIDEARGS),)
+CC_FLAGS += -fpass-plugin=$(WIDEARGS)
+endif
+
 all: $(TARGETS) $(DYN_TARGETS)
 
 # 静态链接（-static）：.o + libpdclib.a → 自包含 ET_EXEC

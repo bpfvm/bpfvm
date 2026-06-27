@@ -92,6 +92,7 @@ make -C test
 ├── insn.h / insn.cpp     # VM 核心：指令定义与解释执行
 ├── posix_syscall.h/cpp   # POSIX 系统调用实现 (PosixSyscall)
 ├── empty_syscall.h       # 空系统调用桩 (EmptySyscall, 用于测试)
+├── BpfWideArgs.cpp       # LLVM pass：突破 5 参数限制 + 返回结构体 + 变参函数
 ├── insn_test.cpp         # 指令集单元测试
 ├── include/              # BPF Guest 程序使用的头文件
 ├── pdclib/               # PDCLib 标准 C 库 (子模块)
@@ -108,12 +109,10 @@ VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp
 由于 BPF 架构的特殊性，为本虚拟机开发 C 程序时需注意以下限制：
 
 1.  **无浮点数支持**: BPF 硬件/指令集不支持浮点运算。请使用整型或定点数运算。
-2.  **参数与返回值限制**: 
-    *   **参数数量**: 标准 BPF 函数调用最多支持 **5 个参数**。
-    *   **返回类型**: 无法直接通过寄存器返回结构体 (struct)，只能返回标量（整数或指针）。
-    *   **解决方案**: 对于需要更多参数或返回结构体的逻辑，请使用 `__attribute__((always_inline))` 强制内联函数，从而绕过调用约定限制。
-3.  **变长参数 (Varargs)**: 不支持标准的 C 变长参数机制。
-    *   *解决方案*: 使用 PDCLib 提供的 `PDCLIB_MAKE_VA_LIST` 宏来构建伪参数列表。
+2.  **参数与返回值限制**: 原生 BPF 调用约定最多 **5 个参数**，且无法返回结构体。本项目自带 `BpfWideArgs` LLVM pass 插件，编译时自动解决这两个限制。
+3.  **变长参数 (Varargs)**: BPF 后端拒绝任何变参函数。`BpfWideArgs` pass 同样自动解决，可直接使用 `...` 函数及 `va_start`/`va_arg`。
+
+> 三类限制的细节与历史实现方案见 [`AGENTS.md`](AGENTS.md) 的 "BPF Architecture Constraints & Developer Guide" 一节。
 
 ## 工具链
 
