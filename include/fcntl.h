@@ -31,6 +31,10 @@
 #define F_SETFD 2
 #define FD_CLOEXEC 1
 
+# define SEEK_SET	0	/* Seek from beginning of file.  */
+# define SEEK_CUR	1	/* Seek from current position.  */
+# define SEEK_END	2	/* Seek from end of file.  */
+
 #ifndef BPF_NO_SYSCALL
 int open3(const char *pathname, int flags, mode_t mode);
 int openat4(int dirfd, const char *pathname, int flags, mode_t mode);

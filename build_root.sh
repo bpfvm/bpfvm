@@ -5,7 +5,7 @@ ROOT_DIR=$(pwd)
 CLANG_RES=$(clang -print-resource-dir)/include
 BPFVM_LD="${ROOT_DIR}/build/bpfvm-ld"
 
-COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin -isystem ${ROOT_DIR}/libc/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
+COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin -fpass-plugin=${ROOT_DIR}/build/libBpfWideArgs.so -isystem ${ROOT_DIR}/libc/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
 # clang -target bpf 把链接委托给 /usr/bin/bpf-gcc，bpf-gcc 再用 /usr/lib/gcc/bpf/14/ld
 # （binutils bpf-ld）。让它改用 bpfvm-ld 的三个坑：
 #   1) clang 不把 -B 转发给 bpf-gcc（实测 -### 里没有 -B；-Wl,-B 传给 ld 也没用）；
