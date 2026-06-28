@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 
 int main(void) {
     /* 按 BPF_TEST_VARIANT 选择 exec 的 helper 变体（.out 静态 / .linked 动态）。

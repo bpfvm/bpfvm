@@ -59,8 +59,8 @@ int main(int argc, char** argv) {
     }
 
     auto vm = vm::create();
-    uint64_t entry = vm->load_elf(elf_file_path);
-    if(entry == 0) {
+    ElfLoadInfo load_info = vm->load_elf(elf_file_path);
+    if(load_info.entry == 0) {
         return 1;
     }
 
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     };
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    options.entry = entry;
+    options.entry = load_info.entry;
     options.argv.reserve(argc - optind);
     for(int i = optind; i < argc; i++) {
         options.argv.emplace_back(argv[i]);
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
         if (s.rfind("BPF_", 0) == 0) options.envp.emplace_back(s);
     }
     umask(0);
-    std::cout<<(int)vm->run(&options)<<std::endl;
+    std::cout<<(int)vm->run(&options, load_info)<<std::endl;
     free((void*)elf_file_path);
     return vm->r(0);
 }

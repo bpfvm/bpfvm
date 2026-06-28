@@ -10,7 +10,7 @@ int main(void) {
         return 1;
     }
 
-    char *buf = mmap((size_t)page_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *buf = mmap(NULL, (size_t)page_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if(buf == MAP_FAILED) {
         perror("mmap");
         return 2;

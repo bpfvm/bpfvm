@@ -317,15 +317,67 @@ public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
         if (F.isDeclaration())
             return PreservedAnalyses::all();
-        // 不要软化我们自己的软浮点库函数（避免无限递归改写）。
-        if (F.getName().starts_with("__add") || F.getName().starts_with("__sub") ||
-            F.getName().starts_with("__mul") || F.getName().starts_with("__div") ||
-            F.getName().starts_with("__neg") || F.getName().starts_with("__cmp") ||
-            F.getName().starts_with("__fix") || F.getName().starts_with("__float") ||
-            F.getName().starts_with("__extend") || F.getName().starts_with("__trunc") ||
-            F.getName().starts_with("__unord"))
+        // 不要软化编译器自带的软浮点库函数（如 __adddf3/__floatsidf/__fixdfdi 等），
+        // 否则会在它们内部无限递归改写。这里用精确后缀判断：这些 runtime helper
+        // 的命名是 libgcc/compiler-rt 的固定集合，特征是「名字里含 sf/df 且以
+        // 数字 2/3 结尾」（如 __adddf3、__floatsidf、__extendsfdf2、__unorddf2）。
+        // 注意不能用 starts_with("__float") 之类——会误伤 musl 内部的
+        // __floatscan/__floatundisf 等同名前缀函数。
+        if (isSoftFpRuntimeFunc(F.getName()))
             return PreservedAnalyses::all();
         return softenFunction(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+
+private:
+    static bool isSoftFpRuntimeFunc(StringRef Name) {
+        // libgcc / compiler-rt 软浮点 runtime 函数全集（sf=单精度，df=双精度，
+        // tf=long double/quad，xf=80-bit）。命名约定见 GCC manual「Statements that
+        // affect the runtime」与 LLVM lib/builtins。
+        static const char *const SoftFpFuncs[] = {
+            // 算术
+            "__addsf3", "__adddf3", "__addtf3", "__addxf3",
+            "__subsf3", "__subdf3", "__subtf3", "__subxf3",
+            "__mulsf3", "__muldf3", "__multf3", "__mulxf3",
+            "__divsf3", "__divdf3", "__divtf3", "__divxf3",
+            // 一元
+            "__negsf2", "__negdf2", "__negtf2", "__negxf2",
+            "__sqrtf", "__sqrt", "__sqrttf2",
+            // fp -> int (fix)
+            "__fixsfsi", "__fixsfdi", "__fixsfti",
+            "__fixdfsi", "__fixdfdi", "__fixdfti",
+            "__fixtfsi", "__fixtfdi", "__fixtfti",
+            "__fixxfsi", "__fixxfdi", "__fixxfti",
+            "__fixunssfsi", "__fixunssfdi", "__fixunssfti",
+            "__fixunsdfsi", "__fixunsdfdi", "__fixunsdfti",
+            "__fixunstfsi", "__fixunstfdi", "__fixunstfti",
+            "__fixunsxfsi", "__fixunsxfdi", "__fixunsxfti",
+            // int -> fp (float)
+            "__floatsisf", "__floatdisf", "__floattisf",
+            "__floatsidf", "__floatdidf", "__floattidf",
+            "__floatsitf", "__floatditf", "__floattitf",
+            "__floatsixf", "__floatdixf", "__floattixf",
+            "__floatunsisf", "__floatundisf", "__floatuntisf",
+            "__floatunsidf", "__floatundidf", "__floatuntidf",
+            "__floatunsitf", "__floatunditf", "__floatuntitf",
+            "__floatunsixf", "__floatundixf", "__floatuntixf",
+            // 类型转换
+            "__extendsfdf2", "__extendsftf2", "__extendsfxf2",
+            "__truncdfsf2", "__trunctfsf2", "__truncxfsf2",
+            "__trunctfdf2", "__truncxfdf2",
+            "__extenddftf2", "__extenddfxf2",
+            // 比较
+            "__eqsf2", "__nesf2", "__ltsf2", "__gtsf2", "__lesf2", "__gesf2",
+            "__eqdf2", "__nedf2", "__ltdf2", "__gtdf2", "__ledf2", "__gedf2",
+            "__eqtf2", "__netf2", "__lttf2", "__gttf2", "__letf2", "__getf2",
+            "__eqxf2", "__nexf2", "__ltxf2", "__gtxf2", "__lexf2", "__gexf2",
+            "__unordsf2", "__unorddf2", "__unordtf2", "__unordxf2",
+            // 杂项
+            "__multi3",
+        };
+        for (const char *S : SoftFpFuncs)
+            if (Name == S)
+                return true;
+        return false;
     }
 };
 

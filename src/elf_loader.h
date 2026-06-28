@@ -52,8 +52,18 @@ struct memmap {
 // name 若是绝对路径或当前目录可直接访问的文件，原样返回。找不到返回空串。
 std::string find_library(const std::vector<std::string>& extra_dirs, const std::string& name);
 
+// 主程序加载结果：除入口地址外，还带 auxv 启动所需的信息（musl/glibc 的
+// __init_tls 靠 AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 program headers 与 TLS）。
+// entry 为 0 表示加载失败；phdr 为 0 表示主程序无 PT_PHDR（lib/动态链接器场景）。
+struct ElfLoadInfo {
+    uint64_t entry = 0;
+    uint64_t phdr = 0;     // program header table 的运行时 guest 虚拟地址
+    uint64_t phent = 0;    // 单个 program header 字节数（通常 56）
+    uint64_t phnum = 0;    // program header 个数
+};
+
 // 加载 ELF（主程序 + DT_NEEDED 依赖的 .so），为每个 PT_LOAD 段构造 memmap
-// 并通过 add 回调交给调用方（如 vm::addmem）。返回入口地址，失败返回 0。
-uint64_t load_elf(const char* path, std::function<void(memmap&&)> add);
+// 并通过 add 回调交给调用方（如 vm::addmem）。返回加载信息（entry 为 0 表失败）。
+ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add);
 
 #endif // ELF_LOADER_H

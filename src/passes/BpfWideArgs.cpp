@@ -22,6 +22,14 @@
 //      int  f(int n, ptr __va_base) { ... load + 指针推进 ... }
 //    调用点：在栈上 alloca 一段内存，按变参实参布局填值，传首地址。
 //
+// 4. syscall 形式的 6 参调用（call <imm>，src_reg=0， callee =
+//    inttoptr(ConstantInt)）：BPF call 指令的 syscall 形式最多 6 参。前 5 个
+//    走 r1..r5，第 6 个【特殊地】放在 r0 —— BPF 的 r0 一般是返回值，但 syscall
+//    是宿主拦截的瞬间指令，调用前 r0 可作输入，调用后即被返回覆盖，无冲突。
+//    pass 通过一条 side-effect 内联 asm 把第 6 参绑定到 r0（clobber r1..r9
+//    强制 input 选 r0，并让后端自动 spill/reload r1..r5），随后重建 5 参 call。
+//    普通 >5 参函数不受影响，仍走 packed struct 路径。syscall 实参超 6 报错。
+//
 // 用法：clang -target bpf -fpass-plugin=libBpfWideArgs.so ...
 //
 //===----------------------------------------------------------------------===//
@@ -34,6 +42,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
@@ -42,6 +51,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -60,6 +70,30 @@ static bool isInternalOrIntrinsic(Function &F) {
         return true;
     if (F.getIntrinsicID() != Intrinsic::not_intrinsic)
         return true;
+    return false;
+}
+
+// 判断 callee（CallBase 的 called operand）是否是 syscall 形式：
+//   inttoptr (ConstantInt <id>) to ptr
+// BPF 后端把这种 callee lower 成 `call <imm>`（src_reg=0），即一条 syscall 指令。
+// 关键：这种 call 最多 6 参，前 5 个走 r1..r5，第 6 个用 r0 当输入（见文件头注释
+// 第 4 条）。本 pass 对这种 call site 走专门的 syscall 路径，不走 packed struct。
+static bool isSyscallCallee(Value *Callee) {
+    // BPF syscall 形式 callee = inttoptr <id> to ptr。两种出现形态：
+    //   1) 常量折叠后：callee 是 ConstantExpr(IntToPtr, ConstantInt) —— 已 constprop
+    //      过的常见形态（如 musl __bpf_syscall6 直接调用、测试 reduced_syscall6）。
+    //   2) 内联后未 constprop：callee 是 IntToPtr 指令（Instruction），其操作数是
+    //      sext/zext 自函数参数 —— musl `__syscall6(n, ...)` 内联进 caller 后的形态
+    //      （n 此时是 Argument 而非 ConstantInt；instcombine 还没把 call site 的常量
+    //      实参 constprop 进内联体）。pass 跑在 PipelineStartEP 早于 instcombine。
+    //      后续 instcombine 会把操作数折叠成常量，BPF 后端再 lower 成 call <imm>。
+    //
+    // 关键判据：callee 形态是 IntToPtr（无论常量形式还是指令形式）。BPF 用户态代码
+    // 用 inttoptr 当函数指针调用的只有 syscall 形式这一种，不会误判。
+    if (auto *CE = dyn_cast<ConstantExpr>(Callee))
+        return CE->getOpcode() == Instruction::IntToPtr;
+    if (auto *I = dyn_cast<Instruction>(Callee))
+        return I->getOpcode() == Instruction::IntToPtr;
     return false;
 }
 
@@ -130,6 +164,16 @@ Function *rewriteFunction(Function &F, StructType *PackTy) {
     NewF->setSection(F.getSection());
     NewF->setDSOLocal(F.isDSOLocal());
 
+    // 声明（prototype，无定义）：只换签名即可，没有函数体可搬/可改。它的真正定义
+    // 在另一个 TU（那里会被本 pass 同样改写，签名一致）。调用点改写在第二阶段处理。
+    // 这一支路关键：BPF 后端对 >5 参的「调用」也会拒绝，所以即便 callee 是声明，
+    // 调用点也必须改写；而调用点改写要求 callee 签名匹配新 ABI，故声明也必须重签。
+    if (F.isDeclaration()) {
+        NewF->takeName(&F);
+        F.dropAllReferences();
+        return NewF;
+    }
+
     // 3. 把旧函数体整体 move 过来：把所有 BasicBlock 从 F 搬到 NewF
     NewF->splice(NewF->end(), &F);
     NewF->takeName(&F);  // 拿回原名（此时旧 F 已被改名）
@@ -138,8 +182,14 @@ Function *rewriteFunction(Function &F, StructType *PackTy) {
     //    插入点：函数入口块第一个非 phi、非 alloca 指令前（保证支配所有 use）。
     BasicBlock &Entry = NewF->front();
     Instruction *InsertPt = &Entry.front();
-    while (isa<PHINode>(InsertPt) || isa<AllocaInst>(InsertPt))
+    // 跳过前导 phi / alloca；getNextNode 可能为 null（块全是 phi/alloca 且无终止符，
+    // 罕见但可能），需要判空，否则 isa<PHINode>(nullptr) 会触发断言崩溃。
+    while (InsertPt && (isa<PHINode>(InsertPt) || isa<AllocaInst>(InsertPt)))
         InsertPt = InsertPt->getNextNode();
+    if (!InsertPt) {
+        // 兜底：直接插到入口块末尾（终止符之前）。
+        InsertPt = Entry.getTerminator();
+    }
 
     // 第 5 个新参数（索引 KEEP_REGS）= PackTy*
     Value *PackPtr = NewF->getArg(KEEP_REGS);
@@ -252,12 +302,64 @@ void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
     CI->eraseFromParent();
 }
 
+// 改写一个 6 参 syscall 调用点（callee = inttoptr(ConstantInt)，BPF 后端编为
+// `call <imm>`（src_reg=0））为「5 参 IR call + 前置内联 asm 写 r0 = 第6参」：
+//   1. 在 call 之前插入一条 side-effect 内联 asm，input "r" 放第 6 参，clobber
+//      r1..r9。BPF 后端只有 r0 不在 clobber 列表里且能承接 input，因此 LLVM 寄存器
+//      分配器别无选择，把第 6 参落到 r0；clobber r1..r5 顺带让后端自动 spill/reload
+//      原 5 个实参，重建 call 时再恢复 r1..r5（实测见 t10.c 反汇编）。这等价于
+//      "call 前把第 6 参写进 r0"，但完全在 IR 层完成，无需改 BPF 后端。
+//   2. 重建 call：保留原 callee（inttoptr id），仅传前 5 个实参，返回类型不变。
+//      原 call imm（BPF_CALL_*）此时变成 5 参 syscall 形式。call 执行后 r0 自然
+//      被 syscall 返回值覆盖，与之前写入的第 6 参没有冲突（syscall 不读自己写的 r0
+//      输入，VM do_xxx 直接读 r0 既是参数也覆写为返回值）。
+//
+// 实参 ≤5 个的 syscall 形式 call site 不进本函数（不需要写 r0），由本 pass 完全
+// 保留原样，BPF 后端本就支持 ≤5 参的 syscall 形式调用。
+static void rewriteCallSiteSyscall6(CallBase *CB, Value *Callee) {
+    IRBuilder<> B(CB);
+    LLVMContext &Ctx = CB->getContext();
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+
+    // 第 6 个实参（索引 5）。BPF 寄存器是 64 位；若实参不是 i64，按 musl __scc()
+    // 语义 sign-extend 到 i64。实际 musl 的 __syscall6 所有参数已经是 long。
+    Value *arg6 = CB->getArgOperand(5);
+    if (arg6->getType() != I64Ty)
+        arg6 = B.CreateSExt(arg6, I64Ty, "__syscall.arg6");
+
+    // 构造 InlineAsm：void(i64)；约束串 "r,~{r1},...,~{r9}"。
+    // 空汇编体、side-effect=true 防止被优化器删除。
+    FunctionType *AsmFTy = FunctionType::get(Type::getVoidTy(Ctx), {I64Ty}, false);
+    InlineAsm *IA = InlineAsm::get(
+        AsmFTy, /*AsmString=*/"", /*Constraints=*/"r,~{r1},~{r2},~{r3},~{r4},~{r5},~{r6},~{r7},~{r8},~{r9}",
+        /*hasSideEffects=*/true);
+    B.CreateCall(IA, {arg6}, "__syscall.setarg6");
+
+    // 重建 5 参 call：原 callee（inttoptr id）+ 前 5 个实参。BPF 后端将编为
+    // `call <imm>`（src_reg=0），即 5 参 syscall 形式；第 6 参通过 r0 传递。
+    SmallVector<Value *, 8> newArgs;
+    SmallVector<Type *, 8> newArgTys;
+    for (unsigned i = 0; i < 5; ++i) {
+        Value *a = CB->getArgOperand(i);
+        newArgs.push_back(a);
+        newArgTys.push_back(a->getType());
+    }
+    FunctionType *NewFTy = FunctionType::get(CB->getFunctionType()->getReturnType(),
+                                             newArgTys, false /*非变参*/);
+    auto *CI = cast<CallInst>(CB);
+    CallInst *NC = B.CreateCall(NewFTy, Callee, newArgs);
+    NC->setTailCallKind(CI->getTailCallKind());
+    CI->replaceAllUsesWith(NC);
+    CI->eraseFromParent();
+}
+
 // 一个待改写的调用点：调用谁（Callee：直接调用是 NewF，间接调用是函数指针 Value）、
 // 第几个实参起打包（Threshold）。
 struct PackSite {
     CallBase *CB;
     Value *Callee;     // 直接调用 = NewF；间接调用 = 原 callee（Value*）
     unsigned Threshold;
+    bool IsSyscall = false;   // syscall 6 参特例走 rewriteCallSiteSyscall6
 };
 
 // 按 caller 聚合的调用点表，及每个 caller 所需的最大打包字节数。
@@ -299,6 +401,29 @@ static void collectIndirectCallSites(Module &M, const DataLayout &DL,
                     continue;
                 if (CB->getCalledFunction() != nullptr)
                     continue;   // 直接调用，已由 collectCallSites 处理
+
+                // 【syscall 路径】：callee 是 inttoptr(ConstantInt)，BPF 后端编为
+                // `call <imm>`（src_reg=0）的 syscall 形式。最多 6 参：前 5 个走
+                // r1..r5，第 6 个通过前置内联 asm 写到 r0（见 rewriteCallSiteSyscall6）。
+                // 不走 packed struct 路径。
+                if (isSyscallCallee(CB->getCalledOperand())) {
+                    unsigned nargs = CB->arg_size();
+                    if (nargs > 6) {
+                        // syscall 硬上限 6 参；超出直接报编译期错误。
+                        errs() << "BpfWideArgs: error: syscall call site has "
+                               << nargs << " arguments (max 6)\n";
+                        report_fatal_error("BPF syscall with > 6 arguments");
+                    }
+                    if (nargs < 6)
+                        continue;   // ≤5 参的 syscall 形式调用原本就合法，无需改写
+                    // 恰好 6 参：走 syscall 路径
+                    Function *Caller = CB->getFunction();
+                    byCaller[Caller].push_back(
+                        {CB, CB->getCalledOperand(), /*Threshold=*/6,
+                         /*IsSyscall=*/true});
+                    continue;
+                }
+
                 unsigned threshold;
                 if (CB->getFunctionType()->isVarArg()) {
                     // 变参：具名参数之后的变参实参打包
@@ -421,6 +546,15 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
 
     const DataLayout &DL = F.getParent()->getDataLayout();
 
+    // 收集 va_arg/va_copy 涉及的指针参数索引：lower 后会通过它们写回推进值，
+    // 必须清除 clang 标记的 readonly/readnone/nocapture，否则后续优化器（instcombine）
+    // 会把写回的 store 当死存储删掉（pop_arg 的 va_list 参数就因此丢失推进）。
+    std::set<unsigned> mutatedArgIndices;
+    auto record_arg = [&](Value *V) {
+        if (auto *A = dyn_cast<Argument>(V))
+            mutatedArgIndices.insert(A->getArgNo());
+    };
+
     for (Instruction *I : toProcess) {
         IRBuilder<> B(I);
 
@@ -433,18 +567,24 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
                 I->eraseFromParent();
             }
         } else if (auto *VAA = dyn_cast<VAArgInst>(I)) {
-            // va_arg(%ap, T)：从 %ap 指向的位置读一个 T，并把 %ap 推进。
-            Value *ApList = VAA->getPointerOperand();   // ptr to va_list (ptr)
+            // va_arg(%ap, T)：VoidPtrBuiltinVaList 下，va_list 是 void*，va_arg 的指针
+            // 操作数是「指向 va_list 的指针」(void**)——指向一个保存「当前数据指针」的
+            // 可写槽。读出当前 cur、load T、按 allocSize(T) 推进 cur 并写回槽。
+            //   CurPtr = *ApOp        // 当前数据指针
+            //   Val    = *CurPtr      // 读 T
+            //   *ApOp  = CurPtr+step  // 推进，下一次 va_arg 读下一个参数
+            // 推进的 store 直接内联，不依赖外部 helper。
+            Value *ApOp = VAA->getPointerOperand();
             Type *Ty = VAA->getType();
-            Value *CurPtr = B.CreateLoad(PointerType::getUnqual(F.getContext()), ApList,
+            Value *CurPtr = B.CreateLoad(PointerType::getUnqual(F.getContext()), ApOp,
                                          "__va.cur");
             Value *Val = B.CreateLoad(Ty, CurPtr, "__va.val");
-            // 推进：按 allocSize(T) 前进（含对齐）。
             uint64_t Step = DL.getTypeAllocSize(Ty);
             Value *Next = B.CreatePtrAdd(CurPtr,
                                          ConstantInt::get(Type::getInt64Ty(F.getContext()), Step),
                                          "__va.next");
-            B.CreateStore(Next, ApList);
+            B.CreateStore(Next, ApOp);
+            record_arg(ApOp);
             I->replaceAllUsesWith(Val);
             I->eraseFromParent();
         } else if (auto *VAE = dyn_cast<VAEndInst>(I)) {
@@ -456,9 +596,24 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
             Value *Src = VAC->getSrc();
             Value *Tmp = B.CreateLoad(PointerType::getUnqual(F.getContext()), Src, "__va.cp");
             B.CreateStore(Tmp, Dst);
+            record_arg(Dst);
+            record_arg(Src);
             I->eraseFromParent();
         }
     }
+
+    // 清除被写回参数的 readonly/readnone/nocapture：lower 后这些参数会被 store，
+    // clang 原标的「不修改内存」属性已不成立，留着会让后续 instcombine 删掉推进 store。
+    for (unsigned idx : mutatedArgIndices) {
+        if (idx < F.arg_size()) {
+            F.removeParamAttr(idx, Attribute::ReadOnly);
+            F.removeParamAttr(idx, Attribute::ReadNone);
+            F.removeParamAttr(idx, Attribute::NoCapture);
+        }
+    }
+    // 函数级的 readonly/readnone 也得清（pop_arg 整体被标 readonly）。
+    F.removeFnAttr(Attribute::ReadOnly);
+    F.removeFnAttr(Attribute::ReadNone);
     return true;
 }
 
@@ -559,7 +714,11 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
         //
         // 先按 caller 聚合所有调用点，算出每个 caller 的最大打包字节数；再为每 caller
         // 分配单块 [MaxBytes x i8]，逐点改写。
-        if (!work.empty() || !vaWork.empty()) {
+        //
+        // 注意：即使本 TU 没有 >5 参数的定义或变参定义（work/vaWork 都空），间接调用
+        // 点（如通过函数指针发起的 6 参调用）仍需改写——collectIndirectCallSites 独立
+        // 扫描整个模块。故第二阶段无条件执行。
+        {
             const DataLayout &DL = M.getDataLayout();
             SiteMap byCaller;
             BytesMap maxBytes;
@@ -575,9 +734,21 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
             collectIndirectCallSites(M, DL, byCaller, maxBytes);
 
             for (auto &[Caller, sites] : byCaller) {
-                AllocaInst *SharedBuf = allocSharedPackBuf(Caller, maxBytes[Caller]);
+                // syscall 6 参路径不需要共享缓冲区（无 pack），单独分流。
+                // 其余路径共用入口块单块 [MaxBytes x i8]。
+                AllocaInst *SharedBuf = nullptr;
+                bool anyPack = false;
                 for (PackSite &s : sites)
-                    rewriteCallSitePacked(s.CB, s.Callee, SharedBuf, s.Threshold);
+                    if (!s.IsSyscall) { anyPack = true; break; }
+                if (anyPack)
+                    SharedBuf = allocSharedPackBuf(Caller, maxBytes[Caller]);
+                for (PackSite &s : sites) {
+                    if (s.IsSyscall)
+                        rewriteCallSiteSyscall6(s.CB, s.Callee);
+                    else
+                        rewriteCallSitePacked(s.CB, s.Callee, SharedBuf,
+                                             s.Threshold);
+                }
             }
         }
 

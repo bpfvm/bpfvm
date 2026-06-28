@@ -17,7 +17,7 @@ LIBC_BPFSO := ../libc/lib64/libc.so
 #   （而非对库符号 sqrt 的调用），BpfSoftFp pass 才能在 IR 层接住并 lower 成
 #   BPF_CALL_FP_SQRT_*。去掉 errno 副作用不影响正确性（BPF 无 errno）。
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
-CC_FLAGS := -std=c11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 \
+CC_FLAGS := -std=c11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
             -nostdinc -fno-builtin -fno-math-errno \
             -isystem ../libc/include/ -isystem ../include -g
 

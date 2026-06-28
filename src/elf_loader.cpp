@@ -229,12 +229,14 @@ void layout_module(Elf* elf, size_t fi, bool is_dyn,
             segs.push_back({fi, mod_base + ph.p_vaddr, ph.p_memsz, ph.p_offset, ph.p_filesz, ph.p_flags});
         }
     } else {
-        bool first = true;
+        // ET_EXEC：段 vaddr 已是绝对地址（bpfvm-ld 写死 guest_base_ 起），直接按 phdr 映射。
+        // 首段覆盖 ELF header + phdr table 的扩展由 bpfvm-ld 在产物里完成（PT_PHDR 配套），
+        // loader 不再需要特例处理。
+        base_out = 0;
         for (size_t i = 0; i < eh.e_phnum; i++) {
             GElf_Phdr ph;
             if (gelf_getphdr(elf, i, &ph) != &ph) continue;
             if (ph.p_type != PT_LOAD) continue;
-            if (first) { base_out = 0; first = false; }
             segs.push_back({fi, ph.p_vaddr, ph.p_memsz, ph.p_offset, ph.p_filesz, ph.p_flags});
         }
     }
@@ -453,24 +455,24 @@ void process_rela_plt(const RelocState& rs, const DynSections& ds,
 
 }  // namespace
 
-uint64_t load_elf(const char* path, std::function<void(memmap&&)> add) {
+ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
     // 加载 ET_EXEC（静态，固定地址）或 ET_DYN（PIE 主程序 / .so，运行时分配地址）。
     // 运行时处理 .rela.dyn（数据/lddw 重定位）和 .rela.plt（GOT 槽）。
     if (elf_version(EV_CURRENT) == EV_NONE) {
         std::cerr << "Failed to initialize libelf: " << elf_errmsg(-1) << std::endl;
-        return 0;
+        return ElfLoadInfo{};
     }
 
     int main_fd = open(path, O_RDONLY);
     if (main_fd < 0) {
         std::cerr << "Failed to open: " << path << ": " << strerror(errno) << std::endl;
-        return 0;
+        return ElfLoadInfo{};
     }
     Elf* main_elf = elf_begin(main_fd, ELF_C_READ, nullptr);
     if (!main_elf) {
         std::cerr << "Failed to open ELF file: " << elf_errmsg(-1) << std::endl;
         close(main_fd);
-        return 0;
+        return ElfLoadInfo{};
     }
     std::vector<std::pair<Elf*, int>> opened = {{main_elf, main_fd}};
     Defer defer_close([&]() {
@@ -479,19 +481,19 @@ uint64_t load_elf(const char* path, std::function<void(memmap&&)> add) {
 
     if (elf_kind(main_elf) != ELF_K_ELF) {
         std::cerr << "Not an ELF file: " << path << std::endl;
-        return 0;
+        return ElfLoadInfo{};
     }
     GElf_Ehdr ehdr;
     if (gelf_getehdr(main_elf, &ehdr) != &ehdr) {
         std::cerr << "Failed to get ELF header: " << elf_errmsg(-1) << std::endl;
-        return 0;
+        return ElfLoadInfo{};
     }
-    if (!validate_ehdr(ehdr, path)) return 0;
+    if (!validate_ehdr(ehdr, path)) return ElfLoadInfo{};
 
     // 收集主程序 + 递归所有 DT_NEEDED 依赖（BFS，按 soname 去重）
     std::vector<ElfFile> elves;
     elves.push_back({path, main_elf, main_fd});
-    if (!collect_dependencies(elves, opened)) return 0;
+    if (!collect_dependencies(elves, opened)) return ElfLoadInfo{};
 
     // 地址分配 + 段布局
     uint64_t next_alloc = 0x40000000ULL;
@@ -504,9 +506,9 @@ uint64_t load_elf(const char* path, std::function<void(memmap&&)> add) {
     }
     if (segs.empty()) {
         std::cerr << "[load_elf] no PT_LOAD segments in " << path << std::endl;
-        return 0;
+        return ElfLoadInfo{};
     }
-    if (!check_overlaps(segs, elves)) return 0;
+    if (!check_overlaps(segs, elves)) return ElfLoadInfo{};
 
     // mmap 每段；记录 {host, guest vaddr, size} 供后续重定位 vaddr→host 查询
     std::vector<MapInfo> seg_maps;
@@ -518,7 +520,7 @@ uint64_t load_elf(const char* path, std::function<void(memmap&&)> add) {
     for (const auto& s : segs) {
         memmap m;
         MapInfo mi;
-        if (!map_segment(s, elves[s.file_idx], m, mi)) return 0;
+        if (!map_segment(s, elves[s.file_idx], m, mi)) return ElfLoadInfo{};
         seg_maps.push_back(mi);
         add(std::move(m));
     }
@@ -547,5 +549,20 @@ uint64_t load_elf(const char* path, std::function<void(memmap&&)> add) {
     }
 
     // 入口地址：ET_DYN（PIE）→ 主程序加载基址 + e_entry；ET_EXEC → e_entry（绝对）
-    return (ehdr.e_type == ET_DYN) ? (load_base[0] + ehdr.e_entry) : ehdr.e_entry;
+    const uint64_t entry = (ehdr.e_type == ET_DYN) ? (load_base[0] + ehdr.e_entry) : ehdr.e_entry;
+
+    // program header table 的运行时地址（供 auxv AT_PHDR，musl __init_tls 用）：
+    // 直接读 PT_PHDR 段。bpfvm-ld 对所有可执行文件（ET_EXEC + PIE）都生成 PT_PHDR，
+    // 其 p_vaddr 是 phdr 表的绝对/相对地址，loader 加上加载基址即得运行时地址。
+    // ET_EXEC：p_vaddr 已是绝对地址，load_base[0]=0；PIE：p_vaddr 是模块内偏移，加 load_base[0]。
+    uint64_t phdr_addr = 0;
+    for (size_t i = 0; i < ehdr.e_phnum && phdr_addr == 0; i++) {
+        GElf_Phdr ph;
+        if (gelf_getphdr(main_elf, i, &ph) != &ph) break;
+        if (ph.p_type == PT_PHDR) {
+            phdr_addr = load_base[0] + ph.p_vaddr;
+        }
+    }
+
+    return ElfLoadInfo{entry, phdr_addr, ehdr.e_phentsize, ehdr.e_phnum};
 }

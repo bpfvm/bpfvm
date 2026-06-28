@@ -351,11 +351,41 @@ bool PosixSyscall::do_clock_gettime(vm* v) {
 }
 
 bool PosixSyscall::do_mmap(vm* v) {
-    int prot = arg_s32(v->r(2));
-    int flags = arg_s32(v->r(3));
-    int fd = arg_s32(v->r(4));
-    int host_fd = -1;
+    /* 标准 Linux mmap 调用约定：mmap(addr, len, prot, flags, fd, offset)。
+     *   前 5 个用户参数（addr, len, prot, flags, fd）落在 r1..r5；第 6 个 offset
+     *   经 BpfWideArgs pass 用前置内联 asm 写到 r0（syscall 6 参特例 ABI：
+     *   r0 在 call 前作输入、call 后被返回值覆盖）。
+     *
+     * 地址模型：guest vaddr（memmap.paddr）与 host 真实内存（memmap.data）是两套
+     * 独立空间。host 内存永远用 mmap(nullptr,...) 独立分配，与 addr 无关；addr 只
+     * 决定 guest vaddr 的取值：
+     *   - 无 MAP_FIXED：addr 仅作 hint，Linux 允许忽略。沿用尾部分配（接着上一个
+     *     guest 映射尾部），返回新分配的 guest 地址。
+     *   - MAP_FIXED：必须把映射放在 guest 空间的 addr 处。先按 Linux 语义 unmap 掉
+     *     与 [addr, addr+len) 重叠的旧 guest 映射，再令 memmap.paddr = addr。
+     *     addr 未页对齐返回 -EINVAL。长度向上页对齐（Linux 要求）。 */
+    uint64_t addr_hint = v->r(1);
+    size_t len = arg_size(v->r(2));
+    int prot = arg_s32(v->r(3));
+    int flags = arg_s32(v->r(4));
+    int fd = arg_s32(v->r(5));
+    off_t offset = (off_t)v->r(0);
 
+    // 长度向上页对齐（Linux mmap 要求，否则 EINVAL）。
+    static constexpr size_t PAGE = 0x1000;
+    len = (len + PAGE - 1) & ~(PAGE - 1);
+    if (len == 0) {
+        v->r(0) = -EINVAL;
+        return true;
+    }
+
+    const bool fixed = flags & MAP_FIXED;
+    if (fixed && (addr_hint % PAGE) != 0) {
+        v->r(0) = -EINVAL;   // MAP_FIXED 要求 addr 页对齐
+        return true;
+    }
+
+    int host_fd = -1;
     if (!(flags & MAP_ANONYMOUS)) {
         auto it = fds.find(fd);
         if (it == fds.end()) {
@@ -365,15 +395,41 @@ bool PosixSyscall::do_mmap(vm* v) {
         host_fd = it->second->fd;
     }
 
-    void* addr = mmap(nullptr, arg_size(v->r(1)), prot, flags, host_fd, (off_t)v->r(5));
+    // host 内存始终独立分配（addr_hint 是 guest 空间地址，与 host 无关；host 端不
+    // 用 MAP_FIXED，避免 guest 间接控制 host 地址布局）。
+    void* addr = mmap(nullptr, len, prot, flags & ~MAP_FIXED, host_fd, offset);
     if(addr == MAP_FAILED) {
         v->r(0) = -errno;
         return true;
     }
+
+    // MAP_FIXED：按 Linux 语义先 unmap 与 [addr_hint, addr_hint+len) 重叠的旧 guest
+    // 映射。本 VM 映射粒度粗（一个 memmap 一段），这里删除所有与该区间相交的整段
+    // 映射（不做 VMA 切分，多数 MAP_FIXED 用法是整段覆盖，足够）。
+    if (fixed) {
+        const uint64_t base = addr_hint;
+        const uint64_t end = addr_hint + len;
+        for (auto it = maps(v).begin(); it != maps(v).end();) {
+            const bool overlap = (it->paddr < end) && (base < it->paddr + it->size);
+            if (overlap) it = maps(v).erase(it);
+            else ++it;
+        }
+        v->flush_tlb();
+    }
+
     memmap mem;
-    mem.size = arg_size(v->r(1));
+    mem.size = len;
     mem.set_data((unsigned char*)addr, mem.size);
-    mem.paddr = maps(v).back().paddr + maps(v).back().size;
+    if (fixed) {
+        mem.paddr = addr_hint;   // guest 空间固定地址
+    } else {
+        // 接着上一个映射尾部，但页对齐（Linux mmap 总是返回页对齐地址）。
+        // mallocng 等分配器强依赖 4096 对齐：meta_area 用 `meta & -4096` 反推
+        // meta_area 起点；若 mmap 返回非对齐地址，meta 落在错误 meta_area 里，
+        // `area->check != ctx.secret` 立即崩溃。
+        uint64_t next = maps(v).back().paddr + maps(v).back().size;
+        mem.paddr = (next + PAGE - 1) & ~(PAGE - 1);
+    }
     mem.flags = 0;
     if(prot & PROT_READ) {
         mem.flags |= PF_R;
@@ -793,12 +849,15 @@ bool PosixSyscall::do_execve(vm* v) {
     }
 
     auto fresh = vm::create();
-    uint64_t entry = fresh->load_elf(resolve_path(path).c_str());
-    if(entry == 0) {
+    ElfLoadInfo load_info = fresh->load_elf(resolve_path(path).c_str());
+    if(load_info.entry == 0) {
         v->r(0) = -ENOEXEC;
         return true;
     }
-    if(!fresh->setup_stack(argv_strings, envp_strings)) {
+    const uint64_t entry = load_info.entry;
+    // setup_stack 直接接收 load_info，用它合成 auxv（musl __init_tls 靠
+    // AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 PT_TLS）。
+    if(!fresh->setup_stack(argv_strings, envp_strings, load_info)) {
         v->r(0) = -E2BIG;
         return true;
     }
@@ -806,6 +865,12 @@ bool PosixSyscall::do_execve(vm* v) {
         v->r(0) = -ENOEXEC;
         return true;
     }
+    // execve 替换整个 guest 地址空间为新程序：同步 v->options 里「跑什么程序」的字段
+    //（entry/argv/envp），让后续 dump_stats/调试读到的是新程序而非旧残留。
+    // 宿主侧配置（verbose/breakpoint/insn_limit/sys 等）跨 execve 保留不变。
+    options(v).entry = entry;
+    options(v).argv = std::move(argv_strings);
+    options(v).envp = std::move(envp_strings);
     maps(v).swap(maps(fresh.get()));
     v->flush_tlb();
     // execve 替换了整个 guest 地址空间：旧程序编译的 JIT 函数全部失效。
@@ -895,6 +960,11 @@ bool PosixSyscall::do_fork(vm* v) {
         child->r(i) = v->r(i);
     }
     child->r(0) = 0;
+    // 继承父进程的 thread pointer（musl __init_tp 在启动时写好的 struct pthread*）。
+    // 子进程是父进程地址空间的副本（CoW），struct pthread 还在同样的虚拟地址，
+    // TP 指向它仍然有效。若不继承，子进程 tp_=0 → __pthread_self() 返回 NULL →
+    // musl fork 后续写 self->tid（偏移 0x30）会 invalid write at 0x30 崩溃。
+    tp(child.get()) = tp(v);
 
     uint64_t pc_addr = pc(v);
     if(!child->mmu(pc_addr)) {
@@ -1843,6 +1913,23 @@ bool PosixSyscall::do_gettid(vm* v) {
     return true;
 }
 
+bool PosixSyscall::do_set_tls(vm* v) {
+    // 设置 thread pointer（musl __init_tp → __set_thread_area 在启动时调用）。
+    // BPF 无 TLS 寄存器，用一个 VM 字段 tp_ 模拟；guest 侧 __get_tp() 经
+    // BPF_SYS_GET_TLS 读回同一值。
+    // 必须返回 0（成功），否则 musl __init_tls.c:149 会 a_crash()。
+    tp(v) = v->r(1);
+    v->r(0) = 0;
+    return true;
+}
+
+bool PosixSyscall::do_get_tls(vm* v) {
+    // 读取 thread pointer（guest 侧 __get_tp 用）。单线程下调用稀疏
+    // （stdio getc/putc 热路径因 f->lock==0 短路，不触发 __pthread_self）。
+    v->r(0) = tp(v);
+    return true;
+}
+
 bool PosixSyscall::syscall(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
@@ -1902,8 +1989,14 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_MADVISE:        return do_madvise(v);
     case BPF_SYS_SCHED_YIELD:    return do_sched_yield(v);
     case BPF_SYS_GETTID:         return do_gettid(v);
+    case BPF_SYS_SET_TLS:        return do_set_tls(v);
+    case BPF_SYS_GET_TLS:        return do_get_tls(v);
     default:
-        fprintf(stderr, "unsupported func: 0x%x\n", call);
+        /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
+         * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG
+         * 时打印，避免每次启动刷屏（这些调用大多 musl 会主动忽略返回值）。 */
+        if (getenv("BPF_DEBUG"))
+            fprintf(stderr, "unsupported func: 0x%x\n", call);
         v->r(0) = -ENOSYS;
         return true;
     }

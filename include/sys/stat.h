@@ -4,20 +4,29 @@
 #include <sys/types.h>
 #include <time.h>
 
+/*
+ * struct stat 布局：对齐 musl 的 bits/stat.h（x86_64 kernel 风格）。
+ * 字段顺序、padding、末尾 __unused 都与 musl 一致——musl/PDCLib guest 程序与 VM 的
+ * fill_bpf_stat64（posix_syscall.cpp）读写同一份布局，偏移必须严丝合缝。
+ * 关键差异点（相对早期布局）：st_nlink 在 st_mode 之前；st_gid 后有 __pad0；
+ * 末尾有 __unused[3]。注释里的偏移供核对（见 fill_bpf_stat64）。
+ */
 struct stat {
-    dev_t st_dev;
-    ino_t st_ino;
-    mode_t st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
-    dev_t st_rdev;
-    off64_t st_size;
-    long st_blksize;
-    long st_blocks;
-    struct timespec st_atim;
-    struct timespec st_mtim;
-    struct timespec st_ctim;
+    dev_t       st_dev;         /* 0x00 */
+    ino_t       st_ino;         /* 0x08 */
+    nlink_t     st_nlink;       /* 0x10 */
+    mode_t      st_mode;        /* 0x18 */
+    uid_t       st_uid;         /* 0x1c */
+    gid_t       st_gid;         /* 0x20 */
+    unsigned int __pad0;        /* 0x24 */
+    dev_t       st_rdev;        /* 0x28 */
+    off_t       st_size;        /* 0x30 */
+    blksize_t   st_blksize;     /* 0x38 */
+    blkcnt_t    st_blocks;      /* 0x40 */
+    struct timespec st_atim;    /* 0x48 */
+    struct timespec st_mtim;    /* 0x58 */
+    struct timespec st_ctim;    /* 0x68 */
+    long        __unused[3];    /* 0x78 */
 };
 
 #define st_atime st_atim.tv_sec

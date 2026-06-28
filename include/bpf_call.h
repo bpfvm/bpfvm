@@ -64,6 +64,8 @@ enum bpf_syscall_id {
     BPF_SYS_MADVISE,        // madvise — 不实现，返回 -ENOSYS
     BPF_SYS_SCHED_YIELD,    // sched_yield() — 让出执行（JIT 安全点）
     BPF_SYS_GETTID,         // gettid()
+    BPF_SYS_SET_TLS,        // set_thread_area(tp) — 设置 thread pointer（musl __init_tp 启动必需）
+    BPF_SYS_GET_TLS,        // 读取 thread pointer（guest __get_tp 用；单线程 TLS 模拟）
 
     /* —— 虚拟浮点指令：每个浮点运算一条 `call <imm>`（src_reg=0）——
        BPF 无硬件浮点。本工程给每个浮点运算分配一个稳定编号（BPF_CALL_FP_*），
@@ -170,6 +172,8 @@ enum bpf_syscall_id {
 #define BPF_CALL_MADVISE   BPF_CALL_ID(BPF_SYS_MADVISE)
 #define BPF_CALL_SCHED_YIELD BPF_CALL_ID(BPF_SYS_SCHED_YIELD)
 #define BPF_CALL_GETTID    BPF_CALL_ID(BPF_SYS_GETTID)
+#define BPF_CALL_SET_TLS   BPF_CALL_ID(BPF_SYS_SET_TLS)
+#define BPF_CALL_GET_TLS   BPF_CALL_ID(BPF_SYS_GET_TLS)
 
 // —— 虚拟浮点指令的 call 编号（与上方 BPF_SYS_FP_* 一一对应）——
 #define BPF_CALL_FP_ADD_F  BPF_CALL_ID(BPF_SYS_FP_ADD_F)

@@ -24,7 +24,7 @@ extern std::mutex log_mutex;
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
-#define STACK_LIMIT 4096
+#define STACK_LIMIT (16 * 1024)
 
 #ifndef PF_X
 #define PF_X		0x1
@@ -137,6 +137,7 @@ protected:
     static auto& flags(vm* v);
     static auto& signal_depth(vm* v);
     static auto& pc(vm* v);
+    static auto& tp(vm* v);
 public:
     virtual ~SyscallHandler() = default;
     virtual void init(const std::shared_ptr<vm>& v) = 0;
@@ -182,6 +183,7 @@ private:
     size_t signal_depth = 0;
     uint64_t insn_count = 0;              // 已执行指令计数（JIT+解释器共用，单线程访问）
     uint64_t interp_insns = 0;            // 解释器执行的指令数
+    uint64_t tp_ = 0;                     // thread pointer（BPF_SYS_SET_TLS 设置；单线程 TLS 模拟）
 
     std::unique_ptr<JitCompilerBase> jit_;
 
@@ -225,10 +227,11 @@ public:
     // Slow path: linear scan maps + fill TLB (no TLB lookup).  Called by JIT on miss.
     void* mmu_slow(uint64_t addr, size_t size);
     void* mmu_w_slow(uint64_t addr, size_t size);
-    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp);
+    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
+                     const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
     bool wait_for_exit(int timeout_ms);
-    uint64_t load_elf(const char* elf_file_path);
+    ElfLoadInfo load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();
@@ -239,7 +242,7 @@ public:
     }
 
     uint64_t run();
-    uint64_t run(const vmOptions* options);
+    uint64_t run(const vmOptions* options, const ElfLoadInfo& info = ElfLoadInfo{});
     void dump_stats() const;
 };
 
@@ -247,6 +250,7 @@ inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
 inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
+inline auto& SyscallHandler::tp(vm* v) { return v->tp_; }
 inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 
 #endif //INSN_H

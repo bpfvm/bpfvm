@@ -129,6 +129,8 @@ public:
     bool do_madvise(vm* v);
     bool do_sched_yield(vm* v);
     bool do_gettid(vm* v);
+    bool do_set_tls(vm* v);
+    bool do_get_tls(vm* v);
 };
 
 #endif

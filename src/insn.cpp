@@ -215,7 +215,7 @@ std::shared_ptr<vm> vm::create() {
     return std::make_shared<vm>(Token{});
 }
 
-uint64_t vm::load_elf(const char* elf_file_path) {
+ElfLoadInfo vm::load_elf(const char* elf_file_path) {
     return ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); });
 }
 
@@ -1224,7 +1224,7 @@ uint64_t vm::run() {
     return r(0);
 }
 
-uint64_t vm::run(const vmOptions* options) {
+uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
     this->options = *options;
     insn_count = 0;
     interp_insns = 0;
@@ -1232,7 +1232,7 @@ uint64_t vm::run(const vmOptions* options) {
         printf("entry: 0x%lx\n", options->entry);
     }
 
-    if(!setup_stack(options->argv, options->envp)) {
+    if(!setup_stack(options->argv, options->envp, info)) {
         return 0;
     }
     flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
@@ -1265,7 +1265,8 @@ bool vm::wait_for_exit(int timeout_ms) {
     return (flags.load(std::memory_order_acquire) & VM_EXITED) != 0;
 }
 
-bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp) {
+bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
+                     const ElfLoadInfo& info) {
     unsigned char* stack_base = (unsigned char*)mmu(STACK_BASE);
     if(stack_base == nullptr) {
         unsigned char* data = (unsigned char*)mmap(nullptr, STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1313,6 +1314,10 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         {AT_GID,      0},
         {AT_EGID,     0},
         {AT_SECURE,   0},
+        {AT_PHDR,     info.phdr},   // 主程序 program header table 运行时地址
+        {AT_PHENT,    info.phent},  // 单个 phdr 大小
+        {AT_PHNUM,    info.phnum},  // phdr 个数
+        {AT_ENTRY,    info.entry},  // 入口点
         {AT_PLATFORM, 0},   // 回填
         {AT_EXECFN,   0},   // 回填
         {AT_RANDOM,   0},   // 回填

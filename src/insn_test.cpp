@@ -1217,11 +1217,12 @@ void test_syscall_mmap_readonly_rejects_write() {
     const uint64_t map_size = 4096;
     const uint32_t write_value = 0x12345678;
     bpf_insn instructions[] = {
-        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, (int32_t)map_size },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, PROT_READ },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, MAP_PRIVATE | MAP_ANONYMOUS },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 4, 0, 0, -1 },
-        { BPF_ALU64 | BPF_MOV | BPF_K, 5, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, 0},
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, (int32_t)map_size },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, PROT_READ },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 4, 0, 0, MAP_PRIVATE | MAP_ANONYMOUS },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 5, 0, 0, -1 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },
         { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_MMAP },
         { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },
         { BPF_ST | BPF_MEM | BPF_W, 6, 0, 0, (int32_t)write_value },
@@ -1238,6 +1239,44 @@ void test_syscall_mmap_readonly_rejects_write() {
                     ret == mapped_addr &&
                     *mapped == 0);
     print_test_result("test_syscall_mmap_readonly_rejects_write", success);
+    assert(success);
+}
+
+void test_syscall_mmap_map_fixed() {
+    std::cout << "--- Running Test: test_syscall_mmap_map_fixed ---" << std::endl;
+    auto ebpf_vm = vm::create();
+    // 选一个不与栈(0x10000000)/加载基址(0x40000000)冲突的页对齐固定地址。
+    const uint64_t fixed_addr = 0x50000000;
+    const uint64_t map_size = 4096;
+    const uint32_t magic = 0xCAFEBABE;
+    // mmap(fixed_addr, map_size, RW, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0)
+    bpf_insn instructions[] = {
+        { BPF_LD | BPF_IMM | BPF_DW, 1, 0, 0, (int32_t)(fixed_addr & 0xFFFFFFFF) },
+        { 0, 0, 0, 0, (int32_t)(fixed_addr >> 32) },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, (int32_t)map_size },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, PROT_READ | PROT_WRITE },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 4, 0, 0, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 5, 0, 0, -1 },
+        { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_MMAP },
+        // mmap 返回值在 r0。用 r1 暂存返回地址（r1 在顶层 exit 不被恢复，可安全作中转），
+        // 写入 magic 再读回，验证地址正确且可写可读。最后 r0 = 读回的值，exit 返回它。
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 0, 0, 0 },   // r1 = r0 (mapped addr)
+        { BPF_ST | BPF_MEM | BPF_W, 1, 0, 0, (int32_t)magic },  // *(u32*)(r1+0) = magic
+        { BPF_LDX | BPF_MEM | BPF_W, 0, 1, 0, 0 },     // r0 = *(u32*)(r1+0)
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
+    uint64_t ret = ebpf_vm->run(&posix_option);
+    uint64_t mapped_addr = ebpf_vm->r(1);
+    auto mapped = static_cast<const uint32_t*>(ebpf_vm->mmu(mapped_addr, sizeof(uint32_t)));
+    // ret == magic 验证「写入 + 读回」成功；mapped_addr == fixed_addr 验证 MAP_FIXED 生效。
+    bool success = (ret == magic &&
+                    mapped_addr == fixed_addr &&
+                    mapped != nullptr &&
+                    *mapped == magic);
+    print_test_result("test_syscall_mmap_map_fixed", success);
     assert(success);
 }
 
@@ -1628,6 +1667,7 @@ int main() {
     // Syscall Tests
     test_syscall_clock_gettime();
     test_syscall_mmap_readonly_rejects_write();
+    test_syscall_mmap_map_fixed();
     test_static_memmap_does_not_unmap_external_memory();
     test_syscall_file_io();
     test_syscall_fork_waitpid();

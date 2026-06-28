@@ -130,6 +130,7 @@ struct FileLayout {
     Elf64_Half phnum = 0;
     Elf64_Half shnum = 0;
     Elf64_Half shstrndx = 0;
+    bool has_phdr = false;          // DYNAMIC_EXE: 是否生成 PT_PHDR 条目
     uint64_t seg_data_off = 0;     // 段数据区在文件中的起点（页对齐）
     uint64_t sh_off = 0;           // section header 表在文件中的偏移
     uint64_t seg_file_off[3] = {0, 0, 0};  // text/rodata/data 段的文件 offset
@@ -572,7 +573,13 @@ public:
             s.used = !s.secs.empty();
         }
         // vaddr 链式分配（页对齐，跳过空段）
+        // 可执行文件（STATIC_EXE + DYNAMIC_EXE）首段从 guest_base_+0x1000 开始预留 vaddr：
+        // 给 ELF header + phdr table（文件 offset [0, 0x1000)）让出位置。write_phdrs 会把
+        // 首段 p_offset 扩展到 0、p_vaddr 减 0x1000，让 phdr 表（vaddr 64）被首段 LOAD 覆盖
+        //（供 PT_PHDR），且模块从 guest_base_ 起、offset≡vaddr 严格成立。
+        //（SHARED_LIB 是 .so 无 PT_PHDR 需求，从 guest_base_ 起。）
         uint64_t cur = guest_base_;
+        if (mode_ != Mode::SHARED_LIB) cur += 0x1000;
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
             segs_[c].vaddr = cur;
@@ -861,14 +868,29 @@ private:
             if (sym.binding != STB_GLOBAL && sym.binding != STB_WEAK) continue;
             if (sym.type != STT_FUNC && sym.type != STT_OBJECT) continue;
             if (sym.name.empty()) continue;
-            if (globals_.find(sym.name) == globals_.end()) {
+            auto it = globals_.find(sym.name);
+            if (it == globals_.end()) {
                 globals_[sym.name] = {obj_idx, i};
+            } else {
+                // strong(STB_GLOBAL) 覆盖 weak(STB_WEAK)——标准 ld 行为。
+                // 典型场景：musl libc.a 同时含 lite_malloc.o（weak __libc_malloc_impl）
+                // 和 mallocng/malloc.o（strong __libc_malloc_impl）。archive 拉入顺序不定，
+                // 若 weak 先注册而 strong 不覆盖，malloc 会错误地链到 lite_malloc（brk 分配
+                // 器），与 mallocng 的 free 配对立刻崩溃。weak 不覆盖 strong；两个 strong
+                // 保留先到的（与原行为一致，不新增报错）。
+                const auto& existing = objects_[it->second.obj_idx].symbols[it->second.sym_idx];
+                if (existing.binding == STB_WEAK && sym.binding == STB_GLOBAL) {
+                    globals_[sym.name] = {obj_idx, i};
+                }
             }
         }
     }
 
     // DYNAMIC_EXE：扫描所有重定位引用的 UND 符号，既不在 globals_（.o/.a 提供）也不在
     // bpfso_symbols_（.so 提供）的视为真正未定义，报错（对齐标准 ld）。
+    // 例外：weak 未定义符号（如 __init_array_start/__fini_array_start/_DYNAMIC）允许
+    // 不被定义——标准 ld 把它们解析为 0；musl/glibc 启动代码用 weak 引用这些「可能不
+    // 存在」的边界符号，遍历时空范围安全。重定位时这类符号走 resolve_symbol 返回 0。
     bool check_undefined_symbols() {
         std::set<std::string> reported;
         for (const auto& obj : objects_) {
@@ -877,6 +899,7 @@ private:
                 const auto& sym = obj.symbols[r.sym_idx];
                 if (sym.defined) continue;                       // 本对象内定义
                 if (sym.name.empty()) continue;
+                if (sym.binding == STB_WEAK) continue;           // weak 未定义 → 解析为 0
                 if (globals_.count(sym.name)) continue;          // .o/.a 提供（resolve_symbol 可解析）
                 if (bpfso_symbols_.count(sym.name)) continue;    // .so 提供（运行时解析）
                 if (reported.insert(sym.name).second) {
@@ -889,24 +912,42 @@ private:
     }
 
     // 解析符号的最终 guest 地址；找不到返回 nullopt（调用方据此报错）
+    //
+    // 设计：globals_ 是符号解析的唯一真理来源。register_globals 已按标准 ld 语义
+    // 填好表（strong 覆盖 weak，两个 strong 保留先到的）。这里只查表，不做二次
+    // 优先级判断——无论符号是 defined 还是 UND、是 strong 还是 weak，只要它参与
+    // 全局链接（非 STB_LOCAL），最终地址都由 globals_ 决定。
+    //
+    // 例外 STB_LOCAL：文件私有符号（如 static 函数、section 符号），不进 globals_，
+    // 直接用本 obj 定义。
     std::optional<uint64_t> resolve_symbol(size_t obj_idx, size_t sym_idx) {
         const auto& sym = objects_[obj_idx].symbols[sym_idx];
-        if (!sym.defined) {
-            // UND：查主程序/库内部全局表（内部定义符号）
-            auto it = globals_.find(sym.name);
-            if (it != globals_.end()) {
-                const auto& def_obj = objects_[it->second.obj_idx];
-                const auto& def_sym = def_obj.symbols[it->second.sym_idx];
-                const auto& def_sec = def_obj.sections[def_sym.sec_idx];
-                return def_sec.guest_addr + def_sym.value;
-            }
-            // PIE 模式：.so 提供的符号运行时才知地址，构建期不解析（走 PLT/GOT）
-            // bpfso_symbols_ 仅用于入口符号查找（_start 的 PLT 桩地址由 plt_addr_ 决定）
-            return std::nullopt;
+
+        // STB_LOCAL：本 obj 私有，直接用本 obj 定义
+        if (sym.binding == STB_LOCAL) {
+            const auto& sec = objects_[obj_idx].sections[sym.sec_idx];
+            return sec.guest_addr + sym.value;
         }
-        const auto& obj = objects_[obj_idx];
-        const auto& sec = obj.sections[sym.sec_idx];
-        return sec.guest_addr + sym.value;
+
+        // STB_GLOBAL / STB_WEAK（defined 或 UND）：统一查 globals_
+        auto it = globals_.find(sym.name);
+        if (it != globals_.end()) {
+            const auto& def_obj = objects_[it->second.obj_idx];
+            const auto& def_sym = def_obj.symbols[it->second.sym_idx];
+            const auto& def_sec = def_obj.sections[def_sym.sec_idx];
+            return def_sec.guest_addr + def_sym.value;
+        }
+
+        // 查不到（仅 UND 符号会走到这里；defined 的 non-local 符号必然在 globals_ 中）：
+        //   - weak UND + 链接可执行（STATIC_EXE/DYNAMIC_EXE）：按标准 ld 解析为 0
+        //     （musl/glibc 用 weak 引用 __init_array_start/_DYNAMIC 等「可能不存在」的
+        //      边界符号，空范围 start==end==0 的遍历是安全的 no-op）。
+        //   - SHARED_LIB：保持 UND 返回 nullopt，留给运行期经 PLT/GOT 解析（如 PDCLib
+        //      的 main 是 weak UND，.so 里 _start 调它必须走 PLT 桩，由消费者在链接期
+        //      填入 main 地址）。
+        if (sym.binding == STB_WEAK && mode_ != Mode::SHARED_LIB)
+            return 0;
+        return std::nullopt;
     }
 
     // 加载 .so 文件，提取其 symtab 中所有 GLOBAL 符号 → 地址映射
@@ -1400,6 +1441,12 @@ private:
         for (int c = 0; c < 3; c++) if (segs_[c].used) L.phnum++;
         if (need_dynamic) L.phnum += 2;  // PT_LOAD (动态 section) + PT_DYNAMIC
         if (interp_idx != SIZE_MAX) L.phnum += 1;  // PT_INTERP
+        // 所有可执行文件（STATIC_EXE + DYNAMIC_EXE）都生成 PT_PHDR。PT_PHDR 描述
+        // 「phdr 表自身在内存中的位置」，让 loader 纯靠它就能算出 auxv AT_PHDR，
+        // 不必依赖「phdr 表恰好被某个 PT_LOAD 覆盖」这类文件布局假设。这让 loader
+        // 侧只有一条 phdr_addr 解析路径（见 elf_loader.cpp），无需 ET_EXEC/PIE 分支。
+        //（SHARED_LIB 是 .so，无入口、不被 auxv 直接消费，不需要。）
+        if (mode_ != Mode::SHARED_LIB) { L.has_phdr = true; L.phnum += 1; }
         L.shnum = next_sh + (Elf64_Half)extras.size();  // NULL + 段secs + bss + extras
         L.shstrndx = extras_base + (Elf64_Half)shstrtab_idx;
 
@@ -1502,12 +1549,18 @@ private:
         return fwrite(&ehdr, sizeof(ehdr), 1, f) == 1;
     }
 
-    // 程序头表：PT_LOAD（每段一个）+ 动态区 PT_LOAD（覆盖 dynstr/dynsym/hash/rela.dyn/
-    // dynamic/interp?）+ PT_INTERP（仅 DYNAMIC_EXE）+ PT_DYNAMIC。
+    // 程序头表：PT_LOAD（每段一个；首段在 has_phdr 时向前扩展覆盖文件头）+
+    // PT_PHDR（可执行文件）+ 动态区 PT_LOAD + PT_INTERP（DYNAMIC_EXE）+ PT_DYNAMIC。
     bool write_phdrs(FILE* f, const std::vector<SecBuf>& extras, const FileLayout& L,
                       const std::unordered_map<size_t, uint64_t>& dyn_vaddr_map,
                       const DynSecOut& dyn_idx, size_t interp_idx, bool need_dynamic) const {
-        // PT_LOAD phdrs（每个 used 段一个，权限 R-X / R-- / RW-）
+        // 首个 PT_LOAD：has_phdr 时向前扩展，把 ELF header + phdr table（文件 offset [0, head)）
+        // 纳入映射。PT_PHDR 要求它描述的 phdr 表区域被某个 PT_LOAD 覆盖，否则不可读。
+        // layout_segments 已给首段 vaddr 预留 head（首段 vaddr = guest_base_ + head），
+        // 这里 p_offset 减到 0、p_vaddr 同步前移 head 回到 guest_base_，filesz/memsz 补 head。
+        // phdr_load_vaddr 记录扩展后首段 vaddr，供下方 PT_PHDR 复用（phdr 表在其内偏移 64）。
+        uint64_t phdr_load_vaddr = 0;  // 扩展后首段 vaddr（PT_PHDR.p_vaddr 的基准）
+        bool first_load = true;
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
             Elf64_Phdr ph = {};
@@ -1519,6 +1572,30 @@ private:
             ph.p_filesz = segs_[c].filesz;
             ph.p_memsz = segs_[c].memsz;
             ph.p_align = 0x1000;
+            if (L.has_phdr && first_load && ph.p_offset != 0) {
+                uint64_t head = ph.p_offset;
+                ph.p_offset  = 0;
+                ph.p_vaddr  -= head;
+                ph.p_paddr  -= head;
+                ph.p_filesz += head;
+                ph.p_memsz  += head;
+                phdr_load_vaddr = ph.p_vaddr;
+            }
+            first_load = false;
+            if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
+        }
+        // PT_PHDR：phdr 表在文件 offset sizeof(Elf64_Ehdr)=64，对应内存 vaddr = 首段 vaddr + 64。
+        // loader 据此算 auxv AT_PHDR = load_base + p_vaddr，无需依赖文件布局假设。
+        if (L.has_phdr) {
+            Elf64_Phdr ph = {};
+            ph.p_type = PT_PHDR;
+            ph.p_flags = PF_R;
+            ph.p_offset = sizeof(Elf64_Ehdr);
+            ph.p_vaddr = phdr_load_vaddr + sizeof(Elf64_Ehdr);
+            ph.p_paddr = ph.p_vaddr;
+            ph.p_filesz = sizeof(Elf64_Phdr) * L.phnum;
+            ph.p_memsz = ph.p_filesz;
+            ph.p_align = 8;
             if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
         }
         // PT_LOAD 覆盖动态 section 区：vaddr = offset + delta（页对齐），

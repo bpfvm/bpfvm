@@ -231,3 +231,19 @@ Varargs can be emulated entirely in the headers with a pseudo-`va_list` that the
 
 3.  **Using the `libc` Symlink**:
 The `libc` directory in the project root is a pre-configured symbolic link pointing to `pdclib/build/install`. **Once the installation steps are completed, this symlink becomes active**. BPF compilers (e.g., clang) can then easily reference standard library headers and archives via `-Ilibc/include` and `-Llibc/lib`.
+
+## musl Porting (`musl/`)
+
+The project ships a port of musl 1.2.6 as an alternative C library for the BPF target. Build with `sh musl/build_bpf.sh` — produces `musl/build_bpf/lib/libc.a` (+ `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`) and headers in `musl/build_bpf/install/include/`. Test programs are built with `sh test/build_musl.sh` (static `.musl.out` + dynamic `.musl.linked`).
+
+### musl build (`musl/build_bpf.sh`)
+- **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` at test-build time, not by musl's own build.
+- **`-mllvm -bpf-stack-size=16384`**: musl's `crypt_blowfish` (`BF_crypt`) has ~8.5KB local structs; the default 4096 overflows.
+- **rcrt1.o skipped**: `make install` compiles `rcrt1.o` (static PIE self-start, depends on `dlstart` dynamic linker logic — BPF can't support it) and fails. The script builds only `crt1`/`crti`/`crtn`/`Scrt1` via per-target `make obj/crt/<name>.o`, then manually copies headers to `install/include/` (generic/bits first, then bpf/bits so BPF-specific overrides win).
+
+### Pass rebuild after `.so` changes
+**pdclib (CMake) and musl (Make) do NOT track `libBpfWideArgs.so`/`libBpfSoftFp.so` timestamp changes** — they only look at `.c` source mtimes. After modifying either pass, force a full rebuild:
+- pdclib: `rm -rf pdclib/build`, then `build_root.sh` to regenerate `libc.so`.
+- musl: `find musl/build_bpf/obj -name '*.o' -delete && sh musl/build_bpf.sh` (re-runs `make lib/libc.a` + crt + header install).
+
+Skipping this reuses stale `.o` compiled with the old pass (a past incident: deleting `__va_arg` left old `.o` still referencing it, causing `_va_arg` undefined at link).
