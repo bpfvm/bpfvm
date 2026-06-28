@@ -6,8 +6,10 @@
 
 ## 核心特性
 
-*   **ELF 加载器**: 解析并加载标准 BPF ELF 可执行文件。
-*   **指令集支持**: 实现了核心 eBPF 指令集解释执行。
+*   **ELF 加载器**: 解析并加载标准 BPF ELF 可执行文件（支持静态链接与动态链接 PIE）。
+*   **JIT 加速**: 混合解释器/JIT 执行模型，热函数编译为 x86_64 / AArch64 原生代码，配合软件 TLB 加速地址翻译。
+*   **指令集支持**: 实现核心 eBPF 指令集解释执行。
+*   **浮点支持**: 通过 `BpfSoftFp` LLVM pass 提供 `float`/`double` 支持（算术、类型转换、比较）。
 *   **系统调用模拟**: 通过可插拔的 `SyscallHandler` 接口实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
 *   **标准库支持**: 深度集成了 `PDCLib`，为 BPF 程序提供标准 C 库支持 (stdio, stdlib, string 等)。
 *   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用。
@@ -33,7 +35,10 @@
 cmake -S . -B build
 cmake --build build
 
-# 构建完成后，可执行文件位于 build/bpfvm
+# 构建产物：
+#   build/bpfvm / bpfvm-ld / bpfvm_test —— 虚拟机、链接器、单元测试
+#   build/libBpfWideArgs.so / libBpfSoftFp.so —— LLVM pass 插件（Guest 编译用，
+#     需 LLVM 开发头；缺失时跳过，不影响 VM 本体）
 ```
 
 ### 编译 PDCLib (Guest 标准库)
@@ -88,13 +93,23 @@ make -C test
 ## 项目结构
 
 ```
-├── main.cpp              # VM 入口，命令行解析
-├── insn.h / insn.cpp     # VM 核心：指令定义与解释执行
-├── posix_syscall.h/cpp   # POSIX 系统调用实现 (PosixSyscall)
-├── empty_syscall.h       # 空系统调用桩 (EmptySyscall, 用于测试)
-├── BpfWideArgs.cpp       # LLVM pass：突破 5 参数限制 + 返回结构体 + 变参函数
-├── insn_test.cpp         # 指令集单元测试
-├── include/              # BPF Guest 程序使用的头文件
+├── src/
+│   ├── main.cpp              # VM 入口，命令行解析
+│   ├── insn.h / insn.cpp     # VM 核心：指令定义、解释执行循环、浮点原语 do_softfp
+│   ├── posix_syscall.h/cpp   # POSIX 系统调用实现 (PosixSyscall)
+│   ├── empty_syscall.h       # 空系统调用桩 (EmptySyscall, 用于测试)
+│   ├── elf_loader.h/cpp      # BPF ELF 加载与库搜索
+│   ├── elf_linker.h/cpp      # 离线 BPF 链接器核心（静态/共享/动态三种模式）
+│   ├── ld_main.cpp           # bpfvm-ld CLI
+│   ├── jit.h, jit_base_emitter.h     # JIT 共享结构与发射基类
+│   ├── jit_compiler.h/cpp    # 架构无关的 JIT 编译器模板
+│   ├── x86_emitter.h/cpp     # x86_64 JIT 代码发射
+│   ├── aarch64_emitter.h/cpp # AArch64 JIT 代码发射
+│   ├── BpfWideArgs.cpp       # LLVM pass：突破 5 参数限制 + 返回结构体 + 变参函数
+│   ├── BpfSoftFp.cpp         # LLVM pass：把浮点 IR 改写为软浮点 call（启用 float/double）
+│   └── insn_test.cpp         # 指令集单元测试
+├── include/              # BPF Guest 程序使用的头文件（syscall ID、POSIX 类型、浮点 call 编号）
+├── cmake/                # CMake 辅助脚本（CTest 集成等）
 ├── pdclib/               # PDCLib 标准 C 库 (子模块)
 ├── dash/                 # dash shell (子模块)
 ├── sbase/                # sbase coreutils
@@ -108,7 +123,7 @@ VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp
 
 由于 BPF 架构的特殊性，为本虚拟机开发 C 程序时需注意以下限制：
 
-1.  **无浮点数支持**: BPF 硬件/指令集不支持浮点运算。请使用整型或定点数运算。
+1.  **浮点运算**: BPF 硬件本身无浮点单元。本项目通过 `BpfSoftFp` LLVM pass 插件（编译时自动注入）提供 `float`/`double` 支持，可直接使用，无需手动改写。
 2.  **参数与返回值限制**: 原生 BPF 调用约定最多 **5 个参数**，且无法返回结构体。本项目自带 `BpfWideArgs` LLVM pass 插件，编译时自动解决这两个限制。
 3.  **变长参数 (Varargs)**: BPF 后端拒绝任何变参函数。`BpfWideArgs` pass 同样自动解决，可直接使用 `...` 函数及 `va_start`/`va_arg`。
 

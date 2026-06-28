@@ -51,6 +51,25 @@ set_target_properties(BpfWideArgs PROPERTIES
 )
 message(STATUS "BpfWideArgs: enabled (LLVM ${LLVM_VERSION}, plugin -> ${CMAKE_BINARY_DIR}/libBpfWideArgs.so)")
 
+# ---------------------------------------------------------------------------
+# BpfSoftFp：虚拟浮点指令的编码 pass（见 include/bpf_call.h 的 BPF_SYS_FP_BASE 段）
+#
+# 在 IR 层把每个浮点运算指令替换成一条对 BPF_CALL_FP_* 的直接调用
+# （inttoptr(i64 编号)），后端 lower 成 `call <imm>`（src_reg=0），绕过 BPF
+# 后端在 ISel 阶段对 fadd/fmul/... 的拒绝。编译为 libBpfSoftFp.so，
+# 由 clang -fpass-plugin= 加载。
+add_library(BpfSoftFp MODULE BpfSoftFp.cpp)
+target_include_directories(BpfSoftFp PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(BpfSoftFp PRIVATE ${LLVM_CXXFLAGS} -fno-rtti)
+target_link_libraries(BpfSoftFp PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
+set_target_properties(BpfSoftFp PROPERTIES
+    OUTPUT_NAME BpfSoftFp
+    PREFIX "lib"
+    SUFFIX ".so"
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+message(STATUS "BpfSoftFp: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfSoftFp.so)")
+
 
 add_executable(bpfvm main.cpp)
 target_link_libraries(bpfvm bpfvm_lib ${LIBELF_LIBRARIES})

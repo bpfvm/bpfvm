@@ -10,14 +10,29 @@ GOT_SO := libgot.so
 LIBC_BPFSO := ../libc/lib64/libc.so
 
 # BPF 编译 flags（clang 直接编译，无 wrapper）
+# -nostdinc: 不用宿主 glibc 头，只用 PDCLib(../libc/include) + BPF guest 头(../include)。
+# -fno-builtin: 必须保留。否则 clang 把 mempcpy/strchr/... 等 builtin 优化成对 memcpy
+#   等的调用，BPF 后端在 ISel 拒绝（实测 dash 即触发）。强制走 PDCLib 库实现。
+# -fno-math-errno: 让 __builtin_sqrt 等数学 builtin 折叠成 @llvm.sqrt 等 intrinsic
+#   （而非对库符号 sqrt 的调用），BpfSoftFp pass 才能在 IR 层接住并 lower 成
+#   BPF_CALL_FP_SQRT_*。去掉 errno 副作用不影响正确性（BPF 无 errno）。
+# 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
 CC_FLAGS := -std=c11 -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 \
-            -nostdinc -fno-builtin \
+            -nostdinc -fno-builtin -fno-math-errno \
             -isystem ../libc/include/ -isystem ../include -g
 
 # BpfWideArgs pass 插件：突破 BPF 5 参数限制 + 返回结构体支持。
 WIDEARGS := $(wildcard ../build/libBpfWideArgs.so)
 ifneq ($(WIDEARGS),)
 CC_FLAGS += -fpass-plugin=$(WIDEARGS)
+endif
+
+# BpfSoftFp pass 插件：把浮点运算（fadd/fmul/fcmp/...）在 IR 层替换成直接的
+# BPF_CALL_FP_* call（src_reg=0，syscall 形式），绕过 BPF 后端对浮点的拒绝；
+# VM 侧 do_softfp 用宿主硬件浮点执行。
+SOFTFP := $(wildcard ../build/libBpfSoftFp.so)
+ifneq ($(SOFTFP),)
+CC_FLAGS += -fpass-plugin=$(SOFTFP)
 endif
 
 all: $(TARGETS) $(DYN_TARGETS)

@@ -57,6 +57,8 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     // Buffer access
     { e.size() } -> std::same_as<size_t>;
     { e.data() } -> std::convertible_to<uint8_t*>;
+    // emulate fp instruction (BPF_CALL_FP_*) in JIT (x86 SSE/FP) or fallback to syscall path.
+    { e.emit_call_softfp(insn) } -> std::same_as<bool>;
 
     // Patching
     e.patch_branch_cond(0u, 0u);

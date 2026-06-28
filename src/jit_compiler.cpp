@@ -344,8 +344,13 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
                 e.emit_call_indirect(insn, ret_gpa);
                 compiled_count++;
             } else if (insn->src_reg == 0) {
-                e.emit_call_syscall(insn, i, entry_gpa);
-                compiled_count++;
+                // 虚拟浮点指令：先尝试 JIT 原生执行，未命中则回退通用 syscall 路径。
+                if (e.emit_call_softfp(insn)) {
+                    compiled_count++;
+                } else {
+                    e.emit_call_syscall(insn, i, entry_gpa);
+                    compiled_count++;
+                }
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa    = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
                 uint64_t callee_gpa = entry_gpa + (uint64_t)(i + 1 + insn->imm) * sizeof(bpf_insn);

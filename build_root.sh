@@ -5,7 +5,22 @@ ROOT_DIR=$(pwd)
 CLANG_RES=$(clang -print-resource-dir)/include
 BPFVM_LD="${ROOT_DIR}/build/bpfvm-ld"
 
-COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin -fpass-plugin=${ROOT_DIR}/build/libBpfWideArgs.so -isystem ${ROOT_DIR}/libc/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
+# BPF 交叉编译 flags。
+# -nostdinc：不用宿主 glibc 头，只用 PDCLib(libc/include) + BPF guest 头(include)。
+# -fno-builtin：必须保留。否则 clang 会把 mempcpy/strchr/stpcpy/... 等 builtin
+#   优化成对 memcpy 等的调用，而 BPF 后端在 ISel 拒绝这类 builtin lowering
+#   （实测 dash 的 arith_yylex.c:mempcpy 即触发）。强制走 PDCLib 的库实现即可。
+# 浮点由 BpfSoftFp pass 在 IR 层处理（见下），不依赖 -fno-builtin。
+# 两个 pass plugin：libBpfWideArgs（突破 5 参数限制）、libBpfSoftFp（软件浮点），
+#   存在才加载，避免插件没编出来时 clang 报 "cannot find"。
+COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin"
+if [ -f "${ROOT_DIR}/build/libBpfWideArgs.so" ]; then
+    COMMON_CFLAGS="${COMMON_CFLAGS} -fpass-plugin=${ROOT_DIR}/build/libBpfWideArgs.so"
+fi
+if [ -f "${ROOT_DIR}/build/libBpfSoftFp.so" ]; then
+    COMMON_CFLAGS="${COMMON_CFLAGS} -fpass-plugin=${ROOT_DIR}/build/libBpfSoftFp.so"
+fi
+COMMON_CFLAGS="${COMMON_CFLAGS} -isystem ${ROOT_DIR}/libc/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
 # clang -target bpf 把链接委托给 /usr/bin/bpf-gcc，bpf-gcc 再用 /usr/lib/gcc/bpf/14/ld
 # （binutils bpf-ld）。让它改用 bpfvm-ld 的三个坑：
 #   1) clang 不把 -B 转发给 bpf-gcc（实测 -### 里没有 -B；-Wl,-B 传给 ld 也没用）；

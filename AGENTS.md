@@ -19,6 +19,7 @@
 - `cmake/`: CMake helper scripts (e.g., `RunBpfProgram.cmake` for CTest integration).
 - `bpfvm-ld`: BPF linker (replaces `binutils-bpf` `bpf-ld`); see `src/ld_main.cpp`.
 - `BpfWideArgs.cpp`: LLVM pass plugin that lifts the BPF limit (loaded via `clang -fpass-plugin=...`).
+- `BpfSoftFp.cpp`: LLVM pass plugin that rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support (loaded via `clang -fpass-plugin=...`).
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
@@ -113,12 +114,25 @@ Earlier versions depended on `binutils-bpf` `bpf-ld`, which had a `.rodata.str1.
 ### 1. Floating Point Number Support
 
 **Constraint:**
-The BPF architecture **does not support floating-point arithmetic** (float, double). There are no hardware floating-point units or registers available.
+The BPF architecture has **no hardware floating-point units or registers**. The BPF LLVM backend (`BPFISelLowering.cpp`) rejects any floating-point operation at the ISel stage, reporting e.g. `"A call to built-in function '__adddf3' is not supported"` — and this rejection happens *before* the backend could ever lower the op into a library call, so simply providing `__adddf3` implementations is not enough on its own.
 
-**Solution:**
-*   **Disable Floating Point:** Ensure the compiler does not generate floating-point instructions.
-*   **Integer Arithmetic:** All calculations must be performed using integers (`int`, `int64_t`, `uint64_t`, etc.).
-*   **Fixed-Point Math:** If fractional precision is required, implement fixed-point arithmetic using integers (e.g., scaling values by 1000 to represent 3 decimal places).
+**Solution: a virtual set of floating-point "instructions" encoded as BPF `call`s**
+
+The core idea is to **simulate a batch of floating-point instructions through the BPF `call` (syscall/helper) mechanism**, and then treat each one as a single instruction everywhere in the pipeline. Concretely, every FP operation is given a stable numeric ID — the `BPF_CALL_FP_*` family in `include/bpf_call.h` (e.g. `BPF_CALL_FP_ADD_D`, `BPF_CALL_FP_D2SI`, `BPF_CALL_FP_CMP_D`) — and is encoded in a BPF program as exactly one `call <imm>` with `src_reg=0` (the syscall form). From that point on, **interpreter and JIT alike handle it as a single self-contained instruction**: read operands (bit patterns in `r1`/`r2`), compute the result with the host's hardware FP, write the bit pattern back to `r0`. There is no function call at runtime, no stack frame, no VM state plumbing between operands and result — it is one instruction that happens to use the `call` opcode as its carrier.
+
+This is split across two layers (no guest-side glue):
+
+1. **`BpfSoftFp` LLVM pass** (`src/BpfSoftFp.cpp`, auto-built into `build/libBpfSoftFp.so`, auto-injected by `pdclib/bpf-toolchain.cmake` and `test/Makefile`) — the *encoding* stage: rewrites every floating-point IR instruction (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`, the fp↔int casts, `fpext`/`fptrunc`, and the `fmuladd`/`fma`/`sqrt` intrinsics) into `call <BPF_CALL_FP_*>` (an `inttoptr` call the backend lowers to `call <imm>` with `src_reg=0`). `src_reg=0` is the only call form the JIT can inline as a single instruction — a `src_reg=1` BPF-to-BPF call like `call __adddf3` would force a VM exit. IDs come from `include/bpf_call.h`. `fcmp` expands to *two* calls (`CMP` + `UNORD`) so each IEEE-754 predicate is reconstructed exactly.
+
+2. **Execution** — both paths resolve the same `BPF_CALL_FP_*` ID and run the op with the host's hardware FP (operands as `i64` bit patterns, result to `r0`):
+   - **Interpreter**: `do_softfp` in `insn.cpp` — the reference, also the JIT's fallback.
+   - **JIT**: `emit_call_softfp()` recognizes the ID and emits native host FP code inline. Because the JIT keeps all 11 BPF registers resident in physical registers, r1/r2/r0 are already in place (x86: R9/R10/R8; AArch64: X10/X11/X9) — no flush, no VM exit, the op is just one more instruction in the stream. Per-arch details and the encoding gotchas hit during bring-up are commented at each `emit_call_softfp` site. The only architectural difference that matters at this level: **AArch64 has native `FCVTZU`/`UCVTF` and handles every `BPF_CALL_FP_*` natively, whereas x86 lacks unsigned fp↔int conversion (needs AVX-512), so on x86 the unsigned-conversion IDs fall back to `do_softfp`** via the normal syscall path.
+
+**ABI details:** Floating-point values are stored as IEEE-754 bit patterns in the 64-bit BPF registers / stack slots — no precision is lost. Varargs like `printf("%f", x)` work through the existing `BpfWideArgs` pass (`va_list` slots are 8 bytes). `printf %f` formatting is enabled in PDCLib (`functions/_PDCLIB/_PDCLIB_print.c` `#if 1` block + the `_PDCLIB_print_fp*` / `_PDCLIB_fp_from_dbl` sources in the build).
+
+**What still needs care:**
+*   `long double` == `double` (64-bit) on this target; code using 128-bit `long double` precision should be converted to `double` (see e.g. `log_10_2` in `_PDCLIB_print_fp_deci.c`).
+*   Only `sqrt` is softened among the math intrinsics so far; `fabs`/`copysign`/`floor`/`ceil`/… are trivial to add by extending the `IntrinsicInst` handler in `BpfSoftFp.cpp`.
 
 ### 2. Function Call Conventions
 
