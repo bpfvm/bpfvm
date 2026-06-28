@@ -10,16 +10,18 @@
 - `posix_syscall.h`, `posix_syscall.cpp`: full POSIX syscall implementation (`PosixSyscall` class), fd management, signal queue, process control.
 - `empty_syscall.h`: stub syscall handler (`EmptySyscall`) returning `-ENOSYS`, used for testing.
 - `insn_test.cpp`: unit tests for instruction execution, built into `bpfvm_test`.
-- `jit.h`: shared JIT data structures and type aliases.
-- `jit_compiler.h`, `jit_compiler.cpp`: architecture-independent JIT compiler template and implementation.
-- `jit_base_emitter.h`: architecture-independent code emission base class.
-- `x86_emitter.h`, `x86_emitter.cpp`: x86_64 JIT code emitter.
-- `aarch64_emitter.h`, `aarch64_emitter.cpp`: AArch64 JIT code emitter.
+- `jit/`: JIT subsystem (compilers + architecture-specific emitters), compiled into `bpfvm_lib`.
+    - `jit.h`: shared JIT data structures and type aliases.
+    - `jit_compiler.h`, `jit_compiler.cpp`: architecture-independent JIT compiler template and implementation.
+    - `jit_base_emitter.h`: architecture-independent code emission base class.
+    - `x86_emitter.h`, `x86_emitter.cpp`: x86_64 JIT code emitter.
+    - `aarch64_emitter.h`, `aarch64_emitter.cpp`: AArch64 JIT code emitter.
 - `include/`: BPF-facing headers (syscall IDs, POSIX types) used by guest programs.
 - `cmake/`: CMake helper scripts (e.g., `RunBpfProgram.cmake` for CTest integration).
 - `bpfvm-ld`: BPF linker (replaces `binutils-bpf` `bpf-ld`); see `src/ld_main.cpp`.
-- `BpfWideArgs.cpp`: LLVM pass plugin that lifts the BPF limit (loaded via `clang -fpass-plugin=...`).
-- `BpfSoftFp.cpp`: LLVM pass plugin that rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support (loaded via `clang -fpass-plugin=...`).
+- `passes/`: LLVM pass plugins (compiled into `build/lib*.so`, loaded by `clang -fpass-plugin=...`).
+    - `BpfWideArgs.cpp`: lifts the BPF limit (5-arg, struct return, variadic).
+    - `BpfSoftFp.cpp`: rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support.
 - `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
@@ -122,7 +124,7 @@ The core idea is to **simulate a batch of floating-point instructions through th
 
 This is split across two layers (no guest-side glue):
 
-1. **`BpfSoftFp` LLVM pass** (`src/BpfSoftFp.cpp`, auto-built into `build/libBpfSoftFp.so`, auto-injected by `pdclib/bpf-toolchain.cmake` and `test/Makefile`) — the *encoding* stage: rewrites every floating-point IR instruction (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`, the fp↔int casts, `fpext`/`fptrunc`, and the `fmuladd`/`fma`/`sqrt` intrinsics) into `call <BPF_CALL_FP_*>` (an `inttoptr` call the backend lowers to `call <imm>` with `src_reg=0`). `src_reg=0` is the only call form the JIT can inline as a single instruction — a `src_reg=1` BPF-to-BPF call like `call __adddf3` would force a VM exit. IDs come from `include/bpf_call.h`. `fcmp` expands to *two* calls (`CMP` + `UNORD`) so each IEEE-754 predicate is reconstructed exactly.
+1. **`BpfSoftFp` LLVM pass** (`src/passes/BpfSoftFp.cpp`, auto-built into `build/libBpfSoftFp.so`, auto-injected by `pdclib/bpf-toolchain.cmake` and `test/Makefile`) — the *encoding* stage: rewrites every floating-point IR instruction (`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`, the fp↔int casts, `fpext`/`fptrunc`, and the `fmuladd`/`fma`/`sqrt` intrinsics) into `call <BPF_CALL_FP_*>` (an `inttoptr` call the backend lowers to `call <imm>` with `src_reg=0`). `src_reg=0` is the only call form the JIT can inline as a single instruction — a `src_reg=1` BPF-to-BPF call like `call __adddf3` would force a VM exit. IDs come from `include/bpf_call.h`. `fcmp` expands to *two* calls (`CMP` + `UNORD`) so each IEEE-754 predicate is reconstructed exactly.
 
 2. **Execution** — both paths resolve the same `BPF_CALL_FP_*` ID and run the op with the host's hardware FP (operands as `i64` bit patterns, result to `r0`):
    - **Interpreter**: `do_softfp` in `insn.cpp` — the reference, also the JIT's fallback.
@@ -132,7 +134,7 @@ This is split across two layers (no guest-side glue):
 
 **What still needs care:**
 *   `long double` == `double` (64-bit) on this target; code using 128-bit `long double` precision should be converted to `double` (see e.g. `log_10_2` in `_PDCLIB_print_fp_deci.c`).
-*   Only `sqrt` is softened among the math intrinsics so far; `fabs`/`copysign`/`floor`/`ceil`/… are trivial to add by extending the `IntrinsicInst` handler in `BpfSoftFp.cpp`.
+*   Only `sqrt` is softened among the math intrinsics so far; `fabs`/`copysign`/`floor`/`ceil`/… are trivial to add by extending the `IntrinsicInst` handler in `passes/BpfSoftFp.cpp`.
 
 ### 2. Function Call Conventions
 
@@ -143,9 +145,9 @@ The native BPF calling convention has three strict limits:
 3.  **Variadic Functions:** the backend rejects any variadic function (`isVarArg = true`) at the ISel stage (`"variadic functions are not supported"`, `BPFISelLowering.cpp`). This also covers non-variadic functions that use `va_arg`/`va_copy` intrinsics (e.g. `vfprintf`, which takes a `va_list` parameter).
 
 **Solution: BpfWideArgs pass**
-This project ships an LLVM pass plugin (`src/BpfWideArgs.cpp`) that transparently lifts **all three** limits at compile time, so you can write **standard C** with arbitrary numbers of arguments, struct returns, and `...` variadic functions. It is auto-built into `build/libBpfWideArgs.so` when LLVM dev headers are present, and auto-injected by `bpf-toolchain.cmake` / `test/Makefile`.
+This project ships an LLVM pass plugin (`src/passes/BpfWideArgs.cpp`) that transparently lifts **all three** limits at compile time, so you can write **standard C** with arbitrary numbers of arguments, struct returns, and `...` variadic functions. It is auto-built into `build/libBpfWideArgs.so` when LLVM dev headers are present, and auto-injected by `bpf-toolchain.cmake` / `test/Makefile`.
 
-**How it works** (see `src/BpfWideArgs.cpp`) — the three transforms are independent and composable (e.g. a 6-arg function returning a struct is supported):
+**How it works** (see `src/passes/BpfWideArgs.cpp`) — the three transforms are independent and composable (e.g. a 6-arg function returning a struct is supported):
 *   **>5 arguments:** the pass packs the 5th argument onward into a `__bpf_pack_<func>` struct, passed via a pointer in `r5`. The caller allocates the struct on the stack (re-entrancy/recursive safe); the callee loads the extra args at entry. Thus registers `r1`–`r4` hold the first four scalar args, and `r5` is the pack pointer.
 *   **Struct returns:** LLVM already lowers `struct` returns to the `sret` pointer convention (`void f(ptr sret, ...)`); the pass simply strips the `sret` attribute the BPF backend rejects. Semantics are unchanged.
 *   **Variadic functions** — clang's native `VoidPtrBuiltinVaList` is used, where `va_list` is a single `void*` pointing at the first vararg:

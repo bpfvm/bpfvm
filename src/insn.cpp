@@ -6,19 +6,18 @@
 #include "include/bpf_call.h"   // BPF_CALL_TO_ID / BPF_SYS_FP_*（do_syscall 拦截 FP 段）
 #include <iostream>
 
-#include "jit.h"
+#include "jit/jit.h"
 #include "include/auxv.h"
 #include <algorithm>
 #include <cstring>
-#include <sys/random.h>
 
 #if defined(__x86_64__)
-#include "jit_compiler.h"
-#include "x86_emitter.h"
+#include "jit/jit_compiler.h"
+#include "jit/x86_emitter.h"
 using JitCompilerImpl = JitCompiler<X86Emitter>;
 #elif defined(__aarch64__)
-#include "jit_compiler.h"
-#include "aarch64_emitter.h"
+#include "jit/jit_compiler.h"
+#include "jit/aarch64_emitter.h"
 using JitCompilerImpl = JitCompiler<AArch64Emitter>;
 #else
 class StubJitCompiler : public JitCompilerBase {
@@ -1372,7 +1371,7 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     uint64_t execfn_ptr = (!argv.empty()) ? header[1] : (STACK_BASE + platform_off);
 
     // AT_RANDOM 指向的 16 字节随机数据
-    ssize_t got = getrandom(stack_base + cursor, kRandomBytes, 0);
+    ssize_t got = ::syscall(SYS_getrandom, stack_base + cursor, kRandomBytes, 0);
     if(got != (ssize_t)kRandomBytes) {
         std::cerr << "Failed to get random bytes for AT_RANDOM" << std::endl;
         return false;

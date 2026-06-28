@@ -6,11 +6,11 @@ add_library(bpfvm_lib STATIC
     insn.cpp
     elf_loader.cpp
     posix_syscall.cpp
-    jit_compiler.cpp
-    x86_emitter.cpp
-    aarch64_emitter.cpp
+    jit/jit_compiler.cpp
+    jit/x86_emitter.cpp
+    jit/aarch64_emitter.cpp
 )
-target_include_directories(bpfvm_lib PUBLIC ${CMAKE_SOURCE_DIR})
+target_include_directories(bpfvm_lib PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 
 # ---------------------------------------------------------------------------
 # BpfWideArgs：BPF 突破 5 参数限制 + 返回结构体的 LLVM pass 插件
@@ -40,7 +40,7 @@ separate_arguments(LLVM_CXXFLAGS UNIX_COMMAND "${LLVM_CXXFLAGS}")
 separate_arguments(LLVM_LDFLAGS UNIX_COMMAND "${LLVM_LDFLAGS}")
 separate_arguments(LLVM_LIBS UNIX_COMMAND "${LLVM_LIBS}")
 
-add_library(BpfWideArgs MODULE BpfWideArgs.cpp)
+add_library(BpfWideArgs MODULE passes/BpfWideArgs.cpp)
 target_compile_options(BpfWideArgs PRIVATE ${LLVM_CXXFLAGS} -fno-rtti)
 target_link_libraries(BpfWideArgs PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
 set_target_properties(BpfWideArgs PROPERTIES
@@ -58,7 +58,7 @@ message(STATUS "BpfWideArgs: enabled (LLVM ${LLVM_VERSION}, plugin -> ${CMAKE_BI
 # （inttoptr(i64 编号)），后端 lower 成 `call <imm>`（src_reg=0），绕过 BPF
 # 后端在 ISel 阶段对 fadd/fmul/... 的拒绝。编译为 libBpfSoftFp.so，
 # 由 clang -fpass-plugin= 加载。
-add_library(BpfSoftFp MODULE BpfSoftFp.cpp)
+add_library(BpfSoftFp MODULE passes/BpfSoftFp.cpp)
 target_include_directories(BpfSoftFp PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_options(BpfSoftFp PRIVATE ${LLVM_CXXFLAGS} -fno-rtti)
 target_link_libraries(BpfSoftFp PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})

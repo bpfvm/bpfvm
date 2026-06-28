@@ -23,7 +23,6 @@ namespace bpf{
 #include <filesystem>
 #include <signal.h>
 #include <pthread.h>
-#include <sys/random.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sched.h>
@@ -1775,7 +1774,9 @@ bool PosixSyscall::do_getrandom(vm* v) {
         return true;
     }
     unsigned int flags = (unsigned int)arg_u32(v->r(3));
-    ssize_t rc = getrandom(buf, buflen, flags);
+    // 用 syscall(SYS_getrandom) 而非 libc wrapper：bionic 的 getrandom() 是
+    // __INTRODUCED_IN(28)，在 target API < 28（如 Termux 默认）时声明被隐藏。
+    ssize_t rc = ::syscall(SYS_getrandom, buf, buflen, flags);
     if(rc < 0) {
         v->r(0) = -errno;
         return true;

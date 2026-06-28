@@ -49,6 +49,17 @@ ROOT_BIN_DIR="${ROOT_DIR}/root/bin"
 
 mkdir -p "${ROOT_BIN_DIR}"
 
+# 构建 PDCLib（BPF 目标的 C 标准库）。它用 bpf-toolchain.cmake 交叉编译，
+# 产物安装到 pdclib/build/install，
+# 经项目根的 libc 软链暴露（libc/include、libc/lib64/libpdclib.a）。
+build_pdclib() {
+    echo "Building PDCLib..."
+    cd "${ROOT_DIR}/pdclib"
+    cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=bpf-toolchain.cmake
+    cmake --build build
+    cmake --install build --prefix build/install
+}
+
 # 构建系统库 libc.so（libpdclib 的动态形态）：放到 libc/lib64/，并复制一份到 root/lib/
 build_libc_bpfso() {
     echo "Building libc.so..."
@@ -105,6 +116,7 @@ build_sbase() {
     done
 }
 
+build_pdclib
 build_libc_bpfso
 build_dash
 build_sbase

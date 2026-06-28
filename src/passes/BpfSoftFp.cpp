@@ -348,8 +348,14 @@ llvmGetPassPluginInfo() {
                     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
                 };
                 // 有优化的级别（-O1+）：走 optimizer 末尾。
+                // LLVM >= 21 给 OptimizerLastEPCallback 增加了 ThinOrFullLTOPhase 形参。
                 PB.registerOptimizerLastEPCallback(
+#if LLVM_VERSION_MAJOR >= 21
+                    [addPass](ModulePassManager &MPM, OptimizationLevel OL,
+                              ThinOrFullLTOPhase) {
+#else
                     [addPass](ModulePassManager &MPM, OptimizationLevel OL) {
+#endif
                         addPass(MPM);
                     });
                 // -O0：没有 optimizer 阶段，只能在管道起始跑。

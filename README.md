@@ -101,12 +101,14 @@ make -C test
 │   ├── elf_loader.h/cpp      # BPF ELF 加载与库搜索
 │   ├── elf_linker.h/cpp      # 离线 BPF 链接器核心（静态/共享/动态三种模式）
 │   ├── ld_main.cpp           # bpfvm-ld CLI
-│   ├── jit.h, jit_base_emitter.h     # JIT 共享结构与发射基类
-│   ├── jit_compiler.h/cpp    # 架构无关的 JIT 编译器模板
-│   ├── x86_emitter.h/cpp     # x86_64 JIT 代码发射
-│   ├── aarch64_emitter.h/cpp # AArch64 JIT 代码发射
-│   ├── BpfWideArgs.cpp       # LLVM pass：突破 5 参数限制 + 返回结构体 + 变参函数
-│   ├── BpfSoftFp.cpp         # LLVM pass：把浮点 IR 改写为软浮点 call（启用 float/double）
+│   ├── jit/                  # JIT 子系统（编译器 + 各架构发射器）
+│   │   ├── jit.h, jit_base_emitter.h     # JIT 共享结构与发射基类
+│   │   ├── jit_compiler.h/cpp    # 架构无关的 JIT 编译器模板
+│   │   ├── x86_emitter.h/cpp     # x86_64 JIT 代码发射
+│   │   └── aarch64_emitter.h/cpp # AArch64 JIT 代码发射
+│   ├── passes/               # LLVM pass 插件（编译为 build/lib*.so，由 clang -fpass-plugin= 加载）
+│   │   ├── BpfWideArgs.cpp   #   突破 5 参数限制 + 返回结构体 + 变参函数
+│   │   └── BpfSoftFp.cpp     #   把浮点 IR 改写为软浮点 call（启用 float/double）
 │   └── insn_test.cpp         # 指令集单元测试
 ├── include/              # BPF Guest 程序使用的头文件（syscall ID、POSIX 类型、浮点 call 编号）
 ├── cmake/                # CMake 辅助脚本（CTest 集成等）
