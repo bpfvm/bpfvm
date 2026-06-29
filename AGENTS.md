@@ -22,7 +22,9 @@
 - `passes/`: LLVM pass plugins (compiled into `build/lib*.so`, loaded by `clang -fpass-plugin=...`).
     - `BpfWideArgs.cpp`: lifts the BPF limit (5-arg, struct return, variadic).
     - `BpfSoftFp.cpp`: rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support.
-- `libc/`, `pdclib/`: C library sources and build artifacts used for BPF targets.
+- `musl/`: default C library for BPF targets (musl 1.2.6 port); built via `sh musl/build.sh` → `musl/build/install/{include,lib}`.
+- `libc/`: symlink → `musl/build/install` (default); exposes headers (`-Ilibc/include`) and archives (`-Llibc/lib`).
+- `pdclib/`: alternative C library (optional, not built by default); sources + `bpf-toolchain.cmake` kept for manual builds.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
 - `root/`: demo rootfs output directory (binaries installed to `root/bin`).
@@ -80,8 +82,8 @@ The VM uses a hybrid interpreter/JIT execution model:
 - Syscall IDs are defined in `include/bpf_call.h` and encoded via `BPF_CALL_BASE` / `BPF_CALL_ID()`; the VM dispatches them through the `SyscallHandler::syscall()` virtual method.
 - The VM reads syscall arguments from registers (`r(1)`..`r(5)`), translates guest pointers with `mmu()`, and returns results in `r(0)`; errors are negative `errno` values.
 - Signal handling uses a lock-free multi-producer-single-consumer queue (`MpscQueue`) in `PosixSyscall`, with support for `SIGKILL`/`SIGSTOP`/`SIGCONT` bypassing the queue via direct flags.
-- C library wrappers live in `pdclib/platform/bpf/functions/posix/syscall.c` and map POSIX functions (`open`, `read`, `mmap`, `fork`, etc.) to `BPF_CALL_*` IDs.
-- The low-level `syscall()` macro in `pdclib/platform/bpf/include/pdclib/_PDCLIB_config.h` dispatches by casting the call ID to a function pointer with 0–5 args, so the VM sees a direct call to `BPF_CALL_*`.
+- C library wrappers (default musl) live in `musl/arch/bpf/syscall_arch.h` and the musl `src/` tree, mapping POSIX functions (`open`, `read`, `mmap`, `fork`, etc.) to `BPF_CALL_*` IDs. (pdclib's equivalents are in `pdclib/platform/bpf/functions/posix/syscall.c`, used only when building against pdclib.)
+- The low-level `syscall()` path dispatches by casting the call ID to a function pointer with 0–5 args, so the VM sees a direct call to `BPF_CALL_*`.
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short and action-oriented; recent history uses concise Chinese phrases (e.g., “实现dup2”).
@@ -95,8 +97,8 @@ The VM uses a hybrid interpreter/JIT execution model:
 ## BPF Linker (`bpfvm-ld`)
 The project ships its own BPF linker `bpfvm-ld` that fully replaces `binutils-bpf` `bpf-ld`. Three modes (share the same `Linker` core), aligned with standard `ld` defaults:
 
-- **Static** (`-static`): merges `.o` + archives into a self-contained ET_EXEC (fixed address). Example: `bpfvm-ld -static foo.o -l:libpdclib.a -o foo.linked`.
-- **Shared library** (`-shared` / `--shared`): builds a `.so` from an archive, exports its GLOBAL symbol table, PIE (p_vaddr=0, loadable at any address). Example: `bpfvm-ld --shared --soname libc.so libpdclib.a -o libc.so`.
+- **Static** (`-static`): merges `.o` + archives into a self-contained ET_EXEC (fixed address). Example: `bpfvm-ld -static foo.o -l:libc.a -o foo.linked`.
+- **Shared library** (`-shared` / `--shared`): builds a `.so` from an archive, exports its GLOBAL symbol table, PIE (p_vaddr=0, loadable at any address). Example: `bpfvm-ld --shared --soname libc.so libc.a -o libc.so`.
 - **Dynamic executable** (default): builds a PIE ET_DYN that references `.so` dependencies via `DT_NEEDED`. Cross-module function calls go through PLT/GOT; cross-module data references are recorded in `.rela.dyn`. At runtime `bpfvm` allocates load addresses and applies relocations. Example: `bpfvm-ld foo.o -l libc.so -o foo.linked`.
 
 All three modes emit **three permission-separated `PT_LOAD` segments** (W^X), classified from section flags by `layout_segments` (`src/elf_linker.cpp`):
@@ -130,7 +132,7 @@ This is split across two layers (no guest-side glue):
    - **Interpreter**: `do_softfp` in `insn.cpp` — the reference, also the JIT's fallback.
    - **JIT**: `emit_call_softfp()` recognizes the ID and emits native host FP code inline. Because the JIT keeps all 11 BPF registers resident in physical registers, r1/r2/r0 are already in place (x86: R9/R10/R8; AArch64: X10/X11/X9) — no flush, no VM exit, the op is just one more instruction in the stream. Per-arch details and the encoding gotchas hit during bring-up are commented at each `emit_call_softfp` site. The only architectural difference that matters at this level: **AArch64 has native `FCVTZU`/`UCVTF` and handles every `BPF_CALL_FP_*` natively, whereas x86 lacks unsigned fp↔int conversion (needs AVX-512), so on x86 the unsigned-conversion IDs fall back to `do_softfp`** via the normal syscall path.
 
-**ABI details:** Floating-point values are stored as IEEE-754 bit patterns in the 64-bit BPF registers / stack slots — no precision is lost. Varargs like `printf("%f", x)` work through the existing `BpfWideArgs` pass (`va_list` slots are 8 bytes). `printf %f` formatting is enabled in PDCLib (`functions/_PDCLIB/_PDCLIB_print.c` `#if 1` block + the `_PDCLIB_print_fp*` / `_PDCLIB_fp_from_dbl` sources in the build).
+**ABI details:** Floating-point values are stored as IEEE-754 bit patterns in the 64-bit BPF registers / stack slots — no precision is lost. Varargs like `printf("%f", x)` work through the existing `BpfWideArgs` pass (`va_list` slots are 8 bytes). `printf %f` formatting is provided by the default musl libc (musl's printf handles `%f`/`%e`/`%g` natively); under pdclib it is enabled via the `functions/_PDCLIB/_PDCLIB_print.c` `#if 1` block + `_PDCLIB_print_fp*` sources.
 
 **What still needs care:**
 *   `long double` == `double` (64-bit) on this target; code using 128-bit `long double` precision should be converted to `double` (see e.g. `log_10_2` in `_PDCLIB_print_fp_deci.c`).
@@ -215,35 +217,42 @@ Varargs can be emulated entirely in the headers with a pseudo-`va_list` that the
     })
     ```
 
-## PDCLib Build & Installation
+## Default C Library (musl) & Optional PDCLib
 
-1.  **Cross-Compilation**: Build PDCLib using the built-in BPF toolchain configuration:
+The default C library for BPF targets is **musl** (`musl/`). Build it with `sh musl/build.sh`; the `libc` symlink at the project root points to `musl/build/install`, so `-Ilibc/include` and `-Llibc/lib` resolve to musl's headers and `libc.a` (with crt merged in, containing `_start`).
+
+### Building musl (default)
+```bash
+sh musl/build.sh          # → musl/build/install/{include,lib}
+./build_root.sh           # also runs build_musl + synthesizes libc.so
+```
+
+### Building PDCLib (optional alternative)
+PDCLib is kept as an optional C library but is **not built by default**. To use it instead of musl:
+1.  **Cross-Compilation**:
     ```bash
     cd pdclib
     cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=bpf-toolchain.cmake
     cmake --build build
-    ```
-
-2.  **Installation**: Install the build artifacts to the `build/install` directory:
-    ```bash
     cmake --install build --prefix build/install
     ```
-
-3.  **Using the `libc` Symlink**:
-The `libc` directory in the project root is a pre-configured symbolic link pointing to `pdclib/build/install`. **Once the installation steps are completed, this symlink becomes active**. BPF compilers (e.g., clang) can then easily reference standard library headers and archives via `-Ilibc/include` and `-Llibc/lib`.
+2.  **Switch the `libc` symlink**: `ln -sfn pdclib/build/install libc`
+3.  BPF compilers then reference PDCLib via `-Ilibc/include` and `-Llibc/lib64 -l:libpdclib.a`.
 
 ## musl Porting (`musl/`)
 
-The project ships a port of musl 1.2.6 as an alternative C library for the BPF target. Build with `sh musl/build_bpf.sh` — produces `musl/build_bpf/lib/libc.a` (+ `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`) and headers in `musl/build_bpf/install/include/`. Test programs are built with `sh test/build_musl.sh` (static `.musl.out` + dynamic `.musl.linked`).
+The project ships a port of musl 1.2.6 as the **default** C library for the BPF target. Build with `sh musl/build.sh` — produces `musl/build/install/lib/libc.a` (with `crt1.o`/`crti.o`/`crtn.o` merged in, so it contains `_start`) + standalone `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`, and headers in `musl/build/install/include/`. `test/Makefile` and `build_root.sh` build against this musl directly (static `.out` + dynamic `.linked`).
 
-### musl build (`musl/build_bpf.sh`)
-- **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` at test-build time, not by musl's own build.
+### musl build (`musl/build.sh`)
+- **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (in `build_root.sh`'s `build_libc_bpfso`), not by musl's own build.
 - **`-mllvm -bpf-stack-size=16384`**: musl's `crypt_blowfish` (`BF_crypt`) has ~8.5KB local structs; the default 4096 overflows.
 - **rcrt1.o skipped**: `make install` compiles `rcrt1.o` (static PIE self-start, depends on `dlstart` dynamic linker logic — BPF can't support it) and fails. The script builds only `crt1`/`crti`/`crtn`/`Scrt1` via per-target `make obj/crt/<name>.o`, then manually copies headers to `install/include/` (generic/bits first, then bpf/bits so BPF-specific overrides win).
+- **crt merged into libc.a**: BPF's `_start` lives in `crt1.o` (pure C, `arch/bpf/crt_arch.h`); `crti.o`/`crtn.o` are empty (BPF has no `.init_array`/`.fini_array` framework). The script runs `ar rcs lib/libc.a lib/crt1.o lib/crti.o lib/crtn.o` so `libc.a` carries `_start` itself — like pdclib, linkers only pass `libc.a`/`libc.so` and need no separate crt files or ordering. `Scrt1.o` is not merged (it also defines `_start`, would duplicate).
+- **install layout**: `install/{include,lib}` mirrors pdclib's layout so the project-root `libc` symlink abstracts the choice; `install/lib` holds `libc.a` (+ crt), `Scrt1.o`, `crt1.o`/`crti.o`/`crtn.o`.
 
 ### Pass rebuild after `.so` changes
-**pdclib (CMake) and musl (Make) do NOT track `libBpfWideArgs.so`/`libBpfSoftFp.so` timestamp changes** — they only look at `.c` source mtimes. After modifying either pass, force a full rebuild:
-- pdclib: `rm -rf pdclib/build`, then `build_root.sh` to regenerate `libc.so`.
-- musl: `find musl/build_bpf/obj -name '*.o' -delete && sh musl/build_bpf.sh` (re-runs `make lib/libc.a` + crt + header install).
+**musl (Make, default) and pdclib (CMake, optional) do NOT track `libBpfWideArgs.so`/`libBpfSoftFp.so` timestamp changes** — they only look at `.c` source mtimes. After modifying either pass, force a full rebuild:
+- musl (default): `find musl/build/obj -name '*.o' -delete && sh musl/build.sh` (re-runs `make lib/libc.a` + crt + merge crt into libc.a + header/lib install), then `./build_root.sh` to regenerate `libc.so`.
+- pdclib (optional): `rm -rf pdclib/build`, then rebuild pdclib + `bpfvm-ld -shared` to regenerate `libc.so`.
 
 Skipping this reuses stale `.o` compiled with the old pass (a past incident: deleting `__va_arg` left old `.o` still referencing it, causing `_va_arg` undefined at link).

@@ -6,14 +6,18 @@ CLANG_RES=$(clang -print-resource-dir)/include
 BPFVM_LD="${ROOT_DIR}/build/bpfvm-ld"
 
 # BPF 交叉编译 flags。
-# -nostdinc：不用宿主 glibc 头，只用 PDCLib(libc/include) + BPF guest 头(include)。
+# -nostdinc：不用宿主 glibc 头，只用 musl(libc/include) + BPF guest 头(include)。
 # -fno-builtin：必须保留。否则 clang 会把 mempcpy/strchr/stpcpy/... 等 builtin
 #   优化成对 memcpy 等的调用，而 BPF 后端在 ISel 拒绝这类 builtin lowering
 #   （实测 dash 的 arith_yylex.c:mempcpy 即触发）。强制走 PDCLib 的库实现即可。
 # 浮点由 BpfSoftFp pass 在 IR 层处理（见下），不依赖 -fno-builtin。
 # 两个 pass plugin：libBpfWideArgs（突破 5 参数限制）、libBpfSoftFp（软件浮点），
 #   存在才加载，避免插件没编出来时 clang 报 "cannot find"。
-COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=4096 -nostdinc -fno-builtin"
+# -D_GNU_SOURCE：musl 的 bits/*.h 用 _POSIX/_GNU/_BSD feature 宏门控；显式开启全部
+#   POSIX/GNU/BSD 接口（musl 应用惯例，避免 struct sigaction 等类型缺失）。
+# -mllvm -bpf-stack-size=16384：musl 头比 pdclib 完整，dash cd.c:setpwd 等函数局部
+#   变量栈超 4096（pdclib 时代 4096 够，切 musl 后超限），统一用 16384（与 musl/test 一致）。
+COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -nostdinc -fno-builtin -D_GNU_SOURCE"
 if [ -f "${ROOT_DIR}/build/libBpfWideArgs.so" ]; then
     COMMON_CFLAGS="${COMMON_CFLAGS} -fpass-plugin=${ROOT_DIR}/build/libBpfWideArgs.so"
 fi
@@ -49,24 +53,23 @@ ROOT_BIN_DIR="${ROOT_DIR}/root/bin"
 
 mkdir -p "${ROOT_BIN_DIR}"
 
-# 构建 PDCLib（BPF 目标的 C 标准库）。它用 bpf-toolchain.cmake 交叉编译，
-# 产物安装到 pdclib/build/install，
-# 经项目根的 libc 软链暴露（libc/include、libc/lib64/libpdclib.a）。
-build_pdclib() {
-    echo "Building PDCLib..."
-    cd "${ROOT_DIR}/pdclib"
-    cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=bpf-toolchain.cmake
-    cmake --build build
-    cmake --install build --prefix build/install
+# 构建 musl（BPF 目标的 C 标准库）。musl/build.sh 交叉编译产出 libc.a（已合并 crt，
+# 含 _start）和头，安装到 musl/build/install，经项目根的 libc 软链暴露
+# （libc/include、libc/lib/libc.a）。
+build_musl() {
+    echo "Building musl..."
+    cd "${ROOT_DIR}"
+    sh musl/build.sh
 }
 
-# 构建系统库 libc.so（libpdclib 的动态形态）：放到 libc/lib64/，并复制一份到 root/lib/
+# 构建系统库 libc.so（musl libc.a 的动态形态；libc.a 已含 _start，故 libc.so 自带入口）：
+# 放到 libc/lib/，并复制一份到 root/lib/
 build_libc_bpfso() {
     echo "Building libc.so..."
     "${BPFVM_LD}" -shared --soname libc.so \
-        "${ROOT_DIR}/libc/lib64/libpdclib.a" -o "${ROOT_DIR}/libc/lib64/libc.so"
+        "${ROOT_DIR}/libc/lib/libc.a" -o "${ROOT_DIR}/libc/lib/libc.so"
     mkdir -p "${ROOT_DIR}/root/lib"
-    cp -f "${ROOT_DIR}/libc/lib64/libc.so" "${ROOT_DIR}/root/lib/libc.so"
+    cp -f "${ROOT_DIR}/libc/lib/libc.so" "${ROOT_DIR}/root/lib/libc.so"
 }
 
 build_dash() {
@@ -86,7 +89,7 @@ build_dash() {
         CC_FOR_BUILD="gcc" \
         CFLAGS="-std=gnu11 ${COMMON_CFLAGS} -DJOBS=0" \
         LDFLAGS="${COMMON_LDFLAGS}" \
-        LIBS="${ROOT_DIR}/libc/lib64/libpdclib.a" \
+        LIBS="${ROOT_DIR}/libc/lib/libc.a" \
         --enable-fnmatch
 
     echo "Building dash..."
@@ -105,7 +108,7 @@ build_sbase() {
     COMPILER_PATH="${LD_WRAPPER_DIR}" make \
         CC="clang" \
         CFLAGS="${COMMON_CFLAGS}" \
-        LIB="libutf.a libutil.a ${ROOT_DIR}/libc/lib64/libpdclib.a" \
+        LIB="libutf.a libutil.a ${ROOT_DIR}/libc/lib/libc.a" \
         LDFLAGS="${COMMON_LDFLAGS}"
 
     echo "Build complete. Binaries are in sbase"
@@ -116,7 +119,7 @@ build_sbase() {
     done
 }
 
-build_pdclib
+build_musl
 build_libc_bpfso
 build_dash
 build_sbase
