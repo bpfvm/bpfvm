@@ -19,6 +19,7 @@ namespace bpf{
 #include <memory>
 #include <time.h>
 #include <string.h>
+#include <cstring>
 #include <unistd.h>
 #include <filesystem>
 #include <signal.h>
@@ -79,46 +80,6 @@ bool MpscQueue::try_pop(int& value) {
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
 std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map{};
 std::mutex PosixSyscall::pid_map_mutex;
-
-static void fill_bpf_stat64(const struct stat& st, bpf::stat& out) {
-    out.st_dev = static_cast<decltype(out.st_dev)>(st.st_dev);
-    out.st_ino = static_cast<decltype(out.st_ino)>(st.st_ino);
-    out.st_mode = static_cast<decltype(out.st_mode)>(st.st_mode);
-    out.st_nlink = static_cast<decltype(out.st_nlink)>(st.st_nlink);
-    out.st_uid = static_cast<decltype(out.st_uid)>(st.st_uid);
-    out.st_gid = static_cast<decltype(out.st_gid)>(st.st_gid);
-    out.st_rdev = static_cast<decltype(out.st_rdev)>(st.st_rdev);
-    out.st_size = static_cast<decltype(out.st_size)>(st.st_size);
-    out.st_blksize = static_cast<decltype(out.st_blksize)>(st.st_blksize);
-    out.st_blocks = static_cast<decltype(out.st_blocks)>(st.st_blocks);
-
-#if defined(__linux__)
-    out.st_atim.tv_sec = static_cast<decltype(out.st_atim.tv_sec)>(st.st_atim.tv_sec);
-    out.st_atim.tv_nsec = static_cast<decltype(out.st_atim.tv_nsec)>(st.st_atim.tv_nsec);
-#else
-    out.st_atim.tv_sec = static_cast<decltype(out.st_atim.tv_sec)>(st.st_atime);
-    out.st_atim.tv_nsec = 0;
-#endif
-
-
-#if defined(__linux__)
-    out.st_mtim.tv_sec = static_cast<decltype(out.st_mtim.tv_sec)>(st.st_mtim.tv_sec);
-    out.st_mtim.tv_nsec = static_cast<decltype(out.st_mtim.tv_nsec)>(st.st_mtim.tv_nsec);
-#else
-    out.st_mtim.tv_sec = static_cast<decltype(out.st_mtim.tv_sec)>(st.st_mtime);
-    out.st_mtim.tv_nsec = 0;
-#endif
-
-
-#if defined(__linux__)
-    out.st_ctim.tv_sec = static_cast<decltype(out.st_ctim.tv_sec)>(st.st_ctim.tv_sec);
-    out.st_ctim.tv_nsec = static_cast<decltype(out.st_ctim.tv_nsec)>(st.st_ctim.tv_nsec);
-#else
-    out.st_ctim.tv_sec = static_cast<decltype(out.st_ctim.tv_sec)>(st.st_ctime);
-    out.st_ctim.tv_nsec = 0;
-#endif
-}
-
 
 static inline int32_t arg_s32(uint64_t v) {
     return static_cast<int32_t>(v);
@@ -657,28 +618,25 @@ bool PosixSyscall::do_unlinkat(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_mkdir(vm* v) {
+bool PosixSyscall::do_mkdirat(vm* v) {
+    int dirfd = arg_s32(v->r(1));
     std::string path;
-    if(!read_c_string(v, v->r(1), path, 4096)) {
+    if(!read_c_string(v, v->r(2), path, 4096)) {
         v->r(0) = -EFAULT;
         return true;
     }
-    int rc = mkdir(resolve_path(path).c_str(), (mode_t)(arg_u32(v->r(2)) & ~umask_val));
-    if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+    mode_t mode = (mode_t)(arg_u32(v->r(3)) & ~umask_val);
+    int rc;
+    if(dirfd == AT_FDCWD) {
+        rc = mkdir(resolve_path(path).c_str(), mode);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            v->r(0) = -EBADF;
+            return true;
+        }
+        rc = mkdirat(it->second->fd, path.c_str(), mode);
     }
-    v->r(0) = 0;
-    return true;
-}
-
-bool PosixSyscall::do_rmdir(vm* v) {
-    std::string path;
-    if(!read_c_string(v, v->r(1), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
-    }
-    int rc = rmdir(resolve_path(path).c_str());
     if(rc == -1) {
         v->r(0) = -errno;
         return true;
@@ -763,7 +721,7 @@ bool PosixSyscall::do_linkat(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_renameat(vm* v) {
+bool PosixSyscall::do_renameat2(vm* v) {
     std::string old_path;
     std::string new_path;
     if(!read_c_string(v, v->r(2), old_path, 4096) || !read_c_string(v, v->r(4), new_path, 4096)) {
@@ -772,6 +730,7 @@ bool PosixSyscall::do_renameat(vm* v) {
     }
     int old_dirfd = arg_s32(v->r(1));
     int new_dirfd = arg_s32(v->r(3));
+    unsigned int flags = arg_u32(v->r(5));
 
     int host_old_dirfd = AT_FDCWD;
     if (old_dirfd != AT_FDCWD) {
@@ -801,7 +760,8 @@ bool PosixSyscall::do_renameat(vm* v) {
     if(new_dirfd == AT_FDCWD) {
         resolved_new = resolve_path(new_path);
     }
-    int rc = renameat(host_old_dirfd, resolved_old.c_str(), host_new_dirfd, resolved_new.c_str());
+    int rc = renameat2(host_old_dirfd, resolved_old.c_str(),
+                       host_new_dirfd, resolved_new.c_str(), flags);
     if(rc == -1) {
         v->r(0) = -errno;
         return true;
@@ -810,19 +770,30 @@ bool PosixSyscall::do_renameat(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_readlink(vm* v) {
+bool PosixSyscall::do_readlinkat(vm* v) {
+    int dirfd = arg_s32(v->r(1));
     std::string path;
-    if(!read_c_string(v, v->r(1), path, 4096)) {
+    if(!read_c_string(v, v->r(2), path, 4096)) {
         v->r(0) = -EFAULT;
         return true;
     }
-    size_t bufsiz = arg_size(v->r(3));
-    char* buf = (char*)v->mmu_w(v->r(2), bufsiz);
+    size_t bufsiz = arg_size(v->r(4));
+    char* buf = (char*)v->mmu_w(v->r(3), bufsiz);
     if(buf == nullptr) {
         v->r(0) = -EFAULT;
         return true;
     }
-    int rc = readlink(resolve_path(path).c_str(), buf, bufsiz);
+    ssize_t rc;
+    if(dirfd == AT_FDCWD) {
+        rc = readlink(resolve_path(path).c_str(), buf, bufsiz);
+    } else {
+        auto it = fds.find(dirfd);
+        if(it == fds.end()) {
+            v->r(0) = -EBADF;
+            return true;
+        }
+        rc = readlinkat(it->second->fd, path.c_str(), buf, bufsiz);
+    }
     if(rc == -1) {
         v->r(0) = -errno;
         return true;
@@ -1143,11 +1114,20 @@ bool PosixSyscall::do_dup(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_dup2(vm* v) {
+bool PosixSyscall::do_dup3(vm* v) {
     int old_fd = arg_s32(v->r(1));
     int new_fd = arg_s32(v->r(2));
+    int flags = arg_s32(v->r(3));
     if(old_fd < 0 || new_fd < 0) {
         v->r(0) = -EBADF;
+        return true;
+    }
+    if(old_fd == new_fd) {
+        v->r(0) = -EINVAL;
+        return true;
+    }
+    if(flags & ~O_CLOEXEC) {
+        v->r(0) = -EINVAL;
         return true;
     }
 
@@ -1157,18 +1137,17 @@ bool PosixSyscall::do_dup2(vm* v) {
         return true;
     }
 
-    if(old_fd == new_fd) {
-        v->r(0) = new_fd;
-        return true;
-    }
-
     int new_host_fd = dup(it->second->fd);
     if(new_host_fd < 0) {
         v->r(0) = -errno;
         return true;
     }
 
-    fds[new_fd] = std::make_shared<fd_handle>(new_host_fd, it->second->path);
+    auto handle = std::make_shared<fd_handle>(new_host_fd, it->second->path);
+    if(flags & O_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    fds[new_fd] = handle;
     v->r(0) = new_fd;
     return true;
 }
@@ -1256,36 +1235,40 @@ bool PosixSyscall::do_getcwd(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_fstatat(vm* v) {
+bool PosixSyscall::do_statx(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
         v->r(0) = -EFAULT;
         return true;
     }
-    auto out = static_cast<bpf::stat*>(v->mmu_w(v->r(3), sizeof(bpf::stat)));
+    int flags = arg_s32(v->r(3));
+    unsigned int mask = arg_u32(v->r(4));
+    auto out = static_cast<bpf::statx*>(v->mmu_w(v->r(5), sizeof(bpf::statx)));
     if(out == nullptr) {
         v->r(0) = -EFAULT;
         return true;
     }
-    int flags = arg_s32(v->r(4));
-    struct stat st = {};
+    /* host struct statx 与 bpf::statx 均源自 Linux UAPI stat.h，布局二进制兼容
+     *（同 256 字节、同偏移），故 host statx() 直写后 memcpy 即可，无需逐字段转换。 */
+    static_assert(sizeof(bpf::statx) == sizeof(struct statx));
+    struct statx stx = {};
     int rc = -1;
     if(dirfd == AT_FDCWD) {
-        rc = fstatat(AT_FDCWD, resolve_path(path).c_str(), &st, flags);
+        rc = statx(AT_FDCWD, resolve_path(path).c_str(), flags, mask, &stx);
     } else {
         auto it = fds.find(dirfd);
         if(it == fds.end()) {
             v->r(0) = -EBADF;
             return true;
         }
-        rc = fstatat(it->second->fd, path.c_str(), &st, flags);
+        rc = statx(it->second->fd, path.c_str(), flags, mask, &stx);
     }
     if(rc == -1) {
         v->r(0) = -errno;
         return true;
     }
-    fill_bpf_stat64(st, *out);
+    std::memcpy(out, &stx, sizeof(bpf::statx));
     v->r(0) = 0;
     return true;
 }
@@ -1948,23 +1931,22 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_FTRUNCATE:     return do_ftruncate(v);
     case BPF_SYS_CLOSE:         return do_close(v);
     case BPF_SYS_UNLINKAT:      return do_unlinkat(v);
-    case BPF_SYS_MKDIR:         return do_mkdir(v);
-    case BPF_SYS_RMDIR:         return do_rmdir(v);
+    case BPF_SYS_MKDIRAT:       return do_mkdirat(v);
     case BPF_SYS_SYMLINKAT:     return do_symlinkat(v);
     case BPF_SYS_LINKAT:        return do_linkat(v);
-    case BPF_SYS_RENAMEAT:      return do_renameat(v);
-    case BPF_SYS_READLINK:      return do_readlink(v);
+    case BPF_SYS_RENAMEAT2:     return do_renameat2(v);
+    case BPF_SYS_READLINKAT:    return do_readlinkat(v);
     case BPF_SYS_EXECVE:        return do_execve(v);
     case BPF_SYS_FORK:          return do_fork(v);
     case BPF_SYS_GETPID:        return do_getpid(v);
     case BPF_SYS_GETPPID:       return do_getppid(v);
     case BPF_SYS_WAITPID:       return do_waitpid(v);
     case BPF_SYS_DUP:           return do_dup(v);
-    case BPF_SYS_DUP2:          return do_dup2(v);
+    case BPF_SYS_DUP3:          return do_dup3(v);
     case BPF_SYS_PIPE2:         return do_pipe2(v);
     case BPF_SYS_FCHDIR:        return do_fchdir(v);
     case BPF_SYS_GETCWD:        return do_getcwd(v);
-    case BPF_SYS_FSTATAT:       return do_fstatat(v);
+    case BPF_SYS_STATX:         return do_statx(v);
     case BPF_SYS_FCHMODAT:      return do_fchmodat(v);
     case BPF_SYS_UTIMENSAT:     return do_utimensat(v);
     case BPF_SYS_FACCESSAT:     return do_faccessat(v);

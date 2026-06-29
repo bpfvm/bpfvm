@@ -6,10 +6,10 @@
 
 /*
  * struct stat 布局：对齐 musl 的 bits/stat.h（x86_64 kernel 风格）。
- * 字段顺序、padding、末尾 __unused 都与 musl 一致——musl/PDCLib guest 程序与 VM 的
- * fill_bpf_stat64（posix_syscall.cpp）读写同一份布局，偏移必须严丝合缝。
+ * 字段顺序、padding、末尾 __unused 都与 musl 一致——PDCLib 的 fstatat 封装
+ *（statx→stat 转换）写入此布局，guest 程序读取，偏移必须严丝合缝。
  * 关键差异点（相对早期布局）：st_nlink 在 st_mode 之前；st_gid 后有 __pad0；
- * 末尾有 __unused[3]。注释里的偏移供核对（见 fill_bpf_stat64）。
+ * 末尾有 __unused[3]。注释里的偏移供核对。
  */
 struct stat {
     dev_t       st_dev;         /* 0x00 */
@@ -77,6 +77,62 @@ struct stat {
 #define AT_EACCESS		0x200
 #define UTIME_NOW		((1L << 30) - 1L)
 #define UTIME_OMIT		((1L << 30) - 2L)
+
+/* struct statx 布局对齐 musl include/sys/stat.h（源自 Linux UAPI stat.h）。
+ * VM do_statx（posix_syscall.cpp）与 guest 程序读写同一份布局，偏移须严丝合缝。
+ * host glibc 的 struct statx 同源 UAPI，二进制兼容（均 256 字节）。 */
+struct statx_timestamp {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    uint32_t __pad;
+};
+
+struct statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __pad0[1];
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct statx_timestamp stx_atime;
+    struct statx_timestamp stx_btime;
+    struct statx_timestamp stx_ctime;
+    struct statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint32_t stx_dio_mem_align;
+    uint32_t stx_dio_offset_align;
+    uint64_t stx_subvol;
+    uint32_t stx_atomic_write_unit_min;
+    uint32_t stx_atomic_write_unit_max;
+    uint32_t stx_atomic_write_segments_max;
+    uint32_t __pad1[1];
+    uint64_t __pad2[9];
+};
+
+#define STATX_TYPE 1U
+#define STATX_MODE 2U
+#define STATX_NLINK 4U
+#define STATX_UID 8U
+#define STATX_GID 0x10U
+#define STATX_ATIME 0x20U
+#define STATX_MTIME 0x40U
+#define STATX_CTIME 0x80U
+#define STATX_INO 0x100U
+#define STATX_SIZE 0x200U
+#define STATX_BLOCKS 0x400U
+#define STATX_BASIC_STATS 0x7ffU
+#define STATX_BTIME 0x800U
+#define STATX_ALL 0xfffU
 
 #ifndef BPF_NO_SYSCALL
 int stat(const char *path, struct stat *buf);
