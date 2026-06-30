@@ -123,6 +123,7 @@ struct DynSecOut {
     size_t reladyn_idx = SIZE_MAX;
     size_t relaplt_idx = SIZE_MAX;
     size_t dynamic_idx = SIZE_MAX;
+    size_t dynamic_sym_off = SIZE_MAX;  // _DYNAMIC 符号在 .dynsym 数据中的字节偏移（st_value 字段），SIZE_MAX=未合成
 };
 
 // compute_file_layout 的输出：ELF 文件布局的关键尺寸/偏移
@@ -944,7 +945,7 @@ private:
     //
     // 例外 STB_LOCAL：文件私有符号（如 static 函数、section 符号），不进 globals_，
     // 直接用本 obj 定义。
-    std::optional<uint64_t> resolve_symbol(size_t obj_idx, size_t sym_idx) {
+    std::optional<uint64_t> resolve_symbol(size_t obj_idx, size_t sym_idx) const {
         const auto& sym = objects_[obj_idx].symbols[sym_idx];
 
         // STB_LOCAL：本 obj 私有，直接用本 obj 定义
@@ -1178,6 +1179,7 @@ private:
                 if (r.sym_idx >= objects_[oi].symbols.size()) continue;
                 const auto& sym = objects_[oi].symbols[r.sym_idx];
                 if (sym.defined || sym.name.empty()) continue;
+                if (sym.name == "_DYNAMIC") continue;  // 由 build_dynamic_sections 合成为 defined 符号
                 if (idx.find(sym.name) == idx.end()) {
                     idx[sym.name] = names.size();
                     names.push_back(sym.name);
@@ -1236,6 +1238,15 @@ private:
             dynstr.data.push_back(0);
             export_name_off[sym.name] = off;
         }
+        // _DYNAMIC：标准 ld 在 PIE/.so 上合成的符号，指向 .dynamic section 起始。
+        // musl __init_tls/dl_iterate_phdr 用它（weak 引用）反推加载基址。bpfvm-ld
+        // 这里合成 defined 符号，避免运行时加载器报 "unresolved symbol '_DYNAMIC'"
+        // （虽然 weak UND → 0 语义上安全，musl 走 PT_PHDR 兜底，但消掉噪音更干净）。
+        // st_value 在 backfill_dynamic_vaddrs 里回填（.dynamic vaddr 那时才确定）。
+        Elf64_Word dynamic_name_off = (Elf64_Word)dynstr.data.size();
+        const std::string dynamic_name = "_DYNAMIC";
+        dynstr.data.insert(dynstr.data.end(), dynamic_name.begin(), dynamic_name.end());
+        dynstr.data.push_back(0);
         out.dynstr_idx = extras.size();
         extras.push_back(std::move(dynstr));
 
@@ -1270,6 +1281,20 @@ private:
             s.st_size = sym.size;
             dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
             dynsym_idx[sym.name] = dynsym.data.size() / sizeof(Elf64_Sym) - 1;
+        }
+        // _DYNAMIC 合成条目：STB_GLOBAL / STT_OBJECT，st_value 占位 0（backfill 回填），
+        // st_shndx=SHN_ABS（.dynamic 是 extras section，不对应 obj 的 section，用 ABS
+        // 让加载器视为 defined 即可——exports 收集只判 != SHN_UNDEF）。
+        {
+            Elf64_Sym s = {};
+            s.st_name = dynamic_name_off;
+            s.st_info = GELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
+            s.st_shndx = SHN_ABS;
+            s.st_value = 0;
+            size_t off = dynsym.data.size();
+            dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
+            dynsym_idx["_DYNAMIC"] = dynsym.data.size() / sizeof(Elf64_Sym) - 1;
+            out.dynamic_sym_off = off;  // st_value 在 Elf64_Sym 偏移 8 处，backfill 直接 +8 写
         }
         dynsym.info = first_global;
         out.dynsym_idx = extras.size();
@@ -1333,7 +1358,13 @@ private:
                 Elf64_Rela rela = {};
                 rela.r_offset = target.guest_addr + r.offset;
                 if (sym.defined) {
-                    uint64_t sym_addr = sec_guest_addr_of(objects_[oi], sym.sec_idx) + sym.value;
+                    // 用 globals_ 解析后的地址（resolve_symbol），而非本 obj 内的局部定义地址。
+                    // 否则 weak 符号被 strong 覆盖时（如 musl __stdio_exit.o 的 weak
+                    // __stdout_used 被 stdout.o 的 strong 覆盖），addend 仍指向 weak 的
+                    // .bss.dummy_file（值 0），运行时 __stdio_exit 读到 NULL 不刷新 stdout。
+                    auto resolved = resolve_symbol(oi, r.sym_idx);
+                    uint64_t sym_addr = resolved.value_or(
+                        sec_guest_addr_of(objects_[oi], sym.sec_idx) + sym.value);
                     rela.r_info = ELF64_R_INFO(0, r.type);
                     rela.r_addend = sym_addr + r.addend;
                 } else {
@@ -1521,6 +1552,16 @@ private:
         assign(dyn_idx.relaplt_idx);
         assign(dyn_idx.dynamic_idx);
         assign(interp_idx);
+
+        // 回填 _DYNAMIC 符号的 st_value = .dynamic section 的 vaddr
+        //（st_value 在 Elf64_Sym 偏移 8 处）。让 musl __init_tls 走 PT_DYNAMIC 分支
+        // 反推 base，结果与 PT_PHDR 路径一致；同时消掉运行时 "unresolved _DYNAMIC" 警告。
+        if (dyn_idx.dynamic_sym_off != SIZE_MAX && dyn_idx.dynamic_idx != SIZE_MAX &&
+            dyn_vaddr_map.count(dyn_idx.dynamic_idx)) {
+            auto& dynsym_data = extras[dyn_idx.dynsym_idx].data;
+            uint64_t dyn_vaddr = dyn_vaddr_map[dyn_idx.dynamic_idx];
+            memcpy(dynsym_data.data() + dyn_idx.dynamic_sym_off + 8, &dyn_vaddr, 8);
+        }
 
         // 回填 .dynamic 的 DT_* 指针
         auto& dyn_data = extras[dyn_idx.dynamic_idx].data;
