@@ -197,12 +197,12 @@ private:
     bool jmp32(const bpf_insn* cur);
     bool step();
 
-    // 处理 BPF call 指令：浮点指令段（BPF_SYS_FP_*）优先拦截，否则转 syscall
-    // handler。实现见 insn.cpp（非 inline，以免 insn.h 依赖 bpf_call.h）。
-    bool do_syscall(uint32_t call);
+    // 处理 syscall 形式的 BPF call 指令（src_reg=0）。
+    bool do_syscall(uint32_t call) {
+        return options.sys->syscall(this, call);
+    }
 
-    // 虚拟浮点指令的解释器实现（见 include/bpf_call.h 的 BPF_SYS_FP_BASE 段）。
-    // 也是 JIT 无原生 lowering 时（如 x86 的 uint 转换）经 do_syscall 的回退。
+    // 虚拟浮点指令（src_reg=2）的解释器实现（见 include/bpf_call.h 的 bpf_fp_op enum）。
     bool do_softfp(uint32_t call);
 
     friend class SyscallHandler;

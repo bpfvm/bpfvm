@@ -110,9 +110,12 @@ public:
 
     void emit_call_syscall(const bpf_insn* insn, int current_index,
                            uint64_t entry_gpa);
-    // 虚拟浮点指令的 JIT 实现（见 .cpp 的实现注释）。命中返回 true，
-    // 否则回退通用 syscall 路径（do_softfp）。
+    // 虚拟浮点指令（src_reg=2）的 JIT 实现（见 .cpp 实现注释）。命中返回 true；
+    // 未命中（如 x86 的 uint fp↔int 转换）由 emit_call_softfp_slow 回退到
+    // helper_do_softfp（do_softfp）
     bool emit_call_softfp(const bpf_insn* insn);
+    void emit_call_softfp_slow(const bpf_insn* insn, int current_index,
+                               uint64_t entry_gpa);
     void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa);
     void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
     void emit_exit();

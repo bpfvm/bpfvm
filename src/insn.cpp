@@ -3,7 +3,7 @@
 //
 
 #include "insn.h"
-#include "include/bpf_call.h"   // BPF_CALL_TO_ID / BPF_SYS_FP_*（do_syscall 拦截 FP 段）
+#include "include/bpf_call.h"   // BPF_CALL_TO_ID / BPF_FP_*（do_syscall 拦截 FP 段）
 #include <iostream>
 
 #include "jit/jit.h"
@@ -96,6 +96,8 @@ void dump(uint64_t addr, const bpf_insn* insn) {
                 printf("sys 0x%X\n", insn->imm);
             }else if(insn->src_reg == 1) {
                 printf("%d\n", insn->imm);
+            }else if(insn->src_reg == 2) {
+                printf("fp 0x%X\n", insn->imm);
             }else {
                 printf("!unknown!\n");
             }
@@ -347,21 +349,16 @@ uint64_t vm::pop_frame() {
     return ret_addr;
 }
 
-// 处理 BPF call 指令：浮点指令段优先拦截，否则转 syscall handler。
-bool vm::do_syscall(uint32_t call) {
-    const uint32_t id = BPF_CALL_TO_ID(call);
-    if (id >= BPF_SYS_FP_BASE)
-        return do_softfp(call);
-    return options.sys->syscall(this, call);
-}
 
 // ---------------------------------------------------------------------------
-// 虚拟浮点指令的解释器实现（设计见 include/bpf_call.h 的 BPF_SYS_FP_BASE 段）。
+// 虚拟浮点指令的解释器实现
 // r1/r2 是操作数位模式，用宿主硬件浮点算出结果，位模式写回 r0。
-// 也是 JIT 无原生 lowering 时（如 x86 的 uint 转换）经 do_syscall 的回退。
+// 解释器经 src_reg=2 的 dispatch 直达此处；JIT 无原生 lowering 时（如 x86 的
+// uint 转换）经 emit_call_softfp_slow 回退到此处（helper_do_softfp）。
+// call 即 imm 字段，本身就是 bpf_fp_op 枚举值（1..N，无 BASE 偏移），直接 switch。
 // ---------------------------------------------------------------------------
 bool vm::do_softfp(uint32_t call) {
-    const uint32_t op = BPF_CALL_TO_ID(call);
+    const uint32_t op = call;   // FP 编号空间独立，imm 即 enum 值，无需 BPF_CALL_TO_ID
 
     // 取出两个 i64 操作数（比较/算术用 r1,r2；一元只用 r1）。
     // 题外：glue 函数中所有位转换（double<->i64）已被 clang 优化为寄存器直传，
@@ -393,64 +390,64 @@ bool vm::do_softfp(uint32_t call) {
 
     switch (op) {
     // double 二元算术
-    case BPF_SYS_FP_ADD_D: r(0) = d_out(d_in(a_bits) + d_in(b_bits)); return true;
-    case BPF_SYS_FP_SUB_D: r(0) = d_out(d_in(a_bits) - d_in(b_bits)); return true;
-    case BPF_SYS_FP_MUL_D: r(0) = d_out(d_in(a_bits) * d_in(b_bits)); return true;
-    case BPF_SYS_FP_DIV_D: r(0) = d_out(d_in(a_bits) / d_in(b_bits)); return true;
+    case BPF_FP_ADD_D: r(0) = d_out(d_in(a_bits) + d_in(b_bits)); return true;
+    case BPF_FP_SUB_D: r(0) = d_out(d_in(a_bits) - d_in(b_bits)); return true;
+    case BPF_FP_MUL_D: r(0) = d_out(d_in(a_bits) * d_in(b_bits)); return true;
+    case BPF_FP_DIV_D: r(0) = d_out(d_in(a_bits) / d_in(b_bits)); return true;
     // float 二元算术
-    case BPF_SYS_FP_ADD_F: r(0) = (uint64_t)f_out(f_in(a_bits) + f_in(b_bits)); return true;
-    case BPF_SYS_FP_SUB_F: r(0) = (uint64_t)f_out(f_in(a_bits) - f_in(b_bits)); return true;
-    case BPF_SYS_FP_MUL_F: r(0) = (uint64_t)f_out(f_in(a_bits) * f_in(b_bits)); return true;
-    case BPF_SYS_FP_DIV_F: r(0) = (uint64_t)f_out(f_in(a_bits) / f_in(b_bits)); return true;
+    case BPF_FP_ADD_F: r(0) = (uint64_t)f_out(f_in(a_bits) + f_in(b_bits)); return true;
+    case BPF_FP_SUB_F: r(0) = (uint64_t)f_out(f_in(a_bits) - f_in(b_bits)); return true;
+    case BPF_FP_MUL_F: r(0) = (uint64_t)f_out(f_in(a_bits) * f_in(b_bits)); return true;
+    case BPF_FP_DIV_F: r(0) = (uint64_t)f_out(f_in(a_bits) / f_in(b_bits)); return true;
     // 一元
-    case BPF_SYS_FP_NEG_D: r(0) = d_out(-d_in(a_bits)); return true;
-    case BPF_SYS_FP_NEG_F: r(0) = (uint64_t)f_out(-f_in(a_bits)); return true;
-    case BPF_SYS_FP_SQRT_D: r(0) = d_out(__builtin_sqrt(d_in(a_bits))); return true;
-    case BPF_SYS_FP_SQRT_F: r(0) = (uint64_t)f_out(__builtin_sqrtf(f_in(a_bits))); return true;
+    case BPF_FP_NEG_D: r(0) = d_out(-d_in(a_bits)); return true;
+    case BPF_FP_NEG_F: r(0) = (uint64_t)f_out(-f_in(a_bits)); return true;
+    case BPF_FP_SQRT_D: r(0) = d_out(__builtin_sqrt(d_in(a_bits))); return true;
+    case BPF_FP_SQRT_F: r(0) = (uint64_t)f_out(__builtin_sqrtf(f_in(a_bits))); return true;
     // double -> int（截断向 0）
-    case BPF_SYS_FP_D2SI:  r(0) = (uint64_t)(int64_t)(int32_t)d_in(a_bits); return true;
-    case BPF_SYS_FP_D2DI:  r(0) = (uint64_t)(int64_t)d_in(a_bits); return true;
-    case BPF_SYS_FP_D2USI: r(0) = (uint64_t)(uint64_t)(uint32_t)d_in(a_bits); return true;
-    case BPF_SYS_FP_D2UDI: r(0) = (uint64_t)(uint64_t)d_in(a_bits); return true;
+    case BPF_FP_D2SI:  r(0) = (uint64_t)(int64_t)(int32_t)d_in(a_bits); return true;
+    case BPF_FP_D2DI:  r(0) = (uint64_t)(int64_t)d_in(a_bits); return true;
+    case BPF_FP_D2USI: r(0) = (uint64_t)(uint64_t)(uint32_t)d_in(a_bits); return true;
+    case BPF_FP_D2UDI: r(0) = (uint64_t)(uint64_t)d_in(a_bits); return true;
     // float -> int
-    case BPF_SYS_FP_F2SI:  r(0) = (uint64_t)(int64_t)(int32_t)f_in(a_bits); return true;
-    case BPF_SYS_FP_F2DI:  r(0) = (uint64_t)(int64_t)f_in(a_bits); return true;
-    case BPF_SYS_FP_F2USI: r(0) = (uint64_t)(uint64_t)(uint32_t)f_in(a_bits); return true;
-    case BPF_SYS_FP_F2UDI: r(0) = (uint64_t)(uint64_t)f_in(a_bits); return true;
+    case BPF_FP_F2SI:  r(0) = (uint64_t)(int64_t)(int32_t)f_in(a_bits); return true;
+    case BPF_FP_F2DI:  r(0) = (uint64_t)(int64_t)f_in(a_bits); return true;
+    case BPF_FP_F2USI: r(0) = (uint64_t)(uint64_t)(uint32_t)f_in(a_bits); return true;
+    case BPF_FP_F2UDI: r(0) = (uint64_t)(uint64_t)f_in(a_bits); return true;
     // int -> double
-    case BPF_SYS_FP_SI2D:  r(0) = d_out((double)(int64_t)(int32_t)a_bits); return true;
-    case BPF_SYS_FP_DI2D:  r(0) = d_out((double)(int64_t)a_bits); return true;
-    case BPF_SYS_FP_USI2D: r(0) = d_out((double)(uint64_t)(uint32_t)a_bits); return true;
-    case BPF_SYS_FP_UDI2D: r(0) = d_out((double)(uint64_t)a_bits); return true;
+    case BPF_FP_SI2D:  r(0) = d_out((double)(int64_t)(int32_t)a_bits); return true;
+    case BPF_FP_DI2D:  r(0) = d_out((double)(int64_t)a_bits); return true;
+    case BPF_FP_USI2D: r(0) = d_out((double)(uint64_t)(uint32_t)a_bits); return true;
+    case BPF_FP_UDI2D: r(0) = d_out((double)(uint64_t)a_bits); return true;
     // int -> float
-    case BPF_SYS_FP_SI2F:  r(0) = (uint64_t)f_out((float)(int64_t)(int32_t)a_bits); return true;
-    case BPF_SYS_FP_DI2F:  r(0) = (uint64_t)f_out((float)(int64_t)a_bits); return true;
-    case BPF_SYS_FP_USI2F: r(0) = (uint64_t)f_out((float)(uint64_t)(uint32_t)a_bits); return true;
-    case BPF_SYS_FP_UDI2F: r(0) = (uint64_t)f_out((float)(uint64_t)a_bits); return true;
+    case BPF_FP_SI2F:  r(0) = (uint64_t)f_out((float)(int64_t)(int32_t)a_bits); return true;
+    case BPF_FP_DI2F:  r(0) = (uint64_t)f_out((float)(int64_t)a_bits); return true;
+    case BPF_FP_USI2F: r(0) = (uint64_t)f_out((float)(uint64_t)(uint32_t)a_bits); return true;
+    case BPF_FP_UDI2F: r(0) = (uint64_t)f_out((float)(uint64_t)a_bits); return true;
     // 类型转换
-    case BPF_SYS_FP_EXTEND: r(0) = d_out((double)f_in(a_bits)); return true;
-    case BPF_SYS_FP_TRUNC:  r(0) = (uint64_t)f_out((float)d_in(a_bits)); return true;
+    case BPF_FP_EXTEND: r(0) = d_out((double)f_in(a_bits)); return true;
+    case BPF_FP_TRUNC:  r(0) = (uint64_t)f_out((float)d_in(a_bits)); return true;
     // 比较：返回 -1/0/1（GCC 软浮点 ABI）。glue 侧的 __eq/__ne/__lt/...
     // 都映射到同一个 CMP helper；对于 == 和 != 的 unordered 处理由调用点
     // 的谓词决定（<0/=0/>0），这里统一返回有序比较的三态结果。
-    case BPF_SYS_FP_CMP_D: {
+    case BPF_FP_CMP_D: {
         double a = d_in(a_bits), b = d_in(b_bits);
         r(0) = (a < b) ? (uint64_t)-1 : (a > b) ? 1ULL : 0ULL;
         return true;
     }
-    case BPF_SYS_FP_CMP_F: {
+    case BPF_FP_CMP_F: {
         float a = f_in(a_bits), b = f_in(b_bits);
         r(0) = (a < b) ? (uint64_t)-1 : (a > b) ? 1ULL : 0ULL;
         return true;
     }
     // 无序判定：任一操作数为 NaN 返回 1，否则 0（__unordXX2 语义）。
     // 利用 IEEE754 不等性（NaN != NaN）判定，不依赖 <cmath>。
-    case BPF_SYS_FP_UNORD_D: {
+    case BPF_FP_UNORD_D: {
         double a = d_in(a_bits), b = d_in(b_bits);
         r(0) = (a != a || b != b) ? 1ULL : 0ULL;
         return true;
     }
-    case BPF_SYS_FP_UNORD_F: {
+    case BPF_FP_UNORD_F: {
         float a = f_in(a_bits), b = f_in(b_bits);
         r(0) = (a != a || b != b) ? 1ULL : 0ULL;
         return true;
@@ -515,6 +512,8 @@ bool vm::jmp(const bpf_insn* cur) {
                 return false;
             }
             pc += (int64_t)cur->imm * sizeof(bpf_insn);
+        }else if(cur->src_reg == 2) {
+            return do_softfp(cur->imm);
         }
         break;
     case BPF_EXIT:

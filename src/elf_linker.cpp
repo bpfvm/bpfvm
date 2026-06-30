@@ -891,6 +891,29 @@ private:
     // 例外：weak 未定义符号（如 __init_array_start/__fini_array_start/_DYNAMIC）允许
     // 不被定义——标准 ld 把它们解析为 0；musl/glibc 启动代码用 weak 引用这些「可能不
     // 存在」的边界符号，遍历时空范围安全。重定位时这类符号走 resolve_symbol 返回 0。
+    // FP 虚拟指令的 extern __ksym 符号识别（见 BpfSoftFp pass 的编码链路）。
+    // 符号名形如 `__bpf_fp_<ID>`，尾部 <ID> 是十进制 BPF_FP_* 编号。
+    // 这些符号由 pass 合成、无真实定义，VM 在运行时按 src_reg=2 解释——故 linker
+    // 既不报"未定义"，也不走 PLT，而是在 R_BPF_64_32 处把 call 改写为
+    // src_reg=2 + imm=<ID>。
+    static constexpr const char* kFpKsymPrefix = "__bpf_fp_";
+
+    // 是否 FP ksym 符号。
+    static bool is_fp_ksym(const std::string& name) {
+        return name.rfind(kFpKsymPrefix, 0) == 0;  // 以 prefix 开头
+    }
+
+    // 从符号名解析 FP_ID；非法返回 false。
+    static bool parse_fp_ksym_id(const std::string& name, uint32_t& out_id) {
+        const char* s = name.c_str() + std::strlen(kFpKsymPrefix);
+        if (*s == '\0') return false;
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (*end != '\0' || end == s) return false;   // 必须全是数字
+        out_id = (uint32_t)v;
+        return true;
+    }
+
     bool check_undefined_symbols() {
         std::set<std::string> reported;
         for (const auto& obj : objects_) {
@@ -902,6 +925,7 @@ private:
                 if (sym.binding == STB_WEAK) continue;           // weak 未定义 → 解析为 0
                 if (globals_.count(sym.name)) continue;          // .o/.a 提供（resolve_symbol 可解析）
                 if (bpfso_symbols_.count(sym.name)) continue;    // .so 提供（运行时解析）
+                if (is_fp_ksym(sym.name)) continue;              // FP 虚拟指令符号（VM 运行时解释）
                 if (reported.insert(sym.name).second) {
                     std::cerr << "[elf_linker] undefined symbol '" << sym.name
                               << "' referenced by " << obj.source << "\n";
@@ -1775,11 +1799,12 @@ private:
             if (!target.loadable) continue;
 
             auto resolved = resolve_symbol(obj_idx, r.sym_idx);
-            if (!resolved) {
+            const auto& sym = obj.symbols[r.sym_idx];
+            const bool fp_ksym = is_fp_ksym(sym.name);   // FP 虚拟指令符号（VM 运行时解释）
+            if (!resolved && !fp_ksym) {
                 // check_undefined_symbols（static+dynamic 都已跑）已保证无真正未定义符号；
                 // 走到这里 = .so 提供的符号（运行时解析，仅 PIC 会出现）。R_BPF_64_32 (call)
                 // 经 PLT 桩（plt_addr_ 构建期已知，走下面 case 10）；其余留 .rela.dyn 给 VM 运行时填。
-                const auto& sym = obj.symbols[r.sym_idx];
                 if (!(r.type == 10 && got_enabled_ && plt_addr_.count(sym.name))) {
                     continue;
                 }
@@ -1826,7 +1851,26 @@ private:
                 break;
             }
             case 10: {  // R_BPF_64_32 — 32-bit relative for BPF_CALL
-                // imm = (target - call_site) / 8 - 1
+                // FP 虚拟指令符号：pass 用 extern __ksym __bpf_fp_<ID> 生成，clang emit
+                // src_reg=1 + 本重定位。linker 改写为 src_reg=2 + imm=<ID>（FP 专用通道，
+                // VM 按 src_reg=2 走 do_softfp）。byte[1] 高 4 位是 src_reg：0x10→0x20。
+                if (fp_ksym) {
+                    uint32_t fp_id = 0;
+                    if (!parse_fp_ksym_id(sym.name, fp_id)) {
+                        std::cerr << "[elf_linker] malformed FP ksym name: " << sym.name << "\n";
+                        return false;
+                    }
+                    patch[1] = (patch[1] & 0x0f) | 0x20;   // src_reg: 1 -> 2
+                    int32_t imm = (int32_t)fp_id;
+                    memcpy(patch + 4, &imm, 4);
+                    if (g_debug) {
+                        std::cerr << "[reloc] R_BPF_64_32 FP @ " << obj.source << " off=0x"
+                                  << std::hex << r.offset << " sym=" << sym.name
+                                  << " -> src_reg=2 imm=0x" << fp_id << std::dec << "\n";
+                    }
+                    break;
+                }
+                // 普通 call：imm = (target - call_site) / 8 - 1
                 // clang 对未解析 call 写 imm=-1（占位符），不是有效 addend，必须忽略。
                 //（BPF call 的 imm 单位是 bpf_insn；VM 执行 pc+=imm 后 pc++ 到下一条，
                 // 所以 target = call_site + (imm+1)*8 → imm = (target-call_site)/8 - 1）
@@ -1841,7 +1885,6 @@ private:
                 int64_t byte_off = (int64_t)tgt - (int64_t)call_site;
                 int32_t imm = (int32_t)(byte_off / 8 - 1);
                 if (g_debug) {
-                    const auto& sym = obj.symbols[r.sym_idx];
                     std::cerr << "[reloc] R_BPF_64_32 @ " << obj.source << " off=0x" << std::hex
                                 << r.offset << " sym=" << sym.name << " tgt=0x" << tgt
                                 << " call_site=0x" << call_site << std::dec << " imm=" << imm << "\n";
@@ -1878,6 +1921,10 @@ private:
                 // UND 但定义在其它已加载成员（.a/.o）里：仍是内部 call，不走 PLT/GOT。
                 //（resolve_symbol 会经 globals_ 把它解析成直接相对 call。）
                 if (globals_.count(sym.name)) continue;
+                // FP 虚拟指令符号：apply_relocations 已把 call 改写成 src_reg=2 + imm，
+                // 不再是跨模块函数调用，不走 PLT/GOT（否则 runtime loader 会因找不到
+                // 这些虚拟符号而报警）。
+                if (is_fp_ksym(sym.name)) continue;
                 if (seen.insert(sym.name).second) got_syms.push_back(sym.name);
             }
         }

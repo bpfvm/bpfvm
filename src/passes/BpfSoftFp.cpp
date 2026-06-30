@@ -1,16 +1,27 @@
 //===- BpfSoftFp.cpp - 虚拟 FP 指令的编码 pass ----------------------------===//
 //
-// 虚拟 FP 指令的设计见 include/bpf_call.h（BPF_SYS_FP_BASE 段注释）。本 pass
-// 负责编码阶段：在 IR 层把每个浮点运算指令替换成一条对应的 BPF_CALL_FP_*
-// 直接调用（inttoptr），后端 lower 成 `call <imm>`（src_reg=0），绕过后端在
-// ISel 阶段对 fadd/fmul/... 的拒绝（"A call to built-in function '__adddf3'
-// is not supported"）。
+// 虚拟 FP 指令的设计见 include/bpf_call.h（bpf_fp_op enum 段注释）。本 pass
+// 负责编码阶段：在 IR 层把每个浮点运算指令替换成一次对 extern __ksym 函数
+// `__bpf_fp_<ID>` 的调用，绕过后端在 ISel 阶段对 fadd/fmul/... 的拒绝
+// （"A call to built-in function '__adddf3' is not supported"）。
 //
-// 关键选择：走 syscall 形式（src_reg=0）而非 `call __adddf3` 库函数（src_reg=1
-// 的 BPF-to-BPF 调用）。后者会强制 VM exit、打断 JIT；src_reg=0 的 call 是 JIT
-// 能当作单条指令内联执行的唯一 call 形式。无 guest 侧 glue。
+// 语义目标：FP 走 src_reg=2 的"浮点专用通道"，与 syscall（src_reg=0）彻底分离。
+// VM 解释器/JIT 看到 src_reg=2 直接走 do_softfp / emit_call_softfp，不经过
+// syscall handler。字节码层一眼能区分 FP（call src_reg=2）与 syscall（src_reg=0）。
 //
-// 操作数按 IEEE754 位模式当 i64 传递。覆盖：算术 / fneg / sqrt / 比较 /
+// 编码链路（不在 pass 里直出 src_reg=2，交给 clang 后端 + linker 协同）：
+//   1. pass 把 fadd/... 改成 `call @__bpf_fp_<ID>(i64...)`（extern，section
+//      ".ksyms"）。符号名尾部 <ID> 直接编码 BPF_FP_*，无映射表。
+//   2. clang 后端把它当作普通未解析外部函数调用：按 calling convention 把参数
+//      放 r1/r2、结果放 r0，emit `call -1`（src_reg=1 占位）+ R_BPF_64_32 重定位
+//      （目标符号 = __bpf_fp_<ID>）。参数/结果的寄存器绑定由后端原生 call lowering
+//      保证（这是 InlineAsm 方案做不到的：InlineAsm 的 "r"/"=r" 不保证绑 r1/r2/r0，
+//      在寄存器压力下会错放，且 clobber 会触发 LiveVariables 崩溃，故弃用）。
+//   3. bpfvm-ld 在 R_BPF_64_32 看到 `__bpf_fp_` 符号：解析名字尾的 ID，改写 call
+//      的 src_reg=2 + imm=<ID>，且不报"未定义符号"（VM 按 src_reg=2 解释）。
+//
+// 操作数按 IEEE754 位模式当 i64 传递（fp 参数先 bitcast 到 i64；结果 i64 再按
+// 需 bitcast/trunc 回目标类型）。覆盖：算术 / fneg / sqrt / 比较 /
 // fp<->int / fptrunc / fpext / fmuladd。
 //
 // 用法：clang -target bpf -fpass-plugin=libBpfSoftFp.so ...
@@ -40,34 +51,121 @@ static const char *suffix(Type *Ty) {
     return nullptr;  // 其它（long double 等）不支持
 }
 
-// ---- BPF_CALL_FP_* helper 编号：单一数据源 ----
-// 直接复用 include/bpf_call.h 的定义（BPF_CALL_BASE + BPF_CALL_FP_* 宏），
+// ---- BPF_FP_* helper 编号：单一数据源 ----
+// 直接复用 include/bpf_call.h 的定义（BPF_CALL_BASE + BPF_FP_* 宏），
 // 避免在 pass 里手抄一份容易不一致的编号表。bpf_call.h 是纯宏/enum，C++ 兼容。
-// clang 把 inttoptr(i64 BPF_CALL_FP_*) 的调用编成 `call <imm>`（src_reg=0）。
 #include "include/bpf_call.h"
 
-// 生成一条"直接 syscall 形式"的浮点调用：
-//   result = ((RetTy (*)(ArgTys...)) <FP call id>)(args...)
-// 经 BPF 后端编成 `call <imm>`（src_reg=0），VM 侧由 do_softfp 用宿主浮点执行，
-// JIT 侧可在此识别 imm 直接发原生指令。
+// 把一个操作数转成 i64 位模式，供 FP helper 的整数 ABI 传递：
+//   - float/double：bitcast 到 i32/i64 后再 zext 到 i64（位模式原样）；
+//   - 整数：zext（无符号语义；本 pass 对 int 入参都已是正确宽度，zext 不改语义）。
+static Value *toI64Bits(IRBuilder<> &B, Value *V) {
+    Type *Ty = V->getType();
+    if (Ty->isFloatTy()) {
+        V = B.CreateBitCast(V, Type::getInt32Ty(V->getContext()));
+        return B.CreateZExt(V, Type::getInt64Ty(V->getContext()));
+    }
+    if (Ty->isDoubleTy())
+        return B.CreateBitCast(V, Type::getInt64Ty(V->getContext()));
+    if (Ty->isIntegerTy())
+        return B.CreateZExt(V, Type::getInt64Ty(V->getContext()));
+    return V;  // 已是 i64 等价物
+}
+
+// 生成一条浮点虚拟指令：一次对 extern __ksym 函数的调用。
 //
-// 函数指针签名的参数类型表取各 Args 自身的类型——对 fp<->int 转换（参数是 fp、
-// 返回是 int，或反之）同样精确，无需额外传入。
+// 编码链路：
+//   pass  →  extern long __bpf_fp_<ID>(i64...) (section ".ksyms")
+//   clang →  `call -1`（src_reg=1，PC-relative 占位）+ R_BPF_64_32 重定位
+//            （目标符号 = `__bpf_fp_<ID>`）
+//   linker→  识别 `__bpf_fp_` 符号 → 改写 call 的 src_reg=2、imm=<ID>，
+//            且不报"未定义符号"（这些符号由 VM 在运行时按 src_reg=2 解释）
+//   VM    →  src_reg=2 的 dispatch 直达 do_softfp（与 syscall 彻底分离）
+//
+// 寄存器绑定（关键稳定性来源）：
+//   这是一次"普通外部函数调用"，clang BPF 后端按 calling convention 处理——
+//   参数自动落 r1/r2/...、结果回 r0。这是后端原生 call lowering 保证的，
+//   不依赖 InlineAsm 的约束赌博（InlineAsm 方案实测在寄存器压力下会把一元 op
+//   的输入错放到 r2，且 clobber 会触发 LiveVariables 崩溃，已弃用）。
+//
+// 符号名编码 ID（无映射表）：
+//   符号名 `__bpf_fp_<ID>` 直接携带 FP_ID，linker 解析名字尾部数字即得 ID，
+//   pass 造名 / linker 解名是单向数据流，无需两侧维护同步的查表。
+//
+// 操作数与结果统一按 i64 位模式传递（toI64Bits 入，按 RetTy 出）：
+//   fp 结果：i64 bitcast 回 float/double；
+//   int 结果（如 CMP 的 i32）：i64 trunc 回目标宽度。
 static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
                                unsigned FpCallId,
                                ArrayRef<Value *> Args,
                                Type *RetTy) {
     Type *I64Ty = Type::getInt64Ty(Ctx);
-    // 构造函数指针类型：(RetTy)(ArgTys...)。ArgTys 用各参数自身的类型。
-    SmallVector<Type *, 4> ArgTys;
-    for (Value *A : Args)
-        ArgTys.push_back(A->getType());
-    FunctionType *FTy = FunctionType::get(RetTy, ArgTys, false);
+    Module &M = *B.GetInsertBlock()->getModule();
 
-    // 函数指针 = inttoptr (i64 FpCallId)。
-    Value *FnPtr = B.CreateIntToPtr(ConstantInt::get(I64Ty, FpCallId),
-                                    PointerType::get(FTy, 0));
-    return B.CreateCall(FTy, FnPtr, Args);
+    // 入参全部转成 i64 位模式。
+    SmallVector<Value *, 4> I64Args;
+    for (Value *A : Args)
+        I64Args.push_back(toI64Bits(B, A));
+
+    // 构造 extern 函数声明：(i64)(i64, i64, ...)，符号名 __bpf_fp_<ID>，
+    // 放 .ksyms section（让 clang emit R_BPF_64_32 重定位，linker 据符号名识别）。
+    SmallVector<Type *, 4> ArgTys(I64Args.size(), I64Ty);
+    FunctionType *FTy = FunctionType::get(I64Ty, ArgTys, false);
+    std::string Name = "__bpf_fp_" + std::to_string(FpCallId);
+    FunctionCallee FC = M.getOrInsertFunction(Name, FTy);
+    Function *F = dyn_cast<Function>(FC.getCallee());
+    if (F) {
+        F->setLinkage(GlobalValue::ExternalLinkage);
+        // section 名与内核 libbpf 的 kfunc（extern __ksym）约定一致；
+        // clang 据此 emit R_BPF_64_32 重定位（src_reg=1 的未解析 call）。
+        if (!F->hasSection())
+            F->setSection(".ksyms");
+    }
+
+    // 普通函数调用：clang 后端按 calling convention 把参数放 r1/r2、结果放 r0，
+    // 并 emit `call -1` + R_BPF_64_32（指向 __bpf_fp_<ID>）。
+    Value *Call = B.CreateCall(FC, I64Args);
+
+    // 结果 i64 → 目标类型。
+    if (RetTy->isFloatTy())
+        // float 位模式在低 32 位：i64 trunc → i32，再 bitcast 回 float。
+        return B.CreateBitCast(B.CreateTrunc(Call, Type::getInt32Ty(Ctx)), RetTy);
+    if (RetTy->isDoubleTy())
+        return B.CreateBitCast(Call, RetTy);
+    if (RetTy->isIntegerTy() && RetTy->getIntegerBitWidth() < 64)
+        return B.CreateTrunc(Call, RetTy);
+    return Call;  // 已是 i64
+}
+
+// 计算 64×64→128 无符号乘法的高 64 位（schoolbook 展开）。
+//
+// 用于拦截 @llvm.umul.with.overflow.i64：后端会把该 intrinsic lower 成 __multi3
+// 调用，BPF ISel 一律拒绝（"__multi3 not supported"）。这里在 IR 层用 4 次
+// 32×32 BPF_MUL + 移位/加法构造高位，纯原生 ALU，零递归触发宽乘。
+//
+// 数学推导（aH/aL/bH/bL 均为 32 位）：
+//   a*b = (aH*bH)<<64 + (aH*bL + aL*bH)<<32 + aL*bL
+//   高 64 = aH*bH + ((aH*bL + aL*bH) + (aL*bL >> 32)) >> 32
+//         = aH*bH + (cross + carry_LL) >> 32
+// 32×32→64 乘法对 BPF BPF_MUL 是原生操作（操作数掩码到 32 位，乘积完整落在 64 位）。
+static Value *emitUmulHi64(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb) {
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+    Constant *MASK32 = ConstantInt::get(I64Ty, 0xFFFFFFFFULL);
+    Constant *BITS32 = ConstantInt::get(I64Ty, 32);
+
+    Value *aL = B.CreateAnd(A,  MASK32);
+    Value *aH = B.CreateLShr(A, BITS32);
+    Value *bL = B.CreateAnd(Bb, MASK32);
+    Value *bH = B.CreateLShr(Bb, BITS32);
+
+    Value *LL    = B.CreateMul(aL, bL);                    // aL*bL (32x32->64)
+    Value *t1    = B.CreateMul(aH, bL);                    // aH*bL
+    Value *t2    = B.CreateMul(aL, bH);                    // aL*bH
+    Value *cross = B.CreateAdd(B.CreateAdd(t1, t2),
+                               B.CreateLShr(LL, BITS32));  // cross + LL>>32
+    Value *hi    = B.CreateAdd(B.CreateMul(aH, bH),
+                               B.CreateLShr(cross, BITS32)); // aH*bH + cross>>32
+    return hi;
 }
 
 
@@ -92,10 +190,10 @@ static bool softenFunction(Function &F) {
 
                 unsigned callId;
                 switch (BO->getOpcode()) {
-                case Instruction::FAdd: callId = sfx[0]=='d' ? BPF_CALL_FP_ADD_D : BPF_CALL_FP_ADD_F; break;
-                case Instruction::FSub: callId = sfx[0]=='d' ? BPF_CALL_FP_SUB_D : BPF_CALL_FP_SUB_F; break;
-                case Instruction::FMul: callId = sfx[0]=='d' ? BPF_CALL_FP_MUL_D : BPF_CALL_FP_MUL_F; break;
-                case Instruction::FDiv: callId = sfx[0]=='d' ? BPF_CALL_FP_DIV_D : BPF_CALL_FP_DIV_F; break;
+                case Instruction::FAdd: callId = sfx[0]=='d' ? BPF_FP_ADD_D : BPF_FP_ADD_F; break;
+                case Instruction::FSub: callId = sfx[0]=='d' ? BPF_FP_SUB_D : BPF_FP_SUB_F; break;
+                case Instruction::FMul: callId = sfx[0]=='d' ? BPF_FP_MUL_D : BPF_FP_MUL_F; break;
+                case Instruction::FDiv: callId = sfx[0]=='d' ? BPF_FP_DIV_D : BPF_FP_DIV_F; break;
                 default: continue;
                 }
                 // 参数类型与结果类型相同（fp, fp) -> fp。
@@ -114,7 +212,7 @@ static bool softenFunction(Function &F) {
                 if (!sfx) continue;
                 if (UE->getOpcode() != Instruction::FNeg) continue;
 
-                unsigned callId = sfx[0]=='d' ? BPF_CALL_FP_NEG_D : BPF_CALL_FP_NEG_F;
+                unsigned callId = sfx[0]=='d' ? BPF_FP_NEG_D : BPF_FP_NEG_F;
                 Value *Call = emitDirectFpCall(B, Ctx, callId, {UE->getOperand(0)}, Ty);
                 UE->replaceAllUsesWith(Call);
                 ToErase.push_back(UE);
@@ -134,12 +232,12 @@ static bool softenFunction(Function &F) {
                     bool isDouble = (sfx[0] == 'd');
                     unsigned callId;
                     if (Op == Instruction::FPToSI) {
-                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_CALL_FP_D2SI : BPF_CALL_FP_F2SI;
-                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_CALL_FP_D2DI : BPF_CALL_FP_F2DI;
+                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_FP_D2SI : BPF_FP_F2SI;
+                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_FP_D2DI : BPF_FP_F2DI;
                         else continue;
                     } else {
-                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_CALL_FP_D2USI : BPF_CALL_FP_F2USI;
-                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_CALL_FP_D2UDI : BPF_CALL_FP_F2UDI;
+                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_FP_D2USI : BPF_FP_F2USI;
+                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_FP_D2UDI : BPF_FP_F2UDI;
                         else continue;
                     }
                     Value *Call = emitDirectFpCall(B, Ctx, callId, {CI->getOperand(0)}, Dst);
@@ -155,12 +253,12 @@ static bool softenFunction(Function &F) {
                     bool isDouble = (sfx[0] == 'd');
                     unsigned callId;
                     if (Op == Instruction::SIToFP) {
-                        if (Src->isIntegerTy(32))      callId = isDouble ? BPF_CALL_FP_SI2D : BPF_CALL_FP_SI2F;
-                        else if (Src->isIntegerTy(64)) callId = isDouble ? BPF_CALL_FP_DI2D : BPF_CALL_FP_DI2F;
+                        if (Src->isIntegerTy(32))      callId = isDouble ? BPF_FP_SI2D : BPF_FP_SI2F;
+                        else if (Src->isIntegerTy(64)) callId = isDouble ? BPF_FP_DI2D : BPF_FP_DI2F;
                         else continue;
                     } else {
-                        if (Src->isIntegerTy(32))      callId = isDouble ? BPF_CALL_FP_USI2D : BPF_CALL_FP_USI2F;
-                        else if (Src->isIntegerTy(64)) callId = isDouble ? BPF_CALL_FP_UDI2D : BPF_CALL_FP_UDI2F;
+                        if (Src->isIntegerTy(32))      callId = isDouble ? BPF_FP_USI2D : BPF_FP_USI2F;
+                        else if (Src->isIntegerTy(64)) callId = isDouble ? BPF_FP_UDI2D : BPF_FP_UDI2F;
                         else continue;
                     }
                     Value *Call = emitDirectFpCall(B, Ctx, callId, {CI->getOperand(0)}, Dst);
@@ -173,7 +271,7 @@ static bool softenFunction(Function &F) {
                 if (Op == Instruction::FPTrunc) {
                     // double -> float
                     if (!Src->isDoubleTy() || !Dst->isFloatTy()) continue;
-                    Value *Call = emitDirectFpCall(B, Ctx, BPF_CALL_FP_TRUNC, {CI->getOperand(0)}, Dst);
+                    Value *Call = emitDirectFpCall(B, Ctx, BPF_FP_TRUNC, {CI->getOperand(0)}, Dst);
                     CI->replaceAllUsesWith(Call);
                     ToErase.push_back(CI);
                     Changed = true;
@@ -183,7 +281,7 @@ static bool softenFunction(Function &F) {
                 if (Op == Instruction::FPExt) {
                     // float -> double
                     if (!Src->isFloatTy() || !Dst->isDoubleTy()) continue;
-                    Value *Call = emitDirectFpCall(B, Ctx, BPF_CALL_FP_EXTEND, {CI->getOperand(0)}, Dst);
+                    Value *Call = emitDirectFpCall(B, Ctx, BPF_FP_EXTEND, {CI->getOperand(0)}, Dst);
                     CI->replaceAllUsesWith(Call);
                     ToErase.push_back(CI);
                     Changed = true;
@@ -193,7 +291,7 @@ static bool softenFunction(Function &F) {
 
             // ---- 浮点 intrinsic：fmuladd / fma ----
             // clang 常把 `a*b+c` 收缩成 @llvm.fmuladd / @llvm.fma，必须展开后软化。
-            // 这里直接发两条 BPF_CALL_FP_*（mul + add），避免新生成的 fp 指令被漏掉。
+            // 这里直接发两条 BPF_FP_*（mul + add），避免新生成的 fp 指令被漏掉。
             if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
                 Type *Ty = II->getType();
                 if (II->getIntrinsicID() == Intrinsic::fmuladd ||
@@ -204,8 +302,8 @@ static bool softenFunction(Function &F) {
                     Value *A = II->getArgOperand(0);
                     Value *B_ = II->getArgOperand(1);
                     Value *C = II->getArgOperand(2);
-                    unsigned mulId = isDouble ? BPF_CALL_FP_MUL_D : BPF_CALL_FP_MUL_F;
-                    unsigned addId = isDouble ? BPF_CALL_FP_ADD_D : BPF_CALL_FP_ADD_F;
+                    unsigned mulId = isDouble ? BPF_FP_MUL_D : BPF_FP_MUL_F;
+                    unsigned addId = isDouble ? BPF_FP_ADD_D : BPF_FP_ADD_F;
                     Value *Mul = emitDirectFpCall(B, Ctx, mulId, {A, B_}, Ty);
                     Value *Add = emitDirectFpCall(B, Ctx, addId, {Mul, C}, Ty);
                     II->replaceAllUsesWith(Add);
@@ -213,13 +311,42 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
-                // sqrt：VM 侧有 BPF_CALL_FP_SQRT_D/F，直接发。
+                // sqrt：VM 侧有 BPF_FP_SQRT_D/F，直接发。
                 if (II->getIntrinsicID() == Intrinsic::sqrt) {
                     const char *sfx = suffix(Ty);
                     if (!sfx) continue;
-                    unsigned callId = (sfx[0]=='d') ? BPF_CALL_FP_SQRT_D : BPF_CALL_FP_SQRT_F;
+                    unsigned callId = (sfx[0]=='d') ? BPF_FP_SQRT_D : BPF_FP_SQRT_F;
                     Value *Call = emitDirectFpCall(B, Ctx, callId, {II->getArgOperand(0)}, Ty);
                     II->replaceAllUsesWith(Call);
+                    ToErase.push_back(II);
+                    Changed = true;
+                    continue;
+                }
+                // umul.with.overflow：__builtin_mul_overflow(uint64_t,...) 的 IR 形态。
+                // 后端会 lower 成 __multi3 调用，BPF ISel 一律拒绝。这里在 IR 层展开成
+                // schoolbook 32×32 ALU（Lo = 原生 BPF_MUL 截断，Hi = emitUmulHi64），
+                // 并按 {i64,i1} 语义重写 extractvalue users：index 0→Lo，index 1→Ov。
+                // 注意：II->getType() 是 {i64,i1} struct，不能用 suffix(Ty) 判断
+                // （会返回 nullptr 漏过），必须用 operand 类型判断。只处理 i64 重载
+                // （现实 __multi3 唯一来源）；i32 等窄类型 BPF 原生支持，留给后端。
+                if (II->getIntrinsicID() == Intrinsic::umul_with_overflow) {
+                    Type *OpTy = II->getArgOperand(0)->getType();
+                    if (!OpTy->isIntegerTy(64)) continue;
+
+                    Value *A  = II->getArgOperand(0);
+                    Value *Bb = II->getArgOperand(1);
+                    Value *Lo = B.CreateMul(A, Bb);                               // 低位：原生 BPF_MUL
+                    Value *Hi = emitUmulHi64(B, Ctx, A, Bb);                       // 高位：schoolbook
+                    Value *Ov = B.CreateICmpNE(Hi, ConstantInt::get(OpTy, 0));     // 溢出 = 高位非零
+
+                    SmallVector<User *, 4> Users(II->user_begin(), II->user_end());
+                    for (User *U : Users) {
+                        auto *EV = dyn_cast<ExtractValueInst>(U);
+                        if (!EV) continue;   // 罕见非 extractvalue user，留给后端
+                        Value *Rep = (EV->getNumIndices() && EV->getIndices()[0] == 1) ? Ov : Lo;
+                        EV->replaceAllUsesWith(Rep);
+                        ToErase.push_back(EV);
+                    }
                     ToErase.push_back(II);
                     Changed = true;
                     continue;
@@ -238,8 +365,8 @@ static bool softenFunction(Function &F) {
                 if (!sfx) continue;
 
                 const bool is_d = sfx[0]=='d';
-                unsigned cmpId   = is_d ? BPF_CALL_FP_CMP_D   : BPF_CALL_FP_CMP_F;
-                unsigned unordId = is_d ? BPF_CALL_FP_UNORD_D : BPF_CALL_FP_UNORD_F;
+                unsigned cmpId   = is_d ? BPF_FP_CMP_D   : BPF_FP_CMP_F;
+                unsigned unordId = is_d ? BPF_FP_UNORD_D : BPF_FP_UNORD_F;
                 Value *Op0 = FCmp->getOperand(0);
                 Value *Op1 = FCmp->getOperand(1);
                 Value *Zero = ConstantInt::get(I32Ty, 0);

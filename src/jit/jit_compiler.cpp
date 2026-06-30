@@ -95,6 +95,13 @@ bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
     return true;
 }
 
+// FP 虚拟指令的 JIT 回退：do_softfp 只写 r0、不改 pc、不会导致 VM exit，
+template<typename EmitterT>
+bool JitCompiler<EmitterT>::helper_do_softfp(vm* v, uint32_t call_id) {
+    v->do_softfp(call_id);
+    return true;
+}
+
 template<typename EmitterT>
 void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target) {
     if (!v->push_frame(ret_gpa)) {
@@ -154,6 +161,7 @@ HelperTable JitCompiler<EmitterT>::make_helper_table() const {
     h.push_frame = (void*)&helper_push_frame;
     h.pop_frame = (void*)&helper_pop_frame;
     h.do_syscall = (void*)&helper_do_syscall;
+    h.do_softfp = (void*)&helper_do_softfp;
     h.call_indirect = (void*)&helper_call_indirect;
     h.call_bpf = (void*)&helper_call_bpf;
     h.return_to_caller = (void*)&helper_return_to_caller;
@@ -344,18 +352,22 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
                 e.emit_call_indirect(insn, ret_gpa);
                 compiled_count++;
             } else if (insn->src_reg == 0) {
-                // 虚拟浮点指令：先尝试 JIT 原生执行，未命中则回退通用 syscall 路径。
-                if (e.emit_call_softfp(insn)) {
-                    compiled_count++;
-                } else {
-                    e.emit_call_syscall(insn, i, entry_gpa);
-                    compiled_count++;
-                }
+                e.emit_call_syscall(insn, i, entry_gpa);
+                compiled_count++;
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa    = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
                 uint64_t callee_gpa = entry_gpa + (uint64_t)(i + 1 + insn->imm) * sizeof(bpf_insn);
                 e.emit_call_bpf(ret_gpa, callee_gpa);
                 compiled_count++;
+            } else if (insn->src_reg == 2) {
+                // 浮点专用通道：先 JIT 原生（emit_call_softfp），未命中（如 x86 的
+                // uint fp↔int 转换）走 emit_call_softfp_slow 回退到 helper_do_softfp。
+                if (e.emit_call_softfp(insn)) {
+                    compiled_count++;
+                } else {
+                    e.emit_call_softfp_slow(insn, i, entry_gpa);
+                    compiled_count++;
+                }
             } else {
                 return false;
             }

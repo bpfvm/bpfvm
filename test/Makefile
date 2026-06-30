@@ -18,7 +18,7 @@ LIBC_BPFSO := ../libc/lib/libc.so
 #   等的调用，BPF 后端在 ISel 拒绝（实测 dash 即触发）。强制走 musl 库实现。
 # -fno-math-errno: 让 __builtin_sqrt 等数学 builtin 折叠成 @llvm.sqrt 等 intrinsic
 #   （而非对库符号 sqrt 的调用），BpfSoftFp pass 才能在 IR 层接住并 lower 成
-#   BPF_CALL_FP_SQRT_*。去掉 errno 副作用不影响正确性（BPF 无 errno）。
+#   BPF_FP_SQRT_。去掉 errno 副作用不影响正确性（BPF 无 errno）。
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
 CC_FLAGS := -std=c11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
             -nostdinc -fno-builtin -fno-math-errno \
@@ -30,8 +30,9 @@ ifneq ($(WIDEARGS),)
 CC_FLAGS += -fpass-plugin=$(WIDEARGS)
 endif
 
-# BpfSoftFp pass 插件：把浮点运算（fadd/fmul/fcmp/...）在 IR 层替换成直接的
-# BPF_CALL_FP_* call（src_reg=0，syscall 形式），绕过 BPF 后端对浮点的拒绝；
+# BpfSoftFp pass 插件：把浮点运算（fadd/fmul/fcmp/...）在 IR 层替换成对
+# extern __ksym __bpf_fp_<ID> 的调用，经 bpfvm-ld 改写成 BPF_FP_* call
+# （src_reg=2，FP 专用通道），绕过 BPF 后端对浮点的拒绝；
 # VM 侧 do_softfp 用宿主硬件浮点执行。
 SOFTFP := $(wildcard ../build/libBpfSoftFp.so)
 ifneq ($(SOFTFP),)

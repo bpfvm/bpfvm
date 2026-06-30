@@ -57,8 +57,10 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     // Buffer access
     { e.size() } -> std::same_as<size_t>;
     { e.data() } -> std::convertible_to<uint8_t*>;
-    // emulate fp instruction (BPF_CALL_FP_*) in JIT (x86 SSE/FP) or fallback to syscall path.
+    // emulate fp instruction (BPF_FP_*) in JIT (x86 SSE/FP) natively, or fall
+    // back to helper_do_softfp (e.g. x86 unsigned fp↔int conversion lacks AVX-512).
     { e.emit_call_softfp(insn) } -> std::same_as<bool>;
+    e.emit_call_softfp_slow(insn, idx, gpa);
 
     // Patching
     e.patch_branch_cond(0u, 0u);
@@ -99,6 +101,7 @@ private:
     static bool helper_push_frame(vm* v, uint64_t ret_addr);
     static uint64_t helper_pop_frame(vm* v);
     static bool helper_do_syscall(vm* v, uint32_t call_id);
+    static bool helper_do_softfp(vm* v, uint32_t call_id);
     static void helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target);
     static void helper_call_bpf(vm* v, uint64_t ret_gpa, uint64_t callee_gpa);
     static int helper_return_to_caller(vm* v, uint64_t ret_gpa);

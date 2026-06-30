@@ -3,7 +3,7 @@
 
 /* 软件浮点运行时验证（JIT 原生 SSE 短路 + 解释器 syscall shim 共用此用例）。
    用 volatile 阻止常量折叠，强制浮点运算在 VM 运行时执行（经 BpfSoftFp pass
-   把运算直接编成 caller 里的 BPF_CALL_FP_* call → VM do_softfp / JIT SSE 执行）。
+   把运算直接编成 caller 里的 BPF_FP_* call → VM do_softfp / JIT SSE 执行）。
 
    返回 0 表示全部通过，非 0 表示失败。所有结果以整数形式打印（避开 printf %f
    的 PDCLib 打印器，独立验证算术正确性）。 */
@@ -96,7 +96,7 @@ int main(void) {
     /* sqrt —— PDCLib 只实现了 fabs/fmin/fmax 等少数函数，没有 sqrt/sin/cos/pow/
        floor/ceil 等（math.h 里有声明但无实现，链不上）。sqrt 之所以可用，是因为
        -fno-math-errno 让 __builtin_sqrt 折叠成 @llvm.sqrt intrinsic，BpfSoftFp pass
-       把它 lower 成 BPF_CALL_FP_SQRT_D/F，VM 侧用宿主硬件 sqrtsd/fsqrt 执行。
+       把它 lower 成 BPF_FP_SQRT_D/F，VM 侧用宿主硬件 sqrtsd/fsqrt 执行。
        下面覆盖 sqrt 的 D/F 两条 lowering（含非完全平方数，验宿主硬件精度）。*/
     {
         volatile double sq = 16.0;

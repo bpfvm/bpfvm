@@ -72,6 +72,7 @@ struct HelperTable {
     void* push_frame = nullptr;
     void* pop_frame = nullptr;
     void* do_syscall = nullptr;
+    void* do_softfp = nullptr;      // (vm*, call_id): FP 虚拟指令的 JIT 回退
     void* call_indirect = nullptr;
     void* call_bpf = nullptr;       // (vm*, ret_gpa, callee_gpa): push_frame + v->pc = callee_gpa
     void* return_to_caller = nullptr;

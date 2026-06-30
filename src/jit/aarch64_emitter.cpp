@@ -1001,12 +1001,13 @@ void AArch64Emitter::emit_ja32(const bpf_insn* insn, int cur, std::vector<JumpPl
 // FMOV Wd,Sn 取低 32 位零扩展。
 //
 // 与 x86 的差别：AArch64 有 FCVTZU/UCVTF，uint 转换也能原生实现（x86 需
-// AVX-512）。故全部 BPF_CALL_FP_* 都在此原生处理，无回退路径。
+// AVX-512）。故全部 BPF_FP_* 都在此原生处理，无回退路径。
 // ---------------------------------------------------------------------------
 bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
     const uint32_t imm = (uint32_t)insn->imm;
-    if (imm < BPF_SYS_FP_BASE)
-        return false;
+    // 调用方（JIT dispatcher）已按 src_reg=2 保证这是 FP 指令，无需再按 imm 段过滤；
+    // 下面 switch 未命中的 case 返回 false，由 dispatcher 走 emit_call_softfp_slow
+    // 回退到 do_softfp。
 
     // BPF 寄存器 → AArch64 寄存器（与 BPF_REG_MAP 一致）。
     const uint8_t R_R0 = ARM::X9;    // 结果
@@ -1059,133 +1060,133 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
 
     switch (imm) {
     // —— 双精度算术 ——
-    case BPF_CALL_FP_ADD_D: emit_d_binop(0x0A); return true;
-    case BPF_CALL_FP_SUB_D: emit_d_binop(0x0E); return true;
-    case BPF_CALL_FP_MUL_D: emit_d_binop(0x02); return true;
-    case BPF_CALL_FP_DIV_D: emit_d_binop(0x06); return true;
+    case BPF_FP_ADD_D: emit_d_binop(0x0A); return true;
+    case BPF_FP_SUB_D: emit_d_binop(0x0E); return true;
+    case BPF_FP_MUL_D: emit_d_binop(0x02); return true;
+    case BPF_FP_DIV_D: emit_d_binop(0x06); return true;
 
     // —— 单精度算术 ——
-    case BPF_CALL_FP_ADD_F: emit_f_binop(0x0A); return true;
-    case BPF_CALL_FP_SUB_F: emit_f_binop(0x0E); return true;
-    case BPF_CALL_FP_MUL_F: emit_f_binop(0x02); return true;
-    case BPF_CALL_FP_DIV_F: emit_f_binop(0x06); return true;
+    case BPF_FP_ADD_F: emit_f_binop(0x0A); return true;
+    case BPF_FP_SUB_F: emit_f_binop(0x0E); return true;
+    case BPF_FP_MUL_F: emit_f_binop(0x02); return true;
+    case BPF_FP_DIV_F: emit_f_binop(0x06); return true;
 
     // —— 取负（FNEG 翻转符号位，比 x86 的 xorps 更直接）——
-    case BPF_CALL_FP_NEG_D:
+    case BPF_FP_NEG_D:
         fmov_v_from_x(V_A, R_R1, true);
         fp_neg(V_A, V_A, true);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_CALL_FP_NEG_F:
+    case BPF_FP_NEG_F:
         fmov_v_from_x(V_A, R_R1, true);
         fp_neg(V_A, V_A, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
 
     // —— 平方根 ——
-    case BPF_CALL_FP_SQRT_D:
+    case BPF_FP_SQRT_D:
         fmov_v_from_x(V_A, R_R1, true);
         fp_sqrt(V_A, V_A, true);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_CALL_FP_SQRT_F:
+    case BPF_FP_SQRT_F:
         fmov_v_from_x(V_A, R_R1, true);
         fp_sqrt(V_A, V_A, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
 
     // —— double → 有符号整型（FCVTZS 向 0 截断）——
-    case BPF_CALL_FP_D2SI:   // -> int32
+    case BPF_FP_D2SI:   // -> int32
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, true, false);   // 32 位结果，W 写零扩展进 X9
         return true;
-    case BPF_CALL_FP_D2DI:   // -> int64
+    case BPF_FP_D2DI:   // -> int64
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, true, true);
         return true;
     // —— float → 有符号整型 ——
-    case BPF_CALL_FP_F2SI:
+    case BPF_FP_F2SI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, false, false);
         return true;
-    case BPF_CALL_FP_F2DI:
+    case BPF_FP_F2DI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, false, true);
         return true;
     // —— double/float → 无符号整型（FCVTZU；x86 无此能力）——
-    case BPF_CALL_FP_D2USI:
+    case BPF_FP_D2USI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzu(R_R0, V_A, true, false);
         return true;
-    case BPF_CALL_FP_D2UDI:
+    case BPF_FP_D2UDI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzu(R_R0, V_A, true, true);
         return true;
-    case BPF_CALL_FP_F2USI:
+    case BPF_FP_F2USI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzu(R_R0, V_A, false, false);
         return true;
-    case BPF_CALL_FP_F2UDI:
+    case BPF_FP_F2UDI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzu(R_R0, V_A, false, true);
         return true;
 
     // —— 有符号整型 → double ——
-    case BPF_CALL_FP_DI2D:   // int64 → double
+    case BPF_FP_DI2D:   // int64 → double
         scvtf(V_A, R_R1, true, true);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_CALL_FP_SI2D:   // int32 → double（源按 W 解释，SCVTF 用 32 位源）
+    case BPF_FP_SI2D:   // int32 → double（源按 W 解释，SCVTF 用 32 位源）
         scvtf(V_A, R_R1, true, false);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
     // —— 有符号整型 → float ——
-    case BPF_CALL_FP_DI2F:
+    case BPF_FP_DI2F:
         scvtf(V_A, R_R1, false, true);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
-    case BPF_CALL_FP_SI2F:
+    case BPF_FP_SI2F:
         scvtf(V_A, R_R1, false, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
     // —— 无符号整型 → double（UCVTF）——
-    case BPF_CALL_FP_UDI2D:
+    case BPF_FP_UDI2D:
         ucvtf(V_A, R_R1, true, true);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_CALL_FP_USI2D:
+    case BPF_FP_USI2D:
         ucvtf(V_A, R_R1, true, false);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
     // —— 无符号整型 → float ——
-    case BPF_CALL_FP_UDI2F:
+    case BPF_FP_UDI2F:
         ucvtf(V_A, R_R1, false, true);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
-    case BPF_CALL_FP_USI2F:
+    case BPF_FP_USI2F:
         ucvtf(V_A, R_R1, false, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
 
     // —— 单/双精度互转 ——
-    case BPF_CALL_FP_EXTEND:  // float → double
+    case BPF_FP_EXTEND:  // float → double
         fmov_v_from_x(V_A, R_R1, true);   // 8 字节搬进 V0（低 32 位是 float）
         fp_cvt_sd(V_A, V_A, true);        // S→D 扩展
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_CALL_FP_TRUNC:   // double → float
+    case BPF_FP_TRUNC:   // double → float
         fmov_v_from_x(V_A, R_R1, true);
         fp_cvt_sd(V_A, V_A, false);       // D→S 截断
         fmov_x_from_v(R_R0, V_A, false);  // 取低 32 位零扩展
         return true;
 
     // —— 比较 ——
-    case BPF_CALL_FP_CMP_D: emit_cmp(true);  return true;
-    case BPF_CALL_FP_CMP_F: emit_cmp(false); return true;
+    case BPF_FP_CMP_D: emit_cmp(true);  return true;
+    case BPF_FP_CMP_F: emit_cmp(false); return true;
 
     // —— 无序判定 ——
-    case BPF_CALL_FP_UNORD_D: emit_unord(true);  return true;
-    case BPF_CALL_FP_UNORD_F: emit_unord(false); return true;
+    case BPF_FP_UNORD_D: emit_unord(true);  return true;
+    case BPF_FP_UNORD_F: emit_unord(false); return true;
 
     default:
         return false;
@@ -1204,6 +1205,20 @@ void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t e
     // Check return (al != 0 means ok)
     cbz(X0, false);
     patch_branch_cond(size() - 4, vm_exit_offset);
+    reload_from_vm();
+}
+
+// FP 虚拟指令（src_reg=2）的 JIT 回退路径：emit_call_softfp 无法原生 lower 时
+// 走此路径。结构同 emit_call_syscall，但调 helper_do_softfp（只读 r1/r2、写 r0，
+// 不会 VM exit），故无需检查返回值。
+void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64_t entry_gpa) {
+    flush_to_vm();
+    mov_imm(X0, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
+    str_imm(X0, X28, (int32_t)off_pc_, true);
+    // Call helper_do_softfp(vm*, call_id)
+    mov_reg(X0, X28, true);
+    mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
+    call_helper(helpers_.do_softfp);
     reload_from_vm();
 }
 

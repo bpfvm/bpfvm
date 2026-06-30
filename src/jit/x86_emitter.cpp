@@ -1295,10 +1295,37 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
 }
 
 // ---------------------------------------------------------------------------
+// CALL softfp_slow — FP 虚拟指令（src_reg=2）的 JIT 回退路径。
+//
+// 当 emit_call_softfp 无法原生 lower（如 x86 缺少 AVX-512 的 uint fp↔int 转换）
+// 时走此路径：flush 寄存器 → 调 helper_do_softfp(vm*, call_id) → reload。
+//
+// 与 emit_call_syscall 结构相同，但调 do_softfp（只读 r1/r2、写 r0，不会导致
+// VM exit），故无需检查返回值——helper_do_softfp 无条件返回 true。
+// ---------------------------------------------------------------------------
+void X86Emitter::emit_call_softfp_slow(const bpf_insn* insn, int current_index,
+                                         uint64_t entry_gpa) {
+    flush_to_vm();
+
+    // 保存当前 pc（guest 地址）到 vm->pc
+    uint64_t insn_gpa = entry_gpa + (uint64_t)current_index * sizeof(bpf_insn);
+    mov_rax_imm64(insn_gpa);
+    emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
+
+    // 调用 helper_do_softfp(vm*, call_id)
+    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
+    emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
+    call_helper(helpers_.do_softfp);
+
+    // do_softfp 只写 r0、不改其他寄存器语义外的东西，但 reload 以保持一致与安全。
+    reload_from_vm();
+}
+
+// ---------------------------------------------------------------------------
 // 虚拟浮点指令的 JIT 实现（x86_64）。
 //
 // 寄存器驻留：JIT 把全部 11 个 BPF 寄存器常驻在 x86 物理寄存器，纯计算路径
-// 不碰 vm->reg[]。故到一条 BPF_CALL_FP_* 时 r1/r2/r0 已在 R9/R10/R8，直接读
+// 不碰 vm->reg[]。故到一条 BPF_FP_* 时 r1/r2/r0 已在 R9/R10/R8，直接读
 // → SSE 运算 → 写回 R8 即可，无需 flush/reload 或退 JIT。
 // scratch：RAX/RCX（整数）、xmm0/xmm1（浮点），均 caller-saved。
 //
@@ -1310,9 +1337,6 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
 
 bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     const uint32_t imm = (uint32_t)insn->imm;
-    // 非 FP 段直接回退通用 syscall。
-    if (imm < BPF_SYS_FP_BASE)
-        return false;
 
     // BPF 寄存器 → x86 寄存器（与 BPF_REG_MAP 一致）。
     const uint8_t R_R0 = X86::R8;   // 结果
@@ -1395,19 +1419,19 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
 
     switch (imm) {
     // —— 双精度算术 ——
-    case BPF_CALL_FP_ADD_D: emit_d_binop(0x58); return true;
-    case BPF_CALL_FP_SUB_D: emit_d_binop(0x5C); return true;
-    case BPF_CALL_FP_MUL_D: emit_d_binop(0x59); return true;
-    case BPF_CALL_FP_DIV_D: emit_d_binop(0x5E); return true;
+    case BPF_FP_ADD_D: emit_d_binop(0x58); return true;
+    case BPF_FP_SUB_D: emit_d_binop(0x5C); return true;
+    case BPF_FP_MUL_D: emit_d_binop(0x59); return true;
+    case BPF_FP_DIV_D: emit_d_binop(0x5E); return true;
 
     // —— 单精度算术 ——
-    case BPF_CALL_FP_ADD_F: emit_f_binop(0x58); return true;
-    case BPF_CALL_FP_SUB_F: emit_f_binop(0x5C); return true;
-    case BPF_CALL_FP_MUL_F: emit_f_binop(0x59); return true;
-    case BPF_CALL_FP_DIV_F: emit_f_binop(0x5E); return true;
+    case BPF_FP_ADD_F: emit_f_binop(0x58); return true;
+    case BPF_FP_SUB_F: emit_f_binop(0x5C); return true;
+    case BPF_FP_MUL_F: emit_f_binop(0x59); return true;
+    case BPF_FP_DIV_F: emit_f_binop(0x5E); return true;
 
     // —— 取负（异或符号位掩码）——
-    case BPF_CALL_FP_NEG_D: {
+    case BPF_FP_NEG_D: {
         sse_movq_xmm_r64(X0, R_R1);
         // mov rcx, 0x8000000000000000 ; xmm1 = 该位模式 ; xorps
         emit8(0x48); emit8(0xB9); emit64(0x8000000000000000ULL);  // mov rcx, imm64
@@ -1416,7 +1440,7 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
         sse_movq_r64_xmm(R_R0, X0);
         return true;
     }
-    case BPF_CALL_FP_NEG_F: {
+    case BPF_FP_NEG_F: {
         // 单精度符号位掩码在低 32 位；用 32 位搬运。
         sse_movd_xmm_r32(X0, R_R1);
         emit8(0xB9); emit32(0x80000000u);                          // mov ecx, imm32
@@ -1428,13 +1452,13 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     }
 
     // —— 平方根 ——
-    case BPF_CALL_FP_SQRT_D: {
+    case BPF_FP_SQRT_D: {
         sse_movq_xmm_r64(X0, R_R1);
         sse_sqrt_scalar(0xF2, X0, X0);
         sse_movq_r64_xmm(R_R0, X0);
         return true;
     }
-    case BPF_CALL_FP_SQRT_F: {
+    case BPF_FP_SQRT_F: {
         sse_movd_xmm_r32(X0, R_R1);
         sse_sqrt_scalar(0xF3, X0, X0);
         sse_movd_r32_xmm(X86::RAX, X0);
@@ -1443,40 +1467,40 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     }
 
     // —— double → 有符号整数（向 0 截断）——
-    case BPF_CALL_FP_D2SI:
-    case BPF_CALL_FP_D2DI: {
+    case BPF_FP_D2SI:
+    case BPF_FP_D2DI: {
         sse_movq_xmm_r64(X0, R_R1);
         sse_cvtsd2si(R_R0, X0);   // 64 位结果；D2SI 取低 32 位（调用方 w0 零扩展）
         return true;
     }
     // —— float → 有符号整数 ——
-    case BPF_CALL_FP_F2SI:
-    case BPF_CALL_FP_F2DI: {
+    case BPF_FP_F2SI:
+    case BPF_FP_F2DI: {
         sse_movq_xmm_r64(X0, R_R1);
         sse_cvtss2si(R_R0, X0);
         return true;
     }
 
     // —— int → double（src 在 R9，按宽度做有符号解释）——
-    case BPF_CALL_FP_DI2D: {   // int64 → double
+    case BPF_FP_DI2D: {   // int64 → double
         sse_cvtsi2sd(X0, R_R1, true);
         sse_movq_r64_xmm(R_R0, X0);
         return true;
     }
-    case BPF_CALL_FP_SI2D: {   // int32 → double（符号扩展后转换）
+    case BPF_FP_SI2D: {   // int32 → double（符号扩展后转换）
         // cvtsi2sd 的 32 位源读 R9D（低 32 位，符号扩展到 int32）。不需要显式扩展。
         sse_cvtsi2sd(X0, R_R1, false);
         sse_movq_r64_xmm(R_R0, X0);
         return true;
     }
     // —— int → float ——
-    case BPF_CALL_FP_DI2F: {
+    case BPF_FP_DI2F: {
         sse_cvtsi2ss(X0, R_R1, true);
         sse_movd_r32_xmm(X86::RAX, X0);
         mov_r64(R_R0, X86::RAX);
         return true;
     }
-    case BPF_CALL_FP_SI2F: {
+    case BPF_FP_SI2F: {
         sse_cvtsi2ss(X0, R_R1, false);
         sse_movd_r32_xmm(X86::RAX, X0);
         mov_r64(R_R0, X86::RAX);
@@ -1484,13 +1508,13 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     }
 
     // —— 类型转换 ——
-    case BPF_CALL_FP_EXTEND: {  // float → double
+    case BPF_FP_EXTEND: {  // float → double
         sse_movd_xmm_r32(X0, R_R1);
         sse_cvtss2sd(X0, X0);
         sse_movq_r64_xmm(R_R0, X0);
         return true;
     }
-    case BPF_CALL_FP_TRUNC: {   // double → float
+    case BPF_FP_TRUNC: {   // double → float
         sse_movq_xmm_r64(X0, R_R1);
         sse_cvtsd2ss(X0, X0);
         sse_movd_r32_xmm(X86::RAX, X0);
@@ -1499,12 +1523,12 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     }
 
     // —— 比较：见上方 emit_cmp lambda ——
-    case BPF_CALL_FP_CMP_D: emit_cmp(true);  return true;
-    case BPF_CALL_FP_CMP_F: emit_cmp(false); return true;
+    case BPF_FP_CMP_D: emit_cmp(true);  return true;
+    case BPF_FP_CMP_F: emit_cmp(false); return true;
 
     // —— 无序判定：见上方 emit_unord lambda ——
-    case BPF_CALL_FP_UNORD_D: emit_unord(true);  return true;
-    case BPF_CALL_FP_UNORD_F: emit_unord(false); return true;
+    case BPF_FP_UNORD_D: emit_unord(true);  return true;
+    case BPF_FP_UNORD_F: emit_unord(false); return true;
 
     default:
         // 未实现的 FP 编号（主要是 uint 目标的转换 D2USI/D2UDI/F2USI/F2UDI
