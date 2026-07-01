@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <signal.h>
 #include "posix_syscall.h"
 #include "empty_syscall.h"
 
@@ -1393,7 +1394,12 @@ void test_syscall_fork_waitpid() {
     auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 0, 0, SIGCHLD },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 2, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 3, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 4, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 5, 0, 0, 0 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_CLONE },          // r0 = pid (parent) or 0 (child)
         { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 8, 0 },               // if r0 == 0 jump to child
         { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },             // r6 = child pid
         { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 },             // r1 = pid
@@ -1445,7 +1451,12 @@ void test_syscall_waitpid_any_twice() {
     auto ebpf_vm = vm::create();
 
     bpf_insn instructions[] = {
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_FORK },          // r0 = pid (parent) or 0 (child)
+        { BPF_ALU64 | BPF_MOV | BPF_X, 1, 0, 0, SIGCHLD },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 2, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 3, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 4, 0, 0, 0 },
+        { BPF_ALU64 | BPF_MOV | BPF_X, 5, 0, 0, 0 },
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_CLONE },          // r0 = pid (parent) or 0 (child)
         { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 10, 0 },              // if r0 == 0 jump to child
         { BPF_ALU64 | BPF_MOV | BPF_X, 6, 0, 0, 0 },             // r6 = child pid
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)

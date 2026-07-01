@@ -36,9 +36,10 @@
 - `cmake -S . -B build && cmake --build build` — configure and build `bpfvm` and `bpfvm_test`.
 - `./build/bpfvm <elf-file>` — run the VM on a BPF ELF file.
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
-- `cd build && ctest` — run all CTest tests (see below).
+- `cd build && ctest -j$(nproc)` — run CTest with parallel jobs; tests are independent, so always pass `-j` (e.g. `-j$(nproc)`) to run them concurrently instead of serially.
 - `make -C test` — build BPF test programs into `.out` files using `clang` and `bpfvm-ld`.
 - `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
+- Disassemble BPF ELF binaries with `bpf-objdump` (from `binutils-bpf`), e.g. `bpf-objdump -d foo.out`. Prefer it over plain `objdump`, which does not understand the BPF target.
 
 ## Coding Style & Naming Conventions
 - C++20 (`CMAKE_CXX_STANDARD 20`); keep code compatible with `clang`.

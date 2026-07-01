@@ -1703,7 +1703,7 @@ size_t X86Emitter::emit_prologue() {
 // 循环回边处插入安全点，让 VM 有机会处理信号和检查中止标志。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_safepoint(uint32_t loop_body_size) {
+void X86Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) {
     if (insn_count_enabled_) {
         // --- 指令计数递增 ---
         // mov rax, qword [rbp + off_insn_count_]
@@ -1752,6 +1752,17 @@ void X86Emitter::emit_safepoint(uint32_t loop_body_size) {
     patch_branch_cond(flags_jnz, slow_start);
 
     flush_to_vm();
+
+    // 写当前 guest pc 到 vm->pc。JIT 的"寄存器驻留纯执行段"不维护 vm->pc，
+    // 但 safepoint 的 slow path 会调用 helper_safepoint → handle_signals，后者用
+    // vm->pc 作为信号返回帧的返回地址。若不写回，vm->pc 会停在最后一次
+    // emit_call_syscall 的 stale 值上，导致信号处理返回后回到错误的 pc（如重复
+    // 执行一条 syscall 形式的 call 指令）。insn_gpa 是本 safepoint 所在 BPF 指令
+    // （循环头）的 guest 地址，即信号返回后应当恢复执行的位置。
+    // RAX 作写 pc 的专用 scratch（非参数寄存器；对应 aarch64 版用 X2）。
+    mov_rax_imm64(insn_gpa);
+    emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
+
     mov_r64(X86::RDI, X86::RBP);
     call_helper(helpers_.safepoint);
     test_eax_eax();

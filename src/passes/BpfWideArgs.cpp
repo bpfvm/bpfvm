@@ -587,7 +587,7 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
             record_arg(ApOp);
             I->replaceAllUsesWith(Val);
             I->eraseFromParent();
-        } else if (auto *VAE = dyn_cast<VAEndInst>(I)) {
+        } else if (dyn_cast<VAEndInst>(I)) {
             // va_end：no-op。
             I->eraseFromParent();
         } else if (auto *VAC = dyn_cast<VACopyInst>(I)) {

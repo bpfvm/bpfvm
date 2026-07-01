@@ -11,16 +11,18 @@ LIBC_BPFSO := ../libc/lib/libc.so
 
 # BPF 编译 flags（clang 直接编译，无 wrapper）
 # -nostdinc: 不用宿主 glibc 头，只用 musl(../libc/include) + BPF guest 头(../include)。
-# -D_GNU_SOURCE: musl 的 bits/*.h 用 _POSIX/_GNU/_BSD feature 宏门控；-std=c11 定义
-#   __STRICT_ANSI__，musl features.h 不启用默认 feature 宏，导致 struct sigaction 等
-#   类型缺失。显式 -D_GNU_SOURCE 开启全部 POSIX/GNU/BSD 接口。
+# -std=gnu11: gnu11 不定义 __STRICT_ANSI__，musl features.h 启用默认 feature 宏
+#   （_GNU_SOURCE 等），struct sigaction 等类型可见。同时让 GNU 扩展
+#   （`, ##__VA_ARGS__`）可用 —— 用户侧 syscall 宏（arch/bpf/bits/syscall.h.in）
+#   依赖该扩展做 0..6 参 narg 分发；严格 -std=c11 下不删空变参前的逗号，
+#   NARG() 误算成 1，syscall(GETTID) 错调 __bpf_syscall1 报参数不足。
 # -fno-builtin: 必须保留。否则 clang 把 mempcpy/strchr/... 等 builtin 优化成对 memcpy
 #   等的调用，BPF 后端在 ISel 拒绝（实测 dash 即触发）。强制走 musl 库实现。
 # -fno-math-errno: 让 __builtin_sqrt 等数学 builtin 折叠成 @llvm.sqrt 等 intrinsic
 #   （而非对库符号 sqrt 的调用），BpfSoftFp pass 才能在 IR 层接住并 lower 成
 #   BPF_FP_SQRT_。去掉 errno 副作用不影响正确性（BPF 无 errno）。
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
-CC_FLAGS := -std=c11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
+CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
             -nostdinc -fno-builtin -fno-math-errno \
             -isystem ../libc/include/ -isystem ../include -g
 

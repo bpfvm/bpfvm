@@ -133,6 +133,8 @@ template<typename T> class JitCompiler;
 class SyscallHandler{
 protected:
     static auto& maps(vm* v);
+    static auto& maps_ptr(vm* v);
+    static auto& maps_mutex(vm* v);
     static auto& options(vm* v);
     static auto& flags(vm* v);
     static auto& signal_depth(vm* v);
@@ -176,7 +178,8 @@ private:
     vmOptions options;
     uint64_t pc;
     uint64_t reg[11];
-    std::list<memmap> maps;
+    std::shared_ptr<std::list<memmap>> maps = std::make_shared<std::list<memmap>>();
+    std::shared_ptr<std::mutex> maps_mutex = std::make_shared<std::mutex>();
     pthread_mutex_t exit_mutex;
     pthread_cond_t exit_cv;
     std::atomic<uint32_t> flags{0};
@@ -217,6 +220,7 @@ public:
     static constexpr uint32_t VM_KILLED = 0x4;
     static constexpr uint32_t VM_SIGNAL_PENDING = 0x8;
     static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
+    static constexpr uint32_t VM_BLOCKED = 0x20;
 
     vm(Token);
     ~vm();
@@ -230,12 +234,18 @@ public:
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                      const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
-    bool wait_for_exit(int timeout_ms);
+    // 通用阻塞原语：调用方先置 VM_BLOCKED（与其等待注册原子），再调用本函数。阻塞在自身
+    // exit_cv 上，直至 unblock、或 VM_KILLED/ VM_SIGNAL_PENDING 置位、或超时。
+    // 返回 0（被唤醒）/ -EINTR（被信号/kill 打断）/ -ETIMEDOUT。
+    // timeout 为相对时长，nullptr 表示无限等待（1s 兜底防 spurious）。
+    int wait_for(const struct timespec* timeout);
+    void unblock();
     ElfLoadInfo load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();
     void clear_jit_cache();
+    // 这个函数和unblock区别是，它不加锁，因为会在信号上下文中使用
     void wakeup();
     uint64_t& r(int n) {
         return reg[n];
@@ -246,7 +256,9 @@ public:
     void dump_stats() const;
 };
 
-inline auto& SyscallHandler::maps(vm* v) { return v->maps; }
+inline auto& SyscallHandler::maps(vm* v) { return *v->maps; }
+inline auto& SyscallHandler::maps_ptr(vm* v) { return v->maps; }
+inline auto& SyscallHandler::maps_mutex(vm* v) { return v->maps_mutex; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
 inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }

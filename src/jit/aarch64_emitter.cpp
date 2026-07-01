@@ -1195,9 +1195,12 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
 
 void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t entry_gpa) {
     flush_to_vm();
-    // Save pc (guest address)
-    mov_imm(X0, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
-    str_imm(X0, X28, (int32_t)off_pc_, true);
+    // Save pc (guest address)。用 X2 作写 pc 的临时，避免与 helper 第一参数 X0 复用
+    // （旧写法 mov_imm(X0) 后又 mov_reg(X0,X28) 覆盖，意图不清且 str_imm 的 fallback
+    //  会 clobber X1，隐式依赖 helper 不在 str 前设 X1）。X2 是参数寄存器，但这些 helper
+    //  最多 2 参（X0/X1），且写 pc 在设参数之前，无冲突。
+    mov_imm(X2, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
+    str_imm(X2, X28, (int32_t)off_pc_, true);
     // Call helper_do_syscall(vm*, call_id)
     mov_reg(X0, X28, true);
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
@@ -1213,8 +1216,9 @@ void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t e
 // 不会 VM exit），故无需检查返回值。
 void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64_t entry_gpa) {
     flush_to_vm();
-    mov_imm(X0, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
-    str_imm(X0, X28, (int32_t)off_pc_, true);
+    // Save pc：用 X2 作写 pc 的临时（同 emit_call_syscall 的理由）。
+    mov_imm(X2, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
+    str_imm(X2, X28, (int32_t)off_pc_, true);
     // Call helper_do_softfp(vm*, call_id)
     mov_reg(X0, X28, true);
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
@@ -1327,7 +1331,7 @@ size_t AArch64Emitter::emit_prologue() {
 // Safepoint (at loop back-edge targets)
 // ---------------------------------------------------------------------------
 
-void AArch64Emitter::emit_safepoint(uint32_t loop_body_size) {
+void AArch64Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) {
     if (insn_count_enabled_) {
         // --- 指令计数递增 ---
         // X0 = insn_count, X1 = loop_body_size
@@ -1381,6 +1385,11 @@ void AArch64Emitter::emit_safepoint(uint32_t loop_body_size) {
     patch_branch_cond(slow_patch, slow);
 
     flush_to_vm();
+    // 写当前 guest pc 到 vm->pc（同 x86 版本的注释：JIT 纯执行段不维护 vm->pc，
+    // 但 safepoint slow path 的 handle_signals 需要准确的 vm->pc 作信号返回地址）。
+    // 用 X2 作写 pc 的临时，X0 留给 helper 参数（见 emit_call_syscall 同款说明）。
+    mov_imm(X2, insn_gpa, true);
+    str_imm(X2, X28, (int32_t)off_pc_, true);
     mov_reg(X0, X28, true);
     call_helper(helpers_.safepoint);
     // helper returns 0=ok, non-zero=exit

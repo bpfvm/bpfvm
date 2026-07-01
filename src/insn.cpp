@@ -663,7 +663,7 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     std::cerr << std::dec << std::endl;
 
     std::cerr << "Current memory maps:" << std::endl;
-    for(const auto& map : maps) {
+    for(const auto& map : *maps) {
         // 权限符号化（PF_R=0x4, PF_W=0x2, PF_X=0x1），形如 /proc/<pid>/maps 的 rwx
         char perm[4];
         perm[0] = (map.flags & PF_R) ? 'r' : '-';
@@ -677,11 +677,68 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     }
 }
 
+int vm::wait_for(const struct timespec* timeout) {
+    // 阻塞在 exit_cv 上，谓词 = VM_BLOCKED 被清（外部 unblock）/ kill·信号 / 超时。
+    // exit_cv 为 CLOCK_REALTIME，pthread_cond_timedwait 取【绝对】时限，故把相对的
+    // timeout 一次性转成绝对 deadline 直接喂给它；每轮醒来在循环顶重判 flag + 是否已过
+    // deadline（标准 condvar 模式，天然处理 wake/timeout 竞争）。
+    bool has_deadline = timeout != nullptr;
+    struct timespec deadline{};
+    if(has_deadline) {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += timeout->tv_sec;
+        deadline.tv_nsec += timeout->tv_nsec;
+        if(deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+    int rc;
+    pthread_mutex_lock(&exit_mutex);
+    while(true) {
+        uint32_t f = flags.load(std::memory_order_acquire);
+        if(!(f & VM_BLOCKED)) {                 // 被 unblock 清位
+            rc = 0;
+            break;
+        }
+        if(f & (VM_KILLED | VM_SIGNAL_PENDING)) {
+            rc = -EINTR;                        // 交回 safepoint 投递信号 / 退出
+            break;
+        }
+        if(has_deadline) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if(now.tv_sec > deadline.tv_sec ||
+               (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+                rc = -ETIMEDOUT;
+                break;
+            }
+            pthread_cond_timedwait(&exit_cv, &exit_mutex, &deadline);
+        } else {
+            // 无 deadline：wakeup()（kill/信号路径）无锁 broadcast 偶有丢失窗口，用 1s
+            // 滚动绝对兜底覆盖——每轮重算，不累积成固定超时。
+            struct timespec backstop;
+            clock_gettime(CLOCK_REALTIME, &backstop);
+            backstop.tv_sec += 1;
+            pthread_cond_timedwait(&exit_cv, &exit_mutex, &backstop);
+        }
+    }
+    pthread_mutex_unlock(&exit_mutex);
+    return rc;
+}
+
+void vm::unblock() {
+    // 唤醒端：持 exit_mutex 清 VM_BLOCKED + broadcast。与 wait_for 谓词检查同锁串行，
+    // 杜绝丢失唤醒（否则 broadcast 可能落在 waiter「谓词检查→cond_timedwait」之间）。
+    pthread_mutex_lock(&exit_mutex);
+    flags.fetch_and(~VM_BLOCKED, std::memory_order_release);
+    pthread_cond_broadcast(&exit_cv);
+    pthread_mutex_unlock(&exit_mutex);
+}
+
 void vm::wakeup() {
     pthread_cond_broadcast(&exit_cv);
 }
-
-
 
 bool vm::ld(const bpf_insn* cur) {
     if(cur->dst_reg >= 10) {
@@ -769,21 +826,23 @@ bool vm::st(const bpf_insn* cur) {
 template<typename T>
 static bool do_atomic(T* p, int32_t op, uint64_t& src_reg, uint64_t& r0) {
     T src = (T)src_reg;
-    T old = *p;
     switch(op) {
-    case BPF_ADD:                *p = old + src; break;
-    case BPF_OR:                 *p = old | src; break;
-    case BPF_AND:                *p = old & src; break;
-    case BPF_XOR:                *p = old ^ src; break;
-    case BPF_ADD | BPF_FETCH:    *p = old + src; src_reg = old; break;
-    case BPF_OR  | BPF_FETCH:    *p = old | src; src_reg = old; break;
-    case BPF_AND | BPF_FETCH:    *p = old & src; src_reg = old; break;
-    case BPF_XOR | BPF_FETCH:    *p = old ^ src; src_reg = old; break;
-    case BPF_XCHG:               *p = src; src_reg = old; break;
-    case BPF_CMPXCHG:
-        if(old == (T)r0) { *p = src; }
+    case BPF_ADD:                __atomic_fetch_add(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_OR:                 __atomic_fetch_or(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_AND:                __atomic_fetch_and(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_XOR:                __atomic_fetch_xor(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_ADD | BPF_FETCH:    src_reg = __atomic_fetch_add(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_OR  | BPF_FETCH:    src_reg = __atomic_fetch_or(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_AND | BPF_FETCH:    src_reg = __atomic_fetch_and(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_XOR | BPF_FETCH:    src_reg = __atomic_fetch_xor(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_XCHG:               src_reg = __atomic_exchange_n(p, src, __ATOMIC_SEQ_CST); break;
+    case BPF_CMPXCHG: {
+        T expected = (T)r0;
+        T old = expected;
+        __atomic_compare_exchange_n(p, &old, src, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         r0 = old;
         break;
+    }
     default: return false;
     }
     return true;
@@ -1004,6 +1063,14 @@ bool vm::safepoint() {
         }
     }
 
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 100000000L; // 100ms
+    if(ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+
     while(true) {
         uint32_t f = flags.load(std::memory_order_acquire);
         if(f & (VM_EXITED | VM_KILLED | VM_BUDGET_EXCEEDED)) {
@@ -1013,13 +1080,6 @@ bool vm::safepoint() {
             return false;
         }
         if(!(f & VM_STOPPED)) break;
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100000000L; // 100ms
-        if(ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000L;
-        }
         pthread_mutex_lock(&exit_mutex);
         pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
         pthread_mutex_unlock(&exit_mutex);
@@ -1098,18 +1158,20 @@ bool vm::step() {
 
 void vm::addmem(memmap&& memmap) {
     //add by sorted order
-    auto it = maps.begin();
-    while(it != maps.end() && it->paddr < memmap.paddr) {
+    std::lock_guard<std::mutex> lock(*maps_mutex);
+    auto it = maps->begin();
+    while(it != maps->end() && it->paddr < memmap.paddr) {
         it++;
     }
-    maps.insert(it, std::move(memmap));
+    maps->insert(it, std::move(memmap));
     flush_tlb();
 }
 
 bool vm::unmap(uint64_t addr) {
-    for(auto it = maps.begin(); it != maps.end(); ++it) {
+    std::lock_guard<std::mutex> lock(*maps_mutex);
+    for(auto it = maps->begin(); it != maps->end(); ++it) {
         if(addr == it->paddr) {
-            maps.erase(it); // unique_ptr destructor handles munmap if owned
+            maps->erase(it); // unique_ptr destructor handles munmap if owned
             flush_tlb();
             return true;
         }
@@ -1139,7 +1201,8 @@ void* vm::mmu(uint64_t addr, size_t size) {
 void* vm::mmu_slow(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
-    for(const auto& map: maps) {
+    std::lock_guard<std::mutex> lock(*maps_mutex);
+    for(const auto& map: *maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
             return map.data.get() + (addr - map.paddr);
@@ -1163,7 +1226,8 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
 void* vm::mmu_w_slow(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
-    for(auto& map: maps) {
+    std::lock_guard<std::mutex> lock(*maps_mutex);
+    for(auto& map: *maps) {
         if(addr >= map.paddr && end <= map.paddr + map.size) {
             if(!(map.flags & PF_W)) return nullptr;
             if(map.cow_data) { // CoW triggered: copy on write
@@ -1242,26 +1306,6 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
     }
     push_frame(0);
     return run();
-}
-
-bool vm::wait_for_exit(int timeout_ms) {
-    if(flags.load(std::memory_order_acquire) & VM_EXITED) {
-        return true;
-    }
-    pthread_mutex_lock(&exit_mutex);
-    if(!(flags.load(std::memory_order_acquire) & VM_EXITED)) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-        if(ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
-    }
-    pthread_mutex_unlock(&exit_mutex);
-    return (flags.load(std::memory_order_acquire) & VM_EXITED) != 0;
 }
 
 bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,

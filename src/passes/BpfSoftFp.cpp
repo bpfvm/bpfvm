@@ -530,10 +530,9 @@ llvmGetPassPluginInfo() {
                 // LLVM >= 21 给 OptimizerLastEPCallback 增加了 ThinOrFullLTOPhase 形参。
                 PB.registerOptimizerLastEPCallback(
 #if LLVM_VERSION_MAJOR >= 21
-                    [addPass](ModulePassManager &MPM, OptimizationLevel OL,
-                              ThinOrFullLTOPhase) {
+                    [addPass](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
 #else
-                    [addPass](ModulePassManager &MPM, OptimizationLevel OL) {
+                    [addPass](ModulePassManager &MPM, OptimizationLevel) {
 #endif
                         addPass(MPM);
                     });

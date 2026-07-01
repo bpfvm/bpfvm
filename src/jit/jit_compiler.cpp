@@ -450,7 +450,7 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     uint64_t entry_gpa = gpa;
 
     const bpf_insn* seg_end = nullptr;
-    for (auto& m : v->maps) {
+    for (auto& m : *v->maps) {
         if (entry_gpa >= m.paddr && entry_gpa < m.paddr + m.size) {
             size_t bytes_remaining = m.size - (size_t)(entry_gpa - m.paddr);
             seg_end = entry_pc + bytes_remaining / sizeof(bpf_insn);
@@ -520,7 +520,10 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
 
         // Safepoint at back-edge targets (loop headers)
         if (back_edge_targets[i]) {
-            e.emit_safepoint(loop_body_sizes[i]);
+            // 本 safepoint 所在 BPF 指令（循环头）的 guest pc：信号处理返回后应
+            // 恢复到此处执行，故把该地址传给 emit_safepoint 写入 vm->pc。
+            uint64_t insn_gpa = entry_gpa + (uint64_t)i * sizeof(bpf_insn);
+            e.emit_safepoint(loop_body_sizes[i], insn_gpa);
         }
 
         if (!emit_instruction(e, entry_pc, entry_gpa, i,

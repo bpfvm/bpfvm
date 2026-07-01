@@ -24,7 +24,7 @@ enum bpf_syscall_id {
     BPF_SYS_RENAMEAT2,
     BPF_SYS_READLINKAT,
     BPF_SYS_EXECVE,
-    BPF_SYS_FORK,
+    BPF_SYS_CLONE,
     BPF_SYS_GETPID,
     BPF_SYS_GETPPID,
     BPF_SYS_WAITPID,
@@ -65,6 +65,14 @@ enum bpf_syscall_id {
     BPF_SYS_GETTID,         // gettid()
     BPF_SYS_SET_TLS,        // set_thread_area(tp) — 设置 thread pointer（musl __init_tp 启动必需）
     BPF_SYS_GET_TLS,        // 读取 thread pointer（guest __get_tp 用；单线程 TLS 模拟）
+    BPF_SYS_SETPGID,        // setpgid(pid, pgrp)
+    BPF_SYS_GETPGID,        // getpgid(pid)
+    BPF_SYS_GETPGRP,        // getpgrp() == getpgid(0)
+    BPF_SYS_SETSID,         // setsid()
+    BPF_SYS_GETSID,         // getsid(pid)
+    BPF_SYS_FUTEX,          // futex(uaddr, op, val, timeout, uaddr2) — 第 6 参 val3 走 r0
+    BPF_SYS_TKILL,          // tkill(tid, sig)
+    BPF_SYS_TGKILL,         // tgkill(tgid, tid, sig)
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -79,7 +87,6 @@ enum bpf_syscall_id {
 #define BPF_CALL_RENAMEAT2 BPF_CALL_ID(BPF_SYS_RENAMEAT2)
 #define BPF_CALL_READLINKAT BPF_CALL_ID(BPF_SYS_READLINKAT)
 #define BPF_CALL_EXECVE    BPF_CALL_ID(BPF_SYS_EXECVE)
-#define BPF_CALL_FORK      BPF_CALL_ID(BPF_SYS_FORK)
 #define BPF_CALL_KILL      BPF_CALL_ID(BPF_SYS_KILL)
 #define BPF_CALL_SIGACTION BPF_CALL_ID(BPF_SYS_SIGACTION)
 #define BPF_CALL_GETPID    BPF_CALL_ID(BPF_SYS_GETPID)
@@ -120,6 +127,15 @@ enum bpf_syscall_id {
 #define BPF_CALL_GETTID    BPF_CALL_ID(BPF_SYS_GETTID)
 #define BPF_CALL_SET_TLS   BPF_CALL_ID(BPF_SYS_SET_TLS)
 #define BPF_CALL_GET_TLS   BPF_CALL_ID(BPF_SYS_GET_TLS)
+#define BPF_CALL_SETPGID   BPF_CALL_ID(BPF_SYS_SETPGID)
+#define BPF_CALL_GETPGID   BPF_CALL_ID(BPF_SYS_GETPGID)
+#define BPF_CALL_GETPGRP   BPF_CALL_ID(BPF_SYS_GETPGRP)
+#define BPF_CALL_SETSID    BPF_CALL_ID(BPF_SYS_SETSID)
+#define BPF_CALL_GETSID    BPF_CALL_ID(BPF_SYS_GETSID)
+#define BPF_CALL_CLONE     BPF_CALL_ID(BPF_SYS_CLONE)
+#define BPF_CALL_FUTEX     BPF_CALL_ID(BPF_SYS_FUTEX)
+#define BPF_CALL_TKILL     BPF_CALL_ID(BPF_SYS_TKILL)
+#define BPF_CALL_TGKILL    BPF_CALL_ID(BPF_SYS_TGKILL)
 
 // ===========================================================================
 // 虚拟浮点指令（src_reg=2）

@@ -38,7 +38,7 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
 
     // Prologue / safepoint
     { e.emit_prologue() } -> std::same_as<size_t>;
-    e.emit_safepoint(0u);
+    e.emit_safepoint(0u, (uint64_t)0);
 
     // BPF instruction emission
     e.emit_alu(insn, true);
