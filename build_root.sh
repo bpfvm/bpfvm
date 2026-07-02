@@ -87,7 +87,7 @@ build_dash() {
         --host=bpf-unknown-none \
         CC="${CLANG_WRAPPER}" \
         CC_FOR_BUILD="gcc" \
-        CFLAGS="-std=gnu11 ${COMMON_CFLAGS} -DJOBS=0" \
+        CFLAGS="-std=gnu11 ${COMMON_CFLAGS} -DJOBS=1" \
         LDFLAGS="${COMMON_LDFLAGS}" \
         LIBS="${ROOT_DIR}/libc/lib/libc.a" \
         --enable-fnmatch

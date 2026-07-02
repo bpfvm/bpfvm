@@ -330,14 +330,14 @@ bool PosixSyscall::do_statx(vm* v) {
     }
     int flags = arg_s32(v->r(3));
     unsigned int mask = arg_u32(v->r(4));
-    auto out = static_cast<bpf::statx*>(v->mmu_w(v->r(5), sizeof(bpf::statx)));
+    /* host struct statx 与 guest 的均源自 Linux UAPI stat.h，布局二进制兼容（同 256 字节、
+     * 同偏移），故直接用 host 类型：statx() 直写后 memcpy 进 guest 缓冲即可，无需逐字段转换，
+     * 也不必依赖 guest 头 include/sys/stat.h。 */
+    auto out = static_cast<struct statx*>(v->mmu_w(v->r(5), sizeof(struct statx)));
     if(out == nullptr) {
         v->r(0) = -EFAULT;
         return true;
     }
-    /* host struct statx 与 bpf::statx 均源自 Linux UAPI stat.h，布局二进制兼容
-     *（同 256 字节、同偏移），故 host statx() 直写后 memcpy 即可，无需逐字段转换。 */
-    static_assert(sizeof(bpf::statx) == sizeof(struct statx));
     struct statx stx = {};
     int rc = -1;
     if(dirfd == AT_FDCWD) {
@@ -363,7 +363,7 @@ bool PosixSyscall::do_statx(vm* v) {
         v->r(0) = -errno;
         return true;
     }
-    std::memcpy(out, &stx, sizeof(bpf::statx));
+    std::memcpy(out, &stx, sizeof(stx));
     v->r(0) = 0;
     return true;
 }

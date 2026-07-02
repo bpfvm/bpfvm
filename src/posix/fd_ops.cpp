@@ -1,5 +1,13 @@
 #include "posix_internal.h"
 
+// 复制 guest fd 句柄（dup/dup2/fork 用）：host dup 得独立 host fd，GuestTty
+// 共享——同一 pty 的多份 fd（及 fork 后）指向同一 GuestTty。失败返回 nullptr。
+std::shared_ptr<fd_handle> clone_fd_handle(const std::shared_ptr<fd_handle>& h) {
+    int new_fd = dup(h->fd);
+    if(new_fd < 0) return nullptr;
+    return std::make_shared<fd_handle>(new_fd, h->path, h->tty);
+}
+
 int PosixSyscall::allocate_fd(int min_fd) {
     int fd = min_fd;
     while(ps->fds.count(fd)) {
@@ -28,14 +36,14 @@ bool PosixSyscall::do_dup(vm* v) {
         return true;
     }
 
-    int new_host_fd = dup(it->second->fd);
-    if(new_host_fd < 0) {
+    auto new_handle = clone_fd_handle(it->second);  // host dup host fd；GuestTty共享
+    if(!new_handle) {
         v->r(0) = -errno;
         return true;
     }
 
     int new_fd = allocate_fd();
-    ps->fds[new_fd] = std::make_shared<fd_handle>(new_host_fd, it->second->path);
+    ps->fds[new_fd] = new_handle;
     v->r(0) = new_fd;
     return true;
 }
@@ -63,13 +71,11 @@ bool PosixSyscall::do_dup3(vm* v) {
         return true;
     }
 
-    int new_host_fd = dup(it->second->fd);
-    if(new_host_fd < 0) {
+    auto handle = clone_fd_handle(it->second);
+    if(!handle) {
         v->r(0) = -errno;
         return true;
     }
-
-    auto handle = std::make_shared<fd_handle>(new_host_fd, it->second->path);
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
     }
@@ -128,15 +134,13 @@ bool PosixSyscall::do_fcntl(vm* v) {
             return true;
         }
 
-        int new_fd = allocate_fd(min_fd);
-
-        int new_host_fd = dup(it->second->fd);
-        if(new_host_fd < 0) {
+        auto new_handle = clone_fd_handle(it->second);
+        if(!new_handle) {
             v->r(0) = -errno;
             return true;
         }
 
-        auto new_handle = std::make_shared<fd_handle>(new_host_fd, it->second->path);
+        int new_fd = allocate_fd(min_fd);
         if (cmd == F_DUPFD_CLOEXEC) {
             new_handle->cloexec = true;
         }
@@ -189,48 +193,136 @@ bool PosixSyscall::do_ioctl(vm* v) {
         return true;
     }
     unsigned long request = v->r(2);
-    int rc;
 
-    if (request == TCGETS) {
-        struct termios host_t = {};
-        rc = ioctl(it->second->fd, TCGETS, &host_t);
-        if (rc == 0) {
-            auto guest_t = (bpf::termios*)v->mmu_w(v->r(3), sizeof(bpf::termios));
-            if (guest_t) {
-                guest_t->c_lflag = host_t.c_lflag;
-            } else {
-                v->r(0) = -EFAULT;
-                return true;
-            }
+    // 终端属性 (TCGETS/TCSETS/...)、winsize (TIOCGWINSZ/TIOCSWINSZ)、ptmx 锁/编号
+    // (TIOCSPTLCK/TIOCGPTN) 等透传 host 内核（host ioctl 直通，由 host n_tty 处理）。
+    // 只有 job-control 类（TIOCSCTTY/TIOCSPGRP/TIOCGPGRP）是 guest 进程语义，bpfvm 自己管。
+    if (request == TIOCSCTTY) {
+        // 绑定控制终端。语义：arg==1 强制（即使已被别的 session 占也夺），arg==0 仅在无人
+        // 占用时绑定。前提：调用者须是 session leader（setsid 后），fd 是 pty 设备，否则错。
+        const auto& tty = it->second->tty;
+        if(!tty) {
+            v->r(0) = -ENOTTY;
+            return true;
         }
-    } else if (request == TIOCGWINSZ) {
-        void* arg = v->mmu_w(v->r(3), sizeof(struct winsize));
-        if(arg == nullptr) {
+        if(!session || session->sid != pid) {  // session leader 检查
+            v->r(0) = -EPERM;
+            return true;
+        }
+        int force = arg_s32(v->r(3));
+        // 本会话已绑同一 tty：幂等成功。
+        if(session->ctty.get() == tty.get()) {
+            v->r(0) = 0;
+            return true;
+        }
+        // tty 已被别的 session 占用？持 pid_map_mutex 保护 owner_ 读写（防抢夺竞态）。
+        {
+            std::lock_guard<std::mutex> lock(pid_map_mutex);
+            if(tty->owner_ != nullptr && tty->owner_ != session.get()) {
+                if(!force) {
+                    v->r(0) = -EPERM;
+                    return true;
+                }
+                // force 抢夺：解除原 session 的 ctty 引用。
+                tty->owner_->ctty.reset();
+            }
+            // 绑定：session->ctty 指向 GuestTty，owner_ 反指 session，前台组初始化为自身。
+            session->ctty = tty;
+            tty->owner_ = session.get();
+        }
+        tty->fg_pgrp.store(pgrp->pgid, std::memory_order_release);
+        v->r(0) = 0;
+        return true;
+    } else if (request == TIOCSPGRP) {
+        // 设置前台进程组（tcsetpgrp）。musl 的 tcsetpgrp 传指向 int 的指针（&pgrp），
+        // 故 r(3) 是 guest 指针，需 mmu 取值。仅更新本 ctty 的 fg_pgrp，供 deliver_tty_signal
+        // 选目标组。POSIX：fd 必须是本会话 ctty，否则 ENOTTY。
+        if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
+            v->r(0) = -ENOTTY;
+            return true;
+        }
+        const pid_t* in = (const pid_t*)v->mmu(v->r(3), sizeof(pid_t));
+        if(in == nullptr) {
             v->r(0) = -EFAULT;
             return true;
         }
-        rc = ioctl(it->second->fd, TIOCGWINSZ, arg);
+        pid_t g_pgid = *in;
+        if(g_pgid <= 0) {
+            v->r(0) = -EINVAL;
+            return true;
+        }
+        // 校验目标 pgrp 存在且同 session（Linux：不存在/跨 session→EPERM）。
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(pid_map_mutex);
+            for(const auto& entry : pid_map) {
+                auto s = sys(entry.second.get());
+                if(s && s->session.get() == session.get() && s->pgrp->pgid == static_cast<uint64_t>(g_pgid)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if(!found) {
+            v->r(0) = -EPERM;
+            return true;
+        }
+        session->ctty->fg_pgrp.store(static_cast<uint64_t>(g_pgid), std::memory_order_release);
+        v->r(0) = 0;
+        return true;
+    } else if (request == TIOCGPGRP) {
+        // 读取前台进程组（tcgetpgrp）。fd 必须是本会话 ctty，否则 ENOTTY。
+        if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
+            v->r(0) = -ENOTTY;
+            return true;
+        }
+        pid_t* out = (pid_t*)v->mmu_w(v->r(3), sizeof(pid_t));
+        if(out == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+        *out = (pid_t)session->ctty->fg_pgrp.load(std::memory_order_acquire);
+        v->r(0) = 0;
+        return true;
     } else {
-        // Check if the command has a size field > 0, indicating a pointer argument.
-        // Linux ioctl encoding: size is bits 16-29 (14 bits).
-        size_t ioctl_size = (request >> 16) & 0x3FFF;
-        if (ioctl_size) {
-            int dir = _IOC_DIR(request);
-            void* arg = (dir & _IOC_READ) ? v->mmu_w(v->r(3), ioctl_size) : v->mmu(v->r(3), ioctl_size);
+        // 通用 ioctl（含 TCGETS/TCSETS/TIOCGWINSZ/TIOCSPTLCK/TIOCGPTN...）：把 guest 指针按
+        // 方向翻译成 host 指针，再透传 host 内核。这些是 ldisc/设备属性，host n_tty 处理得
+        // 比我们正确。旧式终端 ioctl（TCGETS/TIOCGWINSZ/...）用固定方向编码：明确方向以便
+        // 正确翻译 guest 指针（旧值如 TIOCGWINSZ=0x5413 不含 _IOC_DIR 位，按已知方向显式判定）。
+        bool write_back = false;   // TCGETS/TIOCGWINSZ：host 写回 guest 缓冲（需 mmu_w）
+        size_t psize = 0;
+        if(request == TCGETS || request == TCSETS || request == TCSETSW || request == TCSETSF) {
+            write_back = (request == TCGETS);
+            psize = sizeof(struct termios);
+        } else if(request == TIOCGWINSZ || request == TIOCSWINSZ) {
+            write_back = (request == TIOCGWINSZ);
+            psize = sizeof(struct winsize);
+        } else {
+            // 其余（含 TIOCSPTLCK/TIOCGPTN 及任意 dir-encoded ioctl）：按 Linux 编码判方向。
+            size_t ioctl_size = (request >> 16) & 0x3FFF;
+            psize = ioctl_size;
+            if(ioctl_size) {
+                int dir = _IOC_DIR(request);
+                write_back = (dir & _IOC_READ) != 0;
+            }
+            // 既非已知终端 ioctl 又无 size 编码：arg 当作无指针（r(3) 即值本身），透传。
+        }
+        void* arg = nullptr;
+        if(psize) {
+            arg = write_back ? v->mmu_w(v->r(3), psize) : v->mmu(v->r(3), psize);
             if(arg == nullptr) {
                 v->r(0) = -EFAULT;
                 return true;
             }
-            rc = ioctl(it->second->fd, request, arg);
         } else {
-            rc = ioctl(it->second->fd, request, (void*)v->r(3));
+            arg = (void*)v->r(3);
         }
+        int rc = ioctl(it->second->fd, request, arg);
+        if(rc == -1) {
+            v->r(0) = -errno;
+        } else {
+            v->r(0) = rc;
+        }
+        return true;
     }
-
-    if(rc == -1) {
-        v->r(0) = -errno;
-    } else {
-        v->r(0) = rc;
-    }
-    return true;
 }

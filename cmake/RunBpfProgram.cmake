@@ -46,6 +46,7 @@ foreach(v ${variants})
     execute_process(
         COMMAND "${BPFVM}" "${prog}"
         WORKING_DIRECTORY "${WORKDIR}"
+        INPUT_FILE /dev/null
         RESULT_VARIABLE result
         OUTPUT_VARIABLE stdout
         ERROR_VARIABLE stderr

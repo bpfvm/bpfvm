@@ -129,6 +129,7 @@ For load and store instructions the 8-bit 'code' field is divided as:
 
 class vm;
 class JitCompilerBase;
+class Pty;
 template<typename T> class JitCompiler;
 class SyscallHandler{
 protected:
@@ -145,7 +146,11 @@ public:
     virtual void init(const std::shared_ptr<vm>& v) = 0;
     virtual void fini(const std::shared_ptr<vm>& v) = 0;
     virtual bool syscall(vm* v, uint32_t call) = 0;
-    virtual void queue_signal(vm* v, int sig) = 0;
+    // 宿主侧信号（物理终端 ^C / 终端挂断 / 外部 kill 给 bpfvm）转交 handler 路由。
+    // handler 凭自己掌握的进程语义（session/ctty/前台组）决定投给谁：有控制终端走
+    // 前台进程组，无 ctty 退化为投给该 vm 自身。默认实现 = 直接 queue 给该 vm。
+    // 调用方（如 main.cpp 的信号 handler）不再关心"PTY 模式"等 host 侧接入细节。
+    virtual void host_signal(vm* v, int sig) { (void)v; (void)sig; }
     virtual bool handle_signals(vm* v) = 0;
     virtual int id() = 0;
 };
@@ -160,6 +165,9 @@ struct vmOptions {
     std::vector<std::string> argv;
     std::vector<std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
+    // host 接入器 + 信号路由器，始终非空。PTY 模式开真 pty（fd 0/1/2 接 slave）；
+    // 非 PTY 模式退化为仅信号路由。pump 线程读 signalfd 后调 sys->host_signal。
+    std::shared_ptr<Pty> pty = nullptr;
 };
 
 struct TlbEntry {
@@ -180,8 +188,8 @@ private:
     uint64_t reg[11];
     std::shared_ptr<std::list<memmap>> maps = std::make_shared<std::list<memmap>>();
     std::shared_ptr<std::mutex> maps_mutex = std::make_shared<std::mutex>();
-    pthread_mutex_t exit_mutex;
-    pthread_cond_t exit_cv;
+    pthread_mutex_t wait_mutex;
+    pthread_cond_t wait_cv;
     std::atomic<uint32_t> flags{0};
     size_t signal_depth = 0;
     uint64_t insn_count = 0;              // 已执行指令计数（JIT+解释器共用，单线程访问）
@@ -216,11 +224,11 @@ private:
     uint64_t pop_frame();
 public:
     static constexpr uint32_t VM_EXITED = 0x1;
-    static constexpr uint32_t VM_STOPPED = 0x2;
+    static constexpr uint32_t VM_STOPPED = 0x2;  //外部暂停，在safepoint等待
     static constexpr uint32_t VM_KILLED = 0x4;
     static constexpr uint32_t VM_SIGNAL_PENDING = 0x8;
     static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
-    static constexpr uint32_t VM_BLOCKED = 0x20;
+    static constexpr uint32_t VM_BLOCKED = 0x20; //内部暂停，在wait_for等待
 
     vm(Token);
     ~vm();
@@ -234,19 +242,20 @@ public:
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                      const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
-    // 通用阻塞原语：调用方先置 VM_BLOCKED（与其等待注册原子），再调用本函数。阻塞在自身
-    // exit_cv 上，直至 unblock、或 VM_KILLED/ VM_SIGNAL_PENDING 置位、或超时。
+    // 通用阻塞原语：调用方先置 VM_BLOCKED（与其等待注册原子），再调用本函数。自身阻塞
+    // 直至 wakeup(true) 清 VM_BLOCKED、或 VM_KILLED/VM_SIGNAL_PENDING 置位、或超时。
     // 返回 0（被唤醒）/ -EINTR（被信号/kill 打断）/ -ETIMEDOUT。
     // timeout 为相对时长，nullptr 表示无限等待（1s 兜底防 spurious）。
     int wait_for(const struct timespec* timeout);
-    void unblock();
+    // 唤醒阻塞在 wait_for / safepoint 的vm。
+    // clear_blocked=true：清 VM_BLOCKED，wait_for 返回 0（正常唤醒，如 futex_wake / IO 完成）。
+    // clear_blocked=false：保留 VM_BLOCKED，仅 broadcast 让 waiter 重判信号 flag 而返回 -EINTR
+    void wakeup(bool clear_blocked);
     ElfLoadInfo load_elf(const char* elf_file_path);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();
     void clear_jit_cache();
-    // 这个函数和unblock区别是，它不加锁，因为会在信号上下文中使用
-    void wakeup();
     uint64_t& r(int n) {
         return reg[n];
     }

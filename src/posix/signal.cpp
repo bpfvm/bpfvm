@@ -1,23 +1,71 @@
 #include "posix_internal.h"
 
+void PosixSyscall::notify_parent_sigchld() {
+    // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm（leader），sys() downcast 后调其
+    // queue_signal(SIGCHLD)。父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
+    // （测试，sys() 返 nullptr）、或正常 PosixSyscall。前两者降级 no-op。
+    // ppid 从 this 取（本进程的父 pid），不需传 v。
+    uint64_t parent_pid = ppid.load();
+    if(parent_pid == 0) return;  // pid 1 无父（init）
+    auto parent_vm = find_task(parent_pid);
+    if(!parent_vm) return;
+    if(auto ps = sys(parent_vm.get())) ps->queue_signal(parent_vm.get(), SIGCHLD);
+}
+
+void PosixSyscall::stop_process(int sig) {
+    // 停止整个线程组（进程级 stop 语义）。三件事：
+    //   1) 设 tg 级停止状态（stopped/stop_sig），waitpid(WUNTRACED) 据此报告 WIFSTOPPED
+    //   2) 组内每个线程设 VM_STOPPED + wakeup(false)：safepoint 见 VM_STOPPED 即 cond_wait
+    //   3) 给父进程投一次 SIGCHLD（去重 stop_reported），让 dash 的 wait/sigsuspend 唤醒
+    tg->stopped.store(true, std::memory_order_release);
+    tg->stop_sig.store(sig, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(tg->mtx);
+        for(auto& weak_vm : tg->threads) {
+            auto tvm = weak_vm.lock();
+            if(!tvm) {
+                continue;
+            }
+            flags(tvm.get()).fetch_or(vm::VM_STOPPED, std::memory_order_release);
+            tvm->wakeup(false);
+        }
+    }
+    bool expected = false;
+    if(tg->stop_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        // 首次停止（未被 waitpid 消费过）才投 SIGCHLD，避免重复通知。
+        notify_parent_sigchld();
+    }
+}
+
 void PosixSyscall::queue_signal(vm* v, int sig) {
     if(sig == SIGKILL) {
         flags(v).fetch_or(vm::VM_KILLED, std::memory_order_release);
-        v->wakeup();
+        v->wakeup(false);
     } else if(sig == SIGSTOP) {
-        flags(v).fetch_or(vm::VM_STOPPED, std::memory_order_release);
-        v->wakeup();
+        stop_process(SIGSTOP);   // 进程级停止：设 tg 状态 + 整组 VM_STOPPED + SIGCHLD
     } else if(sig == SIGCONT) {
-        flags(v).fetch_and(~vm::VM_STOPPED, std::memory_order_release);
-        v->wakeup();
+        // 恢复整个线程组：清 tg 停止状态 + 组内每线程清 VM_STOPPED + wakeup(true) 让 safepoint
+        // 的 cond_wait 返回。stop_sig 不清（waitpid 已消费或不再查询；下次停止会覆盖）。
+        // 本次不投 SIGCHLD(CLD_CONTINUED) / 不报告 WIFCONTINUED（范围控制）。
+        tg->stopped.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(tg->mtx);
+            for(auto& weak_vm : tg->threads) {
+                auto tvm = weak_vm.lock();
+                if(!tvm) {
+                    continue;
+                }
+                flags(tvm.get()).fetch_and(~vm::VM_STOPPED, std::memory_order_release);
+                tvm->wakeup(false);  // 唤醒 safepoint 的停止 cond_wait；
+            }
+        }
     } else {
         // Best-effort: drop if the queue is full to avoid blocking the VM thread.
         if(pending_signals.try_push(sig)) {
             flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
-            // 排队信号也要 wakeup()：vm 可能正阻塞在 futex 的 exit_cv 上，而 SIGUSR1
-            // 无法可靠打断 pthread_cond_wait（glibc 内部重试 EINTR），必须靠 broadcast
-            // exit_cv 让等待者醒来查 VM_SIGNAL_PENDING 并返回 -EINTR 交回 safepoint。
-            v->wakeup();
+            // 排队信号也要 wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1
+            // 无法可靠打断 pthread_cond_wait（glibc 内部重试 EINTR）
+            v->wakeup(false);
         }
     }
     if (tid != 0) {
@@ -68,8 +116,9 @@ bool PosixSyscall::handle_signals(vm* v) {
         case SIGTSTP:
         case SIGTTIN:
         case SIGTTOU:
-            flags(v).fetch_or(vm::VM_STOPPED, std::memory_order_release);
-            v->wakeup();
+            // 默认动作 = 停止作业（进程级）。stop_process 设 tg 状态 + 整组 VM_STOPPED +
+            // 给父进程投 SIGCHLD，让父（如 dash）经 waitpid(WUNTRACED) 报告 WIFSTOPPED。
+            stop_process(sig);
             return true;
         default:
             return true;
@@ -151,7 +200,7 @@ bool PosixSyscall::do_kill(vm* v) {
     }
 
     for(auto& t : targets) {
-        options(t.get()).sys->queue_signal(t.get(), sig);
+        if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
     }
     v->r(0) = 0;
     return true;
@@ -173,7 +222,7 @@ bool PosixSyscall::do_tkill(vm* v) {
         v->r(0) = 0;
         return true;
     }
-    options(target_vm.get()).sys->queue_signal(target_vm.get(), sig);
+    if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), sig);
     v->r(0) = 0;
     return true;
 }
@@ -200,7 +249,7 @@ bool PosixSyscall::do_tgkill(vm* v) {
         v->r(0) = 0;
         return true;
     }
-    options(target_vm.get()).sys->queue_signal(target_vm.get(), sig);
+    target->queue_signal(target_vm.get(), sig);
     v->r(0) = 0;
     return true;
 }

@@ -27,20 +27,22 @@ int main(void) {
         return 1;
     }
 
-    // Wait for the killed child
+    // Wait for the killed child. POSIX 语义：被信号杀死时 WIFSIGNALED 为真，
+    // WTERMSIG 给出信号号（SIGKILL=9）。status 低 7 位 = 信号号，WIFEXITED 为假。
     int status = 0;
     pid_t wpid = waitpid(pid, &status, 0);
-    
+
     if (wpid != pid) {
         printf("waitpid returned %d, expected %d\n", wpid, pid);
         return 1;
     }
 
-    int code = ((unsigned int)status >> 8) & 0xff;
-    int expected = 128 + SIGKILL;
-    
-    if (code != expected) {
-        printf("Child exited with %d, expected %d\n", code, expected);
+    if (!WIFSIGNALED(status)) {
+        printf("expected WIFSIGNALED, got status=0x%x\n", status);
+        return 1;
+    }
+    if (WTERMSIG(status) != SIGKILL) {
+        printf("WTERMSIG=%d expected %d\n", WTERMSIG(status), SIGKILL);
         return 1;
     }
 

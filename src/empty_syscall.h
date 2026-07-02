@@ -15,10 +15,6 @@ public:
     virtual int id() override {
         return 1;
     }
-    virtual void queue_signal(vm* v, int sig) override {
-        (void)v;
-        (void)sig;
-    }
     virtual bool handle_signals(vm* v) override {
         (void)v;
         return true;

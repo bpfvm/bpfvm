@@ -5,19 +5,41 @@
 #include <unordered_map>
 #include <array>
 #include <memory>
+#include <deque>
+#include <mutex>
 #include <condition_variable>
+#include <unistd.h>
 
+struct GuestTty;
 struct fd_handle {
     const int fd = -1;
     bool cloexec = false;
     std::string path;
-    explicit fd_handle(int fd, std::string path = {}) : fd(fd), path(std::move(path)) {}
-    ~fd_handle(){if(fd >= 0) close(fd);}
+    // 非空表示本 fd 是某 pty 设备的一端（master/slave）；空表示普通文件/pipe/socket。
+    // dup/fork 后多份 fd 共享同一 GuestTty
+    std::shared_ptr<GuestTty> tty;
+    explicit fd_handle(int fd_, std::string path_ = {}, std::shared_ptr<GuestTty> t = {})
+        : fd(fd_), path(std::move(path_)), tty(std::move(t)) {}
+    ~fd_handle(){ if(fd >= 0) close(fd); }
+    bool is_tty() const { return tty != nullptr || ::isatty(fd) == 1; }
 };
 
-// 会话（session）：setsid 创建，sid == leader->pid。控制终端/前台组留到后续阶段。
+// guest tty 设备的 bpfvm 侧状态。
+// 本对象只持有 bpfvm 必须管的进程语义：
+//   fg_pgrp  —— 本设备当前前台进程组。tty 信号（SIGINT/SIGTSTP/...）发给 fg_pgrp 的所有成员。
+//   owner_   —— 当前归属 session（裸指针，不参与生命周期：TIOCSCTTY 抢夺判定用）。
+struct Session;
+struct GuestTty {
+    std::atomic<uint64_t> fg_pgrp{0};
+    Session* owner_ = nullptr;
+    GuestTty() = default;
+};
+
+// 会话（session）：setsid 创建，sid == leader->pid。
+// 持有控制终端 ctty（shared_ptr<GuestTty>，nullptr = 无 ctty）。前台组挂在 GuestTty 上。
 struct Session {
     uint64_t sid;
+    std::shared_ptr<GuestTty> ctty;   // 控制终端；setsid 后置 nullptr（脱离），TIOCSCTTY 绑定
     explicit Session(uint64_t sid) : sid(sid) {}
 };
 
@@ -38,11 +60,21 @@ struct ThreadGroup {
     std::atomic<size_t> live_threads{1};
     std::atomic<bool> exited{false};
     // 整组对外报告的退出码（waitpid 读此值）。初值 -1 = 未设。
-    // exit/exit_group/被信号杀（走 do_exit）均用 CAS(-1→code) 写入：首个正常退出者
+    // exit/exit_group/被信号杀（走 do_exit）均用 CAS(-1->code) 写入：首个正常退出者
     // 赢，后续不覆盖。被 exit_group 置 VM_KILLED 的线程不走 do_exit，fini 里不碰此值，
     // 故不会覆盖 winner 设的码。last 线程 fini 时若仍为 -1（整组无人正常退出，理论上
     // 不会发生——置 VM_KILLED 的调用方必先走过 do_exit_group），兜底置 137。
     std::atomic<int> exit_code{-1};
+    // —— job-control 停止状态（thread-group 级，整组一致）——
+    // stop 是进程级语义：SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU 停止整个线程组，故状态放tg而非vm
+    // stopped       —— 整组处于停止态（waitpid WUNTRACED 查此位）
+    // stop_sig      —— 停止信号号（WSTOPSIG 用；musl WIFSTOPPED 要求 status 低字节 0x7f、
+    //                  高字节为信号号）
+    // stop_reported —— SIGCHLD 去重：停止后给父进程投一次 SIGCHLD 后置 true，waitpid
+    //                  消费（报告 WIFSTOPPED）后清零，使下次停止能再投。避免重复通知。
+    std::atomic<bool> stopped{false};
+    std::atomic<int>  stop_sig{-1};
+    std::atomic<bool> stop_reported{false};
     std::mutex mtx;
     std::condition_variable cv;
     std::vector<std::weak_ptr<vm>> threads;
@@ -94,9 +126,12 @@ class PosixSyscall: public SyscallHandler{
     static std::atomic<uint64_t> next_pid;
     static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
     static std::mutex pid_map_mutex;
+    // ptmx 注册表：guest open("/dev/ptmx") 合成的 host pty，按 pts 编号(=TIOCGPTN 返回值)
+    // 索引到 GuestTty。后续 open("/dev/pts/N") 用 N 查此表，复用同一 GuestTty。
+    static std::unordered_map<int, std::shared_ptr<GuestTty>> ptmx_registry;
+    static std::mutex ptmx_registry_mutex;
     uint64_t pid = 0;          // task id（== tid）。gettid 返回此值。
     std::shared_ptr<ThreadGroup> tg;  // 线程组生命周期（CLONE_THREAD 共享；fork 新建）。
-    // tg->tgid 即线程组主 tid（getpid 返回值，leader: tg->tgid == pid）。
     std::atomic<uint64_t> ppid{0};
     pthread_t tid = 0;
     MpscQueue pending_signals;
@@ -106,9 +141,17 @@ class PosixSyscall: public SyscallHandler{
     std::shared_ptr<ProcessGroup> pgrp;
     std::shared_ptr<Session> session;
 
+    // 把信号投给指定 vm 的内部接口
+    void queue_signal(vm* v, int sig);
+    // 停止整个线程组（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）：设 tg 级停止状态 + 组内每线程
+    // VM_STOPPED + 给父进程投一次 SIGCHLD（去重）。stop 是进程级，整组一致
+    void stop_process(int sig);
+    // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
+    // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
+    void notify_parent_sigchld();
+
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
-    virtual void queue_signal(vm* v, int sig) override;
     virtual bool handle_signals(vm* v) override;
     virtual bool syscall(vm* v, uint32_t call) override;
     virtual int id() override {
@@ -116,7 +159,7 @@ class PosixSyscall: public SyscallHandler{
     }
     static std::shared_ptr<PosixSyscall> sys(vm* v_);
     static std::shared_ptr<vm> find_task(uint64_t target_pid);
-    // futex 实现：等待者阻塞在 vm 自身 exit_cv 上，由 VM_BLOCKED 标志协调唤醒。
+    // futex 实现：等待者阻塞在 vm 自身 wait_cv 上，由 VM_BLOCKED 标志协调唤醒。
     // 见 posix/futex.cpp 中 futex_wait/futex_wake。
     static int futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val,
                           const struct timespec* timeout);
@@ -131,12 +174,21 @@ public:
     bool read_c_string_array(vm* v, uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
     std::string resolve_path(const std::string& path);
 
+    // 宿主侧信号（物理终端 ^C/^Z/^\ / 终端挂断 / 外部 kill 给 bpfvm）转交 handler 路由。
+    // 凭本 handler 掌握的 session/ctty/前台组决定目标：有控制终端->发到 ctty 的前台
+    // 进程组所有成员（tty 信号语义）；无 ctty->退化为投给该 vm 自身。
+    virtual void host_signal(vm* v, int sig) override;
+
     bool do_clock_gettime(vm* v);
     bool do_mmap(vm* v);
     bool do_munmap(vm* v);
     bool do_exit(vm* v);
     bool do_nanosleep(vm* v);
     bool do_openat(vm* v);
+    // job-control 门控：检查对 fd 的后台 tty 访问是否需要投 SIGTTIN(read)/SIGTTOU(write)。
+    // 返回 true 表示已处理（已投信号并按 POSIX 设好 r(0)，调用方直接 return true）；
+    // false 表示放行。仅当 fd 是本 session ctty 且调用者非前台组时触发。
+    bool tty_bg_check(vm* v, const std::shared_ptr<fd_handle>& fd, bool is_read);
     bool do_read(vm* v);
     bool do_write(vm* v);
     bool do_lseek(vm* v);

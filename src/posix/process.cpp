@@ -21,7 +21,7 @@ bool PosixSyscall::do_exit_group(vm* v) {
         for(auto& weak_vm : tg->threads) {
             auto tvm = weak_vm.lock();
             if(tvm && tvm.get() != v) {
-                options(tvm.get()).sys->queue_signal(tvm.get(), SIGKILL);
+                if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), SIGKILL);
             }
         }
     }
@@ -131,12 +131,12 @@ bool PosixSyscall::do_clone(vm* v) {
     std::unordered_map<int, std::shared_ptr<fd_handle>> child_fds;
     if(!is_thread) {
         for(const auto& entry : ps->fds) {
-            int new_host_fd = dup(entry.second->fd);
-            if(new_host_fd < 0) {
+            // fork：host dup 得独立 host fd；GuestTty共享。
+            auto new_handle = clone_fd_handle(entry.second);
+            if(!new_handle) {
                 v->r(0) = -errno;
                 return true;
             }
-            auto new_handle = std::make_shared<fd_handle>(new_host_fd, entry.second->path);
             new_handle->cloexec = entry.second->cloexec;
             child_fds[entry.first] = new_handle;
         }
@@ -302,7 +302,8 @@ bool PosixSyscall::do_waitpid(vm* v) {
     uint64_t status_addr = v->r(2);
     int32_t options = arg_s32(v->r(3));
 
-    if((options & ~WNOHANG) != 0) {
+    // 接受 WNOHANG（非阻塞）与 WUNTRACED（报告停止子进程）。其余选项（WCONTINUED 等）暂不支持。
+    if((options & ~(WNOHANG | WUNTRACED)) != 0) {
         v->r(0) = -EINVAL;
         return true;
     }
@@ -338,9 +339,15 @@ bool PosixSyscall::do_waitpid(vm* v) {
         return false;
     };
 
-    auto child_exited = [](const std::shared_ptr<vm>& task_vm) -> bool {
+    // 子进程是否有可报告事件：已退出（WIFEXITED/WIFSIGNALED）或已停止且 stop_reported（WIFSTOPPED）。
+    // stop_reported 由 stop_process 投 SIGCHLD 时置 true，waitpid 消费后清——它兼做"该停止已通知过"
+    // 的去重标志：只有 stop_reported 为真的停止才可被本函数报告（避免重复报告同一停止）。
+    auto child_has_event = [](const std::shared_ptr<vm>& task_vm) -> bool {
         auto s = sys(task_vm.get());
-        return s && s->tg->exited.load(std::memory_order_acquire);
+        if(!s) return false;
+        return s->tg->exited.load(std::memory_order_acquire) ||
+               (s->tg->stopped.load(std::memory_order_acquire) &&
+                s->tg->stop_reported.load(std::memory_order_acquire));
     };
 
     std::vector<std::shared_ptr<vm>> children;
@@ -361,12 +368,14 @@ bool PosixSyscall::do_waitpid(vm* v) {
         } else {
             for(const auto& entry : pid_map) {
                 if(!match_child(entry.second)) continue;
-                if(child_exited(entry.second)) {
-                    children.clear();
-                    children.push_back(entry.second);
+                children.push_back(entry.second);
+            }
+            // 优先返回已有事件的子进程（退出或已通知的停止）。
+            for(auto& c : children) {
+                if(child_has_event(c)) {
+                    children = {c};
                     break;
                 }
-                children.push_back(entry.second);
             }
         }
     }
@@ -376,53 +385,86 @@ bool PosixSyscall::do_waitpid(vm* v) {
         return true;
     }
 
+    // 选一个有事件的子进程。无事件且非阻塞 → 立即返 0；否则轮询 tg->cv 等事件。
     std::shared_ptr<vm> child;
-    if(children.size() == 1 && child_exited(children[0])) {
-        child = children[0];
-    } else {
-        if(options & WNOHANG) {
-            v->r(0) = 0;
-            return true;
+    for(auto& c : children) {
+        if(child_has_event(c)) {
+            child = c;
+            break;
         }
+    }
+    if((child == nullptr) && options & WNOHANG) {
+        v->r(0) = 0;
+        return true;
+    }
 
-        do {
-            for(const auto& candidate : children) {
-                auto cs = sys(candidate.get());
-                if(!cs) continue;
-                {
-                    std::unique_lock<std::mutex> lk(cs->tg->mtx);
-                    cs->tg->cv.wait_for(lk, std::chrono::milliseconds(100), [&]{
-                        return cs->tg->exited.load(std::memory_order_acquire);
-                    });
-                }
-                if(cs->tg->exited.load(std::memory_order_acquire)) {
-                    child = candidate;
-                    break;
-                }
-                // VM_KILLED：被 exit_group / 致命信号命中，应立即返回 EINTR 让线程回 safepoint 退出。
-                // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 waitpid 内部时恒为假。
-                if(!pending_signals.empty() || (flags(v).load(std::memory_order_acquire) & vm::VM_KILLED)) {
-                    v->r(0) = -EINTR;
-                    return true;
-                }
+    while(child == nullptr) {
+        for(const auto& candidate : children) {
+            auto cs = sys(candidate.get());
+            if(!cs) continue;
+            {
+                std::unique_lock<std::mutex> lk(cs->tg->mtx);
+                // 子退出 或 子停止且已通知。notify 来自 fini()/stop_process()。
+                cs->tg->cv.wait_for(lk, std::chrono::milliseconds(100), [&]{
+                    return cs->tg->exited.load(std::memory_order_acquire) ||
+                           (cs->tg->stopped.load(std::memory_order_acquire) &&
+                            cs->tg->stop_reported.load(std::memory_order_acquire));
+                });
             }
-        } while(child == nullptr);
+            if(cs->tg->exited.load(std::memory_order_acquire)) {
+                child = candidate;
+                break;
+            }
+            if(cs->tg->stopped.load(std::memory_order_acquire) &&
+               cs->tg->stop_reported.load(std::memory_order_acquire)) {
+                child = candidate;
+                break;
+            }
+            // 调用者自身被 VM_KILL 或收到信号 → EINTR 让线程回 safepoint 处理。
+            // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 waitpid 内部时恒为假。
+            if(!pending_signals.empty() ||
+               (flags(v).load(std::memory_order_acquire) & (vm::VM_KILLED | vm::VM_STOPPED))) {
+                v->r(0) = -EINTR;
+                return true;
+            }
+        }
     }
 
     //wait不能加锁，否则会死锁
     auto cs = sys(child.get());
-    uint64_t exit_code = static_cast<uint64_t>(cs->tg->exit_code.load(std::memory_order_acquire));
-    if(status_ptr != nullptr) {
-        int status = (static_cast<int>(exit_code) & 0xff) << 8;
-        *status_ptr = status;
+    // exited 优先于 stopped：被 SIGKILL 的已停止进程，fini 设 tg->exited 但不清
+    // tg->stopped（只有 SIGCONT 清），必须按退出报告，否则父进程（如 dash `kill -9 %1`）
+    // 永不回收作业。
+    if(cs->tg->exited.load(std::memory_order_acquire)) {
+        // 报告退出。exit_code 编码：< 128 为正常退出码（WIFEXITED，bits 8-15）；
+        // >= 128 为信号致死（do_kill/致命信号默认动作走 do_exit_group 存 128+sig），
+        // 此时 status = sig & 0x7f（WIFSIGNALED）。
+        uint64_t exit_code = static_cast<uint64_t>(cs->tg->exit_code.load(std::memory_order_acquire));
+        if(status_ptr != nullptr) {
+            int status;
+            if(exit_code >= 128) {
+                status = static_cast<int>(exit_code - 128) & 0x7f;  // WIFSIGNALED
+            } else {
+                status = (static_cast<int>(exit_code) & 0xff) << 8;  // WIFEXITED
+            }
+            *status_ptr = status;
+        }
+        uint64_t child_pid = cs->pid;
+        {
+            std::lock_guard<std::mutex> lock(pid_map_mutex);
+            pid_map.erase(child_pid);
+        }
+    } else {
+        // 报告停止：status = (stop_sig << 8) | 0x7f（musl WIFSTOPPED 判定低字节 == 0x7f，
+        // WSTOPSIG 取高字节）。进程仍存活：不 erase pid_map，不清 stopped（SIGCONT 才清），
+        // 清 stop_reported 使下次停止能再投 SIGCHLD + 再被报告。
+        int ssig = cs->tg->stop_sig.load(std::memory_order_acquire);
+        if(status_ptr != nullptr) {
+            *status_ptr = ((ssig & 0xff) << 8) | 0x7f;
+        }
+        cs->tg->stop_reported.store(false, std::memory_order_release);
     }
-
-    uint64_t child_pid = cs->pid;  // leader 的 pid（== tg->tgid）
-    {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map.erase(child_pid);
-    }
-    v->r(0) = child_pid;
+    v->r(0) = cs->pid;  // leader 的 pid（== tg->tgid）；停止/退出均返此值
     return true;
 }
 

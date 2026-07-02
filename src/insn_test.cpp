@@ -1604,6 +1604,16 @@ void test_atomic64_xor_fetch() {
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
 
+    // PosixSyscall 契约：跨线程/跨 vm 投递信号（fork 子退出给父投 SIGCHLD、queue_signal
+    // 唤醒阻塞线程等）会用 pthread_kill(tid, SIGUSR1) 打断目标线程。SIGUSR1 默认动作是
+    // 终止进程，故宿主程序必须为其设空 handler（bpfvm main.cpp 已设）。本测试跑
+    // fork/clone/signal 用例，同样必须设，否则子进程退出投 SIGCHLD 时 SIGUSR1 会杀掉
+    // 整个测试进程。
+    struct sigaction sa{};
+    sa.sa_handler = [](int){};
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, nullptr);
+
     // ALU64 Tests
     test_alu64_add_imm();
     test_alu64_sub_reg();

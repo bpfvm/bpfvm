@@ -1,15 +1,17 @@
 #include "posix_internal.h"
+#include "pty.h"
 
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
 std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map{};
 std::mutex PosixSyscall::pid_map_mutex;
+std::unordered_map<int, std::shared_ptr<GuestTty>> PosixSyscall::ptmx_registry{};
+std::mutex PosixSyscall::ptmx_registry_mutex{};
 
 PosixSyscall::PosixSyscall() {
     pid = next_pid.fetch_add(1);
     tg = std::make_shared<ThreadGroup>(pid);
-    ps->fds.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
-    ps->fds.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
-    ps->fds.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
+    // guest fd 0/1/2 在 init(pid==1) 内播种（构造函数拿不到 vm/options）；fork/clone 子进程
+    // 经带参构造函数注入 fds，不走此路径。
 
     char buf[PATH_MAX];
     if(::getcwd(buf, sizeof(buf)) != nullptr) {
@@ -30,6 +32,9 @@ PosixSyscall::PosixSyscall(uint64_t ppid, const std::unordered_map<int, std::sha
     this->ppid = ppid;
     ps->fds = opened;
     ps->cwd = cwd_;
+    // 子进程经 fork 继承父的 pgrp/session（shared_ptr 共享同一对象），其控制终端由
+    // session->ctty 表达（同样共享）。GuestTty随 fd 句柄的 tty 字段
+    // 共享——fork 后子进程的 pty slave fd（clone_fd_handle）携带同一 GuestTty 引用。
 }
 
 void PosixSyscall::init(const std::shared_ptr<vm>& v){
@@ -43,7 +48,29 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
     }
     std::lock_guard<std::mutex> lock(pid_map_mutex);
     //这里只对1号进程添加，其他进程由fork添加，因为推迟到这里就太晚了
-    if(pid == 1) pid_map[pid] = v;
+    if(pid == 1) {
+        pid_map[pid] = v;
+        // guest fd 0/1/2 播种：PTY 模式取 Pty 的 slave fd 包成 fd_handle 并绑 ctty；否则 dup 宿主 stdio。
+        // 注意：pump 线程由 main 在 vm->run() 前启动（host 接入职责），此处只消费 Pty 的 slave 产物
+        // 做 guest 侧播种。测试（insn_test）不设 pty，nullptr 退化走 dup stdio。
+        auto& pty = options(v.get()).pty;
+        if(pty && pty->master_fd() >= 0) {
+            int slave_fd = pty->take_slave_fd();
+            auto tty = std::make_shared<GuestTty>();
+            tty->owner_ = session.get();
+            tty->fg_pgrp.store(pgrp->pgid);
+            session->ctty = tty;
+            auto mk = [&](int host_fd){ return std::make_shared<fd_handle>(host_fd, "", tty); };
+            ps->fds.emplace(0, mk(dup(slave_fd)));
+            ps->fds.emplace(1, mk(dup(slave_fd)));
+            ps->fds.emplace(2, mk(dup(slave_fd)));
+            close(slave_fd);
+        } else {
+            ps->fds.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
+            ps->fds.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
+            ps->fds.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
+        }
+    }
 }
 
 void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
@@ -56,7 +83,7 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
         if(!ctid) return;
         // 持 futex 锁清零 *ctid + wake（实现见 futex.cpp）：避免与 futex_wait 的 *p
         // 检查产生 lost wakeup——futex_wait 在持锁时检查 *p==val 并注册进 waiters；
-        // 这里持锁清零后摘一个等待者并 wakeup()，确保等待者要么看到 *p 已变（EAGAIN
+        // 这里持锁清零后摘一个等待者并 wakeup(true)，确保等待者要么看到 *p 已变（EAGAIN
         // 返回），要么被 wake 唤醒。
         futex_child_tid_clear(tg.get(), ctid, tid_address_);
     };
@@ -94,6 +121,10 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     tg->exit_code.compare_exchange_strong(expected, 128 + 9, std::memory_order_acq_rel);
     tg->exited.store(true, std::memory_order_release);
     tg->cv.notify_all();
+    // 子进程退出时给父进程投 SIGCHLD：让阻塞在 read/sigsuspend 的父（如 dash）被唤醒，
+    // 进而 waitpid 回收。当前 dash 靠同步 waitpid 也能回收，但 SIGCHLD 使交互式 job-control
+    // 行为正确（父不必轮询）。
+    notify_parent_sigchld();
 
     // 把本组派生的孤儿重定向到 pid 1。children 的 ppid 记的是本组 tg->tgid（leader pid），
     // 故用 tg->tgid 匹配；由最后一个退出的线程执行即可——不必是 leader，规避 leader 先于
@@ -117,6 +148,50 @@ std::shared_ptr<PosixSyscall> PosixSyscall::sys(vm* v) {
         return nullptr;
     }
     return std::dynamic_pointer_cast<PosixSyscall>(options(v).sys);
+}
+
+void PosixSyscall::host_signal(vm* v, int sig) {
+    // 宿主侧信号转 guest 路由。判据是 guest 是否有控制终端——这是 PosixSyscall 内部
+    // session->ctty，与 host 侧 PTY/非 PTY 接入方式无关。
+    //
+    // 有 ctty：tty 信号发给"控制终端的前台进程组所有成员"。
+    // 无 ctty（非 PTY 模式 / setsid 前）：前台组即本进程所在 pgrp。
+    if(sig <= 0) return;
+
+    GuestTty* tty = nullptr;
+    uint64_t target_pgid;
+    if(session && session->ctty) {
+        tty = session->ctty.get();
+        target_pgid = tty->fg_pgrp.load(std::memory_order_acquire);
+    } else {
+        target_pgid = pgrp->pgid;
+    }
+
+    std::vector<std::shared_ptr<vm>> targets;
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        for(const auto& entry : pid_map) {
+            auto s = sys(entry.second.get());
+            if(!s || s->pgrp->pgid != target_pgid) continue;
+            // 同 pgid 必同 session，但不同 session 可能复用同一 pgid 数值——有 ctty
+            // 时按 ctty 收窄到同一控制终端的前台组，无 ctty 时退化为按 session 比对。
+            if(tty) {
+                if(!s->session || s->session->ctty.get() != tty) continue;
+            } else {
+                if(s->session.get() != session.get()) continue;
+            }
+            targets.push_back(entry.second);
+        }
+    }
+
+    if(targets.empty()) {
+        queue_signal(v, sig);
+        return;
+    }
+    for(auto& t : targets) {
+        // 目标是另一个 PosixSyscall：经 sys() downcast 后调内部 queue_signal。
+        if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
+    }
 }
 
 // —— 进程级杂项属性 / 系统信息类 syscall ——

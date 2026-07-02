@@ -9,6 +9,7 @@ add_subdirectory(posix)
 add_library(bpfvm_lib STATIC
     insn.cpp
     elf_loader.cpp
+    pty.cpp
     $<TARGET_OBJECTS:posix_obj>
     jit/jit_compiler.cpp
     jit/x86_emitter.cpp
@@ -45,7 +46,9 @@ separate_arguments(LLVM_LDFLAGS UNIX_COMMAND "${LLVM_LDFLAGS}")
 separate_arguments(LLVM_LIBS UNIX_COMMAND "${LLVM_LIBS}")
 
 add_library(BpfWideArgs MODULE passes/BpfWideArgs.cpp)
-target_compile_options(BpfWideArgs PRIVATE ${LLVM_CXXFLAGS} -fno-rtti)
+# -Wno-unused-parameter：LLVM 系统头（DenseMap/Instructions/...）模板里有大量未用形参，
+# 是第三方代码，抑制之；bpfvm 自身源码不受影响。
+target_compile_options(BpfWideArgs PRIVATE ${LLVM_CXXFLAGS} -fno-rtti -Wno-unused-parameter)
 target_link_libraries(BpfWideArgs PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
 set_target_properties(BpfWideArgs PROPERTIES
     OUTPUT_NAME BpfWideArgs
@@ -59,7 +62,8 @@ message(STATUS "BpfWideArgs: enabled (LLVM ${LLVM_VERSION}, plugin -> ${CMAKE_BI
 # 由 clang -fpass-plugin= 加载。
 add_library(BpfSoftFp MODULE passes/BpfSoftFp.cpp)
 target_include_directories(BpfSoftFp PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_options(BpfSoftFp PRIVATE ${LLVM_CXXFLAGS} -fno-rtti)
+# -Wno-unused-parameter：同 BpfWideArgs，抑制 LLVM 系统头的未用形参 warning。
+target_compile_options(BpfSoftFp PRIVATE ${LLVM_CXXFLAGS} -fno-rtti -Wno-unused-parameter)
 target_link_libraries(BpfSoftFp PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
 set_target_properties(BpfSoftFp PROPERTIES
     OUTPUT_NAME BpfSoftFp

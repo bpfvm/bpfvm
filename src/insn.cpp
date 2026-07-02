@@ -203,14 +203,14 @@ void dump(uint64_t addr, const bpf_insn* insn) {
 }
 
 vm::vm(Token) {
-    pthread_mutex_init(&exit_mutex, nullptr);
-    pthread_cond_init(&exit_cv, nullptr);
+    pthread_mutex_init(&wait_mutex, nullptr);
+    pthread_cond_init(&wait_cv, nullptr);
     memset(reg, 0, sizeof(reg));
 }
 
 vm::~vm() {
-    pthread_cond_destroy(&exit_cv);
-    pthread_mutex_destroy(&exit_mutex);
+    pthread_cond_destroy(&wait_cv);
+    pthread_mutex_destroy(&wait_mutex);
 }
 
 std::shared_ptr<vm> vm::create() {
@@ -678,10 +678,7 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
 }
 
 int vm::wait_for(const struct timespec* timeout) {
-    // 阻塞在 exit_cv 上，谓词 = VM_BLOCKED 被清（外部 unblock）/ kill·信号 / 超时。
-    // exit_cv 为 CLOCK_REALTIME，pthread_cond_timedwait 取【绝对】时限，故把相对的
-    // timeout 一次性转成绝对 deadline 直接喂给它；每轮醒来在循环顶重判 flag + 是否已过
-    // deadline（标准 condvar 模式，天然处理 wake/timeout 竞争）。
+    // 阻塞在 wait_cv 上等待, timeout是相对时间 
     bool has_deadline = timeout != nullptr;
     struct timespec deadline{};
     if(has_deadline) {
@@ -694,15 +691,15 @@ int vm::wait_for(const struct timespec* timeout) {
         }
     }
     int rc;
-    pthread_mutex_lock(&exit_mutex);
+    pthread_mutex_lock(&wait_mutex);
     while(true) {
         uint32_t f = flags.load(std::memory_order_acquire);
-        if(!(f & VM_BLOCKED)) {                 // 被 unblock 清位
+        if(!(f & VM_BLOCKED)) {                 // 被 wakeup(true) 清位
             rc = 0;
             break;
         }
-        if(f & (VM_KILLED | VM_SIGNAL_PENDING)) {
-            rc = -EINTR;                        // 交回 safepoint 投递信号 / 退出
+        if(f & (VM_KILLED | VM_SIGNAL_PENDING | VM_STOPPED)) {
+            rc = -EINTR;                        // 交回 safepoint：投递信号 / 退出 / 停止阻塞
             break;
         }
         if(has_deadline) {
@@ -713,31 +710,27 @@ int vm::wait_for(const struct timespec* timeout) {
                 rc = -ETIMEDOUT;
                 break;
             }
-            pthread_cond_timedwait(&exit_cv, &exit_mutex, &deadline);
+            pthread_cond_timedwait(&wait_cv, &wait_mutex, &deadline);
         } else {
-            // 无 deadline：wakeup()（kill/信号路径）无锁 broadcast 偶有丢失窗口，用 1s
-            // 滚动绝对兜底覆盖——每轮重算，不累积成固定超时。
+            // 无 deadline：wakeup() 持锁 broadcast，理论上不丢唤醒；仍保留 1s 滚动超时作
+            // spurious-wakeup 兜底（condvar 语义允许假唤醒），每轮重判 flag。
             struct timespec backstop;
             clock_gettime(CLOCK_REALTIME, &backstop);
             backstop.tv_sec += 1;
-            pthread_cond_timedwait(&exit_cv, &exit_mutex, &backstop);
+            pthread_cond_timedwait(&wait_cv, &wait_mutex, &backstop);
         }
     }
-    pthread_mutex_unlock(&exit_mutex);
+    pthread_mutex_unlock(&wait_mutex);
     return rc;
 }
 
-void vm::unblock() {
-    // 唤醒端：持 exit_mutex 清 VM_BLOCKED + broadcast。与 wait_for 谓词检查同锁串行，
-    // 杜绝丢失唤醒（否则 broadcast 可能落在 waiter「谓词检查→cond_timedwait」之间）。
-    pthread_mutex_lock(&exit_mutex);
-    flags.fetch_and(~VM_BLOCKED, std::memory_order_release);
-    pthread_cond_broadcast(&exit_cv);
-    pthread_mutex_unlock(&exit_mutex);
-}
-
-void vm::wakeup() {
-    pthread_cond_broadcast(&exit_cv);
+void vm::wakeup(bool clear_blocked) {
+    pthread_mutex_lock(&wait_mutex);
+    if(clear_blocked) {
+        flags.fetch_and(~VM_BLOCKED, std::memory_order_release);
+    }
+    pthread_cond_broadcast(&wait_cv);
+    pthread_mutex_unlock(&wait_mutex);
 }
 
 bool vm::ld(const bpf_insn* cur) {
@@ -1063,28 +1056,25 @@ bool vm::safepoint() {
         }
     }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 100000000L; // 100ms
-    if(ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000L;
-    }
-
+    // 停止等待：VM_STOPPED 由 stop_process（SIGSTOP/SIGTSTP/...）设置。
+    pthread_mutex_lock(&wait_mutex);
     while(true) {
         uint32_t f = flags.load(std::memory_order_acquire);
         if(f & (VM_EXITED | VM_KILLED | VM_BUDGET_EXCEEDED)) {
+            pthread_mutex_unlock(&wait_mutex);
             if (f & VM_KILLED) {
                 r(0) = 128 + SIGKILL;
             }
             return false;
         }
         if(!(f & VM_STOPPED)) break;
-        pthread_mutex_lock(&exit_mutex);
-        pthread_cond_timedwait(&exit_cv, &exit_mutex, &ts);
-        pthread_mutex_unlock(&exit_mutex);
+        pthread_cond_wait(&wait_cv, &wait_mutex);
     }
-    return true;
+    pthread_mutex_unlock(&wait_mutex);
+    // 唤醒后投递停止期间挂起的信号（POSIX：SIGCONT 恢复运行时在返回用户态前 get_signal
+    // 投递 pending）。否则停止态收到的 SIGTERM 滞留队列，子进程已先执行到阻塞系统调用
+    // （nanosleep），就会卡死。
+    return options.sys->handle_signals(this);
 }
 
 bool vm::step() {
@@ -1283,7 +1273,7 @@ uint64_t vm::run() {
         r(0) = 255;
     }
     flags.fetch_or(VM_EXITED, std::memory_order_release);
-    pthread_cond_broadcast(&exit_cv);
+    pthread_cond_broadcast(&wait_cv);
     return r(0);
 }
 

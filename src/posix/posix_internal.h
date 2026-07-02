@@ -13,9 +13,6 @@ namespace bpf{
     #undef __unused
 #endif
     #include "include/signal.h"
-    #include "include/sys/stat.h"
-    #include "include/termios.h"
-    #include "include/sys/uio.h"
 }
 
 #include <errno.h>
@@ -44,6 +41,11 @@ namespace bpf{
 
 #undef sa_handler
 #undef sa_sigaction
+
+// 复制 guest fd 句柄（dup/dup2/fork 用）：host dup 得独立 host fd，GuestTty
+// 共享——同一 pty 的多份 fd（及 fork 后）指向同一 GuestTty。失败返回 nullptr。
+// 实现在 file_io.cpp，posix/ 内各 handler 共用。
+std::shared_ptr<fd_handle> clone_fd_handle(const std::shared_ptr<fd_handle>& h);
 
 // —— futex 子系统对外封装（实现在 futex.cpp）——
 // g_futex_mutex / g_futex_table 是 futex.cpp 内部 file-static，不暴露；
