@@ -117,7 +117,7 @@ class PosixSyscall: public SyscallHandler{
     static std::shared_ptr<PosixSyscall> sys(vm* v_);
     static std::shared_ptr<vm> find_task(uint64_t target_pid);
     // futex 实现：等待者阻塞在 vm 自身 exit_cv 上，由 VM_BLOCKED 标志协调唤醒。
-    // 见 posix_syscall.cpp 中 futex_wait/futex_wake。
+    // 见 posix/futex.cpp 中 futex_wait/futex_wake。
     static int futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val,
                           const struct timespec* timeout);
     static int futex_wake(ThreadGroup* tg, uint64_t addr, int val);

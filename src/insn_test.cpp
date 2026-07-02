@@ -9,7 +9,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
-#include "posix_syscall.h"
+#include "posix/posix_syscall.h"
 #include "empty_syscall.h"
 
 // Helper function to print test results

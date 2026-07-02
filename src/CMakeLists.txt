@@ -2,10 +2,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
+# POSIX syscall 实现：单独成目录，自带 CMakeLists（见 posix/CMakeLists.txt）。
+# 这里把它的对象库并入 bpfvm_lib，最终产物仍是单个 libbpfvm_lib.a。
+add_subdirectory(posix)
+
 add_library(bpfvm_lib STATIC
     insn.cpp
     elf_loader.cpp
-    posix_syscall.cpp
+    $<TARGET_OBJECTS:posix_obj>
     jit/jit_compiler.cpp
     jit/x86_emitter.cpp
     jit/aarch64_emitter.cpp
