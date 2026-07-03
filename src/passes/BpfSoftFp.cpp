@@ -230,14 +230,23 @@ static bool softenFunction(Function &F) {
                     const char *sfx = suffix(Src);
                     if (!sfx) continue;
                     bool isDouble = (sfx[0] == 'd');
+                    // 窄整数目标（i1/i8/i16）统一走 i32 路径：先转 i32，再由
+                    // emitDirectFpCall 末尾的 trunc 收窄到原宽度。语义等价：
+                    //   (i8)(double)x == (i8)(int)(double)x
+                    // 与 SIToFP/UIToFP 分支处理窄整数源（256-268 行）对称。
+                    // 不走这条路会留给后端，BPF ISel 对 double→i8 等 lower
+                    // 成 __fixdfsi libcall 后拒绝（"A call to built-in function
+                    // '__fixdfsi' is not supported"），如 busybox awk.c 的
+                    // `char cc = getvar_i(arg)`（getvar_i 返回 double）。
+                    unsigned dstBits = Dst->isIntegerTy() ? Dst->getIntegerBitWidth() : 0;
                     unsigned callId;
                     if (Op == Instruction::FPToSI) {
-                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_FP_D2SI : BPF_FP_F2SI;
-                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_FP_D2DI : BPF_FP_F2DI;
+                        if (dstBits <= 32)             callId = isDouble ? BPF_FP_D2SI : BPF_FP_F2SI;
+                        else if (dstBits == 64)        callId = isDouble ? BPF_FP_D2DI : BPF_FP_F2DI;
                         else continue;
                     } else {
-                        if (Dst->isIntegerTy(32))      callId = isDouble ? BPF_FP_D2USI : BPF_FP_F2USI;
-                        else if (Dst->isIntegerTy(64)) callId = isDouble ? BPF_FP_D2UDI : BPF_FP_F2UDI;
+                        if (dstBits <= 32)             callId = isDouble ? BPF_FP_D2USI : BPF_FP_F2USI;
+                        else if (dstBits == 64)        callId = isDouble ? BPF_FP_D2UDI : BPF_FP_F2UDI;
                         else continue;
                     }
                     Value *Call = emitDirectFpCall(B, Ctx, callId, {CI->getOperand(0)}, Dst);
@@ -251,6 +260,23 @@ static bool softenFunction(Function &F) {
                     const char *sfx = suffix(Dst);
                     if (!sfx) continue;
                     bool isDouble = (sfx[0] == 'd');
+
+                    // 窄整数（i1/i8/i16）源：先扩展到 i32 再走 i32 路径。
+                    // 语义等价：(double)(unsigned char)x == (double)(unsigned int)x。
+                    // 否则后端 DAG legalise 会把 i1 提升、把 uitofp i32→double lower
+                    // 成 __floatunsidf libcall，BPF ISel 拒绝。
+                    Value *SrcVal = CI->getOperand(0);
+                    if (Src->isIntegerTy()) {
+                        unsigned bw = Src->getIntegerBitWidth();
+                        if (bw != 32 && bw != 64) {
+                            Type *I32 = Type::getInt32Ty(Ctx);
+                            SrcVal = (Op == Instruction::SIToFP)
+                                ? B.CreateSExt(SrcVal, I32)
+                                : B.CreateZExt(SrcVal, I32);
+                            Src = I32;
+                        }
+                    }
+
                     unsigned callId;
                     if (Op == Instruction::SIToFP) {
                         if (Src->isIntegerTy(32))      callId = isDouble ? BPF_FP_SI2D : BPF_FP_SI2F;
@@ -261,7 +287,7 @@ static bool softenFunction(Function &F) {
                         else if (Src->isIntegerTy(64)) callId = isDouble ? BPF_FP_UDI2D : BPF_FP_UDI2F;
                         else continue;
                     }
-                    Value *Call = emitDirectFpCall(B, Ctx, callId, {CI->getOperand(0)}, Dst);
+                    Value *Call = emitDirectFpCall(B, Ctx, callId, {SrcVal}, Dst);
                     CI->replaceAllUsesWith(Call);
                     ToErase.push_back(CI);
                     Changed = true;
