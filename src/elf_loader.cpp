@@ -326,22 +326,29 @@ public:
         if (!d) return;
         size_t n = d->d_size / sizeof(GElf_Sym);
         dynsym_names_.reserve(n);
+        dynsym_weak_.reserve(n);
         for (size_t i = 0; i < n; i++) {
             GElf_Sym sym; gelf_getsym(d, i, &sym);
             char* nm = elf_strptr(ef_.elf, ds.dynsym_link, sym.st_name);
             dynsym_names_.emplace_back(nm ? nm : "");
+            dynsym_weak_.push_back(GELF_ST_BIND(sym.st_info) == STB_WEAK);
         }
     }
 
     // si=0（NULL 符号）→ 本模块加载基址（本模块符号重定位用，addend 已含相对偏移）
-    // 其他 → 按名查 exports；未找到返回 nullopt
+    // 其他 → 按名查 exports；未找到返回 nullopt。
+    // 例外：weak UND 符号（如 __init_array_start 等边界符号）查不到时按标准 ld 语义
+    // 解析为 0，返回 0 而非 nullopt——让调用方正常 patch（写 0）且不报 warning。
     std::optional<uint64_t> resolve(size_t si) const {
         if (si == 0) return base_;
         if (si >= dynsym_names_.size()) return std::nullopt;
         const std::string& nm = dynsym_names_[si];
         if (nm.empty()) return std::nullopt;
         auto it = exports_.find(nm);
-        return it != exports_.end() ? std::optional<uint64_t>(it->second) : std::nullopt;
+        if (it != exports_.end()) return it->second;
+        // 未定义且为 weak UND → 0（空范围遍历安全 no-op）
+        if (si < dynsym_weak_.size() && dynsym_weak_[si]) return 0;
+        return std::nullopt;
     }
 
     const std::string& sym_name(size_t si) const {
@@ -357,6 +364,7 @@ private:
     uint64_t base_;
     const std::unordered_map<std::string, uint64_t>& exports_;
     std::vector<std::string> dynsym_names_;
+    std::vector<bool> dynsym_weak_;  // 与 dynsym_names_ 并行：该条目是否 STB_WEAK
 };
 
 // 应用 .rela.dyn（DT_RELA/DT_RELASZ）：

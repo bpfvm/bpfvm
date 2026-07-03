@@ -1171,28 +1171,41 @@ private:
 
     // 收集所有 UND 符号名（跨模块重定位引用的未定义符号 → .dynsym 的导入部分）。
     // DYNAMIC_EXE：入口符号若不在 globals_ 也加入，让 .rela.plt 能引用（PLT 桩作 e_entry）。
-    std::pair<std::vector<std::string>, std::unordered_map<std::string, size_t>> collect_und_names() const {
+    // 同时跟踪每个名字是否「纯 weak UND」：某名字的所有 UND 引用都是 STB_WEAK（且无 globals_
+    // 定义、不是 _DYNAMIC/入口）时，标记为 weak——输出到 .dynsym 时写 STB_WEAK，loader 对其
+    // 解析失败静默处理（weak UND → 0 是标准 ld 语义，如 musl 的 __init_array_start 等边界符号）。
+    struct UndNames {
         std::vector<std::string> names;
-        std::unordered_map<std::string, size_t> idx;
+        std::unordered_map<std::string, size_t> idx;            // name → names 下标
+        std::unordered_map<std::string, bool> is_weak;          // name → 是否纯 weak UND
+    };
+    UndNames collect_und_names() const {
+        UndNames out;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (const auto& r : objects_[oi].relocations) {
                 if (r.sym_idx >= objects_[oi].symbols.size()) continue;
                 const auto& sym = objects_[oi].symbols[r.sym_idx];
                 if (sym.defined || sym.name.empty()) continue;
                 if (sym.name == "_DYNAMIC") continue;  // 由 build_dynamic_sections 合成为 defined 符号
-                if (idx.find(sym.name) == idx.end()) {
-                    idx[sym.name] = names.size();
-                    names.push_back(sym.name);
+                bool inserted = out.idx.find(sym.name) == out.idx.end();
+                if (inserted) {
+                    out.idx[sym.name] = out.names.size();
+                    out.names.push_back(sym.name);
+                    out.is_weak[sym.name] = (sym.binding == STB_WEAK);
+                } else if (sym.binding != STB_WEAK) {
+                    // 同名符号只要存在一个 strong 引用，就不再算纯 weak
+                    out.is_weak[sym.name] = false;
                 }
             }
         }
         if (mode_ == Mode::DYNAMIC_EXE && !entry_name_.empty() &&
-            globals_.find(entry_name_) == globals_.end() &&
-            idx.find(entry_name_) == idx.end()) {
-            idx[entry_name_] = names.size();
-            names.push_back(entry_name_);
+            out.idx.find(entry_name_) == out.idx.end() &&
+            globals_.find(entry_name_) == globals_.end()) {
+            out.idx[entry_name_] = out.names.size();
+            out.names.push_back(entry_name_);
+            out.is_weak[entry_name_] = false;  // 入口符号由运行期解析，必须走 strong 导入
         }
-        return {std::move(names), std::move(idx)};
+        return out;
     }
 
     // SHARED_LIB/DYNAMIC_EXE：构建 .dynstr/.dynsym/.hash/.rela.dyn/.rela.plt?/.dynamic
@@ -1202,7 +1215,8 @@ private:
     DynSecOut build_dynamic_sections(std::vector<SecBuf>& extras, Elf64_Half extras_base,
                                        Elf64_Half bss_shndx, const Elf64_Half seg_shndx[3]) const {
         DynSecOut out;
-        auto [und_names, und_idx] = collect_und_names();
+        auto und = collect_und_names();
+        const auto& und_names = und.names;
 
         // .dynstr：\0 + und 名 + soname/needed + 导出符号名
         SecBuf dynstr;
@@ -1263,10 +1277,14 @@ private:
         for (size_t i = 0; i < und_names.size(); i++) {
             Elf64_Sym s = {};
             s.st_name = und_name_offs[i];
-            s.st_info = GELF_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+            const std::string& nm = und_names[i];
+            bool weak = und.is_weak.count(nm) && und.is_weak.at(nm);
+            // 纯 weak UND（如 __init_array_start/__fini_array_start）：保留 STB_WEAK，loader
+            // 对其解析失败静默处理（weak UND → 0，标准 ld 语义）；其余 UND 保持 STB_GLOBAL。
+            s.st_info = GELF_ST_INFO(weak ? STB_WEAK : STB_GLOBAL, STT_NOTYPE);
             s.st_shndx = SHN_UNDEF;
             dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
-            dynsym_idx[und_names[i]] = 1 + i;
+            dynsym_idx[nm] = 1 + i;
         }
         Elf64_Word first_global = 1 + (Elf64_Word)und_names.size();
         for (const auto& kv : globals_) {
