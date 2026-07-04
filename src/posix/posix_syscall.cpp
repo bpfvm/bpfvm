@@ -320,8 +320,8 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_FCNTL:         return do_fcntl(v);
     case BPF_SYS_IOCTL:         return do_ioctl(v);
     case BPF_SYS_UMASK:         return do_umask(v);
-    case BPF_SYS_SETJMP:        return do_setjmp(v);
-    case BPF_SYS_LONGJMP:       return do_longjmp(v);
+    case BPF_SYS_SIGSETJMP:     return do_sigsetjmp(v);
+    case BPF_SYS_SIGLONGJMP:    return do_siglongjmp(v);
     case BPF_SYS_CLOCK_GETTIME: return do_clock_gettime(v);
     // —— musl/libc 兼容性补充 ——
     case BPF_SYS_MPROTECT:       return do_mprotect(v);

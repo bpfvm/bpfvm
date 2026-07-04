@@ -391,9 +391,10 @@ bool PosixSyscall::do_sigprocmask(vm* v) {
     return true;
 }
 
-bool PosixSyscall::do_setjmp(vm* v) {
+bool PosixSyscall::do_sigsetjmp(vm* v) {
     uint64_t env_addr = v->r(1);
-    uint64_t* env = (uint64_t*)v->mmu_w(env_addr, 7 * sizeof(uint64_t));
+    int savemask = arg_s32(v->r(2));
+    uint64_t* env = (uint64_t*)v->mmu_w(env_addr, 10 * sizeof(uint64_t));
     if (!env) {
         v->r(0) = -EFAULT;
         return true;
@@ -405,14 +406,18 @@ bool PosixSyscall::do_setjmp(vm* v) {
     env[4] = v->r(10);
     env[5] = pc(v);
     env[6] = signal_depth(v);
+    env[7] = 0;
+    env[8] = savemask ? 1 : 0;    // __fl
+    if (savemask)
+        env[9] = sigmask.load(std::memory_order_relaxed);   // __ss[0]
     v->r(0) = 0;
     return true;
 }
 
-bool PosixSyscall::do_longjmp(vm* v) {
+bool PosixSyscall::do_siglongjmp(vm* v) {
     uint64_t env_addr = v->r(1);
     int32_t val = arg_s32(v->r(2));
-    uint64_t* env = (uint64_t*)v->mmu(env_addr);
+    uint64_t* env = (uint64_t*)v->mmu(env_addr, 10 * sizeof(uint64_t));
     if (!env) {
         v->r(0) = -EFAULT;
         return true;
@@ -428,6 +433,17 @@ bool PosixSyscall::do_longjmp(vm* v) {
     // pc points to syscall instruction.
     // loop increments pc.
     // next instruction is executed.
+
+    // 若 setjmp 时保存过掩码（__fl!=0），恢复之。与 do_sigprocmask 一致：
+    // 解锁后 pending 队列里先前被阻塞的信号可能变可投递，需补设 pending 标志 + 唤醒，
+    // 让本 syscall 返回后 safepoint 重扫投出。
+    if (env[8]) {
+        sigmask.store(env[9], std::memory_order_release);
+        if (!pending_signals.empty()) {
+            flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
+            v->wakeup(false);
+        }
+    }
 
     v->r(0) = (val == 0) ? 1 : val;
     return true;

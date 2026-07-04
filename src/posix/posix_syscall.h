@@ -235,8 +235,8 @@ public:
     bool do_fcntl(vm* v);
     bool do_ioctl(vm* v);
     bool do_umask(vm* v);
-    bool do_setjmp(vm* v);
-    bool do_longjmp(vm* v);
+    bool do_sigsetjmp(vm* v);
+    bool do_siglongjmp(vm* v);
     bool do_mprotect(vm* v);
     bool do_readv(vm* v);
     bool do_writev(vm* v);
