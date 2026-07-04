@@ -73,6 +73,7 @@ enum bpf_syscall_id {
     BPF_SYS_FUTEX,          // futex(uaddr, op, val, timeout, uaddr2) — 第 6 参 val3 走 r0
     BPF_SYS_TKILL,          // tkill(tid, sig)
     BPF_SYS_TGKILL,         // tgkill(tgid, tid, sig)
+    BPF_SYS_SIGPROCMASK,    // rt_sigprocmask(how, set, old, sigsetsize)
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -136,6 +137,7 @@ enum bpf_syscall_id {
 #define BPF_CALL_FUTEX     BPF_CALL_ID(BPF_SYS_FUTEX)
 #define BPF_CALL_TKILL     BPF_CALL_ID(BPF_SYS_TKILL)
 #define BPF_CALL_TGKILL    BPF_CALL_ID(BPF_SYS_TGKILL)
+#define BPF_CALL_SIGPROCMASK BPF_CALL_ID(BPF_SYS_SIGPROCMASK)
 
 // ===========================================================================
 // 虚拟浮点指令（src_reg=2）

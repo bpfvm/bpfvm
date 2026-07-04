@@ -10,6 +10,8 @@
 #include <condition_variable>
 #include <unistd.h>
 
+#define BPF_SIGNAL_QUE_SIZE 1024
+
 struct GuestTty;
 struct fd_handle {
     const int fd = -1;
@@ -86,7 +88,7 @@ class MpscQueue {
         std::atomic<uint64_t> seq;
         int value = 0;
     };
-    static constexpr size_t k_capacity = 1024;
+    static constexpr size_t k_capacity = BPF_SIGNAL_QUE_SIZE;
     static constexpr size_t k_mask = k_capacity - 1;
     static_assert((k_capacity & (k_capacity - 1)) == 0, "k_capacity must be power of two");
     std::array<slot, k_capacity> slots{};
@@ -134,6 +136,11 @@ class PosixSyscall: public SyscallHandler{
     std::shared_ptr<ThreadGroup> tg;  // 线程组生命周期（CLONE_THREAD 共享；fork 新建）。
     std::atomic<uint64_t> ppid{0};
     pthread_t tid = 0;
+    // 信号掩码（POSIX sigprocmask）：bit (sig-1) 表示信号 sig 被阻塞（与 Linux 内核/
+    // musl sigset_t ABI 一致）。SIGKILL/SIGSTOP 不可阻塞（do_sigprocmask 强制清对应位）。
+    // 仅在 handle_signals 投递端过滤；queue_signal 无条件入队，被阻塞的信号留在
+    // pending_signals 里，解锁后 safepoint 重扫时自然投出（实时信号统一模型）。
+    std::atomic<uint64_t> sigmask{0};
     MpscQueue pending_signals;
     // set_tid_address / CLONE_CHILD_CLEARTID 设置；线程退出时清零并 futex_wake。
     uint64_t tid_address_ = 0;
@@ -219,6 +226,7 @@ public:
     bool do_tkill(vm* v);
     bool do_tgkill(vm* v);
     bool do_sigaction(vm* v);
+    bool do_sigprocmask(vm* v);
     bool do_setpgid(vm* v);
     bool do_getpgid(vm* v);
     bool do_getpgrp(vm* v);

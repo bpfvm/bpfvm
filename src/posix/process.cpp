@@ -153,6 +153,8 @@ bool PosixSyscall::do_clone(vm* v) {
         tg->live_threads.fetch_add(1);
     }
     child_sys->umask_val = umask_val;
+    // fork/clone 都继承父的信号掩码（Linux：clone 不论 CLONE_THREAD 都按 fork 语义拷贝 mask）。
+    child_sys->sigmask.store(sigmask.load(std::memory_order_relaxed), std::memory_order_relaxed);
     options(child.get()).sys = child_sys;
 
     /* 地址空间：CLONE_VM 共享 maps（同一 shared_ptr，后续 mmap 互通可见）；

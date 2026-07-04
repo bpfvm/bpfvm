@@ -311,6 +311,7 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_TKILL:         return do_tkill(v);
     case BPF_SYS_TGKILL:        return do_tgkill(v);
     case BPF_SYS_SIGACTION:     return do_sigaction(v);
+    case BPF_SYS_SIGPROCMASK:  return do_sigprocmask(v);
     case BPF_SYS_SETPGID:       return do_setpgid(v);
     case BPF_SYS_GETPGID:       return do_getpgid(v);
     case BPF_SYS_GETPGRP:       return do_getpgrp(v);

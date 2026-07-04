@@ -74,18 +74,52 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
 }
 
 bool PosixSyscall::handle_signals(vm* v) {
+    // 实时信号统一模型：队列 + 掩码过滤。从 pending_signals 逐个 pop，被 sigmask 阻塞
+    // 的信号暂存到 deferred（函数末尾回挂队列，保持 FIFO），找到第一个未阻塞的即投递。
+    // 队列空 / 全部被阻塞 → 收尾：阻塞信号留在队里，VM_SIGNAL_PENDING 保留，待
+    // sigprocmask 解锁后 safepoint 重扫时投出。
+    const uint64_t blocked = sigmask.load(std::memory_order_relaxed);
     int sig = 0;
-    if(!pending_signals.try_pop(sig)) {
-        // Queue is empty. Clear VM_SIGNAL_PENDING with a seq_cst fence, then
-        // re-check to close the race window with a concurrent queue_signal:
-        // if another thread pushed between try_pop and the clear, the second
-        // try_pop will catch it; if it pushed after the clear, it will have
-        // set VM_SIGNAL_PENDING again, so the next safepoint() will retry.
+    int deferred[BPF_SIGNAL_QUE_SIZE];
+    size_t deferred_count = 0;
+    // 扫描上限 = 队列容量，避免极端情况下死循环（理论上每轮最多 pop k_capacity 个）。
+    for(size_t i = 0; i < BPF_SIGNAL_QUE_SIZE; i++) {
+        int s;
+        if(!pending_signals.try_pop(s)) {
+            break;  // 队列空
+        }
+        uint64_t bit = (s >= 1 && s < NSIG) ? (1ULL << (s - 1)) : 0;
+        if(bit && (blocked & bit)) {
+            deferred[deferred_count++] = s;
+            continue;
+        }
+        sig = s;
+        break;
+    }
+    // 重新入队被阻塞的信号（保持入队先后顺序）。
+    for(size_t i = 0; i < deferred_count; i++) {
+        pending_signals.try_push(deferred[i]);
+    }
+    if(sig == 0) {
+        // 没找到可投信号。若队列仍非空（全被阻塞）→ 保留 VM_SIGNAL_PENDING 等解锁；
+        // 若队列空 → 清 VM_SIGNAL_PENDING，并 seq_cst fence 后复检关闭与并发
+        // queue_signal 的丢失窗口（push 发生在 clear 前→复检抓到；后→queue_signal 已置位）。
+        if(deferred_count > 0) {
+            return true;  // 队列里只剩阻塞信号
+        }
         flags(v).fetch_and(~vm::VM_SIGNAL_PENDING, std::memory_order_seq_cst);
-        if(!pending_signals.try_pop(sig)) {
+        int recheck;
+        if(pending_signals.try_pop(recheck)) {
+            // 复检抓到一个 push：要么被阻塞（回挂、留 flag），要么可投（投它）。
+            uint64_t bit = (recheck >= 1 && recheck < NSIG) ? (1ULL << (recheck - 1)) : 0;
+            if(bit && (blocked & bit)) {
+                pending_signals.try_push(recheck);
+                return true;
+            }
+            sig = recheck;
+        } else {
             return true;
         }
-        flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_relaxed);
     }
     if(sig <= 0 || sig >= NSIG) {
         return true;
@@ -290,6 +324,67 @@ bool PosixSyscall::do_sigaction(vm* v) {
         current.handler = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(action->sa_handler));
         current.mask = static_cast<uint64_t>(action->sa_mask);
         current.flags = action->sa_flags;
+    }
+
+    v->r(0) = 0;
+    return true;
+}
+
+bool PosixSyscall::do_sigprocmask(vm* v) {
+    // rt_sigprocmask(how, set, old, sigsetsize)。how ∈ {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}。
+    // sigset_t 在 bpf/musl 是 128 位（16 字节，2 个 unsigned long）；guest 指针指向 16 字节
+    // 区域，本 host 仅用低 8 字节（信号 1..63），高 8 字节恒 0（NSIG=32）。
+    // 信号 sig 占 bit (sig-1)（Linux 内核/musl sigset_t ABI；bit 0 不用）。
+    int how = arg_s32(v->r(1));
+    uint64_t set_addr = v->r(2);
+    uint64_t old_addr = v->r(3);
+    // r(4) = sigsetsize（musl 传 _NSIG/8=8）。本 host 固定按 16 字节 解释，故忽略 size 校验。
+
+    if(how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
+        v->r(0) = -EINVAL;
+        return true;
+    }
+
+    // oldset 总是反映当前 mask，写回 16 字节 sigset_t（低 long = mask，高 long = 0）。
+    if(old_addr != 0) {
+        auto* old_ptr = static_cast<uint64_t*>(v->mmu_w(old_addr, 2 * sizeof(uint64_t)));
+        if(old_ptr == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+        old_ptr[0] = sigmask.load(std::memory_order_relaxed);
+        old_ptr[1] = 0;
+    }
+
+    if(set_addr != 0) {
+        // 读 guest sigset_t 低 8 字节（信号 1..63 足够覆盖 NSIG=32）。
+        auto* set_ptr = static_cast<const uint64_t*>(v->mmu(set_addr, sizeof(uint64_t)));
+        if(set_ptr == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+        uint64_t bits = *set_ptr;
+        // 仅保留有效位（bit (sig-1), sig ∈ [1, NSIG-1]）；SIGKILL/SIGSTOP 不可阻塞。
+        constexpr uint64_t valid = (NSIG < 64) ? ((1ULL << (NSIG - 1)) - 1) : ~0ULL;
+        bits &= valid;
+        bits &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+
+        uint64_t old_mask = sigmask.load(std::memory_order_relaxed);
+        uint64_t new_mask;
+        switch(how) {
+        case SIG_BLOCK:    new_mask = old_mask | bits;  break;
+        case SIG_UNBLOCK:  new_mask = old_mask & ~bits; break;
+        case SIG_SETMASK:  new_mask = bits;             break;
+        }
+        sigmask.store(new_mask, std::memory_order_release);
+
+        // 解锁可能让队列里先前被阻塞的 pending 信号变得可投递：VM_SIGNAL_PENDING 在
+        // handle_signals 走空队列时已被清，这里补设 + 唤醒，让本 syscall 返回后 safepoint
+        // 重扫投出。queue_signal 入队时已无条件置 flag，故这里只在 mask 变化时兜底。
+        if(!pending_signals.empty()) {
+            flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
+            v->wakeup(false);
+        }
     }
 
     v->r(0) = 0;
