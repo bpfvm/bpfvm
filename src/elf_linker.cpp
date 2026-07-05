@@ -84,6 +84,17 @@ struct LoadedReloc {
     int64_t addend = 0;         // SHT_RELA: 来自 r_addend；SHT_REL: 加载时从 patch 点读取
 };
 
+// 调试 section（.debug_*）的搬运记录。debug 段非 VM-loadable，不进 host pool、不占 guest
+// 地址，独立按段落到输出的 extras 区（non-ALLOC SHT_PROGBITS），供 readelf/objdump 等离线
+// 工具消费。extra_idx 由 write_elf_impl 在 push 进 extras 后回填。
+struct DebugSec {
+    std::string name;            // ".debug_info" 等
+    size_t sec_idx;              // obj.sections 下标（对齐 ELF shndx，reloc.target_sec 用）
+    Elf64_Xword addralign = 1;   // sh_addralign（输出时保留对齐）
+    std::vector<uint8_t> data;   // 原始字节（写出时复制进 SecBuf 并按需 patch 重定位）
+    size_t extra_idx = SIZE_MAX; // 写出时在 extras[] 里的位置
+};
+
 // 加载后的 .o
 struct LoadedObject {
     std::string source;         // 路径或 "archive:member"
@@ -95,6 +106,9 @@ struct LoadedObject {
     size_t total_size = 0;      // 在 pool 里占用的字节数
     unsigned char* host_mem = nullptr;  // 指向 pool_ + pool_offset（不拥有）
     size_t host_mem_size = 0;
+    std::vector<DebugSec> debug_secs;  // 本 obj 拥有的 .debug_* 段（按出现顺序）
+    // obj.sections[idx] -> debug_secs 下标；只对属于 debug 的 section 有效
+    std::unordered_map<size_t, size_t> dbg_sec_local_idx;
 };
 
 // 全局符号表
@@ -163,11 +177,18 @@ SegClass classify_section(bool executable, bool writable) {
     return SEG_RODATA;
 }
 
-// 判断 section 是否需要跳过（调试信息等）
-bool is_debug_section(const std::string& name) {
+// DWARF 调试段（.debug* 及其 .rel.debug*）：可保留到输出（keep_debug 时）。
+// 与 .BTF 等分离——BTF 是 BPF 内核用、VM 无需，仍无条件跳过。
+bool is_dwarf_section(const std::string& name) {
     if (name.empty()) return false;
     if (name.rfind(".debug", 0) == 0) return true;
     if (name.rfind(".rel.debug", 0) == 0) return true;
+    return false;
+}
+
+// 判断 section 是否需要跳过（BTF/llvm_addrsig 等；DWARF 由 is_dwarf_section 单独判）
+bool is_debug_section(const std::string& name) {
+    if (name.empty()) return false;
     if (name == ".BTF" || name == ".BTF.ext") return true;
     if (name.rfind(".rel.BTF", 0) == 0) return true;
     if (name == ".llvm_addrsig") return true;
@@ -179,6 +200,7 @@ size_t reloc_write_len(int type) {
     switch (type) {
     case 1:  return 16;  // R_BPF_64_64   (lddw 双槽，imm @ +4/+12)
     case 2:  return 8;   // R_BPF_64_ABS64
+    case 3:  return 4;   // R_BPF_64_ABS32 (DWARF 段偏移引用)
     case 10: return 8;   // R_BPF_64_32   (call 8B，imm @ +4)
     case 4:  return 4;   // R_BPF_64_NODYLD32
     default: return 0;   // 未知/不写入
@@ -202,6 +224,11 @@ int64_t read_embedded_addend(const unsigned char* patch, int type) {
         return a;
     }
     case 4: {  // R_BPF_64_NODYLD32: 4 字节
+        int32_t a = 0;
+        memcpy(&a, patch, 4);
+        return a;
+    }
+    case 3: {  // R_BPF_64_ABS32: 4 字节（DWARF 段偏移引用）
         int32_t a = 0;
         memcpy(&a, patch, 4);
         return a;
@@ -353,6 +380,8 @@ private:
     std::vector<std::string> explicit_archives_;  // STATIC_EXE: 命令行 -l archive（完整路径）
     std::vector<LoadedObject> objects_;
     std::unordered_map<std::string, GlobalSymbol> globals_;
+    bool keep_debug_ = true;  // 默认保留 DWARF 调试段（对齐标准 ld）
+    bool keep_symtab_ = true; // 默认输出静态 .symtab/.strtab（-s/--strip-all 关闭，对齐 ld）
 
     // 3 段布局结果（layout_segments 填充，write_elf 使用）
     struct SegInfo {
@@ -391,6 +420,8 @@ public:
     void set_needed(std::vector<std::string> n) { needed_ = std::move(n); }
     void set_deps(std::vector<std::string> d) { dep_paths_ = std::move(d); }
     void set_archives(std::vector<std::string> a) { explicit_archives_ = std::move(a); }
+    void set_keep_debug(bool b) { keep_debug_ = b; }
+    void set_keep_symtab(bool b) { keep_symtab_ = b; }
 
     // 按扩展名加载一个输入：.a→归档(全展开)、.so→动态符号(读 dynsym+DT_NEEDED)、.o(及其它)→目标文件
     bool load_input(const std::string& in) {
@@ -606,7 +637,7 @@ public:
 
     uint64_t entry() const { return entry_; }
 
-    bool write_elf(const std::string& path) const {
+    bool write_elf(const std::string& path) {
         if (!pool_ || pool_used_ == 0) return false;
 
         FILE* f = fopen(path.c_str(), "wb");
@@ -677,7 +708,8 @@ private:
             char* nm = elf_strptr(elf, shstrndx, shdr.sh_name);
             ls.name = nm ? nm : "";
             ls.size = shdr.sh_size;
-            ls.loadable = is_loadable_section(shdr.sh_type) && !is_debug_section(ls.name);
+            ls.loadable = is_loadable_section(shdr.sh_type) &&
+                          !is_debug_section(ls.name) && !is_dwarf_section(ls.name);
             ls.writable = (shdr.sh_flags & SHF_WRITE) != 0;
             ls.executable = (shdr.sh_flags & SHF_EXECINSTR) != 0;
             ls.seg = classify_section(ls.executable, ls.writable);
@@ -714,7 +746,7 @@ private:
         obj.total_size = total_size;
         pool_used_ += total_size;
 
-        // 第二遍：拷贝 PROGBITS 数据
+        // 第二遍：拷贝 PROGBITS 数据（VM-loadable 进 host pool；DWARF 段进独立 debug_secs）
         scn = nullptr;
         size_t sec_idx = 1;  // 从 1 开始，跳过 NULL 占位
         while ((scn = elf_nextscn(elf, scn)) != nullptr) {
@@ -722,6 +754,21 @@ private:
             gelf_getshdr(scn, &shdr);
             LoadedSection& ls = obj.sections[sec_idx++];
             if (!ls.loadable) {
+                // DWARF 调试段：keep_debug 时搬运原始字节到 debug_secs（独立缓冲，不进 host pool）。
+                // is_dwarf_section 只匹配 .debug*/.rel.debug*；后者是 SHT_REL，被 SHT_PROGBITS
+                // 条件排除，故这里仅捕获真正的 .debug_* 数据段。
+                if (keep_debug_ && shdr.sh_type == SHT_PROGBITS && is_dwarf_section(ls.name)) {
+                    Elf_Data* d = elf_getdata(scn, nullptr);
+                    if (d && d->d_size > 0) {
+                        DebugSec ds;
+                        ds.name = ls.name;
+                        ds.sec_idx = sec_idx - 1;       // 与 obj.sections 下标对齐
+                        ds.addralign = shdr.sh_addralign ? shdr.sh_addralign : 1;
+                        ds.data.assign((uint8_t*)d->d_buf, (uint8_t*)d->d_buf + d->d_size);
+                        obj.dbg_sec_local_idx[sec_idx - 1] = obj.debug_secs.size();
+                        obj.debug_secs.push_back(std::move(ds));
+                    }
+                }
                 continue;
             }
             ls.guest_addr = obj.base + ls.offset;
@@ -821,9 +868,21 @@ private:
                     // SHT_REL：addend 嵌入在 patch 点原值里，按类型读取。
                     // 仅对已定义符号读（UND 符号的 patch 点是 clang 占位符，非真实 addend）。
                     bool sym_defined = (r.sym_idx < obj.symbols.size() && obj.symbols[r.sym_idx].defined);
-                    if (sym_defined && target_sec < obj.sections.size() && obj.sections[target_sec].loadable) {
-                        const unsigned char* patch = obj.host_mem + obj.sections[target_sec].offset + r.offset;
-                        r.addend = read_embedded_addend(patch, r.type);
+                    if (sym_defined && target_sec < obj.sections.size()) {
+                        const auto& tgt = obj.sections[target_sec];
+                        if (tgt.loadable) {
+                            const unsigned char* patch = obj.host_mem + tgt.offset + r.offset;
+                            r.addend = read_embedded_addend(patch, r.type);
+                        } else {
+                            // SHT_REL 的 DWARF 重定位（.rel.debug_*）：patch 点在 debug 段原始字节里。
+                            // 从已搬运的 debug_secs 缓冲读 embedded addend。
+                            auto it = obj.dbg_sec_local_idx.find(target_sec);
+                            if (it != obj.dbg_sec_local_idx.end() &&
+                                r.offset + reloc_write_len(r.type) <= tgt.size) {
+                                const auto& dbuf = obj.debug_secs[it->second].data;
+                                r.addend = read_embedded_addend(dbuf.data() + r.offset, r.type);
+                            }
+                        }
                     }
                 }
                 obj.relocations.push_back(r);
@@ -975,6 +1034,43 @@ private:
         return std::nullopt;
     }
 
+    // 解析符号对 debug 重定位的「值」：DWARF consumer 需要的是 section 内偏移或运行时
+    // 地址，取决于目标所在 section 性质：
+    //   - 符号指向 debug 段（.debug_*）：值 = 符号在该 debug 段内的偏移（sym.value）。
+    //     DWARF 的 section 间引用是「目标段内偏移」语义（如 .debug_info 的 DW_AT_abbrev
+    //     指向 .debug_abbrev 段内偏移），不是文件内偏移。addend 已编码段内目标位置。
+    //   - 符号指向 VM-loadable 段（.text/.rodata/.data）：值 = 运行时 guest 地址（STATIC
+    //     下即最终地址；debug→loadable 引用，如 .debug_addr/.debug_ranges 指向代码/数据）。
+    // 返回 nullopt 表示无法解析。
+    std::optional<uint64_t> resolve_debug_value(size_t obj_idx, size_t sym_idx) const {
+        const auto& sym = objects_[obj_idx].symbols[sym_idx];
+        // 非 STB_LOCAL：按 globals_ 解析为最终定义处的 guest 地址或 debug 段内偏移
+        size_t def_obj_idx = obj_idx;
+        size_t def_sym_idx = sym_idx;
+        if (sym.binding != STB_LOCAL) {
+            auto it = globals_.find(sym.name);
+            if (it != globals_.end()) {
+                def_obj_idx = it->second.obj_idx;
+                def_sym_idx = it->second.sym_idx;
+            } else {
+                if (sym.binding == STB_WEAK && mode_ != Mode::SHARED_LIB) return 0;
+                return std::nullopt;
+            }
+        }
+        const auto& def_sym = objects_[def_obj_idx].symbols[def_sym_idx];
+        if (def_sym.sec_idx == SIZE_MAX || def_sym.sec_idx >= objects_[def_obj_idx].sections.size())
+            return 0;
+        // 符号指向 debug 段：值 = 段内偏移（sym.value）。STT_SECTION 符号 value=0，
+        // addend 在调用处加上，得到段内最终偏移。
+        auto lit = objects_[def_obj_idx].dbg_sec_local_idx.find(def_sym.sec_idx);
+        if (lit != objects_[def_obj_idx].dbg_sec_local_idx.end()) {
+            return def_sym.value;
+        }
+        // 否则指向 loadable 段：用 guest 地址（STATIC_EXE 下即最终地址）
+        const auto& sec = objects_[def_obj_idx].sections[def_sym.sec_idx];
+        return sec.guest_addr + def_sym.value;
+    }
+
     // 加载 .so 文件，提取其 symtab 中所有 GLOBAL 符号 → 地址映射
     // 不加载内容到 pool_，只读符号信息
     bool load_bpfso_symbols(const std::string& path) {
@@ -1062,7 +1158,7 @@ private:
     // ===== write_elf_impl：把 pool + extras 写成 ELF 文件 =====
     // 流程：构建 extras → 计算布局 → 回填动态段 vaddr → 写 header/phdr/payload/shdr。
     // 各阶段拆到 build_*/compute_*/backfill_*/write_* helper，本函数仅编排。
-    bool write_elf_impl(FILE* f) const {
+    bool write_elf_impl(FILE* f) {
         // 1. section index 布局：NULL(0) → .text → .plt? → .rodata → .data → .got.plt? → .bss? → extras
         Elf64_Half seg_shndx[3] = {0,0,0};
         Elf64_Half bss_shndx = 0;
@@ -1086,7 +1182,16 @@ private:
 
         // 2. 构建 extras（按 mode_ 条件追加）
         std::vector<SecBuf> extras;
-        if (mode_ == Mode::SHARED_LIB) {
+        // 2a. DWARF 调试段（最先 push：在 extras 区前部，便于 shstrtab 自动注册名字）。
+        //     仅 STATIC_EXE 启用——PIE 模式下 .debug_addr 等引用的地址在运行时由 VM 选基址
+        //     加载，链接期填死会错（留阶段二）。
+        const bool emit_debug = (keep_debug_ && mode_ == Mode::STATIC_EXE);
+        if (emit_debug) {
+            collect_debug_sections(extras);
+        }
+        // 2b. 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
+        //     -s/--strip-all 时跳过（对齐标准 ld；运行时符号解析仍走 .dynsym）。
+        if (keep_symtab_) {
             build_static_symtab(extras, extras_base, bss_shndx, seg_shndx);
         }
         DynSecOut dyn_idx;
@@ -1104,6 +1209,11 @@ private:
         FileLayout layout = compute_file_layout(extras, extras_base, next_sh,
                                                  names.shstrtab_idx, interp_idx, need_dynamic);
 
+        // 3a. DWARF 重定位 patch：debug 段在文件中的偏移已由 layout 算出，可填重定位值
+        if (emit_debug) {
+            apply_debug_relocations(extras);
+        }
+
         // 4. 回填动态 section 的 vaddr 并 patch DT_*
         std::unordered_map<size_t, uint64_t> dyn_vaddr_map;
         if (need_dynamic) {
@@ -1118,6 +1228,68 @@ private:
         return true;
     }
 
+    // 收集所有 obj 的 DWARF 调试段为 non-ALLOC SecBuf，推入 extras；同时回填各
+    // DebugSec::extra_idx 以便后续 patch 按索引找到对应缓冲。
+    void collect_debug_sections(std::vector<SecBuf>& extras) {
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (size_t di = 0; di < objects_[oi].debug_secs.size(); di++) {
+                auto& ds = objects_[oi].debug_secs[di];
+                SecBuf sb;
+                sb.name = ds.name;
+                sb.type = SHT_PROGBITS;
+                sb.flags = 0;       // 非 ALLOC：write_shdrs 留 sh_addr=0（non-loadable）
+                sb.addralign = ds.addralign;
+                sb.data = ds.data;  // 复制一份，原始 data 留作多次链接/校验
+                ds.extra_idx = extras.size();
+                extras.push_back(std::move(sb));
+            }
+        }
+    }
+
+    // 应用 DWARF 段的重定位（.rel.debug_*）。两类：
+    //   - target 是 debug 段：patch 写在 extras[extra_idx].data 里
+    //   - 符号值按 resolve_debug_value：debug→debug 取段内偏移，debug→loadable 取 guest 地址
+    // 类型仅 R_BPF_64_ABS32(3)/R_BPF_64_ABS64(2)（DWARF 不会出现 lddw/call）。
+    void apply_debug_relocations(std::vector<SecBuf>& extras) {
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            const auto& obj = objects_[oi];
+            for (const auto& r : obj.relocations) {
+                if (r.target_sec >= obj.sections.size()) continue;
+                // 只处理 target 是 debug 段的重定位（.rel.debug_*）
+                auto lit = obj.dbg_sec_local_idx.find(r.target_sec);
+                if (lit == obj.dbg_sec_local_idx.end()) continue;
+                const auto& ds = obj.debug_secs[lit->second];
+                if (ds.extra_idx >= extras.size()) continue;
+                auto& out = extras[ds.extra_idx];
+                // 越界校验（针对实际要 patch 的输出副本）
+                if (r.offset + reloc_write_len(r.type) > out.data.size()) {
+                    std::cerr << "[elf_linker] debug reloc out of bounds in " << obj.source
+                              << ": offset=" << r.offset << " type=" << r.type
+                              << " sec=" << ds.name << " size=" << out.data.size() << "\n";
+                    continue;
+                }
+                auto resolved = resolve_debug_value(oi, r.sym_idx);
+                if (!resolved) continue;
+                uint64_t S = *resolved;
+                uint8_t* patch = out.data.data() + r.offset;
+                switch (r.type) {
+                case 3: {  // R_BPF_64_ABS32
+                    uint32_t V = (uint32_t)(S + (uint64_t)r.addend);
+                    memcpy(patch, &V, 4);
+                    break;
+                }
+                case 2: {  // R_BPF_64_ABS64
+                    uint64_t V = S + (uint64_t)r.addend;
+                    memcpy(patch, &V, 8);
+                    break;
+                }
+                default:
+                    break;  // DWARF 不应出现其它类型
+                }
+            }
+        }
+    }
+
     // 符号所在 section → 输出 ELF 的 section index（text/rodata/data/bss/ABS）
     Elf64_Half sym_to_shndx(const LoadedObject& obj, size_t sec_idx,
                              Elf64_Half bss_shndx, const Elf64_Half seg_shndx[3]) const {
@@ -1127,13 +1299,16 @@ private:
         return seg_shndx[ls.seg] ? seg_shndx[ls.seg] : SHN_ABS;
     }
 
-    // SHARED_LIB：构建 .strtab + .symtab（完整符号表，调试用；运行时用 .dynsym）
+    // 构建 .strtab + .symtab（完整符号表，调试用；运行时符号解析另走 .dynsym）。
+    // 三种模式都输出，对齐标准 ld 默认行为：本地符号在前、global 在后，sh_info 指向
+    // 第一个 global（SHT_SYMTAB 约定）。本地符号含 STB_LOCAL 的 FUNC/OBJECT，让
+    // objdump -d 等工具能在反汇编中标注函数边界。
     void build_static_symtab(std::vector<SecBuf>& extras, Elf64_Half extras_base,
                               Elf64_Half bss_shndx, const Elf64_Half seg_shndx[3]) const {
         SecBuf strtab;
         strtab.name = ".strtab";
         strtab.type = SHT_STRTAB;
-        strtab.data.push_back(0);
+        strtab.data.push_back(0);  // strtab[0] = '\0'（空名）
         strtab.addralign = 1;
 
         SecBuf symtab;
@@ -1141,26 +1316,55 @@ private:
         symtab.type = SHT_SYMTAB;
         symtab.addralign = 8;
         symtab.entsize = sizeof(Elf64_Sym);
-        symtab.info = 1;
 
-        Elf64_Sym zsym = {};
-        symtab.data.insert(symtab.data.end(), (uint8_t*)&zsym, (uint8_t*)&zsym + sizeof(zsym));
-
-        for (const auto& kv : globals_) {
-            const auto& obj = objects_[kv.second.obj_idx];
-            const auto& sym = obj.symbols[kv.second.sym_idx];
-            Elf64_Sym s = {};
-            Elf64_Word name_off = (Elf64_Word)strtab.data.size();
-            strtab.data.insert(strtab.data.end(), sym.name.begin(), sym.name.end());
+        // strtab 写入名字，返回偏移
+        auto add_name = [&](const std::string& n) -> Elf64_Word {
+            if (n.empty()) return 0;
+            Elf64_Word off = (Elf64_Word)strtab.data.size();
+            strtab.data.insert(strtab.data.end(), n.begin(), n.end());
             strtab.data.push_back(0);
-            s.st_name = name_off;
-            s.st_info = GELF_ST_INFO(STB_GLOBAL, sym.type == 0 ? STT_FUNC : sym.type);
+            return off;
+        };
+
+        // NULL 符号（index 0）
+        Elf64_Sym zsym = {};
+        size_t sym_count = 0;
+        symtab.data.insert(symtab.data.end(), (uint8_t*)&zsym, (uint8_t*)&zsym + sizeof(zsym));
+        sym_count++;
+
+        auto emit = [&](const LoadedObject& obj, const LoadedSym& sym, int bind) {
+            Elf64_Sym s = {};
+            s.st_name = add_name(sym.name);
+            s.st_info = GELF_ST_INFO(bind, sym.type == 0 ? STT_FUNC : sym.type);
+            s.st_other = 0;
             s.st_shndx = sym_to_shndx(obj, sym.sec_idx, bss_shndx, seg_shndx);
             s.st_value = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
             s.st_size = sym.size;
             symtab.data.insert(symtab.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
+            sym_count++;
+        };
+
+        // 1. 本地符号（STB_LOCAL 的 FUNC/OBJECT；section 符号 STT_SECTION 也算 local，
+        //    但对反汇编帮助不大且无名字，跳过）
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            const auto& obj = objects_[oi];
+            for (size_t si = 1; si < obj.symbols.size(); si++) {
+                const auto& sym = obj.symbols[si];
+                if (sym.binding != STB_LOCAL) continue;
+                if (!sym.defined) continue;
+                if (sym.type != STT_FUNC && sym.type != STT_OBJECT) continue;
+                emit(obj, sym, STB_LOCAL);
+            }
         }
-        symtab.info = 1;
+        // sh_info = 第一个 global 的下标（local 区结束位置）
+        symtab.info = (Elf64_Word)sym_count;
+
+        // 2. 全局符号（去重：每个 global 名只输出 globals_ 里的定义）
+        for (const auto& kv : globals_) {
+            const auto& obj = objects_[kv.second.obj_idx];
+            const auto& sym = obj.symbols[kv.second.sym_idx];
+            emit(obj, sym, STB_GLOBAL);
+        }
 
         size_t strtab_idx = extras.size();
         extras.push_back(std::move(strtab));
@@ -1533,7 +1737,8 @@ private:
             cur += segs_[c].filesz;
         }
         for (const auto& e : extras) {
-            cur = (cur + (e.addralign - 1)) & ~(e.addralign - 1);
+            // addralign==0 或 1 不需要对齐（避免 (cur + SIZE_MAX) & 0 把 cur 清零）
+            if (e.addralign > 1) cur = (cur + (e.addralign - 1)) & ~(e.addralign - 1);
             L.extra_offs.push_back(cur);
             cur += e.data.size();
         }
@@ -2097,29 +2302,36 @@ private:
 }  // namespace
 
 bool link_bpf_object(const std::vector<std::string>& inputs, const std::string& out_path,
-                     const std::vector<std::string>& archives) {
+                     const std::vector<std::string>& archives,
+                     bool keep_debug, bool keep_symtab) {
     Linker linker;
     linker.set_archives(archives);
+    linker.set_keep_debug(keep_debug);
+    linker.set_keep_symtab(keep_symtab);
     if (!linker.run(inputs)) return false;
     return linker.write_elf(out_path);
 }
 
 bool link_bpf_shared(const std::vector<std::string>& inputs, const std::string& out_path,
                      const std::string& soname,
-                     const std::vector<std::string>& deps) {
+                     const std::vector<std::string>& deps, bool keep_debug, bool keep_symtab) {
     Linker linker(Linker::Mode::SHARED_LIB);
     linker.set_soname(soname);
     linker.set_deps(deps);
+    linker.set_keep_debug(keep_debug);
+    linker.set_keep_symtab(keep_symtab);
     if (!linker.run(inputs)) return false;
     return linker.write_elf(out_path);
 }
 
 bool link_bpf_exe(const std::vector<std::string>& inputs, const std::string& out_path,
                   const std::vector<std::string>& deps,
-                  const std::string& entry_name) {
+                  const std::string& entry_name, bool keep_debug, bool keep_symtab) {
     Linker linker(Linker::Mode::DYNAMIC_EXE);
     linker.set_deps(deps);
     linker.set_entry_name(entry_name);
+    linker.set_keep_debug(keep_debug);
+    linker.set_keep_symtab(keep_symtab);
     if (!linker.run(inputs)) return false;
     return linker.write_elf(out_path);
 }

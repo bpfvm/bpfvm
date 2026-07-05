@@ -111,6 +111,21 @@ Segments are page-aligned and non-overlapping in the guest address space.
 
 Entry symbol defaults to `_start` (standard `ld` behavior); override with `-e <name>` / `--entry <name>`.
 
+### Debug Info (DWARF)
+By default `bpfvm-ld` preserves DWARF debug sections (`.debug_info`, `.debug_line`, `.debug_str`, `.debug_abbrev`, `.debug_addr`, `.debug_frame`, ...) in the output as **non-ALLOC `SHT_PROGBITS`** sections, matching standard `ld` behavior. Compile with `-g` (already on in `test/Makefile`, `build_root.sh`, `build_busybox.sh`) and the linked binary carries full source-level debug info:
+
+```bash
+bpfvm-ld -static foo.o -l:libc.a -o foo.linked     # .debug_* kept (default)
+bpf-objdump -S foo.linked                           # disassembly interleaved with C source
+llvm-dwarfdump --verify foo.linked                  # verify DWARF
+```
+
+- **Static mode only**: debug-section preservation is currently enabled for `-static` (fixed addresses). PIE modes (`-shared`, default dynamic) skip debug emission because `.debug_addr` references `.text` by absolute address, which is only known after the VM picks a load base at runtime (a future stage can emit position-independent debug info).
+- **Strip**: `--strip-debug` (`-S`) drops `.debug_*` only; `-s` / `--strip-all` drops both `.debug_*` and `.symtab`/`.strtab` (matching standard `ld` semantics). `-g` and its variants (`-g2`, `-gdwarf-4`, ...) are accepted as no-ops (debug is already on by default).
+- **Relocations**: `.rel.debug_*` relocations are applied at link time and **not** emitted to the output (cleaner; consumers see pre-resolved values). Two address classes are handled: debug→debug references resolve to section-relative offsets, debug→loadable references resolve to the final guest address.
+- **Symbol table**: all three modes now emit a static `.symtab`/`.strtab` containing both GLOBAL symbols and `STB_LOCAL` FUNC/OBJECT symbols (so `objdump -d` can label local function boundaries). `sh_info` points at the first GLOBAL per the ELF convention. Runtime symbol resolution still uses `.dynsym` in PIE modes.
+- `.BTF`/`.BTF.ext` (BPF kernel metadata) and `.llvm_addrsig` are still dropped (VM has no use for them).
+
 ## Historical Note
 Earlier versions depended on `binutils-bpf` `bpf-ld`, which had a `.rodata.str1.1` merge bug (Debian #1126689). `bpfvm-ld` makes this workaround unnecessary.
 

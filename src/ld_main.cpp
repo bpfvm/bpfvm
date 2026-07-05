@@ -32,6 +32,8 @@ enum class Mode { STATIC_EXE, DYNAMIC_EXE, SHARED_LIB };
 struct Options {
     Mode mode = Mode::DYNAMIC_EXE;  // 默认动态链接（对齐标准 ld）
     bool static_flag = false;       // -static
+    bool strip_debug = false;       // --strip-debug：剥掉 DWARF 调试段（默认保留，对齐 ld）
+    bool strip_all = false;         // -s/--strip-all：剥掉 DWARF + .symtab/.strtab（对齐 ld -s）
     std::vector<std::string> inputs;  // 输入 .o（可多个，gcc 经 bpf-gcc 链接时传多个）
     std::string output = "a.out";
     std::string soname;
@@ -54,6 +56,9 @@ static void usage(const char* prog) {
     std::cerr << "  -l <name>          Dependency: <name>.so (or lib<name>.a with -static)\n";
     std::cerr << "  -l:<file>          Dependency by explicit filename\n";
     std::cerr << "  -L <dir>           Add to library search path\n";
+    std::cerr << "  -g                 Keep DWARF debug sections (default)\n";
+    std::cerr << "  -S, --strip-debug  Strip debug sections\n";
+    std::cerr << "  -s, --strip-all    Strip debug sections and symbol table\n";
 }
 
 int main(int argc, char** argv) {
@@ -141,6 +146,19 @@ int main(int argc, char** argv) {
         if (a.substr(0, 3) == "-l:" && a.size() > 3) { opt.libs.push_back(a.substr(3)); continue; }
         if (a.substr(0, 2) == "-l" && a.size() > 2) { opt.libs.push_back(a.substr(2)); continue; }
 
+        // 调试信息开关（对齐标准 ld 语义）：
+        //   -g              保留 DWARF 调试段（已是默认，显式接受为 no-op）
+        //   --strip-debug   仅剥 .debug_*（-S 等价）
+        //   -s / --strip-all  剥 .debug_* + .symtab/.strtab（标准 ld -s 同时剥符号表）
+        //   注：仅 STATIC_EXE 当前支持输出调试段；PIE 模式传这些开关也无副作用。
+        if (a == "-g" || a.rfind("-g", 0) == 0) continue;  // -g / -g2 / -gdwarf-4 等：默认就保留
+        if (a == "--strip-debug" || a == "-S") {
+            opt.strip_debug = true; continue;
+        }
+        if (a == "-s" || a == "--strip-all") {
+            opt.strip_debug = true; opt.strip_all = true; continue;
+        }
+
         // 跳过带参数的 flags：clang/gcc 编译 flags + gcc 当 ld 驱动时传的 ld flags。
         // ld 驱动类都带一个参数：-plugin <so>（LTO）、-rpath/-rpath-link <dir>、-T <script>。
         // 必须连参数一起跳过，否则参数（如 plugin 的 .so 路径）会被当成输入文件。
@@ -221,10 +239,12 @@ int main(int argc, char** argv) {
     }
 
     bool ok = false;
+    const bool keep_debug = !opt.strip_debug;
+    const bool keep_symtab = !opt.strip_all;
     if (opt.mode == Mode::STATIC_EXE) {
-        ok = link_bpf_object(opt.inputs, opt.output, resolved_libs);
+        ok = link_bpf_object(opt.inputs, opt.output, resolved_libs, keep_debug, keep_symtab);
     } else if (opt.mode == Mode::DYNAMIC_EXE) {
-        ok = link_bpf_exe(opt.inputs, opt.output, resolved_libs, opt.entry_name);
+        ok = link_bpf_exe(opt.inputs, opt.output, resolved_libs, opt.entry_name, keep_debug, keep_symtab);
     } else if (opt.mode == Mode::SHARED_LIB) {
         std::string soname = opt.soname;
         if (soname.empty()) {
@@ -232,7 +252,7 @@ int main(int argc, char** argv) {
             std::string base = (slash == std::string::npos) ? opt.output : opt.output.substr(slash + 1);
             soname = base;
         }
-        ok = link_bpf_shared(opt.inputs, opt.output, soname, resolved_libs);
+        ok = link_bpf_shared(opt.inputs, opt.output, soname, resolved_libs, keep_debug, keep_symtab);
     }
 
     if (!ok) {
