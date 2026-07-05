@@ -44,7 +44,37 @@ endif
 # VLA / 动态 alloca 支持已合并进 libBpfWideArgs.so（同 .so 注册两个 pass，
 # 时机不同：WideArgs 跑 PipelineStartEP，VLA 跑 OptimizerLastEP）。
 
-all: $(TARGETS) $(DYN_TARGETS)
+# === Host 原生构建 ===
+# 用宿主 gcc + glibc 编译同一批 .c，产出 <name>.host 原生可执行文件，
+# 作为 BPF/musl/bpfvm 实现的对照基线：同一段测试逻辑在标准 glibc 下也应通过。
+# ctest 的 host 变体（cmake/RunBpfProgram.cmake）直接运行这些二进制。
+HOST_CC      := gcc
+HOST_CFLAGS  := -O1 -D_GNU_SOURCE -g -Wall
+# -pthread + -lm 统一作为默认链接库（线程类需要 -pthread；test_softfp 等需要 -lm）。
+# 后续若还有其它库依赖，直接加到这里，不做逐测试特化。
+HOST_LDFLAGS := -pthread -lm
+
+HOST_TARGETS := $(SOURCES:.c=.host)
+
+# 通用规则：单文件直接编译链接。host 用 gcc，target=宿主。
+%.host: %.c
+	$(HOST_CC) $(HOST_CFLAGS) $< -o $@ $(HOST_LDFLAGS)
+
+# libgot host 版（供 test_dyn_data.host 链接）。
+libgot.host.o: libgot.c
+	$(HOST_CC) $(HOST_CFLAGS) -fPIC $< -c -o $@
+libgot.host.a: libgot.host.o
+	ar rcs $@ $<
+libgot.host.so: libgot.host.o
+	$(HOST_CC) -shared $< -o $@
+
+# test_dyn_data.host：链入 libgot.host.a（host 上跨模块直接静态链，验证逻辑等价）。
+test_dyn_data.host: test_dyn_data.c libgot.host.a
+	$(HOST_CC) $(HOST_CFLAGS) $< libgot.host.a -o $@ $(HOST_LDFLAGS)
+
+host-build: $(HOST_TARGETS) libgot.host.so
+
+all: $(TARGETS) $(DYN_TARGETS) host-build
 
 # 静态链接（-static）：.o + libc.a（含 _start）→ 自包含 ET_EXEC
 %.out: %.o
@@ -74,7 +104,8 @@ test_dyn_data.out: test_dyn_data.o libgot.a
 	../build/bpfvm-ld -static $< libgot.a -L ../libc/lib -l:libc.a -o $@
 
 # 标记 .o 为中间文件，make 构建后会自动删除（和其他 .o 行为一致）
-.INTERMEDIATE: libgot.o test_dyn_data.o
+.INTERMEDIATE: libgot.o test_dyn_data.o libgot.host.o
 
 clean:
-	rm -f $(TARGETS) $(DYN_TARGETS) *.o $(GOT_SO) libgot.a *.tmp
+	rm -f $(TARGETS) $(DYN_TARGETS) $(HOST_TARGETS) *.o $(GOT_SO) libgot.a \
+	      libgot.host.so libgot.host.a *.tmp

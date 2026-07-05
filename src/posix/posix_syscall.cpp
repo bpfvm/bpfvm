@@ -34,7 +34,7 @@ PosixSyscall::PosixSyscall(uint64_t ppid, const std::unordered_map<int, std::sha
     ps->cwd = cwd_;
     // 子进程经 fork 继承父的 pgrp/session（shared_ptr 共享同一对象），其控制终端由
     // session->ctty 表达（同样共享）。GuestTty随 fd 句柄的 tty 字段
-    // 共享——fork 后子进程的 pty slave fd（clone_fd_handle）携带同一 GuestTty 引用。
+    // 共享——fork 后子进程的 pty slave fd（fd_handle::clone）携带同一 GuestTty 引用。
 }
 
 void PosixSyscall::init(const std::shared_ptr<vm>& v){
@@ -139,7 +139,10 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
         }
     }
 
-    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处仅清 fd 表。
+    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表，对齐do_close
+    for(auto& kv : ps->fds) {
+        drop_fd_handle(v.get(), kv.second);
+    }
     ps->fds.clear();
 }
 
@@ -156,12 +159,21 @@ void PosixSyscall::host_signal(vm* v, int sig) {
     //
     // 有 ctty：tty 信号发给"控制终端的前台进程组所有成员"。
     // 无 ctty（非 PTY 模式 / setsid 前）：前台组即本进程所在 pgrp。
+    deliver_to_ctty_fg(v, session ? session->ctty.get() : nullptr, sig);
+}
+
+
+void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
+    // 向控制终端的前台进程组（或无 ctty 时的本 session）投递 tty 信号。
+    // tty != nullptr：向绑该 tty 为 ctty 的 session 的前台组（tty->fg_pgrp）投递。若该 tty
+    //   未被任何 session 绑为 ctty（owner_ == nullptr），或前台组无活进程，则不投递（不
+    //   fallback）——Linux tty_vhangup 只影响把该 tty 作为控制终端的 session。
+    // tty == nullptr（host_signal 无 ctty 路径）：退化为按调用者 session 选目标组，目标
+    //   为空时给当前 v 投信号（保留原 fallback 语义，让 pid 1 收到宿主信号）。
     if(sig <= 0) return;
 
-    GuestTty* tty = nullptr;
     uint64_t target_pgid;
-    if(session && session->ctty) {
-        tty = session->ctty.get();
+    if(tty) {
         target_pgid = tty->fg_pgrp.load(std::memory_order_acquire);
     } else {
         target_pgid = pgrp->pgid;
@@ -170,6 +182,7 @@ void PosixSyscall::host_signal(vm* v, int sig) {
     std::vector<std::shared_ptr<vm>> targets;
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
+        if(tty && tty->owner_ == nullptr) return;  // tty 路径不 fallback
         for(const auto& entry : pid_map) {
             auto s = sys(entry.second.get());
             if(!s || s->pgrp->pgid != target_pgid) continue;
@@ -185,7 +198,8 @@ void PosixSyscall::host_signal(vm* v, int sig) {
     }
 
     if(targets.empty()) {
-        queue_signal(v, sig);
+        if(tty) return;  // tty 路径不 fallback
+        queue_signal(v, sig);  // 无 ctty fallback：投给当前 v（pid 1）
         return;
     }
     for(auto& t : targets) {
@@ -193,6 +207,16 @@ void PosixSyscall::host_signal(vm* v, int sig) {
         if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
     }
 }
+
+void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<fd_handle>& h) {
+    // 所有 fd 销毁路径（do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
+    // master fd（master_token 非空）且是最后一个引用（use_count()==1）时，向 ctty 前台组投
+    // SIGHUP（对齐 Linux pty_close → tty_vhangup）。
+    if(h->master_token && h->master_token.use_count() == 1) {
+        deliver_to_ctty_fg(v, h->tty.get(), SIGHUP);
+    }
+}
+
 
 // —— 进程级杂项属性 / 系统信息类 syscall ——
 // clock_gettime/nanosleep（时间）、getrandom（随机源）既不属 fd 操作也不属文件

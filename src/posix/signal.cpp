@@ -137,14 +137,28 @@ bool PosixSyscall::handle_signals(vm* v) {
     }
     if(handler == sig_dfl) {
         switch(sig) {
-        case SIGTERM:
+        // 默认动作为"终止"（Term）的信号（见 signal(7)）。bpfvm 不区分 core dump，
+        // 统一走 do_exit_group 终止整个线程组（POSIX：default action of fatal signals
+        // is process termination，等价 exit_group），不只杀当前线程。退出码 128+sig。
+        case SIGHUP:
         case SIGINT:
-        case SIGABRT:
-        case SIGSEGV:
+        case SIGQUIT:
         case SIGILL:
+        case SIGTRAP:
+        case SIGABRT:
+        case SIGBUS:
         case SIGFPE:
-            // 致命信号默认动作 = 终止整个线程组（POSIX/Linux 语义：default action of
-            // fatal signals is process termination，等价 exit_group），不只杀当前线程。
+        case SIGUSR1:
+        case SIGSEGV:
+        case SIGUSR2:
+        case SIGPIPE:
+        case SIGALRM:
+        case SIGTERM:
+        case SIGSTKFLT:
+        case SIGVTALRM:
+        case SIGPROF:
+        case SIGXCPU:
+        case SIGXFSZ:
             v->r(1) = 128 + static_cast<uint64_t>(sig);
             return do_exit_group(v);
         case SIGTSTP:
@@ -155,6 +169,8 @@ bool PosixSyscall::handle_signals(vm* v) {
             stop_process(sig);
             return true;
         default:
+            // SIGCHLD（忽略）、SIGURG（忽略）、SIGWINCH（忽略）等默认动作为忽略的信号，
+            // 以及任何未列出的信号：默认动作 = 丢弃，进程继续。
             return true;
         }
     }

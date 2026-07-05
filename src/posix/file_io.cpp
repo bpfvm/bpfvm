@@ -108,7 +108,8 @@ bool PosixSyscall::do_openat(vm* v) {
             std::lock_guard<std::mutex> lk(ptmx_registry_mutex);
             ptmx_registry[ptn] = tty;
         }
-        auto handle = std::make_shared<fd_handle>(master, resolved, tty);
+        // master token：仅由 master fd 持有（use_count = master fd 数），最后一个关闭触发 SIGHUP。
+        auto handle = std::make_shared<fd_handle>(master, resolved, tty, std::make_shared<PtySide>());
         if(flags & O_CLOEXEC) handle->cloexec = true;
         int guest_fd = allocate_fd();
         ps->fds[guest_fd] = handle;
@@ -266,6 +267,8 @@ bool PosixSyscall::do_close(vm* v) {
         v->r(0) = -EBADF;
         return true;
     }
+    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP
+    drop_fd_handle(v, it->second);
     ps->fds.erase(it);
     v->r(0) = 0;
     return true;

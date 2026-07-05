@@ -142,7 +142,12 @@ static int leader_main(void) {
             printf("child TIOCSCTTY(non-force) unexpectedly succeeded\n");
             _exit(1);
         }
-        /* force=1 抢：成功 */
+        /* force=1 抢夺：bpfvm 合成 pty 允许（对齐 POSIX 抢夺语义）；Linux 真机内核对
+         * TIOCSCTTY 的 stealing 严格要求 CAP_SYS_ADMIN 且目标 tty 无活动引用，普通用户
+         * 甚至 root 也被 EPERM 拒绝。这是 bpfvm 有意放宽的语义（无 uid/CAP 模型），
+         * 故 force 抢断言只在 __bpf__ 下检查；后续依赖抢夺成功的 tcsetpgrp/TIOCGPGRP
+         * 往返同样只在 __bpf__ 下执行。 */
+#ifdef __bpf__
         if(ioctl(slave, TIOCSCTTY, 1) != 0) {
             printf("child TIOCSCTTY(force) failed errno=%d\n", errno);
             _exit(1);
@@ -162,6 +167,7 @@ static int leader_main(void) {
             printf("child fg %d != pgrp %d\n", fg, getpgrp());
             _exit(1);
         }
+#endif
         _exit(0);
     }
     int st = 0;
@@ -174,9 +180,12 @@ static int leader_main(void) {
         return 1;
     }
 
+    /* 先报告成功再关 master：close(master) 对齐 Linux pty_close → tty_vhangup，向该
+     * ctty 前台组（leader 自身）投 SIGHUP，默认动作终止 leader。故 printf 必须在
+     * close(master) 之前完成，否则被 SIGHUP 打断跑不到。close(slave) 不触发 SIGHUP。 */
+    printf("pty ok row=%d col=%d pgrp=%d\n", ws.ws_row, ws.ws_col, pgrp);
     close(slave);
     close(master);
-    printf("pty ok row=%d col=%d pgrp=%d\n", ws.ws_row, ws.ws_col, pgrp);
     return 0;
 }
 
@@ -197,6 +206,12 @@ int main(void) {
         printf("waitpid leader failed\n");
         return 1;
     }
+    /* leader 正常退出：返回其退出码。
+     * leader 被 SIGHUP 杀：也算成功。因为 leader_main 在 close(master) 前已 printf 完
+     * 成功信息并 return 0，随后的 close(master) 对齐 Linux pty_close → 向 ctty 前台组
+     * 投 SIGHUP，leader 自身正是前台组，故被 SIGHUP 终止——这是预期的 Linux 语义，
+     * 不是断言失败（断言失败会先 _exit 非 0，走 WIFEXITED 分支返回非 0）。 */
     if(WIFEXITED(status)) return WEXITSTATUS(status);
+    if(WIFSIGNALED(status) && WTERMSIG(status) == SIGHUP) return 0;
     return 1;
 }

@@ -97,6 +97,8 @@ bool PosixSyscall::do_execve(vm* v) {
     for (const auto& entry : ps->fds) {
         if (!entry.second->cloexec) {
             new_fds.insert(entry);
+        } else {
+            drop_fd_handle(v, entry.second);
         }
     }
     ps->fds.swap(new_fds);
@@ -134,7 +136,7 @@ bool PosixSyscall::do_clone(vm* v) {
     if(!is_thread) {
         for(const auto& entry : ps->fds) {
             // fork：host dup 得独立 host fd；GuestTty共享。
-            auto new_handle = clone_fd_handle(entry.second);
+            auto new_handle = entry.second->clone();
             if(!new_handle) {
                 v->r(0) = -errno;
                 return true;

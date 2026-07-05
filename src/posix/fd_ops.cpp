@@ -1,13 +1,5 @@
 #include "posix_internal.h"
 
-// 复制 guest fd 句柄（dup/dup2/fork 用）：host dup 得独立 host fd，GuestTty
-// 共享——同一 pty 的多份 fd（及 fork 后）指向同一 GuestTty。失败返回 nullptr。
-std::shared_ptr<fd_handle> clone_fd_handle(const std::shared_ptr<fd_handle>& h) {
-    int new_fd = dup(h->fd);
-    if(new_fd < 0) return nullptr;
-    return std::make_shared<fd_handle>(new_fd, h->path, h->tty);
-}
-
 int PosixSyscall::allocate_fd(int min_fd) {
     int fd = min_fd;
     while(ps->fds.count(fd)) {
@@ -36,7 +28,7 @@ bool PosixSyscall::do_dup(vm* v) {
         return true;
     }
 
-    auto new_handle = clone_fd_handle(it->second);  // host dup host fd；GuestTty共享
+    auto new_handle = it->second->clone();  // host dup host fd；GuestTty共享
     if(!new_handle) {
         v->r(0) = -errno;
         return true;
@@ -71,13 +63,19 @@ bool PosixSyscall::do_dup3(vm* v) {
         return true;
     }
 
-    auto handle = clone_fd_handle(it->second);
+    auto handle = it->second->clone();
     if(!handle) {
         v->r(0) = -errno;
         return true;
     }
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
+    }
+    // 若 new_fd 已被占用：dup2/dup3 静默关闭旧 fd（Linux 语义）。旧 fd 若是最后一个 master
+    // 端，应触发 SIGHUP（drop_fd_handle 判断）。先 drop 再覆盖（覆盖的赋值会析构旧 shared_ptr）。
+    auto existing = ps->fds.find(new_fd);
+    if(existing != ps->fds.end()) {
+        drop_fd_handle(v, existing->second);
     }
     ps->fds[new_fd] = handle;
     v->r(0) = new_fd;
@@ -134,7 +132,7 @@ bool PosixSyscall::do_fcntl(vm* v) {
             return true;
         }
 
-        auto new_handle = clone_fd_handle(it->second);
+        auto new_handle = it->second->clone();
         if(!new_handle) {
             v->r(0) = -errno;
             return true;

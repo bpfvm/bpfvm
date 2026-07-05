@@ -14,11 +14,15 @@ if(NOT DEFINED WORKDIR)
 endif()
 
 # label|program_suffix|BPF_TEST_VARIANT|JIT_ENABLE  ("-" 占位空值)
+# 前 4 个走 bpfvm（静态/动态 × JIT/解释器）。
+# 第 5 个 host 变体直接运行宿主 gcc 原生二进制（test/Makefile 的 *.host），
+# 作为 BPF/musl/bpfvm 实现的对照基线：同一测试逻辑在标准 glibc 下也应通过。
 set(variants
     "static_jit|out|-|-"
     "dynamic_jit|linked|linked|-"
     "static_interp|out|-|0"
     "dynamic_interp|linked|linked|0"
+    "host|host|host|-"
 )
 
 foreach(v ${variants})
@@ -40,17 +44,31 @@ foreach(v ${variants})
     else()
         set(ENV{JIT_ENABLE} "${jit_env}")
     endif()
-    # test/ 下可能含测试用 .so（如 GOT 的 testgot.so），加入库搜索路径
+    # test/ 下可能含测试用 .so（如 GOT 的 libgot.so），加入库搜索路径
     set(ENV{BPF_LIB_PATH} "${WORKDIR}/test")
 
-    execute_process(
-        COMMAND "${BPFVM}" "${prog}"
-        WORKING_DIRECTORY "${WORKDIR}"
-        INPUT_FILE /dev/null
-        RESULT_VARIABLE result
-        OUTPUT_VARIABLE stdout
-        ERROR_VARIABLE stderr
-    )
+    if(label STREQUAL "host")
+        # host 变体：直接运行宿主二进制，不经过 bpfvm。
+        # 用 /bin/sh -c "umask 0022 && exec ..." 包装，对齐 bpfvm 启动时设置的 umask
+        # （宿主 shell umask 可能不是 0022，如 0002，会导致 test_umask 误判失败）。
+        execute_process(
+            COMMAND /bin/sh -c "umask 0022 && exec \"$0\" \"$@\"" "${prog}"
+            WORKING_DIRECTORY "${WORKDIR}"
+            INPUT_FILE /dev/null
+            RESULT_VARIABLE result
+            OUTPUT_VARIABLE stdout
+            ERROR_VARIABLE stderr
+        )
+    else()
+        execute_process(
+            COMMAND "${BPFVM}" "${prog}"
+            WORKING_DIRECTORY "${WORKDIR}"
+            INPUT_FILE /dev/null
+            RESULT_VARIABLE result
+            OUTPUT_VARIABLE stdout
+            ERROR_VARIABLE stderr
+        )
+    endif()
 
     if(NOT result EQUAL 0)
         message("Variant '${label}' (${prog}) failed with exit ${result}:")

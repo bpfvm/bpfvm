@@ -12,6 +12,11 @@
 
 #define BPF_SIGNAL_QUE_SIZE 1024
 
+// pty master 端的共享 token。fd_handle 持有它的 shared_ptr，use_count 即 master fd 引用数
+// （对应内核 master tty_struct::count）。归零（drop_fd_handle 里 use_count()==1 判断，
+// erase 析构后）触发 SIGHUP。slave fd 不持有 PtySide——slave 关闭不发 SIGHUP，故无需计数。
+struct PtySide {};
+
 struct GuestTty;
 struct fd_handle {
     const int fd = -1;
@@ -20,9 +25,19 @@ struct fd_handle {
     // 非空表示本 fd 是某 pty 设备的一端（master/slave）；空表示普通文件/pipe/socket。
     // dup/fork 后多份 fd 共享同一 GuestTty
     std::shared_ptr<GuestTty> tty;
-    explicit fd_handle(int fd_, std::string path_ = {}, std::shared_ptr<GuestTty> t = {})
-        : fd(fd_), path(std::move(path_)), tty(std::move(t)) {}
+    // 仅 master fd 设此字段（多个 master fd 副本共享同一 PtySide，use_count = master fd 数）；
+    std::shared_ptr<PtySide> master_token;
+    explicit fd_handle(int fd_, std::string path_ = {}, std::shared_ptr<GuestTty> t = {},
+                       std::shared_ptr<PtySide> m = {})
+        : fd(fd_), path(std::move(path_)), tty(std::move(t)), master_token(std::move(m)) {}
     ~fd_handle(){ if(fd >= 0) close(fd); }
+    // 复制本 fd 句柄（dup/dup2/fork 用）：host dup 得独立 host fd
+    // 不复制 cloexec（由调用方按需设置）。失败返回 nullptr。
+    std::shared_ptr<fd_handle> clone() const {
+        int new_fd = ::dup(fd);
+        if(new_fd < 0) return nullptr;
+        return std::make_shared<fd_handle>(new_fd, path, tty, master_token);
+    }
     bool is_tty() const { return tty != nullptr || ::isatty(fd) == 1; }
 };
 
@@ -156,6 +171,15 @@ class PosixSyscall: public SyscallHandler{
     // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
     // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
     void notify_parent_sigchld();
+    // 向控制终端的前台进程组（tty->fg_pgrp）投递 tty 信号。tty==nullptr 时退化为按
+    // 调用者 session 选目标组。host_signal（宿主→guest 路由）与 do_close 的 pty master
+    // 关闭发 SIGHUP（对齐 Linux tty_vhangup 语义）共用此路径。
+    void deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig);
+    // 销毁一个 fd_handle 前的 master SIGHUP 处理：若是 master 端且是最后一个引用
+    // （side.use_count()==1），向 ctty 前台组投 SIGHUP。所有 fd 销毁路径（do_close、
+    // dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数，避免重复实现。返回后
+    // 调用方再 erase 析构（side shared_ptr 自动 -1）。
+    void drop_fd_handle(vm* v, const std::shared_ptr<fd_handle>& h);
 
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
