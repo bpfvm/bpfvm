@@ -252,6 +252,7 @@ public:
     bool do_set_tls(vm* v);
     bool do_get_tls(vm* v);
     bool do_futex(vm* v);
+    bool do_alloca(vm* v);
 };
 
 #endif

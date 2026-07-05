@@ -16,6 +16,7 @@ static struct option long_options[] = {
     {"breakpoint", required_argument, nullptr, 'b'},
     {"step", no_argument, nullptr, 's'},
     {"insn-limit", required_argument, nullptr, 'l'},
+    {"stack-size", required_argument, nullptr, 'S'},
     {"pty", no_argument, nullptr, 't'},
     {"no-pty", no_argument, nullptr, 'T'},
     {nullptr, 0, nullptr, 0}
@@ -35,7 +36,7 @@ int main(int argc, char** argv) {
     PtyMode pty_mode = PtyMode::Auto;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vb:sl:tT", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vb:sl:S:tT", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options.verbose = true;
@@ -49,6 +50,9 @@ int main(int argc, char** argv) {
         case 'l':
             options.insn_limit = std::stoull(optarg, nullptr, 0);
             break;
+        case 'S':
+            options.stack_limit = std::stoull(optarg, nullptr, 0);
+            break;
         case 't':
             pty_mode = PtyMode::On;
             break;
@@ -56,13 +60,13 @@ int main(int argc, char** argv) {
             pty_mode = PtyMode::Off;
             break;
         default:
-            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
             return 1;
         }
     }
 
     if (optind >= argc) {
-        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
         return 1;
     }
 

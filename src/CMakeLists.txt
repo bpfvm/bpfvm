@@ -46,6 +46,8 @@ separate_arguments(LLVM_LDFLAGS UNIX_COMMAND "${LLVM_LDFLAGS}")
 separate_arguments(LLVM_LIBS UNIX_COMMAND "${LLVM_LIBS}")
 
 add_library(BpfWideArgs MODULE passes/BpfWideArgs.cpp)
+# 需要 ${CMAKE_SOURCE_DIR} 来解析 #include "include/bpf_call.h"（VLA 路径用 BPF_CALL_ALLOCA）。
+target_include_directories(BpfWideArgs PRIVATE ${CMAKE_SOURCE_DIR})
 # -Wno-unused-parameter：LLVM 系统头（DenseMap/Instructions/...）模板里有大量未用形参，
 # 是第三方代码，抑制之；bpfvm 自身源码不受影响。
 target_compile_options(BpfWideArgs PRIVATE ${LLVM_CXXFLAGS} -fno-rtti -Wno-unused-parameter)

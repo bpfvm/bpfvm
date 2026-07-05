@@ -24,7 +24,16 @@ extern std::mutex log_mutex;
 
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
-#define STACK_LIMIT (16 * 1024)
+
+// 栈帧 frame_base[0] 的编码（flags + 栈长度）：
+//   bit  0..31 : 本函数栈帧的总长度 = stack_limit + alloca_len
+//   bit     32 : is_signal（1=信号帧 / 0=普通帧）；其余高位保留。
+#define FRAME_FLAG_SIGNAL  (1ull << 32)
+#define FRAME_LEN_MASK     0xFFFFFFFFull          // 低 32 位 = stack_limit + alloca_len
+#define frame_flags_make(is_sig, total_len) \
+    ((uint64_t)(((uint64_t)(total_len) & FRAME_LEN_MASK) | ((is_sig) ? FRAME_FLAG_SIGNAL : 0)))
+#define frame_is_signal(flags0)  (((flags0) & FRAME_FLAG_SIGNAL) != 0)
+#define frame_total_len(flags0)  ((uint64_t)((flags0) & FRAME_LEN_MASK))
 
 #ifndef PF_X
 #define PF_X		0x1
@@ -162,6 +171,10 @@ struct vmOptions {
     bool step_run = false;
     bool raw_stack = false;
     uint64_t insn_limit = 0;  // 0 = 无限制
+    // 每个函数栈帧为编译器分配的局部变量预留的区大小（默认 16KiB，对齐
+    // -mllvm -bpf-stack-size=16384）。可经 bpfvm -S 调整，用于与 guest 编译时
+    // 的栈帧上限对齐。frame[0] 低 32 位存的总长度 = stack_limit + alloca_len。
+    uint64_t stack_limit = 16 * 1024;
     std::vector<std::string> argv;
     std::vector<std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
@@ -242,6 +255,7 @@ public:
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                      const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
+    int64_t alloca(int64_t inc);
     // 通用阻塞原语：调用方先置 VM_BLOCKED（与其等待注册原子），再调用本函数。自身阻塞
     // 直至 wakeup(true) 清 VM_BLOCKED、或 VM_KILLED/VM_SIGNAL_PENDING 置位、或超时。
     // 返回 0（被唤醒）/ -EINTR（被信号/kill 打断）/ -ETIMEDOUT。

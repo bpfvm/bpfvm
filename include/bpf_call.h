@@ -74,6 +74,7 @@ enum bpf_syscall_id {
     BPF_SYS_TKILL,          // tkill(tid, sig)
     BPF_SYS_TGKILL,         // tgkill(tgid, tid, sig)
     BPF_SYS_SIGPROCMASK,    // rt_sigprocmask(how, set, old, sigsetsize)
+    BPF_SYS_ALLOCA,         // alloca(inc) — 当前栈帧 alloca 区增量调整；返回调整后下界
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -138,6 +139,7 @@ enum bpf_syscall_id {
 #define BPF_CALL_TKILL     BPF_CALL_ID(BPF_SYS_TKILL)
 #define BPF_CALL_TGKILL    BPF_CALL_ID(BPF_SYS_TGKILL)
 #define BPF_CALL_SIGPROCMASK BPF_CALL_ID(BPF_SYS_SIGPROCMASK)
+#define BPF_CALL_ALLOCA      BPF_CALL_ID(BPF_SYS_ALLOCA)
 
 // ===========================================================================
 // 虚拟浮点指令（src_reg=2）

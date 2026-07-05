@@ -1,6 +1,9 @@
-//===- BpfWideArgs.cpp - Pass: BPF 参数/变参/struct 返回支持 ---------------===//
+//===- BpfWideArgs.cpp - BPF 参数/变参/struct 返回/VLA/alloca 综合改写 -----===//
 //
-// 一个 LLVM ModulePass 插件，解决 BPF 后端的三类调用约定限制：
+// 本插件在一个 .so 里注册两个独立 pass，挂在各自正确的 pipeline EP：
+//
+// A. BpfWideArgsPass（ModulePass，PipelineStartEPCallback，所有 -O 都触发）
+//    解决 BPF 后端调用约定的三类限制：
 //
 // 1. >5 参数：BPF 后端拒绝参数个数 >5 的函数（"stack arguments are not
 //    supported"）。本 pass 把第 6 个及以后的参数打包成一个结构体，通过一个
@@ -30,9 +33,19 @@
 //    强制 input 选 r0，并让后端自动 spill/reload r1..r5），随后重建 5 参 call。
 //    普通 >5 参函数不受影响，仍走 packed struct 路径。syscall 实参超 6 报错。
 //
+// B. BpfVlaPass（FunctionPass，OptimizerLastEPCallback + -O0 兜底）
+//    把 C 的 VLA（int buf[n]）/ __builtin_alloca / 非入口块固定 alloca + 配套
+//    的 llvm.stacksave / llvm.stackrestore intrinsic 改写成对 BPF_SYS_ALLOCA
+//    syscall 的调用，由 VM 在栈帧上分配（frame_base[0] 低 32 位记录累计
+//    alloca 量，详见 insn.h）。必须晚跑（在 SROA/instcombine 之后），让固定
+//    大小 alloca 先被消除，只改写"漏网"的动态/非入口块 alloca；与 A 无数据
+//    依赖（A 只碰 CallBase/sret/va intrinsic，不碰 alloca/stacksave/restore）。
+//
 // 用法：clang -target bpf -fpass-plugin=libBpfWideArgs.so ...
 //
-//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===*/
+
+#include "include/bpf_call.h"   // BPF_CALL_ALLOCA（VLA 路径用）
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -801,17 +814,254 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
     static bool isRequired() { return true; }
 };
 
+// ===========================================================================
+// B. VLA / 动态 alloca 改写
+//
+// 背景：BPF 后端在 ISel 阶段拒绝动态栈分配（"unsupported dynamic stack
+// allocation"），因此 C 的 VLA（`int buf[n];`）与 `__builtin_alloca(n)` 都无法
+// 编译。本 pass 在 IR 层把这类动态分配改写成对 BPF_SYS_ALLOCA syscall 的调用。
+//
+// 改写目标：clang 前端把 VLA 编码为三件套——
+//   %sp = call ptr @llvm.stacksave()         ; 记录当前栈顶（退出时回退的 token）
+//   %buf = alloca i32, i64 %n                ; 动态分配（被后端拒绝）
+//   call void @llvm.stackrestore(ptr %sp)    ; 退回 %sp，释放期间的 alloca
+// 其中动态 `alloca` 的总字节数 = 元素数 × 元素大小。
+//
+// alloca(inc) 语义（VM 内部 syscall，接口形状参考 sbrk：带符号 inc）：inc > 0
+// 扩展 / = 0 读当前下界 / < 0 收缩；返回调整后的下界（= 新块起始地址）。本 pass
+// 把三件套映射如下：
+//   1. 动态 `alloca Ty, i64 %n`
+//      以及"固定大小但不在入口块"的 alloca（BPF 同样拒绝后者——优化器有时把
+//      编译期已知大小的 VLA 折叠成固定 alloca 但留在循环/中间块里）：
+//        → %bytes = ((n * sizeof(Ty)) + 15) & ~15   ; 客户端按 16 字节对齐
+//          %p    = call ptr (i64) inttoptr(BPF_CALL_ALLOCA to ptr)(i64 %bytes)
+//        inc > 0 时返回值即新块起始地址（C alloca 语义）。
+//   2. @llvm.stacksave → alloca(0)：
+//        返回当前下界作为 token（inttoptr 到 ptr 以匹配 stacksave 的返回类型）。
+//   3. @llvm.stackrestore(tok) → alloca(tok - alloca(0))：
+//        先读当前下界，与 token 的差作为收缩量（负值）。clang 在每个 VLA 块的
+//        所有退出点（含 break/continue/return/goto）都放了一个 stackrestore，
+//        逐个替换即可，无需做控制流分析。
+//
+// 调用约定：BPF syscall 走 src_reg=0 的 call 指令，imm 直接是 BPF_CALL_* 值。
+//   `call ptr inttoptr(i64 <CALL> to ptr)(...)` 经后端 lowering 成一条
+//   `call <imm>`（与 musl syscall_arch.h 把 call id 当函数指针直接调用同机制，
+//   见 BpfSoftFp.cpp 的同类 inttoptr-callee 用法）。入参落 r1，结果回 r0——无需
+//   改 linker、无需符号重写。
+//
+// 时机：作为模块级 pass 跑在优化器末尾（OptimizerLastEP）。理由：
+//   - 必须在 SROA/instcombine 之后，让固定大小的 alloca 先被消除（它们不应被
+//     改写，BPF 后端能处理固定 alloca）；只留下真正的动态 alloca。
+//   - 必须在 CodeGen 之前（否则后端拒绝动态 alloca）。
+//   - 与同 .so 内的 BpfWideArgsPass（PipelineStartEP）无数据依赖：后者只处理
+//     CallBase/sret/va intrinsic，不碰 alloca 与 stacksave/stackrestore。
+// ===========================================================================
+
+// 构造一次 BPF syscall 调用：call <ptr> inttoptr(i64 <CallId> to ptr)(Args...)。
+// 返回值类型按 RetTy 处理（BPF syscall 结果在 r0，整数/指针皆为 i64）。
+static Value *emitVlaSyscall(IRBuilder<> &B, LLVMContext &Ctx, uint64_t CallId,
+                             ArrayRef<Value *> Args, Type *RetTy) {
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+    // LLVM 15+ 默认 opaque pointer，函数指针类型即 ptr（地址空间 0）。
+    Type *PtrTy = PointerType::get(Ctx, 0);
+
+    // 入参全部 zext 到 i64（BPF 寄存器 64 位；指针/size_t 即 i64）。
+    SmallVector<Value *, 4> I64Args;
+    for(Value *A : Args) {
+        if(A->getType()->isIntegerTy() && A->getType()->getIntegerBitWidth() < 64)
+            A = B.CreateZExt(A, I64Ty);
+        I64Args.push_back(A);
+    }
+
+    // 函数类型：RetTy(I64...)。统一用 i64 入参；返回值用 RetTy（i64 或 ptr）。
+    SmallVector<Type *, 4> ArgTys(I64Args.size(), I64Ty);
+    Type *EffRetTy = RetTy->isPointerTy() ? I64Ty : RetTy;
+    FunctionType *FTy = FunctionType::get(EffRetTy, ArgTys, false);
+
+    // inttoptr(const CallId) 当作函数指针直接调用 → 后端 emit `call <imm>`。
+    Value *FnPtr = B.CreateIntToPtr(ConstantInt::get(I64Ty, CallId), PtrTy);
+    Value *Call = B.CreateCall(FTy, FnPtr, I64Args);
+
+    // 指针类型结果：i64 → ptr（inttoptr）。整数窄类型：trunc。
+    if(RetTy->isPointerTy())
+        return B.CreateIntToPtr(Call, RetTy);
+    if(RetTy->isIntegerTy() && RetTy->getIntegerBitWidth() < 64)
+        return B.CreateTrunc(Call, RetTy);
+    return Call;
+}
+
+// 处理单个函数：扫描所有动态 alloca 与 stacksave/stackrestore intrinsic，改写之。
+static bool rewriteVla(Function &F) {
+    LLVMContext &Ctx = F.getContext();
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+    bool Changed = false;
+    SmallVector<Instruction *, 16> ToErase;
+
+    // 第一遍：改写动态 alloca + 非入口块的固定大小 alloca。
+    //
+    // BPF 后端拒绝两种情况：
+    //   (a) 动态大小 alloca（"unsupported dynamic stack allocation"）；
+    //   (b) 不在入口块的固定大小 alloca —— 即使大小固定，BPF 也要求所有 alloca
+    //       集中在函数入口块（static alloca）。优化器有时会把 VLA（编译期已知大小）
+    //       折叠成固定大小 alloca 但仍留在循环/中间块里（典型场景：VLA 指针逃逸到
+    //       未内联的函数，阻止了提升），后端照样拒绝。
+    //
+    // 策略：凡"非常量大小"或"不在入口块"的 alloca，统一改写成 BPF_SYS_ALLOCA
+    // syscall（inc = 字节数，inc > 0 时返回新下界 = 新块起始地址）。
+    // 入口块里的常量大小 alloca（标准 static alloca）BPF 能处理，不动。
+    BasicBlock *Entry = &F.getEntryBlock();
+    for(BasicBlock &BB : F) {
+        for(Instruction &I : BB) {
+            AllocaInst *AI = dyn_cast<AllocaInst>(&I);
+            if(!AI) continue;
+
+            Value *ArraySize = AI->getArraySize();
+            bool isDynamicSize = ArraySize && !isa<ConstantInt>(ArraySize);
+            bool isStaticInEntry = (&BB == Entry) && !isDynamicSize;
+            if(isStaticInEntry) continue;  // 标准 static alloca，BPF 接受
+
+            // 总字节数 = 元素数 × 元素大小，统一 i64。
+            //   动态：用 ArraySize（非常量）乘以元素大小。
+            //   固定但非入口块：用常量元素数（ArraySize==nullptr→1，或 ConstantInt）
+            //     乘以元素大小，得一个常量字节数。
+            IRBuilder<> B(AI);
+            Type *ElemTy = AI->getAllocatedType();
+            const DataLayout &DL = F.getParent()->getDataLayout();
+            uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
+            Value *Count;
+            if(!ArraySize)
+                Count = ConstantInt::get(I64Ty, 1);
+            else
+                Count = B.CreateZExt(ArraySize, I64Ty);
+            Value *Bytes = Count;
+            if(ElemSize != 1) {
+                Value *SizeVal = ConstantInt::get(I64Ty, ElemSize);
+                Bytes = B.CreateMul(Bytes, SizeVal, "vla.bytes");
+            }
+            // 字节数向上取整到 16 的倍数：保证相邻 alloca 块间隔 16 字节、每块起始
+            // 相对 r10 偏移 16 对齐。
+            //   bytes = (bytes + 15) & ~15
+            Constant *Fifteen = ConstantInt::get(I64Ty, 15);
+            Constant *InvMask = ConstantInt::get(I64Ty, ~(uint64_t)15);
+            Bytes = B.CreateAnd(B.CreateAdd(Bytes, Fifteen), InvMask,
+                                "vla.aligned");
+
+            // inc = bytes > 0；新下界即新块起始地址（C alloca 语义）。
+            Value *Ptr = emitVlaSyscall(B, Ctx, BPF_CALL_ALLOCA, {Bytes},
+                                        AI->getType());
+            AI->replaceAllUsesWith(Ptr);
+            ToErase.push_back(AI);
+            Changed = true;
+        }
+    }
+
+    // 第二遍：处理 stacksave / stackrestore intrinsic。
+    //   stacksave     → alloca(0)：返回当前下界作 token。
+    //   stackrestore  → alloca(token - alloca(0))：把下界截回到 token（增量 <= 0）。
+    //     clang 在 VLA 块的所有退出点都放了一个 stackrestore，逐个替换即可。
+    Constant *Zero = ConstantInt::get(I64Ty, 0);
+    for(BasicBlock &BB : F) {
+        for(Instruction &I : BB) {
+            IntrinsicInst *II = dyn_cast<IntrinsicInst>(&I);
+            if(!II) continue;
+            Intrinsic::ID ID = II->getIntrinsicID();
+
+            if(ID == Intrinsic::stacksave) {
+                // alloca(0) 返回 i64 当前下界，inttoptr 到 ptr 以匹配 stacksave 的
+                // 返回类型（emitVlaSyscall 内部完成 inttoptr）。
+                IRBuilder<> B(II);
+                Value *Tok = emitVlaSyscall(B, Ctx, BPF_CALL_ALLOCA, {Zero},
+                                            II->getType());
+                II->replaceAllUsesWith(Tok);
+                ToErase.push_back(II);
+                Changed = true;
+            } else if(ID == Intrinsic::stackrestore) {
+                // tok_i = ptrtoint(tok, i64)       ; stacksave 时记录的下界
+                // cur   = alloca(0)                 ; i64 当前下界
+                // inc   = cur - tok_i               ; 通常 < 0（要收缩到 tok 之上）
+                // call alloca(inc)                  ; 返回值丢弃
+                //
+                // 推导：栈向低地址生长，下界 = r10 - total_len。stacksave 时 tok 较高
+                // （total_len 小）；本次 stackrestore 时 cur 较低（期间做过 alloca，
+                // total_len 大）。要截回到 tok，alloca_len 减少量 = (cur_total -
+                // save_total) > 0；alloca 的 inc 是 alloca_len 增量，所以 inc < 0。
+                // 用地址表达：inc = cur_lower - tok = (r10 - cur_total) -
+                // (r10 - save_total) = save_total - cur_total < 0 ✓
+                //
+                // 注意：这里未对 inc 做夹紧（理论上 clang 生成的 stackrestore 总满足
+                // cur >= tok 即 inc <= 0）。若 inc > 0，stackrestore 会反向扩展 alloca
+                // 区而非收缩——当前实现不设护栏，依赖前端正确性。
+                IRBuilder<> B(II);
+                Value *TokPtr = II->getArgOperand(0);
+                Value *TokI = B.CreatePtrToInt(TokPtr, I64Ty, "alloca.tok");
+                Value *Cur  = emitVlaSyscall(B, Ctx, BPF_CALL_ALLOCA, {Zero}, I64Ty);
+                Value *Inc  = B.CreateSub(Cur, TokI, "alloca.inc");
+                emitVlaSyscall(B, Ctx, BPF_CALL_ALLOCA, {Inc}, I64Ty);
+                II->replaceAllUsesWith(UndefValue::get(I.getType()));
+                ToErase.push_back(II);
+                Changed = true;
+            }
+        }
+    }
+
+    for(Instruction *I : ToErase)
+        I->eraseFromParent();
+
+    return Changed;
+}
+
+class BpfVlaPass : public PassInfoMixin<BpfVlaPass> {
+public:
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+        if(F.isDeclaration())
+            return PreservedAnalyses::all();
+        return rewriteVla(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+};
+
 } // namespace
 
 // ---- 插件注册：支持新的 PassBuilder / -fpass-plugin 机制 ----
+// 一个 .so 注册两个独立 pass，挂在各自正确的 pipeline EP：
+//   - BpfWideArgsPass：PipelineStartEP（早，所有 -O 触发）—— 改签名/调用点。
+//   - BpfVlaPass：     OptimizerLastEP（晚）+ -O0 兜底的 PipelineStartEP ——
+//                      必须在 SROA/instcombine 之后，只处理漏网的动态 alloca。
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "BpfWideArgs", LLVM_VERSION_STRING, [](PassBuilder &PB) {
-        // 在模块级别的优化管道起始处插入，保证在 BPF 后端 codegen 之前生效。
-        // PipelineStartEPCallback 在每一个 -O 级别都会触发。
+        // A. BpfWideArgsPass：在模块级别的优化管道起始处插入，保证在 BPF 后端
+        // codegen 之前生效。PipelineStartEPCallback 在每一个 -O 级别都会触发。
         PB.registerPipelineStartEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel) {
                 MPM.addPass(BpfWideArgsPass());
+            });
+
+        // B. BpfVlaPass：跑在优化器末尾
+        //   - 必须在 SROA/instcombine 之后：固定大小 alloca 先被消除/提升，本 pass
+        //     只需处理"漏网"的动态 alloca 与被优化器留在非入口块的固定 alloca
+        //     （BPF 后端同样拒绝后者）。
+        //   - 必须在 CodeGen 之前：否则后端拒绝动态/非入口块 alloca。
+        auto addVlaPass = [](ModulePassManager &MPM) {
+            FunctionPassManager FPM;
+            FPM.addPass(BpfVlaPass());
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        };
+        PB.registerOptimizerLastEPCallback(
+#if LLVM_VERSION_MAJOR >= 21
+            [addVlaPass](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
+#else
+            [addVlaPass](ModulePassManager &MPM, OptimizationLevel) {
+#endif
+                addVlaPass(MPM);
+            });
+        // -O0：clang 的 -O0 路径不经过常规 pass 管理器，OptimizerLastEP 实际不触发；
+        // 在 PipelineStartEP 显式补一份（仅 O0）。本项目 test/Makefile 与 build_*.sh
+        // 均用 -O1 编译，故 -O0 下不支持 VLA（与 BpfSoftFp 同限制）。
+        // 本回调晚于上方 A（WideArgs）的 PipelineStartEP 回调注册。
+        PB.registerPipelineStartEPCallback(
+            [addVlaPass](ModulePassManager &MPM, OptimizationLevel OL) {
+                if(OL == OptimizationLevel::O0)
+                    addVlaPass(MPM);
             });
     }};
 }

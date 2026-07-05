@@ -269,6 +269,13 @@ bool PosixSyscall::do_getrandom(vm* v) {
     return true;
 }
 
+// alloca(inc) 的 syscall 入口
+bool PosixSyscall::do_alloca(vm* v) {
+    int64_t inc = (int64_t)v->r(1);
+    v->r(0) = (uint64_t)v->alloca(inc);
+    return true;
+}
+
 bool PosixSyscall::syscall(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
@@ -311,7 +318,7 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_TKILL:         return do_tkill(v);
     case BPF_SYS_TGKILL:        return do_tgkill(v);
     case BPF_SYS_SIGACTION:     return do_sigaction(v);
-    case BPF_SYS_SIGPROCMASK:  return do_sigprocmask(v);
+    case BPF_SYS_SIGPROCMASK:   return do_sigprocmask(v);
     case BPF_SYS_SETPGID:       return do_setpgid(v);
     case BPF_SYS_GETPGID:       return do_getpgid(v);
     case BPF_SYS_GETPGRP:       return do_getpgrp(v);
@@ -338,6 +345,7 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_SET_TLS:        return do_set_tls(v);
     case BPF_SYS_GET_TLS:        return do_get_tls(v);
     case BPF_SYS_FUTEX:          return do_futex(v);
+    case BPF_SYS_ALLOCA:         return do_alloca(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG

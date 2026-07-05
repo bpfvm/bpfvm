@@ -8,7 +8,6 @@
 
 #include "jit/jit.h"
 #include "include/auxv.h"
-#include <algorithm>
 #include <cstring>
 
 #if defined(__x86_64__)
@@ -224,9 +223,13 @@ ElfLoadInfo vm::load_elf(const char* elf_file_path) {
 /*
  * Stack Frame Layout:
  *
+ * frame_base[0] 编码（见 insn.h 的 FRAME_FLAG_* / frame_*）：
+ *   bit  0..31 : 本函数栈帧总长度 = stack_limit + alloca_len
+ *   bit     32 : is_signal（1=信号帧 / 0=普通帧）；其余保留。
+ *
  * Normal Frame (64 bytes):
  * +------------------+
- * | flags (0)        | frame_base[0]
+ * | flags+total_len  | frame_base[0]
  * +------------------+
  * | r6               | frame_base[1]
  * | r7               | frame_base[2]
@@ -242,7 +245,7 @@ ElfLoadInfo vm::load_elf(const char* elf_file_path) {
  *
  * Signal Frame (128 bytes):
  * +------------------+
- * | flags (1)        | frame_base[0]
+ * | flags+total_len  | frame_base[0]
  * +------------------+
  * | r0               | frame_base[1]
  * | r1               | frame_base[2]
@@ -264,16 +267,21 @@ ElfLoadInfo vm::load_elf(const char* elf_file_path) {
  */
 bool vm::push_frame(uint64_t return_addr, bool is_signal) {
     uint32_t frame_size = is_signal ? 128 : 64;
-    if(r(10) - STACK_LIMIT - frame_size < STACK_BASE) {
+    // 调用者（被中断函数）栈帧的总长度 = stack_limit + alloca_len，读"当前 r10
+    //   处那个帧"frame_base[0] 的低 32 位。调用者的局部变量区是
+    //   [r10 - stack_limit, r10]，alloca 区在其下 [r10 - total_len, r10 - stack_limit]。
+    uint64_t* cur_frame = (uint64_t*)mmu(r(10), sizeof(uint64_t));
+    uint64_t caller_total_len = cur_frame ? frame_total_len(cur_frame[0]) : 0;
+    if(r(10) - caller_total_len - frame_size < STACK_BASE) {
         log_mem_violation("stack overflow", r(10));
         return false;
     }
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%d] [STACK] PUSH sp=%lx ret=%lx sig=%d size=%d\n", 
-            options.sys->id(), r(10), return_addr, is_signal, frame_size);
+        printf("[#%d] [STACK] PUSH sp=%lx ret=%lx sig=%d size=%d caller_len=%lu\n",
+            options.sys->id(), r(10), return_addr, is_signal, frame_size, caller_total_len);
     }
-    uint64_t sp = r(10) - STACK_LIMIT;
+    uint64_t sp = r(10) - caller_total_len;
     uint64_t frame_base_addr = sp - frame_size;
     uint64_t* frame_base = (uint64_t*)mmu_w(frame_base_addr, frame_size);
     if(!frame_base) {
@@ -281,7 +289,8 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
         return false;
     }
 
-    frame_base[0] = is_signal ? 1 : 0; // flags
+    // flags + total_len(=stack_limit)：新函数的局部变量区，尚未 alloca。
+    frame_base[0] = frame_flags_make(is_signal, options.stack_limit);
     if (is_signal) {
         signal_depth++;
         frame_base[1] = r(0);
@@ -316,7 +325,7 @@ uint64_t vm::pop_frame() {
 
     uint64_t old_sp;
     uint64_t ret_addr;
-    bool is_signal = frame_base[0] != 0;
+    bool is_signal = frame_is_signal(frame_base[0]);
     if (is_signal) {
         signal_depth--;
         r(0) = frame_base[1];
@@ -342,11 +351,57 @@ uint64_t vm::pop_frame() {
 
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        printf("[#%d] [STACK] POP sp=%lx new_sp=%lx ret=%lx sig=%d\n", 
+        printf("[#%d] [STACK] POP sp=%lx new_sp=%lx ret=%lx sig=%d\n",
             options.sys->id(), sp, old_sp, ret_addr, is_signal);
     }
     r(10) = old_sp;
     return ret_addr;
+}
+
+
+// alloca(inc) — 当前栈帧 alloca 区的增量调整
+// 栈布局（每个函数从其 r10 向下）：
+//     [r10 - stack_limit, r10)                              编译器分配的局部变量区
+//     [r10 - total_len, r10 - stack_limit)                  本函数已 alloca 的区
+//     ...                                                   本函数帧头 / 调用者
+//
+// 三种用法
+//   inc > 0：扩展 inc 字节。新块 = [新下界, 新下界 + inc) = [r10 - new_total,
+//            r10 - new_total + inc)，紧贴上一块 alloca 下方，块间不重叠。
+//            返回新下界正是新块起始地址（C alloca 语义：buf[0] 在 ret，
+//            buf[i] 在 ret+i*sizeof(T)）。
+//   inc = 0：只读，返回当前下界
+//   inc < 0：收缩 -inc 字节，返回新下界（高于旧下界，往高地址截回）
+//
+// 注意：栈往低地址生长，所以 inc 的符号是 "alloca_len 增量"，不是 "下界地址增量"
+// （符合 C alloca(n) 中 n > 0 即分配的直觉）。
+int64_t vm::alloca(int64_t inc) {
+    uint64_t stack_limit = options.stack_limit;
+
+    // 当前 r10 处的帧头：读 frame_base[0]，更新其低 32 位的 total_len。
+    uint64_t* frame = (uint64_t*)mmu_w(r(10), sizeof(uint64_t));
+    if(!frame) return -EFAULT;
+    uint64_t flags0 = frame[0];
+    uint64_t cur_total = frame_total_len(flags0);
+
+    // 防御：若 frame[0] 损坏 / 旧 ABI 残留（total_len < stack_limit）—— 拒绝。
+    if(cur_total < stack_limit) return -EFAULT;
+    int64_t cur_alloca = (int64_t)(cur_total - stack_limit);
+
+    // 带符号累加；负到越过 0 视为错误（不能缩进局部变量区）。
+    int64_t new_alloca = cur_alloca + inc;
+    if(new_alloca < 0) return -EINVAL;
+    uint64_t new_total = stack_limit + (uint64_t)new_alloca;
+
+    // 32 位长度编码上限 + 栈区下界不得低于 STACK_BASE。
+    if(new_total > FRAME_LEN_MASK || r(10) < STACK_BASE + new_total)
+        return -ENOMEM;
+
+    // 保留 is_signal 等高位，仅替换低 32 位的 total_len。
+    frame[0] = (flags0 & ~FRAME_LEN_MASK) | (new_total & FRAME_LEN_MASK);
+
+    // 返回新下界（= inc>0 时新块起始地址；= inc=0 时当前下界作 stacksave token）。
+    return (int64_t)(r(10) - new_total);
 }
 
 
@@ -633,8 +688,8 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     std::cerr << std::endl;
 
     // 调用栈回溯：沿 frame 链向上遍历
-    // 正常帧: flags[0] r6..r9[1..4] old_r10[5] ret_addr[6]
-    // 信号帧: flags[0] r0..r9[1..10] old_r10[11] ret_addr[12]
+    // 正常帧: flags+alloca_len[0] r6..r9[1..4] old_r10[5] ret_addr[6]
+    // 信号帧: flags+alloca_len[0] r0..r9[1..10] old_r10[11] ret_addr[12]
     std::cerr << "Call stack:" << std::hex;
     uint64_t cur_sp = r(10);
     uint64_t cur_pc = pc;
@@ -648,7 +703,7 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
             std::cerr << " (frame unreadable at 0x" << std::hex << cur_sp << ")" << std::dec;
             break;
         }
-        bool is_signal = frame_base[0] != 0;
+        bool is_signal = frame_is_signal(frame_base[0]);
         uint64_t old_sp   = is_signal ? frame_base[11] : frame_base[5];
         uint64_t ret_addr = is_signal ? frame_base[12] : frame_base[6];
         std::cerr << (is_signal ? " [signal]" : "");
@@ -1317,6 +1372,9 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     }
 
     reg[10] = STACK_BASE + STACK_SIZE - 8;
+
+    // 哨兵：在初始 r10 处写一个合法 frame[0]，模拟"调用者帧"，给_start的局部变量用
+    *(uint64_t*)mmu_w(reg[10]) = frame_flags_make(false, options.stack_limit);
 
     if(options.raw_stack) {
         return true;

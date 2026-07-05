@@ -46,6 +46,8 @@ bool PosixSyscall::do_execve(vm* v) {
     }
 
     auto fresh = vm::create();
+    options(fresh.get()).stack_limit = options(v).stack_limit;
+    options(fresh.get()).raw_stack   = options(v).raw_stack;
     ElfLoadInfo load_info = fresh->load_elf(resolve_path(path).c_str());
     if(load_info.entry == 0) {
         v->r(0) = -ENOEXEC;
@@ -198,9 +200,7 @@ bool PosixSyscall::do_clone(vm* v) {
         }
     }
 
-    /* child 继承父所有寄存器（含 r9=func，供 musl __clone.s child 路径 callx r9）。
-     * r(0)=0（clone 返回值），r(10)=新栈顶（arg 已由 .s 压在 *(u64*)(r10+0)），
-     * pc=syscall 返回点（call 后下一条指令）。 */
+    // child 继承父所有寄存器。其中libc的clone的func、arg是通过callee-save寄存器保留的
     for(size_t i = 0; i < 11; i++) {
         child->r(i) = v->r(i);
     }
@@ -210,6 +210,10 @@ bool PosixSyscall::do_clone(vm* v) {
      * 直接用父栈指针即可（上面 r(i)=v->r(i) 已拷贝了 r(10)，这里 stack!=0 才覆盖）。 */
     if(stack != 0) {
         child->r(10) = stack;
+        // 提供了新栈（pthread 路径），写入哨兵帧, clone返回后应该立即调用func(arg)，压入一个真实帧
+        if(uint64_t* sent = static_cast<uint64_t*>(v->mmu_w(stack, sizeof(uint64_t)))) {
+            *sent = frame_flags_make(false, 0);
+        }
     }
     pc(child.get()) = pc(v) + sizeof(bpf_insn);
 

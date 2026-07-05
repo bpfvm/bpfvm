@@ -41,6 +41,9 @@ ifneq ($(SOFTFP),)
 CC_FLAGS += -fpass-plugin=$(SOFTFP)
 endif
 
+# VLA / 动态 alloca 支持已合并进 libBpfWideArgs.so（同 .so 注册两个 pass，
+# 时机不同：WideArgs 跑 PipelineStartEP，VLA 跑 OptimizerLastEP）。
+
 all: $(TARGETS) $(DYN_TARGETS)
 
 # 静态链接（-static）：.o + libc.a（含 _start）→ 自包含 ET_EXEC
