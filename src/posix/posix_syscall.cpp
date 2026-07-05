@@ -370,6 +370,7 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_GET_TLS:        return do_get_tls(v);
     case BPF_SYS_FUTEX:          return do_futex(v);
     case BPF_SYS_ALLOCA:         return do_alloca(v);
+    case BPF_SYS_POLL:           return do_poll(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG

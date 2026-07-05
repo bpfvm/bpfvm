@@ -324,3 +324,76 @@ bool PosixSyscall::do_ioctl(vm* v) {
         return true;
     }
 }
+
+bool PosixSyscall::do_poll(vm* v) {
+    // guest/host 的 struct pollfd 布局一致（{int fd; short events; short revents;}），
+    // 故把 guest 数组当作 host 数组就地读写；唯一要做的是 guest fd → host fd 翻译。
+    nfds_t n = arg_size(v->r(2));
+    int timeout = arg_s32(v->r(3));  // ms；负数=永久阻塞，0=非阻塞
+
+    // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE → EINVAL。bpfvm 无 rlimit 概念，
+    // 给一个固定上限，避免 guest 传极大 n 导致下面的 vector(n) 全量构造时 bad_alloc/OOM。
+    if(n > 1024) {
+        v->r(0) = -EINVAL;
+        return true;
+    }
+
+    struct pollfd* gfds = nullptr;
+    if(n > 0) {
+        // 翻译整段数组（mmu_w 校验 [addr, addr+size) 全在映射范围内）。
+        gfds = static_cast<struct pollfd*>(v->mmu_w(v->r(1), sizeof(struct pollfd) * n));
+        if(gfds == nullptr) {
+            v->r(0) = -EFAULT;
+            return true;
+        }
+    }
+
+    // 构造 host 侧数组：合法 guest fd 翻译成对应 host fd；非法 guest fd（不在 ps->fds 表内）
+    // 用 fd=-1 让宿主 poll 忽略该条，并在 guest 上预填 POLLNVAL（POSIX：fd 不打开算"事件"）。
+    // guest fd<0（POSIX：忽略此条）同样置 host fd=-1，但 revents 清零。
+    std::vector<struct pollfd> hfds(n);
+    std::vector<char> valid(n, 0);
+    nfds_t invalid_count = 0;
+    for(nfds_t i = 0; i < n; ++i) {
+        hfds[i].events = gfds[i].events;
+        hfds[i].revents = 0;
+
+        int gfd = gfds[i].fd;
+        gfds[i].revents = 0;
+        if(gfd < 0) {
+            hfds[i].fd = -1;          // 宿主 poll 跳过；guest revents 维持 0（POSIX：负 fd 条目）
+            continue;
+        }
+        auto it = ps->fds.find(gfd);
+        if(it == ps->fds.end()) {
+            hfds[i].fd = -1;          // 让宿主 poll 忽略；POLLNVAL 由我们直接写回 guest
+            gfds[i].revents = POLLNVAL;
+            invalid_count++;
+            continue;
+        }
+        hfds[i].fd = it->second->fd;
+        valid[i] = 1;
+    }
+
+    // 直接阻塞在宿主 poll。timeout(ms) 直接透传；信号路径下 queue_signal 会
+    // pthread_kill(SIGUSR1) 把宿主 poll 踢出 EINTR，符合 poll 不被 SA_RESTART 重启的语义，
+    // POLLNVAL 是"就绪事件"，POSIX 要求 poll 见到就绪条目立即返回——而我们已把非法 fd 屏蔽
+    // 成 fd=-1，宿主 poll 感知不到它们。若已手握 invalid_count 条 POLLNVAL，强制 timeout=0
+    // 非阻塞，否则当所有合法 fd 未就绪时会等满 timeout（timeout<0 时甚至永久挂起）。
+    int rc = ::poll(hfds.data(), n, invalid_count > 0 ? 0 : timeout);
+    if(rc == -1) {
+        v->r(0) = -errno;             // EINTR/EFAULT/ENOMEM 等
+        return true;
+    }
+
+    // 把 host revents 写回 guest（仅对翻译过的合法条目）。
+    for(nfds_t i = 0; i < n; ++i) {
+        if(!valid[i]) {
+            continue;
+        }
+        gfds[i].revents = hfds[i].revents;
+    }
+    // POLLNVAL 条目按 POSIX 也算"有事件"，加入返回计数。
+    v->r(0) = (uint64_t)(rc + invalid_count);
+    return true;
+}

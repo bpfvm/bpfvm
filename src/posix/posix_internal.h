@@ -18,6 +18,7 @@ namespace bpf{
 #include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>

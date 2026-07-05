@@ -277,6 +277,7 @@ public:
     bool do_get_tls(vm* v);
     bool do_futex(vm* v);
     bool do_alloca(vm* v);
+    bool do_poll(vm* v);
 };
 
 #endif
