@@ -284,7 +284,8 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
     }
     uint64_t sp = r(10) - caller_total_len;
     uint64_t frame_base_addr = sp - frame_size;
-    uint64_t* frame_base = (uint64_t*)mmu_w(frame_base_addr, frame_size);
+    // 检查整段新帧 [frame_base_addr, sp)
+    uint64_t* frame_base = (uint64_t*)mmu_w(frame_base_addr, sp - frame_base_addr);
     if(!frame_base) {
         log_mem_violation("stack access", frame_base_addr);
         return false;
@@ -396,6 +397,10 @@ int64_t vm::alloca(int64_t inc) {
 
     // 32 位长度编码上限 + 栈区下界不得低于 STACK_BASE。
     if(new_total > FRAME_LEN_MASK || r(10) < STACK_BASE + new_total)
+        return -ENOMEM;
+
+    // 扩展时（inc>0）保证新 alloca 区 [r10-new_total, r10) 整段在同一可写映射里
+    if(inc > 0 && !mmu_w(r(10) - new_total, new_total))
         return -ENOMEM;
 
     // 保留 is_signal 等高位，仅替换低 32 位的 total_len。
