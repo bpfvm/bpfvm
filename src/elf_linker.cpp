@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 #include <set>
+#include <algorithm>
 #include <optional>
 #include <cstring>
 #include <cctype>
@@ -164,9 +165,36 @@ struct ShstrtabOut {
     std::vector<Elf64_Word> extra_name_offs;  // 与 extras 一一对应
 };
 
-// ELF section 名 → 是否需要加载到 VM
+// ELF section type → 是否需要加载到 VM
+// SHT_INIT_ARRAY/SHT_FINI_ARRAY 是全局构造/析构函数指针表，必须加载（进 SEG_DATA），
+// 否则 musl 的 __libc_start_init 循环（[__init_array_start, __init_array_end)）拿不到
+// ctor 列表，全局 C++ 对象不会构造。
 bool is_loadable_section(Elf64_Word type) {
-    return type == SHT_PROGBITS || type == SHT_NOBITS;
+    return type == SHT_PROGBITS || type == SHT_NOBITS ||
+           type == SHT_INIT_ARRAY || type == SHT_FINI_ARRAY;
+}
+
+// 标准 ld 的 orphan section 边界符号前缀
+// __start_<name>（首，8 字符）/ __stop_<name>（尾，7 字符）。如 section "__lcxx_override"
+// → __start___lcxx_override（三 _: 前缀尾 1 + section 头 2）。
+constexpr const char* kSectionStartPrefix = "__start_";  // 8 字符
+constexpr const char* kSectionStopPrefix  = "__stop_";   // 7 字符
+
+// 正向：符号名 → {is_start, section_name}；未命中返回 nullopt。
+std::optional<std::pair<bool, std::string>> parse_section_boundary_sym(const std::string& sym) {
+    std::string_view sv(sym);
+    std::string_view sp(kSectionStartPrefix);
+    std::string_view tp(kSectionStopPrefix);
+    if (sv.size() > sp.size() && sv.substr(0, sp.size()) == sp)
+        return std::make_pair(true, std::string(sv.substr(sp.size())));
+    if (sv.size() > tp.size() && sv.substr(0, tp.size()) == tp)
+        return std::make_pair(false, std::string(sv.substr(tp.size())));
+    return std::nullopt;
+}
+
+// 反向：section 名 + is_start → 符号名。
+std::string make_section_boundary_sym(const std::string& sec, bool is_start) {
+    return std::string(is_start ? kSectionStartPrefix : kSectionStopPrefix) + sec;
 }
 
 // 按 section 属性分流到输出段：可写（含 .bss）→ data；可执行 → text；只读 → rodata。
@@ -395,6 +423,20 @@ private:
     };
     SegInfo segs_[3];
 
+    // .init_array/.fini_array 拼接后的边界 guest vaddr（layout_segments 填充，
+    // define_init_fini_symbols 合成 __init_array_start/end 等符号用）。
+    // 无对应 section 时 start==end==0（musl 循环空转，向后兼容）。
+    uint64_t init_array_start_vaddr_ = 0;
+    uint64_t init_array_end_vaddr_ = 0;
+    uint64_t fini_array_start_vaddr_ = 0;
+    uint64_t fini_array_end_vaddr_ = 0;
+
+    // 合成全局符号（name → guest vaddr）：__init_array_start/end、__fini_array_*、
+    // __dso_handle 等。resolve_symbol 先查这里；build_static/dynamic_symtab 会遍历
+    // 它们 emit 到符号表。与 globals_（必须指向真实 obj symbol）不同，这里存的是
+    // linker 凭空合成的定义。
+    std::unordered_map<std::string, uint64_t> synthetic_globals_;
+
 public:
     // STATIC_EXE 用 fixed_base（默认 0x40000000）；SHARED_LIB/DYNAMIC_EXE 传 0（PIE）
     explicit Linker(Mode mode = Mode::STATIC_EXE, uint64_t fixed_base = 0x40000000ULL)
@@ -503,6 +545,13 @@ public:
 
         // 校验未定义符号（static + dynamic；shared 允许导出 UND 给消费者，跳过）。
         // UND 符号必须由 .o/.a（globals_）或 .so（bpfso_symbols_）提供，否则报错（对齐标准 ld）。
+        // 先合成不依赖 layout 的符号（__dso_handle + __start___/___stop section 边界），
+        // 让 check 把它们当已定义。
+        // __dso_handle 用占位值 1（非 0——避免被误当 UND/weak 未定义）。musl 静态链接下
+        // __cxa_atexit 的 dtor 链表对 dso_handle 值不敏感（靠链表管理），故 1 能让
+        // test_cpp_ctor 通过；标准 ld 让 __dso_handle 指向自身对象地址，这里用固定占位是折衷。
+        synthetic_globals_["__dso_handle"] = 1;
+        collect_section_boundary_refs();   // 预登记 __start___<sec>/__stop___<sec>（占位）
         if (mode_ != Mode::SHARED_LIB && !check_undefined_symbols()) return false;
 
         // 运行时 GOT/PLT 合成（DYNAMIC_EXE + SHARED_LIB 默认对所有 UND 函数）：
@@ -512,6 +561,13 @@ public:
 
         // 全局 3 段布局：分配 guest vaddr（必须在 apply_relocations 前，重定位读 guest_addr）
         layout_segments();
+
+        // layout 后 .init_array/.fini_array 边界 vaddr 已定：合成 __init_array_start/end
+        // 等符号（apply_relocations 会 resolve 这些符号，必须先定义）。
+        define_init_fini_symbols();
+        // layout 后各自定义 section（如 __lcxx_override）边界 vaddr 已定：合成
+        // __start___<sec>/__stop___<sec>（标准 ld 对 orphan section 的 __start_/__stop_ 合成）。
+        define_section_boundary_symbols();
 
         // layout 后 .got/.plt 的 guest_addr 已定：回填 PLT 桩字节码（lddw imm = GOT 槽地址）
         if (got_enabled_ && !finalize_plt_stubs()) return false;
@@ -564,16 +620,31 @@ public:
     // 三个 PT_LOAD，分配 guest vaddr（每段页对齐、互不重叠），更新 ls.guest_addr。
     // host pool 布局保持不变（section 数据仍在 load 时的位置）；输出时按段拼接。
     // .bss(NOBITS) 排在 data 段 PROGBITS 之后，不占 filesz，只计入 memsz。
+    // 注意：输出 ELF 的 section header 表只给每段一个 SHT_PROGBITS（.text/.rodata/.data），
+    // .init_array/.fini_array 的内容被折叠进 .data section header（VM 只看 PT_LOAD 段 +
+    // 合成的 __init_array_start/end 符号，不依赖独立 section header；但 readelf -S 看不到
+    // 独立 .init_array，与标准 ld 不同——是有意简化）。
     void layout_segments() {
         for (int c = 0; c < 3; c++) segs_[c] = SegInfo{};
-        // 分桶（保持 object/section 出现顺序 → 段内顺序稳定）
+        // 分桶（保持 object/section 出现顺序 → 段内顺序稳定）。
+        // SEG_DATA 特殊处理：把所有 .init_array/.fini_array section 挑出来排在段尾，
+        // 保证它们各自连续（musl 的 [__init_array_start, __init_array_end) 循环假设
+        // 是连续的函数指针数组，被 .data 穿插会读到非函数指针 → crash）。
+        std::vector<std::pair<size_t,size_t>> data_init, data_fini;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t si = 1; si < objects_[oi].sections.size(); si++) {
                 LoadedSection& ls = objects_[oi].sections[si];
                 if (!ls.loadable) continue;
+                if (ls.seg == SEG_DATA) {
+                    if (ls.type == SHT_INIT_ARRAY) { data_init.push_back({oi, si}); continue; }
+                    if (ls.type == SHT_FINI_ARRAY) { data_fini.push_back({oi, si}); continue; }
+                }
                 segs_[ls.seg].secs.push_back({oi, si});
             }
         }
+        // init_array 在前、fini_array 在后，统一追加到 SEG_DATA 末尾。
+        for (auto& pr : data_init) segs_[SEG_DATA].secs.push_back(pr);
+        for (auto& pr : data_fini) segs_[SEG_DATA].secs.push_back(pr);
         segs_[SEG_TEXT].flags   = PF_R | PF_X;
         segs_[SEG_RODATA].flags = PF_R;
         segs_[SEG_DATA].flags   = PF_R | PF_W;
@@ -623,6 +694,25 @@ public:
                 objects_[pr.first].sections[pr.second].guest_addr += segs_[c].vaddr;
             }
         }
+        // 记录 .init_array/.fini_array 拼接区间的边界 vaddr（已保证连续）。
+        // init_array 在 SEG_DATA 段内连续排列（layout_segments 分桶时挑出），
+        // 边界 = 第一个 section 的 guest_addr .. 最后一个的 guest_addr + size。
+        // 空区间显式判 .empty()（不依赖「首地址非 0」哨兵——PIE 或 fixed_base=0 下
+        // 首地址可能合法地为 0，用哨兵会静默把真区间当空区间）。
+        init_array_start_vaddr_ = init_array_end_vaddr_ = 0;
+        fini_array_start_vaddr_ = fini_array_end_vaddr_ = 0;
+        if (!data_init.empty()) {
+            LoadedSection& first = objects_[data_init.front().first].sections[data_init.front().second];
+            LoadedSection& last  = objects_[data_init.back().first].sections[data_init.back().second];
+            init_array_start_vaddr_ = first.guest_addr;
+            init_array_end_vaddr_   = last.guest_addr + last.size;
+        }
+        if (!data_fini.empty()) {
+            LoadedSection& first = objects_[data_fini.front().first].sections[data_fini.front().second];
+            LoadedSection& last  = objects_[data_fini.back().first].sections[data_fini.back().second];
+            fini_array_start_vaddr_ = first.guest_addr;
+            fini_array_end_vaddr_   = last.guest_addr + last.size;
+        }
         if (g_debug) {
             std::cerr << "[elf_linker] segments:";
             for (int c = 0; c < 3; c++) {
@@ -632,6 +722,76 @@ public:
                           << segs_[c].filesz << "/0x" << segs_[c].memsz << std::dec;
             }
             std::cerr << "\n";
+        }
+    }
+
+    // 合成 .init_array/.fini_array 边界符号 + __dso_handle。
+    void define_init_fini_symbols() {
+        synthetic_globals_["__init_array_start"] = init_array_start_vaddr_;
+        synthetic_globals_["__init_array_end"]   = init_array_end_vaddr_;
+        synthetic_globals_["__fini_array_start"] = fini_array_start_vaddr_;
+        synthetic_globals_["__fini_array_end"]   = fini_array_end_vaddr_;
+        // __dso_handle 已在 check_undefined_symbols 之前合成（不依赖 layout）。
+    }
+
+    // 收集所有 UND 符号里形如 __start___<name> / __stop___<name> 的引用，若存在名为
+    // <name> 的 section，则登记到 synthetic_globals_（占位值 1，让 check_undefined_symbols
+    // 把它当已定义）。真实边界地址在 layout 后由 define_section_boundary_symbols 填入。
+    // 对齐标准 ld：对任意 orphan section <name>，若有对 __start___<name>/__stop___<name>
+    // 的引用，且该 section 存在，则自动合成边界符号。libc++ 的 operator new/delete 弱符号
+    // 放进 __lcxx_override section，其可覆盖检测宏 __is_function_overridden 引用
+    // __start___lcxx_override/__stop___lcxx_override 即走此机制。
+    void collect_section_boundary_refs() {
+        // 先建 name→存在 的 section 名集合（loadable section）。
+        std::set<std::string> sec_names;
+        for (const auto& obj : objects_) {
+            for (const auto& ls : obj.sections) {
+                if (ls.loadable && !ls.name.empty()) sec_names.insert(ls.name);
+            }
+        }
+        for (const auto& obj : objects_) {
+            for (const auto& sym : obj.symbols) {
+                if (sym.defined || sym.name.empty()) continue;
+                auto parsed = parse_section_boundary_sym(sym.name);
+                if (!parsed) continue;
+                const std::string& sec = parsed->second;
+                // section 存在才合成（对齐 ld：无对应 section 时 __start_/__stop_ 不合成，
+                // 留作 weak UND→0 或报 undefined）。
+                if (sec_names.count(sec)) synthetic_globals_[sym.name] = 1;
+            }
+        }
+    }
+
+    // layout 后各自定义 section（如 __lcxx_override）按 section 名合并，取最小 guest_addr
+    // 为 __start___<name>、最大 guest_addr+size 为 __stop___<name>。同名 section 可能跨多
+    // 个 object（如多个 .o 都有 __lcxx_override），合并后边界即标准 ld 的 section 合并结果。
+    // 仅对 collect_section_boundary_refs 已登记（即被引用且 section 存在）的符号更新地址。
+    void define_section_boundary_symbols() {
+        if (synthetic_globals_.empty()) return;
+        // 筛出需要合成的 section 名（复用 parse_section_boundary_sym，单一前缀解析点）。
+        std::set<std::string> wanted;
+        for (const auto& [sym, _] : synthetic_globals_) {
+            auto parsed = parse_section_boundary_sym(sym);
+            if (parsed) wanted.insert(parsed->second);
+        }
+        if (wanted.empty()) return;
+        // 按 section 名算合并后的边界。
+        std::unordered_map<std::string, std::pair<uint64_t,uint64_t>> bounds; // name → {min_addr, max_end}
+        for (const auto& obj : objects_) {
+            for (const auto& ls : obj.sections) {
+                if (!ls.loadable || ls.name.empty()) continue;
+                if (!wanted.count(ls.name)) continue;
+                auto it = bounds.find(ls.name);
+                uint64_t start = ls.guest_addr;
+                uint64_t end = ls.guest_addr + ls.size;
+                if (it == bounds.end()) bounds[ls.name] = {start, end};
+                else { it->second.first  = std::min(it->second.first, start);
+                       it->second.second = std::max(it->second.second, end); }
+            }
+        }
+        for (const auto& [sec, pr] : bounds) {
+            synthetic_globals_[make_section_boundary_sym(sec, true)]  = pr.first;
+            synthetic_globals_[make_section_boundary_sym(sec, false)] = pr.second;
         }
     }
 
@@ -772,7 +932,9 @@ private:
                 continue;
             }
             ls.guest_addr = obj.base + ls.offset;
-            if (shdr.sh_type != SHT_PROGBITS) {
+            if (shdr.sh_type != SHT_PROGBITS &&
+                shdr.sh_type != SHT_INIT_ARRAY &&
+                shdr.sh_type != SHT_FINI_ARRAY) {
                 // SHT_NOBITS (.bss) 已经 zero 了
                 continue;
             }
@@ -866,9 +1028,19 @@ private:
                     r.type = GELF_R_TYPE(rel.r_info);
                     r.sym_idx = GELF_R_SYM(rel.r_info);
                     // SHT_REL：addend 嵌入在 patch 点原值里，按类型读取。
-                    // 仅对已定义符号读（UND 符号的 patch 点是 clang 占位符，非真实 addend）。
+                    // 数据重定位（type 1/2/3/4：lddw / 绝对指针 / DWARF 段内偏移）：patch 点是
+                    // 真实的 embedded addend，对 UND 符号也一样（clang 在这里写的是真偏移，非占位）。
+                    // 典型：C++ RTTI 的 typeinfo 第一槽是「vtable+16 指针」，引用 UND 符号
+                    // _ZTVN10__cxxabiv1*（定义在 libc++abi），embedded addend = +16 必须读出，
+                    // 否则 typeinfo 的 vtable 指针少 16 → 落到 offset-to-top/typeinfo 槽 →
+                    // dynamic_cast/typeid 崩。
+                    // call 重定位（type 10）：clang 对未解析调用写 imm=-1 占位符（非真实 addend），
+                    // 故 UND 符号时 addend 保持 0；已定义符号的 call 也走相对偏移（addend 用不上）。
                     bool sym_defined = (r.sym_idx < obj.symbols.size() && obj.symbols[r.sym_idx].defined);
-                    if (sym_defined && target_sec < obj.sections.size()) {
+                    // 仅 type 10 (R_BPF_64_32 / call) 对 UND 跳过读 embedded addend
+                    //（clang 写 imm=-1 占位符）。其余数据重定位即使 UND 也读真 addend。
+                    bool read_embedded = (sym_defined || r.type != 10);
+                    if (read_embedded && target_sec < obj.sections.size()) {
                         const auto& tgt = obj.sections[target_sec];
                         if (tgt.loadable) {
                             const unsigned char* patch = obj.host_mem + tgt.offset + r.offset;
@@ -984,6 +1156,7 @@ private:
                 if (sym.name.empty()) continue;
                 if (sym.binding == STB_WEAK) continue;           // weak 未定义 → 解析为 0
                 if (globals_.count(sym.name)) continue;          // .o/.a 提供（resolve_symbol 可解析）
+                if (synthetic_globals_.count(sym.name)) continue;// 合成符号（__init_array_start 等）
                 if (bpfso_symbols_.count(sym.name)) continue;    // .so 提供（运行时解析）
                 if (is_fp_ksym(sym.name)) continue;              // FP 虚拟指令符号（VM 运行时解释）
                 if (reported.insert(sym.name).second) {
@@ -1020,6 +1193,13 @@ private:
             const auto& def_sym = def_obj.symbols[it->second.sym_idx];
             const auto& def_sec = def_obj.sections[def_sym.sec_idx];
             return def_sec.guest_addr + def_sym.value;
+        }
+
+        // 合成符号（__init_array_start/end、__fini_array_*、__dso_handle 等）：
+        // linker 凭空定义、不指向真实 obj symbol，直接返回合成的 vaddr。
+        auto sit = synthetic_globals_.find(sym.name);
+        if (sit != synthetic_globals_.end()) {
+            return sit->second;
         }
 
         // 查不到（仅 UND 符号会走到这里；defined 的 non-local 符号必然在 globals_ 中）：
@@ -1366,6 +1546,19 @@ private:
             emit(obj, sym, STB_GLOBAL);
         }
 
+        // 3. 合成全局符号（__init_array_start/end 等，SHN_ABS）
+        for (const auto& kv : synthetic_globals_) {
+            Elf64_Sym s = {};
+            s.st_name = add_name(kv.first);
+            s.st_info = GELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
+            s.st_other = 0;
+            s.st_shndx = SHN_ABS;
+            s.st_value = kv.second;
+            s.st_size = 0;
+            symtab.data.insert(symtab.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
+            sym_count++;
+        }
+
         size_t strtab_idx = extras.size();
         extras.push_back(std::move(strtab));
         size_t symtab_idx = extras.size();
@@ -1391,6 +1584,7 @@ private:
                 const auto& sym = objects_[oi].symbols[r.sym_idx];
                 if (sym.defined || sym.name.empty()) continue;
                 if (sym.name == "_DYNAMIC") continue;  // 由 build_dynamic_sections 合成为 defined 符号
+                if (synthetic_globals_.count(sym.name)) continue;  // 已合成为 defined 符号
                 bool inserted = out.idx.find(sym.name) == out.idx.end();
                 if (inserted) {
                     out.idx[sym.name] = out.names.size();
@@ -1456,6 +1650,13 @@ private:
             dynstr.data.push_back(0);
             export_name_off[sym.name] = off;
         }
+        // 合成符号（__init_array_start 等）也进 dynstr，供 .dynsym emit。
+        for (const auto& kv : synthetic_globals_) {
+            Elf64_Word off = (Elf64_Word)dynstr.data.size();
+            dynstr.data.insert(dynstr.data.end(), kv.first.begin(), kv.first.end());
+            dynstr.data.push_back(0);
+            export_name_off[kv.first] = off;
+        }
         // _DYNAMIC：标准 ld 在 PIE/.so 上合成的符号，指向 .dynamic section 起始。
         // musl __init_tls/dl_iterate_phdr 用它（weak 引用）反推加载基址。bpfvm-ld
         // 这里合成 defined 符号，避免运行时加载器报 "unresolved symbol '_DYNAMIC'"
@@ -1517,6 +1718,18 @@ private:
             dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
             dynsym_idx["_DYNAMIC"] = dynsym.data.size() / sizeof(Elf64_Sym) - 1;
             out.dynamic_sym_off = off;  // st_value 在 Elf64_Sym 偏移 8 处，backfill 直接 +8 写
+        }
+        // 合成符号（__init_array_start/end 等）：SHN_ABS defined，值是 layout 算好的 vaddr。
+        // 让 loader 的 collect_exports 收为 defined，.rela.dyn 引用能解析。
+        for (const auto& kv : synthetic_globals_) {
+            Elf64_Sym s = {};
+            auto nit = export_name_off.find(kv.first);
+            if (nit != export_name_off.end()) s.st_name = nit->second;
+            s.st_info = GELF_ST_INFO(STB_GLOBAL, STT_OBJECT);
+            s.st_shndx = SHN_ABS;
+            s.st_value = kv.second;
+            dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
+            dynsym_idx[kv.first] = dynsym.data.size() / sizeof(Elf64_Sym) - 1;
         }
         dynsym.info = first_global;
         out.dynsym_idx = extras.size();
