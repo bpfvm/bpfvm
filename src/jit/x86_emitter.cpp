@@ -377,6 +377,22 @@ void X86Emitter::sse_xorps(uint8_t dst_xmm, uint8_t src_xmm) {
     emit8(modrm(3, dst_xmm & 7, src_xmm & 7));
 }
 
+// andps xmm_dst, xmm_src —— 0F 54 /r （位与，用于 fabs：清符号位）
+//   ModRM reg=dst, rm=src（dst &= src）。REX: R 位扩 dst，B 位扩 src。
+void X86Emitter::sse_andps(uint8_t dst_xmm, uint8_t src_xmm) {
+    emit8(rex(false, dst_xmm >= 8, false, src_xmm >= 8));
+    emit8(0x0F); emit8(0x54);
+    emit8(modrm(3, dst_xmm & 7, src_xmm & 7));
+}
+
+// orps xmm_dst, xmm_src —— 0F 56 /r （位或，用于 copysign：置符号位）
+//   ModRM reg=dst, rm=src（dst |= src）。REX: R 位扩 dst，B 位扩 src。
+void X86Emitter::sse_orps(uint8_t dst_xmm, uint8_t src_xmm) {
+    emit8(rex(false, dst_xmm >= 8, false, src_xmm >= 8));
+    emit8(0x0F); emit8(0x56);
+    emit8(modrm(3, dst_xmm & 7, src_xmm & 7));
+}
+
 // cvtsi2sd xmm, r/m  —— 有符号整数 → double
 //   64位源: REX.W F2 0F 2A /r    32位源: F2 0F 2A /r
 void X86Emitter::sse_cvtsi2sd(uint8_t dst_xmm, uint8_t src_x86, bool is_signed64) {
@@ -1344,6 +1360,7 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     const uint8_t R_R2 = X86::R10;  // 操作数 b
     const uint8_t X0 = 0;           // xmm0
     const uint8_t X1 = 1;           // xmm1
+    const uint8_t X2 = 2;           // xmm2（掩码暂存）
 
     // 双精度二元算术：xmm0 = a (op) b
     auto emit_d_binop = [&](uint8_t op) {
@@ -1461,6 +1478,57 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     case BPF_FP_SQRT_F: {
         sse_movd_xmm_r32(X0, R_R1);
         sse_sqrt_scalar(0xF3, X0, X0);
+        sse_movd_r32_xmm(X86::RAX, X0);
+        mov_r64(R_R0, X86::RAX);
+        return true;
+    }
+
+    // —— 绝对值（清符号位：andps 0x7FFF...F）——
+    case BPF_FP_FABS_D: {
+        sse_movq_xmm_r64(X0, R_R1);
+        emit8(0x48); emit8(0xB9); emit64(0x7FFFFFFFFFFFFFFFULL);  // mov rcx, 0x7FFF...F
+        sse_movq_xmm_r64(X1, X86::RCX);
+        sse_andps(X0, X1);
+        sse_movq_r64_xmm(R_R0, X0);
+        return true;
+    }
+    case BPF_FP_FABS_F: {
+        sse_movd_xmm_r32(X0, R_R1);
+        emit8(0xB9); emit32(0x7FFFFFFFu);                          // mov ecx, 0x7FFFFFFF
+        sse_movd_xmm_r32(X1, X86::RCX);
+        sse_andps(X0, X1);
+        sse_movd_r32_xmm(X86::RAX, X0);
+        mov_r64(R_R0, X86::RAX);
+        return true;
+    }
+
+    // —— copysign(x, y)：取 y 的符号位并到 x 上。
+    //   (x & 0x7FFF...F) | (y & 0x8000...0)。xmm0=x, xmm1=y；
+    //   先 andps 清 x 符号位，再把 y 的符号位 or 上去。 ——
+    case BPF_FP_COPYSIGN_D: {
+        sse_movq_xmm_r64(X0, R_R1);           // xmm0 = x
+        sse_movq_xmm_r64(X1, R_R2);           // xmm1 = y
+        emit8(0x48); emit8(0xB9); emit64(0x7FFFFFFFFFFFFFFFULL);  // mov rcx, mag_mask
+        sse_movq_xmm_r64(X2, X86::RCX);
+        sse_andps(X0, X2);                    // xmm0 = x 清符号位
+        emit8(0x48); emit8(0xB9); emit64(0x8000000000000000ULL);  // mov rcx, sign_mask
+        sse_movq_xmm_r64(X2, X86::RCX);
+        sse_andps(X1, X2);                    // xmm1 = y 的符号位
+        sse_orps(X0, X1);                     // xmm0 = 合并符号
+        sse_movq_r64_xmm(R_R0, X0);
+        return true;
+    }
+    case BPF_FP_COPYSIGN_F: {
+        // 单精度：位模式在低 32 位。x→xmm0(低32)，y→xmm1(低32)。
+        sse_movq_xmm_r64(X0, R_R1);           // 整 8 字节搬入（高位无所谓）
+        sse_movq_xmm_r64(X1, R_R2);
+        emit8(0xB9); emit32(0x7FFFFFFFu);                          // mov ecx, mag_mask(32)
+        sse_movd_xmm_r32(X2, X86::RCX);
+        sse_andps(X0, X2);                    // 清 x 符号位
+        emit8(0xB9); emit32(0x80000000u);                          // mov ecx, sign_mask(32)
+        sse_movd_xmm_r32(X2, X86::RCX);
+        sse_andps(X1, X2);                    // y 的符号位
+        sse_orps(X0, X1);                     // 合并
         sse_movd_r32_xmm(X86::RAX, X0);
         mov_r64(R_R0, X86::RAX);
         return true;

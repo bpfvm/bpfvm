@@ -51,6 +51,16 @@ static const char *suffix(Type *Ty) {
     return nullptr;  // 其它（long double 等）不支持
 }
 
+static Value *emitLibmCall(IRBuilder<> &B, const char *baseName, Type *Ty,
+                           ArrayRef<Value *> Args) {
+    // 单精度加 'f' 后缀（musl 约定：floorf/ceilf/...）。
+    std::string Name = Ty->isFloatTy() ? std::string(baseName) + "f" : baseName;
+    Module &M = *B.GetInsertBlock()->getModule();
+    FunctionType *FTy = FunctionType::get(Ty, SmallVector<Type *, 2>(Args.size(), Ty), false);
+    FunctionCallee FC = M.getOrInsertFunction(Name, FTy);
+    return B.CreateCall(FC, Args);
+}
+
 // ---- BPF_FP_* helper 编号：单一数据源 ----
 // 直接复用 include/bpf_call.h 的定义（BPF_CALL_BASE + BPF_FP_* 宏），
 // 避免在 pass 里手抄一份容易不一致的编号表。bpf_call.h 是纯宏/enum，C++ 兼容。
@@ -348,6 +358,46 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
+                // 数学函数 intrinsic：分两类
+                //   floor/ceil/trunc/round → emitLibmCall（普通 libcall，交 musl libc）。
+                //   fabs/copysign → VM 虚拟指令（musl 体会被 instcombine 折叠回同名
+                //     intrinsic，走 libcall 会自递归；
+                auto lowerUnaryIntrinsic = [&](Intrinsic::ID iid, const char *name) -> bool {
+                    if (II->getIntrinsicID() != iid) return false;
+                    if (!suffix(Ty)) return false;
+                    Value *Call = emitLibmCall(B, name, Ty, {II->getArgOperand(0)});
+                    II->replaceAllUsesWith(Call);
+                    ToErase.push_back(II);
+                    Changed = true;
+                    return true;
+                };
+                if (lowerUnaryIntrinsic(Intrinsic::floor,  "floor"))  continue;
+                if (lowerUnaryIntrinsic(Intrinsic::ceil,   "ceil"))   continue;
+                if (lowerUnaryIntrinsic(Intrinsic::trunc,  "trunc"))  continue;
+                if (lowerUnaryIntrinsic(Intrinsic::round,  "round"))  continue;
+                // fabs：VM 虚拟指令（避免 libcall 自递归）
+                if (II->getIntrinsicID() == Intrinsic::fabs) {
+                    const char *sfx = suffix(Ty);
+                    if (!sfx) continue;
+                    unsigned callId = (sfx[0]=='d') ? BPF_FP_FABS_D : BPF_FP_FABS_F;
+                    Value *Call = emitDirectFpCall(B, Ctx, callId, {II->getArgOperand(0)}, Ty);
+                    II->replaceAllUsesWith(Call);
+                    ToErase.push_back(II);
+                    Changed = true;
+                    continue;
+                }
+                // copysign 是二元：VM 虚拟指令（避免 libcall 自递归）
+                if (II->getIntrinsicID() == Intrinsic::copysign) {
+                    const char *sfx = suffix(Ty);
+                    if (!sfx) continue;
+                    unsigned callId = (sfx[0]=='d') ? BPF_FP_COPYSIGN_D : BPF_FP_COPYSIGN_F;
+                    Value *Call = emitDirectFpCall(B, Ctx, callId,
+                        {II->getArgOperand(0), II->getArgOperand(1)}, Ty);
+                    II->replaceAllUsesWith(Call);
+                    ToErase.push_back(II);
+                    Changed = true;
+                    continue;
+                }
                 // umul.with.overflow：__builtin_mul_overflow(uint64_t,...) 的 IR 形态。
                 // 后端会 lower 成 __multi3 调用，BPF ISel 一律拒绝。这里在 IR 层展开成
                 // schoolbook 32×32 ALU（Lo = 原生 BPF_MUL 截断，Hi = emitUmulHi64），
@@ -377,8 +427,35 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
-                // fabs / copysign / minnum / maxnum / floor / ceil / trunc / rint / nearbyint
-                // 暂不支持，保留（极少触发）。后续可按需补充。
+            }
+
+            // ---- sqrt/fabs/copysign libcall 拦截 → VM 虚拟指令 ----
+            // （源码直接调 sqrt()/fabsf()，或 libc++ 头里的 sqrt）。
+            if (auto *CI = dyn_cast<CallInst>(&I)) {
+                Function *Callee = CI->getCalledFunction();
+                if (Callee && !Callee->isIntrinsic()) {
+                    StringRef Name = Callee->getName();
+                    unsigned idD = 0, idF = 0;
+                    bool binary = false;
+                    if (Name == "sqrt" || Name == "sqrtf") { idD = BPF_FP_SQRT_D; idF = BPF_FP_SQRT_F; }
+                    else if (Name == "fabs" || Name == "fabsf") { idD = BPF_FP_FABS_D; idF = BPF_FP_FABS_F; }
+                    else if (Name == "copysign" || Name == "copysignf") { idD = BPF_FP_COPYSIGN_D; idF = BPF_FP_COPYSIGN_F; binary = true; }
+                    if (idD != 0) {
+                        Type *RetTy = CI->getType();
+                        const char *sfx = suffix(RetTy);
+                        if (sfx) {
+                            unsigned callId = (sfx[0]=='d') ? idD : idF;
+                            SmallVector<Value*, 2> args;
+                            for (Use &A : CI->args()) args.push_back(toI64Bits(B, A.get()));
+                            (void)binary;
+                            Value *Call = emitDirectFpCall(B, Ctx, callId, args, RetTy);
+                            CI->replaceAllUsesWith(Call);
+                            ToErase.push_back(CI);
+                            Changed = true;
+                            continue;
+                        }
+                    }
+                }
             }
 
             // ---- 比较：fcmp ----

@@ -251,6 +251,8 @@ private:
     void sse_alu_scalar(uint8_t prefix, uint8_t op, uint8_t dst_xmm, uint8_t src_xmm);
     void sse_sqrt_scalar(uint8_t prefix, uint8_t dst_xmm, uint8_t src_xmm);
     void sse_xorps(uint8_t dst_xmm, uint8_t src_xmm);  // dst ^= src（位异或）
+    void sse_andps(uint8_t dst_xmm, uint8_t src_xmm);  // dst &= src（位与，fabs 清符号位）
+    void sse_orps(uint8_t dst_xmm, uint8_t src_xmm);   // dst |= src（位或，copysign 置符号位）
     // is_signed64: true→64位有符号(REX.W), false→32位有符号
     void sse_cvtsi2sd(uint8_t dst_xmm, uint8_t src_x86, bool is_signed64);
     void sse_cvtsi2ss(uint8_t dst_xmm, uint8_t src_x86, bool is_signed64);

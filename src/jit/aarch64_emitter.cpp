@@ -371,6 +371,12 @@ void AArch64Emitter::fp_neg(uint8_t d, uint8_t n, bool is_double) {
     emit_insn((is_double ? 0x1E614000u : 0x1E214000u) | ((uint32_t)n << 5) | rd(d));
 }
 
+// FABS (scalar): 清符号位
+//   double: 1E60C000 | (Rn<<5) | Rd    single: 1E20C000 | (Rn<<5) | Rd
+void AArch64Emitter::fp_abs(uint8_t d, uint8_t n, bool is_double) {
+    emit_insn((is_double ? 0x1E60C000u : 0x1E20C000u) | ((uint32_t)n << 5) | rd(d));
+}
+
 // FSQRT (scalar)
 //   double: 1E61C000 | (Rn<<5) | Rd    single: 1E21C000 | (Rn<<5) | Rd
 void AArch64Emitter::fp_sqrt(uint8_t d, uint8_t n, bool is_double) {
@@ -1094,6 +1100,42 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         fp_sqrt(V_A, V_A, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
+
+    // —— 绝对值（FABS：原生清符号位）——
+    case BPF_FP_FABS_D:
+        fmov_v_from_x(V_A, R_R1, true);
+        fp_abs(V_A, V_A, true);
+        fmov_x_from_v(R_R0, V_A, true);
+        return true;
+    case BPF_FP_FABS_F:
+        fmov_v_from_x(V_A, R_R1, true);
+        fp_abs(V_A, V_A, false);
+        fmov_x_from_v(R_R0, V_A, false);
+        return true;
+
+    // —— copysign(x, y)：取 y 的符号位并到 x 上。
+    //   走 GPR 位运算（避开 FP 条件取负的复杂度）：
+    //   (x & 0x7FFF...F) | (y & 0x8000...0)。R_R1=x, R_R2=y。
+    //   double: 64 位掩码；float: 32 位掩码（高位同形态，32 位操作即正确）。 ——
+    case BPF_FP_COPYSIGN_D: {
+        // X0 = x & mag_mask（清符号位）
+        mov_imm(X0, 0x7FFFFFFFFFFFFFFFULL, true);
+        and_reg(X0, R_R1, X0, true);
+        // X1 = y & sign_mask（仅符号位）
+        mov_imm(X1, 0x8000000000000000ULL, true);
+        and_reg(X1, R_R2, X1, true);
+        orr_reg(R_R0, X0, X1, true);
+        return true;
+    }
+    case BPF_FP_COPYSIGN_F: {
+        // 32 位操作：mag_mask=0x7FFFFFFF, sign_mask=0x80000000。
+        mov_imm(X0, 0x7FFFFFFFu, false);
+        and_reg(X0, R_R1, X0, false);
+        mov_imm(X1, 0x80000000u, false);
+        and_reg(X1, R_R2, X1, false);
+        orr_reg(R_R0, X0, X1, false);   // 32 位写零扩展进 X9
+        return true;
+    }
 
     // —— double → 有符号整型（FCVTZS 向 0 截断）——
     case BPF_FP_D2SI:   // -> int32

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 
 /* 软件浮点运行时验证（JIT 原生 SSE 短路 + 解释器 syscall shim 共用此用例）。
    用 volatile 阻止常量折叠，强制浮点运算在 VM 运行时执行（经 BpfSoftFp pass
@@ -31,7 +32,6 @@ int main(void) {
     /* int <-> double 转换（有符号源 / 有符号目标） */
     volatile int i = 7;
     if ((int)((double)i + 0.5) != 7) { printf("FAIL i2d: %d\n", (int)((double)i+0.5)); fails++; }
-    volatile double g = 9.0;
     if ((int)(double)123 != 123) { printf("FAIL si2d\n"); fails++; }
     /* int32 -> double -> 截断回 int */
     if ((int)(double)(-5) != -5) { printf("FAIL neg_si2d\n"); fails++; }
@@ -108,6 +108,67 @@ int main(void) {
     {
         volatile float sq = 25.0f;
         if ((int)__builtin_sqrtf(sq) != 5) { printf("FAIL sqrt_f\n"); fails++; }
+    }
+
+    /* 数学函数：分两类（分界 = musl 实现体是否会被 instcombine 折叠回同名 intrinsic）。
+       - floor/ceil/trunc/round：musl libm 提供（与 sin/cos/exp 一致），不走 VM 编号。
+         intrinsic 形式由 BpfSoftFp lower 成普通 libcall（call @floor），libcall 形式
+         原样穿透，两条路径都由 libc.a 解析。
+       - fabs/copysign：musl 体是一条位运算会被 instcombine 折叠，走 libcall 会自递归，
+         故保留为 VM 虚拟指令（与 sqrt 同列）。intrinsic 与 libcall 形式都被 pass 拦截
+         改写成 BPF_FP_FABS/COPYSIGN。
+       下面分别用 __builtin_*（intrinsic 路径）和直接调用（libcall 路径）覆盖两类。*/
+    {
+        volatile double dx = -3.7;
+        volatile double dy = 2.5;
+        volatile float fx = -3.7f;
+        volatile float fy = 2.5f;
+
+        /* —— floor/ceil/trunc/round：intrinsic→libcall + libcall 直穿，均经 musl —— */
+        if ((int)__builtin_floor(dx) != -4) { printf("FAIL floor_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_ceil(dx) != -3) { printf("FAIL ceil_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_trunc(dx) != -3) { printf("FAIL trunc_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_round(dx) != -4) { printf("FAIL round_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_floorf(fx) != -4) { printf("FAIL floor_f_intrinsic\n"); fails++; }
+        if ((int)__builtin_ceilf(fx) != -3) { printf("FAIL ceil_f_intrinsic\n"); fails++; }
+        if ((int)__builtin_truncf(fx) != -3) { printf("FAIL trunc_f_intrinsic\n"); fails++; }
+        if ((int)__builtin_roundf(fx) != -4) { printf("FAIL round_f_intrinsic\n"); fails++; }
+        if ((int)floor(dx) != -4) { printf("FAIL floor_d_libcall\n"); fails++; }
+        if ((int)ceil(dx) != -3) { printf("FAIL ceil_d_libcall\n"); fails++; }
+        if ((int)trunc(dx) != -3) { printf("FAIL trunc_d_libcall\n"); fails++; }
+        if ((int)round(dx) != -4) { printf("FAIL round_d_libcall\n"); fails++; }
+        if ((int)floorf(fx) != -4) { printf("FAIL floor_f_libcall\n"); fails++; }
+        if ((int)ceilf(fx) != -3) { printf("FAIL ceil_f_libcall\n"); fails++; }
+
+        /* —— fabs/copysign：intrinsic + libcall 都被拦截到 VM 虚拟指令 ——
+           copysign(x,y): 取 y 的符号、x 的绝对值。
+           copysign(-3.7, 2.5)=+3.7；copysign(2.5, -3.7)=-2.5；copysign(2.5f, -3.7f)=-2.5 */
+        if ((int)__builtin_fabs(dx) != 3) { printf("FAIL fabs_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_fabsf(fx) != 3) { printf("FAIL fabs_f_intrinsic\n"); fails++; }
+        if ((int)__builtin_copysign(dx, dy) != 3) { printf("FAIL copysign_d_intrinsic\n"); fails++; }
+        if ((int)__builtin_copysign(dy, dx) != -2) { printf("FAIL copysign_d_neg_intrinsic\n"); fails++; }
+        if ((int)fabs(dx) != 3) { printf("FAIL fabs_d_libcall\n"); fails++; }
+        if ((int)fabsf(fx) != 3) { printf("FAIL fabs_f_libcall\n"); fails++; }
+        if ((int)copysign(dy, dx) != -2) { printf("FAIL copysign_d_libcall\n"); fails++; }
+        if ((int)copysignf(fy, fx) != -2) { printf("FAIL copysign_f_libcall\n"); fails++; }
+
+        /* —— IEEE754 边界：符号位精确性（double 位模式按位验，避开截断丢符号）——
+           这是 inline 位运算与硬件 fabs/copysign 最容易分叉的点：必须正确传递
+           ±0.0 的符号位、保留 NaN payload。通过 union 读 64 位位模式查最高位。 */
+        volatile double posz = 0.0, negz = -0.0;
+        union { double d; uint64_t i; } u;
+        /* fabs(-0.0) = +0.0：符号位清零 */
+        u.d = __builtin_fabs(negz);
+        if (u.i & 0x8000000000000000ULL) { printf("FAIL fabs_neg0_sign\n"); fails++; }
+        /* copysign(+0.0, -1.0) = -0.0：符号位置位（验证 y 的符号传到 x=0） */
+        u.d = copysign(posz, dx);
+        if (!(u.i & 0x8000000000000000ULL)) { printf("FAIL copysign_neg0_sign\n"); fails++; }
+        /* copysign(-3.7, NaN) = +3.7：NaN 当作正号（符号位 0）→ 结果正 */
+        {
+            volatile double nan_v = __builtin_nan("");
+            u.d = copysign(dx, nan_v);
+            if (u.i & 0x8000000000000000ULL) { printf("FAIL copysign_nan_sign\n"); fails++; }
+        }
     }
 
     /* 无符号整型 ↔ 浮点转换。这是 x86 与 aarch64 行为最容易分叉的一组：

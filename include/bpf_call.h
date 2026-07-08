@@ -197,6 +197,10 @@ enum bpf_fp_op {
     //   等谓词必须配合 UNORD 才能精确还原 IEEE754 比较（见 BpfSoftFp 的 fcmp 处理）。
     BPF_FP_UNORD_F,     // float  无序判定（__unordsf2）
     BPF_FP_UNORD_D,     // double 无序判定（__unorddf2）
+    BPF_FP_FABS_F,      // float  fabs（一元）
+    BPF_FP_FABS_D,      // double fabs
+    BPF_FP_COPYSIGN_F,  // float  copysign（二元）
+    BPF_FP_COPYSIGN_D,  // double copysign
 };
 
 #endif //BPF_CALL_H

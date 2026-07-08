@@ -223,8 +223,9 @@ private:
     void fmov_x_from_v(uint8_t rd, uint8_t vn, bool is_double);  // Xd <- Vn 位模式
     // 标量算术：FADD/FSUB/FMUL/FDIV  (ftype 0F 00..0C Rm Ra Rd)
     void fp_alu(uint8_t op2, uint8_t rd, uint8_t rn, uint8_t rm, bool is_double);
-    // 取负 / 平方根：FNEG/FSQRT  (ftype 1x 10000 .. Rn Rd)
+    // 取负 / 绝对值 / 平方根：FNEG/FABS/FSQRT  (ftype 1x 10000 .. Rn Rd)
     void fp_neg(uint8_t rd, uint8_t rn, bool is_double);
+    void fp_abs(uint8_t rd, uint8_t rn, bool is_double);
     void fp_sqrt(uint8_t rd, uint8_t rn, bool is_double);
     // 类型转换：FCVT S/D 互转  (0001 1110 0110 0x11 10000 Rn Rd)
     void fp_cvt_sd(uint8_t rd, uint8_t rn, bool to_double);  // to_double: f->d, 否则 d->f

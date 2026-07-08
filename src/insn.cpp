@@ -9,6 +9,7 @@
 #include "jit/jit.h"
 #include "include/auxv.h"
 #include <cstring>
+#include <cmath>
 
 #if defined(__x86_64__)
 #include "jit/jit_compiler.h"
@@ -507,6 +508,11 @@ bool vm::do_softfp(uint32_t call) {
         r(0) = (a != a || b != b) ? 1ULL : 0ULL;
         return true;
     }
+    // fabs/copysign：musl 实现体是一条位运算，会被 instcombine 折叠回同名 intrinsic，
+    case BPF_FP_FABS_D: r(0) = d_out(std::fabs(d_in(a_bits))); return true;
+    case BPF_FP_FABS_F: r(0) = (uint64_t)f_out(std::fabs(f_in(a_bits))); return true;
+    case BPF_FP_COPYSIGN_D: r(0) = d_out(std::copysign(d_in(a_bits), d_in(b_bits))); return true;
+    case BPF_FP_COPYSIGN_F: r(0) = (uint64_t)f_out(std::copysign(f_in(a_bits), f_in(b_bits))); return true;
     default:
         r(0) = -ENOSYS;
         return true;
