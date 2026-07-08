@@ -187,6 +187,12 @@ bool PosixSyscall::do_clone(vm* v) {
             }
             child->addmem(std::move(child_map));
         }
+        /* fork（非 CLONE_VM）时 emutls 副本段也随 maps 走 CoW（PF_W 段已建 cow_data）。
+         * 把父的 emutls_slots_ 直接复制给子：子的 slot 指向同一 guest 地址（同一 CoW
+         * 共享页），子进程写 TLS 时 mmu_w 触发 CoW 分配独立页，达到"子继承父的 TLS
+         * 当前值、之后各自独立"的 fork 语义。CLONE_THREAD（线程）不进此分支，每线程
+         * 的 slots 本就独立。 */
+        emutls_slots(child.get()) = emutls_slots(v);
     }
     if(share_vm) {
         v->flush_tlb();
