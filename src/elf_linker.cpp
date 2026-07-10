@@ -423,13 +423,21 @@ private:
     };
     SegInfo segs_[3];
 
-    // .init_array/.fini_array 拼接后的边界 guest vaddr（layout_segments 填充，
-    // define_init_fini_symbols 合成 __init_array_start/end 等符号用）。
-    // 无对应 section 时 start==end==0（musl 循环空转，向后兼容）。
-    uint64_t init_array_start_vaddr_ = 0;
-    uint64_t init_array_end_vaddr_ = 0;
-    uint64_t fini_array_start_vaddr_ = 0;
-    uint64_t fini_array_end_vaddr_ = 0;
+    // .init_array/.fini_array 拼接区间的边界（layout_segments 填充）。
+    // present 表示对应 section 存在；空时 define_init_fini_symbols 不合成边界符号——
+    // 留给 musl 的 weak UND 引用走标准 ld 语义（解析到 libc.so 的真实定义，或静态/动态
+    // 链接器把 weak UND 解析为 0）。否则合成为 GLOBAL ABS、值为 0 的符号会被 musl ldso
+    // 的 find_sym2 当「st_value==0 跳过」而报 symbol not found（见 dynlink.c 的
+    // `if (!sym->st_value) continue`），且与 libc.so 自身的 musl 定义重复污染符号表。
+    struct InitFiniArray {
+        uint64_t start = 0;   // 首 section 的 guest_addr
+        uint64_t end = 0;      // 末 section 的 guest_addr + size
+        bool present = false;  // 是否存在对应 section（即使 size==0 也为 true）
+        uint64_t size() const { return end - start; }
+        bool empty() const { return end <= start; }  // size==0（含无 section）
+    };
+    InitFiniArray init_array_;
+    InitFiniArray fini_array_;
 
     // 合成全局符号（name → guest vaddr）：__init_array_start/end、__fini_array_*、
     // __dso_handle 等。resolve_symbol 先查这里；build_static/dynamic_symtab 会遍历
@@ -718,20 +726,8 @@ public:
         // 边界 = 第一个 section 的 guest_addr .. 最后一个的 guest_addr + size。
         // 空区间显式判 .empty()（不依赖「首地址非 0」哨兵——PIE 或 fixed_base=0 下
         // 首地址可能合法地为 0，用哨兵会静默把真区间当空区间）。
-        init_array_start_vaddr_ = init_array_end_vaddr_ = 0;
-        fini_array_start_vaddr_ = fini_array_end_vaddr_ = 0;
-        if (!data_init.empty()) {
-            LoadedSection& first = objects_[data_init.front().first].sections[data_init.front().second];
-            LoadedSection& last  = objects_[data_init.back().first].sections[data_init.back().second];
-            init_array_start_vaddr_ = first.guest_addr;
-            init_array_end_vaddr_   = last.guest_addr + last.size;
-        }
-        if (!data_fini.empty()) {
-            LoadedSection& first = objects_[data_fini.front().first].sections[data_fini.front().second];
-            LoadedSection& last  = objects_[data_fini.back().first].sections[data_fini.back().second];
-            fini_array_start_vaddr_ = first.guest_addr;
-            fini_array_end_vaddr_   = last.guest_addr + last.size;
-        }
+        init_array_ = compute_array_boundary(data_init);
+        fini_array_ = compute_array_boundary(data_fini);
         if (g_debug) {
             std::cerr << "[elf_linker] segments:";
             for (int c = 0; c < 3; c++) {
@@ -744,12 +740,32 @@ public:
         }
     }
 
+    // 按 (obj_idx, sec_idx) 列表计算拼接区间的边界 [首 guest_addr, 末 guest_addr+size]。
+    // 列表空时返回 present=false（start/end 保持 0）。
+    InitFiniArray compute_array_boundary(const std::vector<std::pair<size_t,size_t>>& secs) const {
+        InitFiniArray b;
+        if (secs.empty()) return b;
+        const LoadedSection& first = objects_[secs.front().first].sections[secs.front().second];
+        const LoadedSection& last  = objects_[secs.back().first].sections[secs.back().second];
+        b.start = first.guest_addr;
+        b.end = last.guest_addr + last.size;
+        b.present = true;
+        return b;
+    }
+
     // 合成 .init_array/.fini_array 边界符号 + __dso_handle。
+    // 仅当对应 section 存在时合成——空时保留 musl 的 weak UND 引用，交由链接器/ldso
+    // 走标准语义解析（合成为值为 0 的 ABS 符号会被 musl ldso 当 st_value==0 跳过而报
+    // symbol not found，dynamic busybox 即此回归）。
     void define_init_fini_symbols() {
-        synthetic_globals_["__init_array_start"] = init_array_start_vaddr_;
-        synthetic_globals_["__init_array_end"]   = init_array_end_vaddr_;
-        synthetic_globals_["__fini_array_start"] = fini_array_start_vaddr_;
-        synthetic_globals_["__fini_array_end"]   = fini_array_end_vaddr_;
+        if (init_array_.present) {
+            synthetic_globals_["__init_array_start"] = init_array_.start;
+            synthetic_globals_["__init_array_end"]   = init_array_.end;
+        }
+        if (fini_array_.present) {
+            synthetic_globals_["__fini_array_start"] = fini_array_.start;
+            synthetic_globals_["__fini_array_end"]   = fini_array_.end;
+        }
         // __dso_handle 已在 check_undefined_symbols 之前合成（不依赖 layout）。
     }
 
@@ -1916,14 +1932,14 @@ private:
         // 全局构造/析构函数指针表。值是段内 guest vaddr（基址=0，layout_segments 后已就绪，
         // 与 DT_PLTGOT 同源——都是 SEG_DATA 段内 section，不进 backfill_dynamic_vaddrs，
         // 也不写占位 0）。loader 用 load_base + d_val 定位。
-        // 用 end > start 判非空：PIE/fixed_base=0 下首地址可能合法为 0，不能用 != 0。
-        if (init_array_end_vaddr_ > init_array_start_vaddr_) {
-            add_dyn(DT_INIT_ARRAY,   init_array_start_vaddr_);
-            add_dyn(DT_INIT_ARRAYSZ, init_array_end_vaddr_ - init_array_start_vaddr_);
+        // 用 !empty() 判非空（size>0）：PIE/fixed_base=0 下首地址可能合法为 0，不能用 != 0。
+        if (!init_array_.empty()) {
+            add_dyn(DT_INIT_ARRAY,   init_array_.start);
+            add_dyn(DT_INIT_ARRAYSZ, init_array_.size());
         }
-        if (fini_array_end_vaddr_ > fini_array_start_vaddr_) {
-            add_dyn(DT_FINI_ARRAY,   fini_array_start_vaddr_);
-            add_dyn(DT_FINI_ARRAYSZ, fini_array_end_vaddr_ - fini_array_start_vaddr_);
+        if (!fini_array_.empty()) {
+            add_dyn(DT_FINI_ARRAY,   fini_array_.start);
+            add_dyn(DT_FINI_ARRAYSZ, fini_array_.size());
         }
         add_dyn(DT_NULL, 0);
         out.dynamic_idx = extras.size();

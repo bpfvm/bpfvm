@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+永远不要使用git checkout, 只能使用git stash作为替代
+
 ## Project Structure & Module Organization
 - `main.cpp`: VM entry point, command-line parsing, signal setup.
 - `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, TLB, and instruction definitions.
@@ -38,7 +40,7 @@
 - `./build/bpfvm_test` — run the unit test executable (see `insn_test.cpp`).
 - `cd build && ctest -j4` — run CTest with parallel jobs; tests are independent, so always pass `-j4` to run them concurrently instead of serially.
 - `make -C test` — build BPF test programs into `.out` files using `clang` and `bpfvm-ld`.
-- `./build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
+- `./scripts/build_root.sh` — build demo rootfs (`dash` + `sbase`) and install to `root/bin` (requires `clang`, `gcc`, and `libelf`).
 - Disassemble BPF ELF binaries with `bpf-objdump` (from `binutils-bpf`), e.g. `bpf-objdump -d foo.out`. Prefer it over plain `objdump`, which does not understand the BPF target.
 
 ## Coding Style & Naming Conventions
@@ -112,7 +114,7 @@ Segments are page-aligned and non-overlapping in the guest address space.
 Entry symbol defaults to `_start` (standard `ld` behavior); override with `-e <name>` / `--entry <name>`.
 
 ### Debug Info (DWARF)
-By default `bpfvm-ld` preserves DWARF debug sections (`.debug_info`, `.debug_line`, `.debug_str`, `.debug_abbrev`, `.debug_addr`, `.debug_frame`, ...) in the output as **non-ALLOC `SHT_PROGBITS`** sections, matching standard `ld` behavior. Compile with `-g` (already on in `test/Makefile`, `build_root.sh`, `build_busybox.sh`) and the linked binary carries full source-level debug info:
+By default `bpfvm-ld` preserves DWARF debug sections (`.debug_info`, `.debug_line`, `.debug_str`, `.debug_abbrev`, `.debug_addr`, `.debug_frame`, ...) in the output as **non-ALLOC `SHT_PROGBITS`** sections, matching standard `ld` behavior. Compile with `-g` (already on in `test/Makefile`, `scripts/build_root.sh`, `scripts/build_busybox.sh`) and the linked binary carries full source-level debug info:
 
 ```bash
 bpfvm-ld -static foo.o -l:libc.a -o foo.linked     # .debug_* kept (default)
@@ -154,7 +156,7 @@ This is split across **three** layers (no guest-side glue):
 
 **What still needs care:**
 *   `long double` == `double` (64-bit) on this target; code using 128-bit `long double` precision should be converted to `double` (see e.g. `log_10_2` in `_PDCLIB_print_fp_deci.c`).
-*   Only `sqrt` is softened among the math intrinsics so far; `fabs`/`copysign`/`floor`/`ceil`/… are trivial to add by extending the `IntrinsicInst` handler in `passes/BpfSoftFp.cpp`.
+*   **Math functions: split between musl libm and VM virtual instructions, with the dividing line = whether the musl body survives `instcombine`.** `floor`/`ceil`/`trunc`/`round` (+ `sin`/`cos`/`exp`/`log`/`pow`/...) come from musl's `src/math/*.c` (generic pure-C; BPF has no arch specialization); the `BpfLibcallLower` pass lowers their *intrinsic* forms (`@llvm.floor`, ...) into plain libcalls (`call @floor`/`floorf`) and lets libcall forms pass through untouched for libc to resolve. `sqrt`/`fabs`/`copysign` stay VM virtual instructions (`BPF_FP_SQRT_*`/`FABS_*`/`COPYSIGN_*`): `sqrt` because the JIT emits a single native hardware instruction (`sqrtsd`/`fsqrt`); `fabs`/`copysign` because their musl bodies are a single bitwise `and`/`or` that `-O1` instcombine folds *back* into the same-name intrinsic (`@llvm.fabs`), so lowering them to `call @fabs` would recurse infinitely (`fabs` calling itself) — keeping them as VM instructions sidesteps the recursion without bespoke inline-bit-twiddling logic in the pass. All three (`sqrt`/`fabs`/`copysign`) have native JIT cases in both `emit_call_softfp` emitters (x86: `sqrtsd`/`andps`/`orps` on xmm; AArch64: `FSQRT`/`FABS` for sqrt/fabs, GPR `and`/`or` bitmask for copysign — it has no single native FP instruction), so they never fall back to the interpreter. Both their intrinsic and libcall forms are intercepted by `BpfSoftFp` and rewritten to the corresponding `BPF_FP_*`. The VM virtual-instruction set thus stays: ISA primitives without a libc counterpart (arithmetic/compare/convert) + `sqrt` + `fabs`/`copysign` + emutls.
 
 ### 2. Function Call Conventions
 
@@ -167,9 +169,13 @@ The native BPF calling convention has three strict limits:
 **Solution: BpfWideArgs pass**
 This project ships an LLVM pass plugin (`src/passes/BpfWideArgs.cpp`) that transparently lifts **all three** limits at compile time, so you can write **standard C** with arbitrary numbers of arguments, struct returns, and `...` variadic functions. It is auto-built into `build/libBpfWideArgs.so` when LLVM dev headers are present, and auto-injected by `bpf-toolchain.cmake` / `test/Makefile`.
 
-**How it works** (see `src/passes/BpfWideArgs.cpp`) — the three transforms are independent and composable (e.g. a 6-arg function returning a struct is supported):
+**How it works** (see `src/passes/BpfWideArgs.cpp`) — the four transforms are independent and composable (e.g. a 6-arg function returning a struct is supported):
 *   **>5 arguments:** the pass packs the 5th argument onward into a `__bpf_pack_<func>` struct, passed via a pointer in `r5`. The caller allocates the struct on the stack (re-entrancy/recursive safe); the callee loads the extra args at entry. Thus registers `r1`–`r4` hold the first four scalar args, and `r5` is the pack pointer.
 *   **Struct returns:** LLVM already lowers `struct` returns to the `sret` pointer convention (`void f(ptr sret, ...)`); the pass simply strips the `sret` attribute the BPF backend rejects. Semantics are unchanged.
+*   **By-value struct parameters:** clang lowers C++ by-value aggregate parameters in two ways, and `lowerAggregateParams` normalizes both to a plain `ptr` (1 register each):
+    *   **Large aggregates (≥3 words, e.g. `std::string` 24B):** clang already emits `ptr byval(%T) align N` — the caller memcpys the argument into a stack temporary and passes its pointer, the callee uses it as a plain pointer (`getelementptr`/`load`). The BPF backend rejects the `byval` attribute ("pass by value not supported"), so the pass strips `byval` from every function signature and call site (covering direct/indirect calls and external callees). No type/body change — the parameter is already a pointer.
+    *   **Small aggregates (≤2 words, e.g. `std::pair`=`{i64,i64}`, `__bit_iterator`=`[2 x i64]`, `i128`):** clang uses the aggregate **value type** directly as the parameter type (no `byval`). The BPF backend expands this into multiple registers per element/field, so `f(__bit_iterator, __bit_iterator, value, proj)` = 2+2+1+1 = 6 registers > the 5-register limit → "too many arguments". The pass rebuilds the signature to a plain `ptr`, moves the body, inserts an entry `load`, and at each call site stores the aggregate argument into a fresh entry-block alloca and passes its pointer.
+    Semantics are unchanged either way (by-value = caller hands callee an independent copy); the per-call-site copy is preserved (the optimizer can't prove the callee won't write through the now-unattributed pointer, so it conservatively keeps it). This unlocks `f(std::string)` / `f(std::vector)` / `f(std::pair)` / any by-value aggregate — previously rejected.
 *   **Variadic functions** — clang's native `VoidPtrBuiltinVaList` is used, where `va_list` is a single `void*` pointing at the first vararg:
     *   **Callee rewrite:** `R f(T0..Tn, ...)` → `R f(T0..Tn, ptr __va_base)`. `__va_base` points to a caller-allocated memory region holding the varargs. Function prototypes (declarations) are rewritten the same way.
     *   **Caller rewrite:** each call site allocates a `__bpf_vapack_<func>` struct on the entry stack (packed, each slot sized by `allocSize(T)`), stores the variadic arguments into it, and passes its address as `__va_base`.
@@ -235,6 +241,88 @@ Varargs can be emulated entirely in the headers with a pseudo-`va_list` that the
     })
     ```
 
+### 4. C++ Support (Language Subset)
+
+The BPF VM supports a **C++ language subset**: programs compiled with `clang++ -target bpf -fno-exceptions -frtti`, using musl's C runtime via `extern "C"` and **libc++** (`libcxx.a`/`libcxx.so`) for the C++ standard library. Verified end-to-end by `test/test_cpp_lang.cpp` (5 ctest variants: static/dynamic × JIT/interp + host); STL coverage by the `test/test_stl_*.cpp` suite.
+
+**What works without a C++ runtime** (bare language subset):
+- Templates, classes/structs, constructors/destructors, single inheritance, virtual functions (vtable dispatch).
+- Namespaces, `constexpr`, function overloading, references, `auto`, lambdas (with capture).
+- `operator new` / `operator delete` backed by musl `malloc`/`free` (define them in the `.cpp`; mangles to `_Znwm`/`_ZdlPv`, resolves without a C++ runtime library).
+
+**STL via libc++** (`libcxx.a`/`libcxx.so`, built by `scripts/build_libcxx.sh`): the standard library works, including RTTI (`typeid`/`dynamic_cast`) and `<thread>`/`<mutex>`/`<future>` (libc++ pthread backend over musl pthread).
+
+**Verified compile-time limitations** (clang 19, `-target bpf -fno-exceptions -frtti`):
+- `throw` / `try`: `error: cannot use 'throw'/'try' with exceptions disabled`. RTTI **is** enabled, so `dynamic_cast` and `typeid` work (see `test/test_stl_rtti.cpp`); only reference-`dynamic_cast` failure (`bad_cast`) is unavailable because it requires exceptions.
+
+**Hard constraints to respect when writing C++ for this target**:
+- **No exceptions**: `throw`/`try` rejected at compile time (no `__cxa_throw`/`__cxa_personality`/libunwind ported). RTTI is enabled; `typeid`/`dynamic_cast` are available.
+- **`thread_local` via `address_space(256)`** (see "Emulated TLS" below): the C++ `thread_local` keyword is rejected by clang's Sema for the BPF target (cannot be bypassed with `-femulated-tls`); use the `__mythread` macro instead.
+- **No `&thread_local_var`**: taking the address of an emutls variable is a compile error (different address spaces); access the variable directly.
+
+**Global ctors/dtors**: supported via the `.init_array`/`.fini_array` framework in `bpfvm-ld` (see `src/elf_linker.cpp`). Global objects with non-trivial constructors/destructors work: ctors run before `main` (in definition order), dtors run at `exit` (reverse order, via `__cxa_atexit` registered in `_GLOBAL__sub_I_*`). Verified by `test/test_cpp_ctor.cpp`.
+
+**Build integration** (see `test/Makefile`):
+- `test/test_cpp_*.cpp` is auto-discovered; the `CXX_FLAGS` mirror the C `CC_FLAGS` (same target/CPU/stack-size/isystem/pass-plugin flags) plus `-std=c++23 -nostdinc++ -fno-exceptions -frtti` and libc++ bypass macros (`-D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC -D_LIBCPP_HAS_NO_INT128 ...`). The C++ pass plugins (`libBpfWideArgs.so`/`libBpfSoftFp.so`/`libBpfLibcallLower.so`/`libBpfEmutls.so`) are injected alongside the C ones.
+- C++ tests link `libcxx.a` (static `.out`) or `libcxx.so` (dynamic `.linked`), both produced by `scripts/build_root.sh`'s `build_libcxx` (`scripts/build_libcxx.sh` → `libcxx.a`; `bpfvm-ld -shared` → `libcxx.so`, `DT_NEEDED libc.so`). C tests stay free of any libcxx dependency.
+- C++ tests run the same 5 ctest variants as C tests via `cmake/RunBpfProgram.cmake`.
+- musl `libc.a` provides **no** C++ ABI symbols (only C-style `__cxa_atexit`/`__cxa_finalize`); the C++ runtime — `operator new`/`delete`, libc++abi typeinfo vtables + `__dynamic_cast` + `__cxa_*`, and the libc++ library itself — comes from `libcxx.a`/`libcxx.so`.
+
+#### Emulated TLS (emutls) via `address_space(256)`
+
+Per-thread storage is supported through a macro + an LLVM pass + a VM runtime, reusing the FP virtual-instruction channel (`src_reg=2`).
+
+**Usage**:
+```cpp
+#ifdef __BPF__
+#define __mythread __attribute__((address_space(256)))
+#else
+#define __mythread thread_local   // host baseline
+#endif
+
+__mythread int counter = 0;          // zero-init
+__mythread int init_val = 42;        // non-zero init (template-copied on first access)
+__mythread int arr[4] = {1,2,3,4};   // arrays (GEP access supported)
+struct Point { int x; int y; };
+__mythread Point pt = {1, 2};        // structs (field access supported)
+```
+On the host, `__mythread` expands to real `thread_local`, so the same source serves as a baseline in the `host` ctest variant.
+
+**Mechanism** (mirrors the `BpfSoftFp` architecture; see `src/passes/BpfEmutls.cpp`):
+1. clang emits `addrspace(256)` globals + `load/store/GEP ... ptr addrspace(256)` — this completely bypasses Sema's `thread_local` rejection (BPF.h: `TLSSupported=false`) and the BPF backend's `GlobalTLSAddress` ISel crash.
+2. The `BpfEmutls` pass (loaded via `-fpass-plugin=libBpfEmutls.so`, runs at `PipelineStartEPCallback`) rewrites every access to an `addrspace(256)` global into:
+   - a control block `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value }` (init template pointer is null for zero-init, else points to a copied `@__emutls_t.<name>` template);
+   - a call `__bpf_fp_<EMUTLS_ID>(i64 ctrl_ptr)` returning the per-thread address (the call is emitted as `extern __ksym`, section `.ksyms`).
+3. The linker needs **no change**: `__bpf_fp_<ID>` is already recognized by `is_fp_ksym`, which rewrites the call to `src_reg=2` + `imm=<ID>`. `BPF_FP_EMUTLS_GET_ADDR` is the ID (in `include/bpf_call.h`, appended to `bpf_fp_op`).
+4. `vm::do_softfp` dispatches `BPF_FP_EMUTLS_GET_ADDR` (`src/insn.cpp`): reads the control block from `r1`, lazily allocates a per-thread slot in `vm::emutls_slots_` (each slot is a fresh `mmap` registered as a `memmap` in the guest address space), copies the init template on first access, and returns the guest address in `r0`. Each VM (= each thread) has its own `emutls_slots_`, so isolation is automatic — no `pthread_key` needed.
+5. JIT: `emit_call_softfp` returns false for `BPF_FP_EMUTLS_GET_ADDR`, falling back to `emit_call_softfp_slow` → `helper_do_softfp` → `do_softfp`. No JIT emitter change needed.
+
+**Limitations**:
+- Trivially-destructible types only (no `__cxa_thread_atexit` for `thread_local` destructors yet).
+- `&var` is a compile error (address-space mismatch); access the variable directly.
+- Each TLS variable currently allocates a full 4 KiB page (no slab/arena yet).
+- TLS variables must be defined and used within a single translation unit; cross-TU `extern __mythread` is not supported (the control block `__emutls_v.<name>` uses internal linkage).
+
+**Fork semantics**: a child created via `fork()` (clone without `CLONE_VM`) inherits the parent's current TLS values (the parent's `emutls_slots_` is copied; each slot's guest page is CoW-shared, so writes by either side trigger CoW and diverge). Threads (`pthread_create`, clone with `CLONE_VM`) each get independent slots (no inheritance — standard `thread_local` semantics).
+
+**Roadmap** (gated, each stage widens what's usable):
+1. ✅ Language subset (this section).
+2. ✅ Emulated TLS via `address_space(256)` (this subsection; `test/test_cpp_tls.cpp`).
+3. ✅ Global ctors/dtors via `.init_array`/`.fini_array` (this subsection; `test/test_cpp_ctor.cpp`).
+4. ✅ STL via libc++ + `libcxx.a`/`libcxx.so` (the `test/test_stl_*.cpp` suite). The standard library works (containers, algorithms, `<iostream>`, `<regex>`, `<thread>`/`<mutex>`/`<future>`, `<filesystem>`, RTTI). Mechanism: `lowerAggregateParams` (by-value aggregate params → ptr) + `BpfAtomicLowerPass` (lower plain atomic load/store — eBPF ISA has only RMW atomics; unlocks static guards in locale/iostream) + `BpfByvalTmpPass` (≤8B by-value unique_ptr double-free fix; avoids clobbering iostream locals like sentry/ostringstream) + `BpfLibcallLower` (memcpy/memmove/memset/trap + floor/ceil/trunc/round → musl calls) + libc++ pthread backend over musl pthread + `uncaught_exceptions` stub override.
+
+#### Global ctors/dtors via `.init_array`/`.fini_array`
+
+Global objects with non-trivial constructors/destructors are supported through linker-synthesized symbols, reusing musl's existing `__libc_start_init` / `__libc_exit_fini` loops — **no loader/VM change**.
+
+**Mechanism** (see `src/elf_linker.cpp`):
+1. clang emits `.init_array` (SHT_INIT_ARRAY) holding function pointers (`_GLOBAL__sub_I_*`), each of which constructs one global object and registers its destructor via `__cxa_atexit(dtor, obj, __dso_handle)`.
+2. `bpfvm-ld` collects `.init_array`/`.fini_array` sections into SEG_DATA (kept contiguous within the segment), and synthesizes four boundary symbols: `__init_array_start/end`, `__fini_array_start/end` (stored in `synthetic_globals_`, emitted to both `.symtab` and `.dynsym` as `SHN_ABS`). It also synthesizes `__dso_handle`.
+3. Static mode: function pointers in `.init_array` are patched at link time (R_BPF_64_ABS64). PIE mode: left as `.rela.dyn` entries, resolved by the loader at runtime (`_GLOBAL__sub_I_*` is a defined symbol in the main program, collected into `exports_`).
+4. musl's `__libc_start_main` → `__libc_start_init` iterates `[__init_array_start, __init_array_end)` calling each ctor; `exit` → `__libc_exit_fini` iterates `[__fini_array_start, __fini_array_end)` in reverse, plus the `__cxa_atexit` chain.
+
+**Ordering**: ctors run in definition order within a TU; dtors run in reverse order (LIFO), interleaved with `__cxa_atexit`-registered dtors. Cross-TU order follows link order (standard `ld` semantics, no guarantee).
+
 ## Default C Library (musl) & Optional PDCLib
 
 The default C library for BPF targets is **musl** (`musl/`). Build it with `sh musl/build.sh`; the `libc` symlink at the project root points to `musl/build/install`, so `-Ilibc/include` and `-Llibc/lib` resolve to musl's headers and `libc.a` (with crt merged in, containing `_start`).
@@ -242,7 +330,7 @@ The default C library for BPF targets is **musl** (`musl/`). Build it with `sh m
 ### Building musl (default)
 ```bash
 sh musl/build.sh          # → musl/build/install/{include,lib}
-./build_root.sh           # also runs build_musl + synthesizes libc.so
+./scripts/build_root.sh           # also runs build_musl + synthesizes libc.so (= ld-bpf.so, single binary; see below)
 ```
 
 ### Building PDCLib (optional alternative)
@@ -259,18 +347,20 @@ PDCLib is kept as an optional C library but is **not built by default**. To use 
 
 ## musl Porting (`musl/`)
 
-The project ships a port of musl 1.2.6 as the **default** C library for the BPF target. Build with `sh musl/build.sh` — produces `musl/build/install/lib/libc.a` (with `crt1.o`/`crti.o`/`crtn.o` merged in, so it contains `_start`) + standalone `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`, and headers in `musl/build/install/include/`. `test/Makefile` and `build_root.sh` build against this musl directly (static `.out` + dynamic `.linked`).
+The project ships a port of musl 1.2.6 as the **default** C library for the BPF target. Build with `sh musl/build.sh` — produces `musl/build/install/lib/libc.a` (with `crt1.o`/`crti.o`/`crtn.o` merged in, so it contains `_start`) + standalone `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`, and headers in `musl/build/install/include/`. `test/Makefile` and `scripts/build_root.sh` build against this musl directly (static `.out` + dynamic `.linked`).
 
 ### musl build (`musl/build.sh`)
-- **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (in `build_root.sh`'s `build_libc_bpfso`), not by musl's own build.
+- **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (in `scripts/build_root.sh`'s `build_libc_bpfso`), not by musl's own build.
 - **`-mllvm -bpf-stack-size=16384`**: musl's `crypt_blowfish` (`BF_crypt`) has ~8.5KB local structs; the default 4096 overflows.
 - **rcrt1.o / crti.o / crtn.o / Scrt1.o skipped**: `make install` compiles `rcrt1.o` (static PIE self-start, depends on `dlstart` dynamic linker logic — BPF can't support it; `_start_c` signature mismatch + `GETFUNCSYM` has no forward decl) and fails. The script builds **only `crt1.o`** via per-target `make obj/crt/crt1.o`. The other crt objects are unnecessary on BPF: `crti.o`/`crtn.o` compile to empty `.o` (BPF has no `.init_array`/`.fini_array` framework), and `Scrt1.o` is identical to `crt1.o` on BPF (clang always emits relocations for address refs, so `-fPIC` doesn't change the output). Headers are copied manually to `install/include/` (generic/bits first, then bpf/bits so BPF-specific overrides win).
 - **crt1 merged into libc.a**: BPF's `_start` lives in `crt1.o` (pure C, `arch/bpf/crt_arch.h`). The script runs `ar rcs lib/libc.a lib/crt1.o` so `libc.a` carries `_start` itself — like pdclib, linkers only pass `libc.a`/`libc.so` and need no separate crt files or ordering. `crt1.o` covers both static and PIE/.so modes (BPF `-fPIC` doesn't change crt1's output).
-- **install layout**: `install/{include,lib}` mirrors pdclib's layout so the project-root `libc` symlink abstracts the choice; `install/lib` holds `libc.a` (with crt1 merged) and `crt1.o`.
+- **ldso objects (`dlstart.lo`/`dynlink.lo`) built separately; merged with libc into one binary**: standard musl puts ldso code (`ldso/dlstart.c`, `ldso/dynlink.c`) into `libc.so`, not `libc.a` (statically-linked programs don't need a dynamic linker). Since BPF's `libc.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (not by musl's build), these objects would otherwise be lost. The script builds them via `make obj/ldso/dlstart.lo obj/ldso/dynlink.lo` and installs them alongside `libc.a`.
+- **`libc.so` == `ld-bpf.so` (single binary, mirrors upstream musl `libc.so` == `ld.so`)**: the ldso must function before any other library is relocated, so the libc it depends on (`malloc`/`memcpy`/TLS setup/`__libc_start_main`/...) must be linked into it — it cannot import these from a separate `libc.so`. `scripts/build_root.sh`'s `build_libc_bpfso` therefore builds **one** binary from `libc.a + dlstart.lo + dynlink.lo`, `--soname libc.so`, entry `_dlstart` (`-e _dlstart`), output to `libc/lib/libc.so`. `root/lib/libc.so` and `root/lib/ld-bpf.so` are both symlinks to this single file. This is not wasteful duplication: at runtime `load_library("libc.so")` hits the `is_self` short-circuit in musl's ldso (`ldso.name` is hardcoded to `"libc.so"` in `__dls2`, and `"libc"` is in the reserved-name table), so a program's `DT_NEEDED libc.so` reuses the already-mapped ldso rather than opening the file — a separate on-disk `libc.so` would be dead weight. The single file serves three paths: link-time (`-l:libc.so` reads its dynsym + `DT_SONAME=libc.so`), `DT_NEEDED libc.so` (→ `is_self`), and `PT_INTERP=/lib/ld-bpf.so` (VM loader resolves `ld-bpf.so`, entry = `load_base + e_entry` → `_dlstart`). ldso does its own stage-1 self-relocation (`_dlstart_c` in `dlstart.c`); the VM loader only mmaps segments + sets up auxv.
+- **install layout**: `install/{include,lib}` mirrors pdclib's layout so the project-root `libc` symlink abstracts the choice; `install/lib` holds `libc.a` (with crt1 merged), `crt1.o`, and the ldso objects `dlstart.lo`/`dynlink.lo`.
 
 ### Pass rebuild after `.so` changes
 **musl (Make, default) and pdclib (CMake, optional) do NOT track `libBpfWideArgs.so`/`libBpfSoftFp.so` timestamp changes** — they only look at `.c` source mtimes. After modifying either pass, force a full rebuild:
-- musl (default): `find musl/build/obj -name '*.o' -delete && sh musl/build.sh` (re-runs `make lib/libc.a` + crt + merge crt into libc.a + header/lib install), then `./build_root.sh` to regenerate `libc.so`.
+- musl (default): `find musl/build/obj -name '*.o' -delete && sh musl/build.sh` (re-runs `make lib/libc.a` + crt + merge crt into libc.a + ldso objects + header/lib install), then `./scripts/build_root.sh` to regenerate the merged `libc.so` (= `ld-bpf.so`) and its `root/lib/` symlinks.
 - pdclib (optional): `rm -rf pdclib/build`, then rebuild pdclib + `bpfvm-ld -shared` to regenerate `libc.so`.
 
 Skipping this reuses stale `.o` compiled with the old pass (a past incident: deleting `__va_arg` left old `.o` still referencing it, causing `_va_arg` undefined at link).
