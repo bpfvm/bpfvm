@@ -459,6 +459,14 @@ public:
 
     void set_soname(const std::string& s) { soname_ = s; }
     void set_entry_name(const std::string& e) { entry_name_ = e; }
+    // 是否需要 ELF header + phdr 表被映射进 guest（生成 PT_PHDR + 首段覆盖文件头）。
+    // 可执行文件（STATIC_EXE/DYNAMIC_EXE）总是需要（loader/crt 读 auxv AT_PHDR + __ehdr_start）。
+    // 普通 .so 不需要（VM loader 用 libelf 读文件，不读内存）。但 ldso 是"可执行的 .so"——
+    // 它的 guest 代码（__dls2 等）要读 __ehdr_start 定位自身 phdr/dynv，故也需映射 ELF header。
+    // 判据：SHARED_LIB 且显式指定了入口符号（-e _dlstart）即为 ldso。
+    bool need_ehdr() const {
+        return mode_ != Mode::SHARED_LIB || entry_name_ != "_start";
+    }
     void set_needed(std::vector<std::string> n) { needed_ = std::move(n); }
     void set_deps(std::vector<std::string> d) { dep_paths_ = std::move(d); }
     void set_archives(std::vector<std::string> a) { explicit_archives_ = std::move(a); }
@@ -612,6 +620,20 @@ public:
                 std::cerr << "[elf_linker] warning: entry symbol '" << entry_name_
                           << "' not found; e_entry will be 0\n";
             }
+        } else {
+            // SHARED_LIB：普通 .so 无入口（entry_ 保持 0）。但 ldso 是特殊的 .so——它需要
+            // e_entry 指向自身入口（_dlstart），供 VM 加载后从那里开始执行动态链接流程。
+            // 仅当显式指定 -e 且符号存在时设置，普通 .so（默认 _start 通常不在 .so 内）不受影响。
+            auto it = globals_.find(entry_name_);
+            if (it != globals_.end()) {
+                const auto& obj = objects_[it->second.obj_idx];
+                const auto& sym = obj.symbols[it->second.sym_idx];
+                const auto& sec = obj.sections[sym.sec_idx];
+                entry_ = sec.guest_addr + sym.value;
+                if (g_debug) std::cerr << "[elf_linker] entry: " << entry_name_
+                          << " @ 0x" << std::hex << entry_ << std::dec
+                          << " from " << obj.source << " (SHARED_LIB)\n";
+            }
         }
         return true;
     }
@@ -676,13 +698,10 @@ public:
             s.used = !s.secs.empty();
         }
         // vaddr 链式分配（页对齐，跳过空段）
-        // 可执行文件（STATIC_EXE + DYNAMIC_EXE）首段从 guest_base_+0x1000 开始预留 vaddr：
-        // 给 ELF header + phdr table（文件 offset [0, 0x1000)）让出位置。write_phdrs 会把
-        // 首段 p_offset 扩展到 0、p_vaddr 减 0x1000，让 phdr 表（vaddr 64）被首段 LOAD 覆盖
-        //（供 PT_PHDR），且模块从 guest_base_ 起、offset≡vaddr 严格成立。
-        //（SHARED_LIB 是 .so 无 PT_PHDR 需求，从 guest_base_ 起。）
+        // 所有模式首段都从 guest_base_+0x1000 起：给文件 offset [0, 0x1000)（ELF header +
+        // phdr table）让出 vaddr 空间。这保证任何 section 的 vaddr > 0。
         uint64_t cur = guest_base_;
-        if (mode_ != Mode::SHARED_LIB) cur += 0x1000;
+        cur += 0x1000;
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
             segs_[c].vaddr = cur;
@@ -1585,6 +1604,8 @@ private:
                 if (sym.defined || sym.name.empty()) continue;
                 if (sym.name == "_DYNAMIC") continue;  // 由 build_dynamic_sections 合成为 defined 符号
                 if (synthetic_globals_.count(sym.name)) continue;  // 已合成为 defined 符号
+                // 内部已定义（globals_ 里有）的符号不发 UND
+                if (globals_.find(sym.name) != globals_.end()) continue;
                 bool inserted = out.idx.find(sym.name) == out.idx.end();
                 if (inserted) {
                     out.idx[sym.name] = out.names.size();
@@ -1782,6 +1803,7 @@ private:
         reladyn.addralign = 8;
         reladyn.entsize = sizeof(Elf64_Rela);
         reladyn.link = extras_base + (Elf64_Word)out.dynsym_idx;
+        bool has_textrel = false;  // 是否有写到可执行段的重定位（lddw imm patch text）
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (const auto& r : objects_[oi].relocations) {
                 if (r.sym_idx >= objects_[oi].symbols.size()) continue;
@@ -1790,6 +1812,7 @@ private:
                 if (r.type == 10) continue;
                 const auto& target = objects_[oi].sections[r.target_sec];
                 if (!target.loadable) continue;
+                if (target.executable) has_textrel = true;
                 Elf64_Rela rela = {};
                 rela.r_offset = target.guest_addr + r.offset;
                 if (sym.defined) {
@@ -1808,6 +1831,24 @@ private:
                     rela.r_info = ELF64_R_INFO(si, r.type);
                     rela.r_addend = r.addend;
                 }
+                reladyn.data.insert(reladyn.data.end(), (uint8_t*)&rela, (uint8_t*)&rela + sizeof(rela));
+            }
+        }
+        // PLT 桩 lddw 重定位：每个桩的 lddw 指令（加载 GOT 槽地址）需运行期 patch 成
+        // base+槽vaddr。emit_plt_stub 在构建期把 lddw imm 写成槽的链接期 vaddr（相对基址），
+        // 这里为每个桩发射一条 type 1 (R_BPF_64_64)、sym_idx=0 的 .rela.dyn 条目：
+        //   r_offset = 桩地址，addend = GOT 槽 vaddr。
+        if (got_enabled_) {
+            for (const auto& sym : got_syms_) {
+                auto pe = plt_entries_.find(sym);
+                auto git = got_slots_.find(sym);
+                if (pe == plt_entries_.end() || git == got_slots_.end()) continue;
+                const LoadedSection& plt_sec = objects_[pe->second.obj_idx].sections[1];
+                const LoadedSection& got_sec = objects_[git->second.obj_idx].sections[1];
+                Elf64_Rela rela = {};
+                rela.r_offset = plt_sec.guest_addr + pe->second.offset;  // 桩 lddw 指令地址
+                rela.r_info = ELF64_R_INFO(0, 1);  // type 1, NULL 符号（本模块内部）
+                rela.r_addend = got_sec.guest_addr + git->second.offset;  // GOT 槽 vaddr
                 reladyn.data.insert(reladyn.data.end(), (uint8_t*)&rela, (uint8_t*)&rela + sizeof(rela));
             }
         }
@@ -1832,7 +1873,7 @@ private:
                 rela.r_offset = got_sec.guest_addr + it->second.offset;
                 auto dit = dynsym_idx.find(sym);
                 uint64_t si = (dit != dynsym_idx.end()) ? dit->second : 0;
-                rela.r_info = ELF64_R_INFO(si, 1);  // R_BPF_64_64：写 64 位绝对地址
+                rela.r_info = ELF64_R_INFO(si, 2);  // R_BPF_64_ABS64：8 字节平坦写（GOT 槽是数据槽，非 lddw 指令）
                 rela.r_addend = 0;
                 relaplt.data.insert(relaplt.data.end(), (uint8_t*)&rela, (uint8_t*)&rela + sizeof(rela));
             }
@@ -1865,11 +1906,24 @@ private:
         add_dyn(DT_RELA, 0);
         add_dyn(DT_RELASZ, extras[out.reladyn_idx].data.size());
         add_dyn(DT_RELAENT, sizeof(Elf64_Rela));
+        if (has_textrel) add_dyn(DT_TEXTREL, 0);
         if (got_enabled_ && out.relaplt_idx != SIZE_MAX) {
             add_dyn(DT_JMPREL, 0);
             add_dyn(DT_PLTRELSZ, extras[out.relaplt_idx].data.size());
             add_dyn(DT_PLTREL, DT_RELA);  // PLT 重定位类型 = RELA
             add_dyn(DT_PLTGOT, 0);
+        }
+        // 全局构造/析构函数指针表。值是段内 guest vaddr（基址=0，layout_segments 后已就绪，
+        // 与 DT_PLTGOT 同源——都是 SEG_DATA 段内 section，不进 backfill_dynamic_vaddrs，
+        // 也不写占位 0）。loader 用 load_base + d_val 定位。
+        // 用 end > start 判非空：PIE/fixed_base=0 下首地址可能合法为 0，不能用 != 0。
+        if (init_array_end_vaddr_ > init_array_start_vaddr_) {
+            add_dyn(DT_INIT_ARRAY,   init_array_start_vaddr_);
+            add_dyn(DT_INIT_ARRAYSZ, init_array_end_vaddr_ - init_array_start_vaddr_);
+        }
+        if (fini_array_end_vaddr_ > fini_array_start_vaddr_) {
+            add_dyn(DT_FINI_ARRAY,   fini_array_start_vaddr_);
+            add_dyn(DT_FINI_ARRAYSZ, fini_array_end_vaddr_ - fini_array_start_vaddr_);
         }
         add_dyn(DT_NULL, 0);
         out.dynamic_idx = extras.size();
@@ -1936,7 +1990,7 @@ private:
         // 不必依赖「phdr 表恰好被某个 PT_LOAD 覆盖」这类文件布局假设。这让 loader
         // 侧只有一条 phdr_addr 解析路径（见 elf_loader.cpp），无需 ET_EXEC/PIE 分支。
         //（SHARED_LIB 是 .so，无入口、不被 auxv 直接消费，不需要。）
-        if (mode_ != Mode::SHARED_LIB) { L.has_phdr = true; L.phnum += 1; }
+        if (need_ehdr()) { L.has_phdr = true; L.phnum += 1; }
         L.shnum = next_sh + (Elf64_Half)extras.size();  // NULL + 段secs + bss + extras
         L.shstrndx = extras_base + (Elf64_Half)shstrtab_idx;
 
@@ -1946,6 +2000,8 @@ private:
         uint64_t cur = L.seg_data_off;
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
+            // 段间文件 offset 按页对齐
+            cur = (cur + 0xFFF) & ~0xFFFULL;
             L.seg_file_off[c] = cur;
             cur += segs_[c].filesz;
         }
@@ -2158,6 +2214,11 @@ private:
         // 段数据：按段顺序拼接各 section（section 数据仍在 host pool 的 load 位置）
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
+            long now = ftell(f);
+            if ((uint64_t)now < L.seg_file_off[c]) {
+                std::vector<uint8_t> pad(L.seg_file_off[c] - now, 0);
+                if (fwrite(pad.data(), 1, pad.size(), f) != pad.size()) return false;
+            }
             uint64_t written = 0;
             for (const auto& pr : segs_[c].secs) {
                 const LoadedSection& ls = objects_[pr.first].sections[pr.second];
@@ -2527,10 +2588,12 @@ bool link_bpf_object(const std::vector<std::string>& inputs, const std::string& 
 
 bool link_bpf_shared(const std::vector<std::string>& inputs, const std::string& out_path,
                      const std::string& soname,
-                     const std::vector<std::string>& deps, bool keep_debug, bool keep_symtab) {
+                     const std::vector<std::string>& deps, bool keep_debug, bool keep_symtab,
+                     const std::string& entry_name) {
     Linker linker(Linker::Mode::SHARED_LIB);
     linker.set_soname(soname);
     linker.set_deps(deps);
+    linker.set_entry_name(entry_name);
     linker.set_keep_debug(keep_debug);
     linker.set_keep_symtab(keep_symtab);
     if (!linker.run(inputs)) return false;

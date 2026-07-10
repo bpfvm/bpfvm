@@ -44,8 +44,10 @@ foreach(v ${variants})
     else()
         set(ENV{JIT_ENABLE} "${jit_env}")
     endif()
-    # test/ 下可能含测试用 .so（如 GOT 的 libgot.so），加入库搜索路径
-    set(ENV{BPF_LIB_PATH} "${WORKDIR}/test")
+    # 运行时库搜索路径（bpfvm 自身与 guest ldso 都用 LD_LIBRARY_PATH 搜库）：
+    #   - root/lib：libc.so/libcxx.so（build_root.sh 复制到此，供 rootfs 与 ctest 共用）。
+    #   - test：测试用 .so（如 GOT 的 libgot.so，构建产物落在 test/ 下）。
+    set(ENV{LD_LIBRARY_PATH} "${WORKDIR}/root/lib:${WORKDIR}/test")
 
     if(label STREQUAL "host")
         # host 变体：直接运行宿主二进制，不经过 bpfvm。

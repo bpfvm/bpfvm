@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
             std::string base = (slash == std::string::npos) ? opt.output : opt.output.substr(slash + 1);
             soname = base;
         }
-        ok = link_bpf_shared(opt.inputs, opt.output, soname, resolved_libs, keep_debug, keep_symtab);
+        ok = link_bpf_shared(opt.inputs, opt.output, soname, resolved_libs, keep_debug, keep_symtab, opt.entry_name);
     }
 
     if (!ok) {

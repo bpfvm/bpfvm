@@ -1489,10 +1489,11 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         {AT_GID,      0},
         {AT_EGID,     0},
         {AT_SECURE,   0},
+        {AT_BASE,     info.ldso_base},  // 动态链接器加载基址（ldso 自举用）；静态为 0
         {AT_PHDR,     info.phdr},   // 主程序 program header table 运行时地址
         {AT_PHENT,    info.phent},  // 单个 phdr 大小
         {AT_PHNUM,    info.phnum},  // phdr 个数
-        {AT_ENTRY,    info.entry},  // 入口点
+        {AT_ENTRY, info.app_entry ? info.app_entry : info.entry},  // 入口点（ldso 模式为主程序入口，否则=info.entry）
         {AT_PLATFORM, 0},   // 回填
         {AT_EXECFN,   0},   // 回填
         {AT_RANDOM,   0},   // 回填

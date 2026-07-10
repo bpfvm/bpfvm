@@ -70,6 +70,17 @@ build_libc_bpfso() {
         "${ROOT_DIR}/libc/lib/libc.a" -o "${ROOT_DIR}/libc/lib/libc.so"
     mkdir -p "${ROOT_DIR}/root/lib"
     cp -f "${ROOT_DIR}/libc/lib/libc.so" "${ROOT_DIR}/root/lib/libc.so"
+
+    # 构建 ld-bpf.so（动态链接器/ldso）：musl 的 ldso 代码（dlstart.c/dynlink.c）不在
+    # libc.a 里（标准 musl 把它们放在 libc.so 而非 libc.a），由 musl/build.sh 单独编译成
+    # dlstart.lo/dynlink.lo 安装到 libc/lib/。此处从 libc.a + 这两个 .lo 合成 ldso，
+    # 入口符号 _dlstart（-e _dlstart）。
+    echo "Building ld-bpf.so..."
+    "${BPFVM_LD}" -shared --soname ld-bpf.so -e _dlstart \
+        "${ROOT_DIR}/libc/lib/libc.a" \
+        "${ROOT_DIR}/libc/lib/dlstart.lo" \
+        "${ROOT_DIR}/libc/lib/dynlink.lo" \
+        -o "${ROOT_DIR}/root/lib/ld-bpf.so"
 }
 
 build_dash() {

@@ -1,4 +1,48 @@
 #include "posix_internal.h"
+#include <iostream>
+#include <algorithm>
+
+// 在 maps 列表里对 [base, end) 打洞：把所有与之重叠的 memmap 切成至多三段，
+// 保留不重叠的左 [paddr,base) / 右 [end, paddr+size) 两段，删掉中间重叠段。
+// host 内存经 cow_data 共享（同 do_mprotect 的切分模式），避免双重释放。
+// 供 MAP_FIXED（do_mmap）按 Linux 语义打洞用。
+static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
+    for (auto it = ml.begin(); it != ml.end();) {
+        memmap& m = *it;
+        if (end <= m.paddr || base >= m.paddr + m.size) { ++it; continue; }  // 不重叠
+        const bool own_host = m.data.get_deleter().owned;
+        if (!m.cow_data && own_host) {
+            m.cow_data = std::shared_ptr<unsigned char>(
+                m.data.get(), DataDeleter{m.data.get_deleter().size, true});
+            m.data.get_deleter().owned = false;
+        }
+        unsigned char* hbase = m.data.get();
+        std::shared_ptr<unsigned char> cb = m.cow_data;
+        const uint32_t fl = m.flags;
+        const uint64_t m_end = m.paddr + m.size;
+        // 左段
+        if (m.paddr < base) {
+            memmap left;
+            left.paddr = m.paddr;
+            left.size = base - m.paddr;
+            left.flags = fl;
+            left.set_data(hbase, left.size, false);
+            left.cow_data = cb;
+            ml.insert(it, std::move(left));
+        }
+        // 右段
+        if (end < m_end) {
+            memmap right;
+            right.paddr = end;
+            right.size = m_end - end;
+            right.flags = fl;
+            right.set_data(hbase + (end - m.paddr), right.size, false);
+            right.cow_data = cb;
+            ml.insert(it, std::move(right));
+        }
+        it = ml.erase(it);
+    }
+}
 
 bool PosixSyscall::do_mmap(vm* v) {
     /* 标准 Linux mmap 调用约定：mmap(addr, len, prot, flags, fd, offset)。
@@ -54,18 +98,13 @@ bool PosixSyscall::do_mmap(vm* v) {
     }
 
     // MAP_FIXED：按 Linux 语义先 unmap 与 [addr_hint, addr_hint+len) 重叠的旧 guest
-    // 映射。本 VM 映射粒度粗（一个 memmap 一段），这里删除所有与该区间相交的整段
-    // 映射（不做 VMA 切分，多数 MAP_FIXED 用法是整段覆盖，足够）。
+    // 映射——对部分重叠的段要切分（打洞），保留不重叠的左/右两段，不能整段删掉。
     if (fixed) {
         const uint64_t base = addr_hint;
         const uint64_t end = addr_hint + len;
         auto& ml = maps(v);
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
-        for (auto it = ml.begin(); it != ml.end();) {
-            const bool overlap = (it->paddr < end) && (base < it->paddr + it->size);
-            if (overlap) it = ml.erase(it);
-            else ++it;
-        }
+        punch_hole(ml, base, end);
         v->flush_tlb();
     }
 
@@ -134,103 +173,85 @@ bool PosixSyscall::do_mprotect(vm* v) {
 
     auto& ml = maps(v);
     std::lock_guard<std::mutex> lock(*maps_mutex(v));
-    for(auto it = ml.begin(); it != ml.end(); ++it) {
+    const uint64_t range_lo = addr;
+    const uint64_t range_hi = addr + len;
+    bool any = false;
+    // 遍历所有与 [addr, addr+len) 重叠的映射，逐一应用权限（Linux mprotect 可跨多个
+    // VMA）。guest ldso 的 DT_TEXTREL 对整模块 mprotect(map, map_len, RWX)，此时模块
+    // 已被 map_library 的 mmap_fixed 切成 text/rodata/data 多段，必须跨段处理。
+    for (auto it = ml.begin(); it != ml.end();) {
         memmap& m = *it;
-        // 查找一个完整覆盖 [addr, addr+len) 的映射；跨映射返回 ENOMEM，
-        // 与 Linux 语义保持一致（mprotect 不跨 VMA）。
-        if(m.paddr > addr || (addr + len) > m.paddr + m.size) {
-            continue;
-        }
-        // 代码段不允许改权限：避免去 PF_X 后绕过宿主保护、加 W 后打宿主只读页。
-        if(m.flags & PF_X) {
+        if (range_hi <= m.paddr || range_lo >= m.paddr + m.size) { ++it; continue; }  // 不重叠
+        // 子区间 = 本 map 与请求范围的交集
+        uint64_t sub_lo = std::max(range_lo, m.paddr);
+        uint64_t sub_hi = std::min(range_hi, m.paddr + m.size);
+        // 不允许去掉可执行（安全）：text 段不能改成非 X。但允许加 W（TEXTREL 需要
+        // 给 text 加 W 写 lddw imm）；原「PF_X 段一律拒绝」过严，会挡掉 TEXTREL。
+        if ((m.flags & PF_X) && !(new_flags & PF_X)) {
             v->r(0) = -EACCES;
             return true;
         }
-        // 权限与现有 flags 完全相同：no-op。跳过切分与宿主 mprotect，避免把映射
-        // 凭空切成三段并建立 cow_data（典型：pthread 栈已是 RW 时再 mprotect RW）。
-        // flags/map/host 均未变化，TLB 条目依然有效，无需 flush。
-        if(new_flags == (m.flags & kProtMask)) {
-            v->r(0) = 0;
-            return true;
-        }
-
-        // 只对 VM 自有（host mmap 分配）的内存调用宿主 mprotect，让堆保护生效；
-        // 借用区（static_map / fork 子 VM / ELF 共享段）的 host_base 不保证按页
-        // 对齐也不归本进程拥有，直接动宿主页保护可能误伤邻近内存或返回 EINVAL。
-        // guest 视角的权限校验由 mmu/mmu_w 走 m.flags 实现，更新 flags 即足够。
+        any = true;
         const bool own_host = m.data.get_deleter().owned;
-
-        // 若 mprotect 的子区间 [addr, addr+len) 严格小于整张映射，必须把映射按
-        // [m.paddr, addr) / [addr, addr+len) / [addr+len, end) 切成至多三段——否则
-        // 整张 map.flags 会被改成 new_flags，但宿主只 mprotect 了子区间，余下段
-        // （典型：pthread 栈的 PROT_NONE guard 页）host 保护未变。fork 后子 VM 对
-        // 这张 map 做 CoW 深拷贝时 memcpy 会读到 guard 的 PROT_NONE 页 → 段错误。
-        // 切分后 guard 段成为独立 map（flags 不含 PF_W，不触发 CoW），可写段 host
-        // 已 mprotect 为可读，CoW 安全。各段共享同一 cow_data 管理宿主生命周期。
-        const uint64_t mid_lo = addr;
-        const uint64_t mid_hi = addr + len;
-        const bool need_split = (m.paddr < mid_lo) || (mid_hi < m.paddr + m.size);
-
-        if(need_split) {
-            // 切分前先把整段宿主纳入 cow_data（同 do_clone 做法），让三段非拥有子映射
-            // 共享同一控制块；否则切出的子段无人持有宿主所有权会泄漏。
-            if(!m.cow_data && own_host) {
+        const bool need_split = (m.paddr < sub_lo) || (sub_hi < m.paddr + m.size);
+        if (need_split) {
+            if (!m.cow_data && own_host) {
                 m.cow_data = std::shared_ptr<unsigned char>(
                     m.data.get(), DataDeleter{m.data.get_deleter().size, true});
                 m.data.get_deleter().owned = false;
             }
             unsigned char* base = m.data.get();
             std::shared_ptr<unsigned char> cb = m.cow_data;
-
             memmap left, mid, right;
-            if(m.paddr < mid_lo) {
+            if (m.paddr < sub_lo) {
                 left.paddr = m.paddr;
-                left.size = mid_lo - m.paddr;
+                left.size = sub_lo - m.paddr;
                 left.flags = m.flags;
                 left.set_data(base, left.size, false);
                 left.cow_data = cb;
             }
-            mid.paddr = mid_lo;
-            mid.size = mid_hi - mid_lo;
+            mid.paddr = sub_lo;
+            mid.size = sub_hi - sub_lo;
             mid.flags = (m.flags & ~kProtMask) | new_flags;
-            mid.set_data(base + (mid_lo - m.paddr), mid.size, false);
+            mid.set_data(base + (sub_lo - m.paddr), mid.size, false);
             mid.cow_data = cb;
-            if(mid_hi < m.paddr + m.size) {
-                right.paddr = mid_hi;
-                right.size = (m.paddr + m.size) - mid_hi;
+            if (sub_hi < m.paddr + m.size) {
+                right.paddr = sub_hi;
+                right.size = (m.paddr + m.size) - sub_hi;
                 right.flags = m.flags;
-                right.set_data(base + (mid_hi - m.paddr), right.size, false);
+                right.set_data(base + (sub_hi - m.paddr), right.size, false);
                 right.cow_data = cb;
             }
-
-            // 宿主 mprotect：仅对 mid 段，与原行为一致（自有内存才动宿主保护）。
-            if(own_host) {
-                unsigned char* host_base = base + (mid_lo - m.paddr);
-                if(mprotect(host_base, mid.size, prot) == -1) {
+            if (own_host) {
+                unsigned char* host_base = base + (sub_lo - m.paddr);
+                if (mprotect(host_base, mid.size, prot) == -1) {
                     v->r(0) = -errno;
                     return true;
                 }
             }
-
-            it = ml.erase(it);
-            if(right.size) it = ml.insert(it, std::move(right));
-            it = ml.insert(it, std::move(mid));
-            if(left.size) it = ml.insert(it, std::move(left));
+            // 按 paddr 升序插回 next 前：先 left、再 mid、再 right。每次 insert(next,X)
+            // 把 X 放到 next 正前，先插的离 next 远、后插的紧贴 next，最终 left,mid,right。
+            // 顺序搞反会让列表失序，尾部分配器 ml.back() 取错元素->mmap 地址碰撞。
+            auto next = ml.erase(it);
+            if (left.size) ml.insert(next, std::move(left));
+            ml.insert(next, std::move(mid));
+            if (right.size) ml.insert(next, std::move(right));
+            it = next;  // next 指向插入块之后的元素，继续
         } else {
-            if(own_host) {
-                unsigned char* host_base = m.data.get() + (addr - m.paddr);
-                if(mprotect(host_base, len, prot) == -1) {
+            // 整张 map 都在范围内
+            if (new_flags == (m.flags & kProtMask)) { ++it; continue; }  // no-op
+            if (own_host) {
+                if (mprotect(m.data.get(), m.size, prot) == -1) {
                     v->r(0) = -errno;
                     return true;
                 }
             }
             m.flags = (m.flags & ~kProtMask) | new_flags;
+            ++it;
         }
-        v->flush_tlb();
-        v->r(0) = 0;
-        return true;
     }
-    v->r(0) = -ENOMEM;
+    v->flush_tlb();
+    v->r(0) = any ? 0 : -ENOMEM;
     return true;
 }
 

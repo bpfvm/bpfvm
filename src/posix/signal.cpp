@@ -443,6 +443,10 @@ bool PosixSyscall::do_siglongjmp(vm* v) {
     v->r(8) = env[2];
     v->r(9) = env[3];
     v->r(10) = env[4];
+    // CRTJMP（ldso 移交控制权到主程序入口）把 argc 地址（argv-1）放进 env[7]，让主程序
+    // _start(long *p) 的 p=r1 指向 argc。普通 sigsetjmp 把 env[7] 置 0，此处不改 r1——
+    // r1 是 caller-saved，标准 longjmp 不恢复它。仅 CRTJMP 路径 env[7]!=0 才设。
+    if (env[7]) v->r(1) = env[7];
     uint64_t saved_pc = env[5];
     signal_depth(v) = static_cast<size_t>(env[6]);
     pc(v) = saved_pc;

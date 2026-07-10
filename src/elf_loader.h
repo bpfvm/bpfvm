@@ -3,7 +3,7 @@
 //
 // ld_main（构建期 -l 解析）和 VM（运行期加载 ELF）共用。
 //
-// 搜索顺序：命令行 -L 目录 → BPF_LIB_PATH → 内置默认（libc/lib64, libc/lib, lib, .）
+// 搜索顺序：命令行 -L 目录 → LD_LIBRARY_PATH → 内置默认（libc/lib64, libc/lib, lib, .）
 //
 // load_elf 通过 std::function 回调把映射好的 memmap 交给调用方，
 //
@@ -60,9 +60,18 @@ struct ElfLoadInfo {
     uint64_t phdr = 0;     // program header table 的运行时 guest 虚拟地址
     uint64_t phent = 0;    // 单个 program header 字节数（通常 56）
     uint64_t phnum = 0;    // program header 个数
+    uint64_t ldso_base = 0;  // 动态链接器（ld-bpf.so）加载基址；静态链接为 0。
+                             // ldso 模式下 setup_stack 据此填 auxv AT_BASE（ldso 自举用：
+                             // _dlstart 从 AT_BASE 读 Ehdr 扫 phdr 定位 .dynamic）。
+    uint64_t app_entry = 0;  // 主程序入口运行时地址（auxv AT_ENTRY 用）。静态/普通动态模式
+                             // 下 == entry（主程序自带 _start）；ldso 模式下 entry 是 ldso 的
+                             // _dlstart（VM 从那里开始执行动态链接流程），而 AT_ENTRY 必须是
+                             // 主程序入口——ldso 的 CRTJMP(aux[AT_ENTRY]) 跳到它移交控制权。
+                             // 两者不同；0 表示回退用 entry（保持旧行为）。
 };
 
-// 加载 ELF（主程序 + DT_NEEDED 依赖的 .so），为每个 PT_LOAD 段构造 memmap
+// 加载 ELF：有 PT_INTERP 走 ldso 模式（只 mmap 主程序+ldso，依赖加载/重定位由 guest
+// ldso 完成）；否则静态路径（mmap 段，链接期已重定位）。为每个 PT_LOAD 段构造 memmap
 // 并通过 add 回调交给调用方（如 vm::addmem）。返回加载信息（entry 为 0 表失败）。
 ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add);
 
