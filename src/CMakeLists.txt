@@ -75,6 +75,35 @@ set_target_properties(BpfSoftFp PROPERTIES
 )
 message(STATUS "BpfSoftFp: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfSoftFp.so)")
 
+# BpfEmutls：把 address_space(256) 全局改写成 __emutls_get_address 调用
+# （绕过 BPF 后端对 thread_local 的拒绝）。由 clang -fpass-plugin= 加载。
+add_library(BpfEmutls MODULE passes/BpfEmutls.cpp)
+target_include_directories(BpfEmutls PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(BpfEmutls PRIVATE ${LLVM_CXXFLAGS} -fno-rtti -Wno-unused-parameter)
+target_link_libraries(BpfEmutls PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
+set_target_properties(BpfEmutls PROPERTIES
+    OUTPUT_NAME BpfEmutls
+    PREFIX "lib"
+    SUFFIX ".so"
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+message(STATUS "BpfEmutls: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfEmutls.so)")
+
+# BpfLibcallLower：把 @llvm.memcpy/memmove/memset/trap + floor/ceil/trunc/round
+# intrinsic 改写成对 musl 函数的普通 call（绕过 BPF 后端对这批 intrinsic 的拒绝）。
+# 由 clang -fpass-plugin= 加载。
+add_library(BpfLibcallLower MODULE passes/BpfLibcallLower.cpp)
+target_include_directories(BpfLibcallLower PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_options(BpfLibcallLower PRIVATE ${LLVM_CXXFLAGS} -fno-rtti -Wno-unused-parameter)
+target_link_libraries(BpfLibcallLower PRIVATE ${LLVM_LDFLAGS} ${LLVM_LIBS})
+set_target_properties(BpfLibcallLower PROPERTIES
+    OUTPUT_NAME BpfLibcallLower
+    PREFIX "lib"
+    SUFFIX ".so"
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+message(STATUS "BpfLibcallLower: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfLibcallLower.so)")
+
 
 add_executable(bpfvm main.cpp)
 target_link_libraries(bpfvm bpfvm_lib ${LIBELF_LIBRARIES})

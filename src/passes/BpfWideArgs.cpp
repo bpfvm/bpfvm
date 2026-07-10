@@ -48,6 +48,7 @@
 #include "include/bpf_call.h"   // BPF_CALL_ALLOCA（VLA 路径用）
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
@@ -520,6 +521,364 @@ bool stripSret(Module &M) {
 }
 
 // ===========================================================================
+// 聚合值参数归一化（统一成裸 ptr，恒占 1 个寄存器）
+//
+// BPF 后端 LowerFormalArguments 对"会被展开成 >1 个 64 位寄存器的参数"会撑爆
+// 5-参数硬上限。clang 对按值聚合参数分两路降级，本 pass 把两路都归一到裸 ptr：
+//
+//   路径 A（大聚合，≥3 个 word，如 string 24B、Quad 32B）：
+//     clang 已 lower 成 `ptr byval(%T) align N %x`——参数类型已是 ptr，caller
+//     已 memcpy 实参到栈临时再传指针，callee 直接当指针用（GEP/load）。本 pass
+//     只需【剥 byval 属性】（BPF 后端见 byval 报 "pass by value not supported"）。
+//     不改类型、不改函数体、不改 call site 的实参——只删属性。caller 的 memcpy
+//     不会被优化器误删（callee 收到无属性 ptr，优化器无法证其不写，保守保留）。
+//
+//   路径 B（小聚合，≤2 个 word，如 std::pair={i64,i64}、__bit_iterator=[2 x i64]、
+//     {i32,i32}=8B、i128）：clang 不走 byval，直接用【聚合值类型】作参数类型：
+//       long f(std::pair<long,long> p)  →  long f([2 x i64] %p)
+//     BPF 后端把这种值类型按元素/字段个数展开成多个寄存器：[2 x i64] 占 2 个。
+//     于是 __count(__bit_iterator, __bit_iterator, value, proj) = 2+2+1+1 = 6
+//     寄存器 > 5 → "too many arguments"。本 pass 把它【重建签名 + 搬函数体 +
+//     入口 load + call site alloca/store】降级成裸 ptr（与路径 A 终态一致）。
+//
+// 两路径不重叠（一个已是 ptr，一个不是），无顺序依赖，无瞬态属性——合并前是
+// 两个 pass（lowerAggregateParams 加 byval、stripByval 剥 byval）背靠背跑造一个
+// 只活几毫秒的中间 byval，纯粹为复用；现直接产出终态裸 ptr，消除中间态。
+//
+// 典型触发 B：bitset::count → std::__count<...>(__bit_iterator, __bit_iterator, ...)
+// （bitset 头里 bit_iterator 是 2-word 聚合）。format 的 __write_string/__format_integer
+// 同理（多参 + 聚合）。
+//
+// 降级判据（needsLowering，针对路径 B 的值类型）：BPF 后端会展开成 >1 个寄存器
+// 的类型——①聚合（ArrayType/StructType，按构成展开，哪怕 {i32,i32}=8B）；②i128
+// 及更大标量（>8B，拆成 2 个 64 位寄存器）。排除指针（含路径 A 已降级的 ptr
+// byval）、≤64 位标量、向量（向量走单独路径，少见且 BPF 后端有原生支持）。
+//
+// 语义不变：按值传递 = caller 拷贝一份给 callee，callee 拿到副本。两路径转成 ptr
+// 后都满足——路径 A 本就是 ptr（caller memcpy）；路径 B caller store 值到 alloca、
+// callee load 出值。callee 对参数的修改不得影响 caller（C++ 按值语义）。
+// ===========================================================================
+// 判断一个参数类型是否需要降级为 ptr byval。
+// 判据：BPF 后端 LowerFormalArguments 会把它展开成 >1 个寄存器的类型。
+//   - 聚合（ArrayType/StructType）：按元素/字段个数展开。哪怕 {i32,i32}=8B 也按 2 个
+//     寄存器算（实测 BPF 后端对聚合按构成展开，不按整体大小）。
+//   - i128（及更大标量）：占 2 个 64 位寄存器。
+// 排除：指针（含已降级的 ptr byval）、≤64 位标量、向量（向量走单独路径，少见且 BPF 后端
+// 有原生支持）。
+static bool needsLowering(Type *T, const DataLayout &DL) {
+    if (T->isPointerTy())
+        return false;
+    if (T->isArrayTy() || T->isStructTy())
+        return true;
+    // 标量但 >8 字节（i128 等）：BPF 后端拆成多个寄存器
+    if (T->isIntegerTy() && DL.getTypeAllocSize(T) > 8)
+        return true;
+    return false;
+}
+
+// 收集函数里"需要降级的值类型聚合参数"的下标（路径 B：非 byval、非 ptr 的聚合
+// 值类型）。已是 byval 的（路径 A，大聚合）不在此收集——它们只剥属性、不重建签名。
+static SmallVector<unsigned, 4> collectAggregateValueParams(Function &F, const DataLayout &DL) {
+    SmallVector<unsigned, 4> idxs;
+    for (unsigned i = 0; i < F.arg_size(); ++i) {
+        if (F.hasParamAttribute(i, Attribute::ByVal))
+            continue;  // 路径 A（已是 byval ptr），走剥属性分支
+        Type *ty = F.getFunctionType()->getParamType(i);
+        if (needsLowering(ty, DL))
+            idxs.push_back(i);
+    }
+    return idxs;
+}
+
+bool lowerAggregateParams(Module &M) {
+    bool changed = false;
+
+    // ===== 路径 A：剥大聚合的 byval 属性（参数已是 ptr，不改类型/函数体/call site 实参）=====
+    // clang 已 lower 成 ptr byval(%T)，caller 已 memcpy 临时拷贝传指针，callee 当指针用。
+    // 只需删 byval 这个 BPF 后端不认的标记。覆盖直接调用 / 间接调用 / 外部声明 callee，
+    // 故 call site 遍历全部 CallBase（不只 F->users()）。
+    //
+    // caller 的 memcpy 不会被优化器误删：callee 收到无属性 ptr，优化器无法证其不写
+    // （byval 内存 callee 可读写），保守保留——正是 C++ 按值语义所需。
+    // 必须先于路径 B 的"重建签名"跑：路径 B 新建的函数 copyAttributesFrom 会原样
+    // 带过来 byval（若有），统一在这里清掉更干净。
+    for (Function &F : M) {
+        for (unsigned i = 0; i < F.arg_size(); ++i) {
+            if (F.hasParamAttribute(i, Attribute::ByVal)) {
+                F.removeParamAttr(i, Attribute::ByVal);
+                changed = true;
+            }
+        }
+    }
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                auto *CB = dyn_cast<CallBase>(&I);
+                if (!CB)
+                    continue;
+                for (unsigned i = 0; i < CB->arg_size(); ++i) {
+                    if (CB->paramHasAttr(i, Attribute::ByVal)) {
+                        CB->removeParamAttr(i, Attribute::ByVal);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== 路径 B：小聚合成值参数降级成裸 ptr（重建签名 + 搬函数体 + 入口 load + call site store）=====
+    // clang 直接用聚合值类型作参数类型（无 byval），BPF 后端按构成展开成多个寄存器。
+    // 第一遍：找出需要改签名的函数（至少一个聚合值参数）。重建 FunctionType 必须
+    // 新建函数搬函数体（LLVM Function 不能就地改类型），先收集再统一处理，避免
+    // 边遍历边改迭代器失效。
+    struct Job { Function *OldF; Function *NewF; SmallVector<unsigned, 4> agIdxs; };
+    SmallVector<Job, 16> jobs;
+    const DataLayout &DL = M.getDataLayout();
+    for (Function &F : M) {
+        if (isInternalOrIntrinsic(F))
+            continue;
+        SmallVector<unsigned, 4> idxs = collectAggregateValueParams(F, DL);
+        if (idxs.empty())
+            continue;
+        // 构造新签名：聚合值参数类型 T → 裸 ptr（不产 byval，直接到终态）。
+        SmallVector<Type *, 8> newArgTys;
+        for (unsigned i = 0; i < F.arg_size(); ++i) {
+            Type *pTy = F.getFunctionType()->getParamType(i);
+            newArgTys.push_back(needsLowering(pTy, DL)
+                                    ? PointerType::getUnqual(F.getContext())
+                                    : pTy);
+        }
+        FunctionType *newFTy = FunctionType::get(F.getReturnType(), newArgTys, F.isVarArg());
+        Function *NewF = Function::Create(newFTy, F.getLinkage(), F.getAddressSpace(),
+                                           "__bpf_agg_tmp_" + F.getName(), &M);
+        NewF->copyAttributesFrom(&F);
+        NewF->setVisibility(F.getVisibility());
+        NewF->setComdat(F.getComdat());
+        NewF->setSection(F.getSection());
+        NewF->setDSOLocal(F.isDSOLocal());
+        jobs.push_back({&F, NewF, idxs});
+        changed = true;
+    }
+    if (jobs.empty())
+        return changed;
+
+    // 第二遍：搬迁函数体（有定义时），入口 load 重建聚合值。
+    for (auto &j : jobs) {
+        Function *F = j.OldF;
+        Function *NewF = j.NewF;
+        if (F->isDeclaration()) {
+            // 声明（prototype，无定义体）：只换签名。真正定义在另一 TU（那里本 pass
+            // 同样改写，签名一致）。调用点改写统一在第三遍处理。
+            NewF->takeName(F);
+            F->dropAllReferences();
+            continue;
+        }
+        // 搬函数体
+        NewF->splice(NewF->end(), F);
+        NewF->takeName(F);
+
+        // 入口插入 load 重建聚合值：把对旧聚合参数（值）的 use 替换成 load 出的值。
+        BasicBlock &Entry = NewF->front();
+        Instruction *InsertPt = &Entry.front();
+        while (InsertPt && (isa<PHINode>(InsertPt) || isa<AllocaInst>(InsertPt)))
+            InsertPt = InsertPt->getNextNode();
+        if (!InsertPt)
+            InsertPt = Entry.getTerminator();
+
+        std::vector<std::pair<Argument *, Value *>> replacements;
+        SmallSet<unsigned, 8> aggSet;
+        aggSet.insert(j.agIdxs.begin(), j.agIdxs.end());
+        unsigned idx = 0;
+        for (Argument &OldArg : F->args()) {
+            Argument *NewArg = NewF->getArg(idx);
+            if (aggSet.count(idx)) {
+                // 聚合参数：新参数是裸指针，load 出原聚合值
+                IRBuilder<> B(InsertPt);
+                Value *loaded = B.CreateLoad(OldArg.getType(), NewArg,
+                                              "__agg.ld." + OldArg.getName());
+                replacements.emplace_back(&OldArg, loaded);
+            } else {
+                replacements.emplace_back(&OldArg, NewArg);
+            }
+            ++idx;
+        }
+        for (auto &[old, neu] : replacements)
+            old->replaceAllUsesWith(neu);
+        F->dropAllReferences();
+    }
+
+    // 第三遍：改写所有 call/invoke 调用点。聚合实参 → store 到临时 alloca，传裸指针。
+    // 关键：先【RAUW 前】收集每个 OldF 的所有调用点，否则 RAUW 会因函数类型不同给
+    // callee operand 套一层 bitcast，getCalledFunction() 返回 null，定位不到 job。
+    // 收集时记录 call site → 它调用的 OldF（指针，RAUW 前的原 callee）。
+    DenseMap<CallBase *, Function *> sites;
+    for (auto &j : jobs) {
+        for (User *U : j.OldF->users()) {
+            auto *CB = dyn_cast<CallBase>(U);
+            if (!CB)
+                continue;
+            // 只认直接调用本 OldF 的（排除传给别的 bitcast 等非调用 use）
+            if (CB->getCalledFunction() != j.OldF)
+                continue;
+            sites[CB] = j.OldF;
+        }
+    }
+
+    // 建立 OldF → job 映射，便于由 call site 的 OldF 反查 agIdxs / NewF。
+    DenseMap<Function *, Job *> jobByOld;
+    for (auto &j : jobs)
+        jobByOld[j.OldF] = &j;
+
+    // 现在改写每个 call site：聚合实参是【值类型】（[2 x i64]/{...}/i128），不是 ptr。
+    // 必须 store 到一个临时 alloca，再把该 alloca 指针作为新实参传给 NewF。
+    // 不能用 memcpy：memcpy 的源要求 ptr，而聚合实参是 SSA 值。store 值到临时即可
+    // （C++ 按值语义：caller 拷贝一份给 callee）。不加 byval 属性——直接产裸 ptr 终态。
+    //
+    // alloca 必须插在【caller 入口块】——BPF 后端要求所有 alloca 集中在入口块（static
+    // alloca），非入口块的固定大小 alloca 会被拒绝（见 BpfVlaPass 的注释）。若 call
+    // 在循环/中间块，把 alloca 插在 call 前会让它脱离入口块。store 仍留在 call 前
+    // （每次调用都要覆写临时），alloca 的入口块布局保证后端接受。
+    for (auto &[CB, OldF] : sites) {
+        Job *j = jobByOld[OldF];
+        Function *NewF = j->NewF;
+        Function *Caller = CB->getFunction();
+        // 先切 callee 到 NewF（NewF 签名里聚合参数已是裸 ptr）
+        CB->setCalledFunction(NewF->getFunctionType(), NewF);
+        // 为每个聚合参数插入口块 alloca + call 前 store，实参换成指针
+        for (unsigned i : j->agIdxs) {
+            Value *arg = CB->getArgOperand(i);
+            Type *aggTy = arg->getType();
+            IRBuilder<> EntryB(&Caller->getEntryBlock(), Caller->getEntryBlock().getFirstInsertionPt());
+            AllocaInst *tmp = EntryB.CreateAlloca(aggTy, nullptr, "__agg.arg");
+            tmp->setAlignment(Align(DL.getABITypeAlign(aggTy)));
+            IRBuilder<> B(CB);
+            B.CreateStore(arg, tmp);
+            CB->setArgOperand(i, tmp);
+        }
+    }
+
+    // RAUW 残余 use（非 call 的 use，如取地址存 vtable 等）→ NewF。此时 NewF 签名
+    // 已定，RAUW 对残余 use 若有类型差会套 bitcast（与 call site 不同，那些 use 不影响
+    // 后端代码生成正确性）。
+    for (auto &j : jobs)
+        j.OldF->replaceAllUsesWith(j.NewF);
+
+    // 第四遍：删除旧函数。RAUW 已把所有 use 转到 NewF，OldF 应无 use——与
+    // rewriteFunction/rewriteVarArgFunction 路径一致无条件 erase（那里先 RAUW 再 erase）。
+    // 旧版用 if(use_empty()) 守卫，若 RAUW 因故没清空 use 会静默泄漏 OldF，不一致。
+    for (auto &j : jobs)
+        j.OldF->eraseFromParent();
+
+    return changed;
+}
+
+// ===========================================================================
+// by-value ≤8B 非平凡析构参数（std::unique_ptr 等）的 double-free 修复
+//
+// 背景：BPF 后端把 ≤8B 的非平凡析构 by-value 参数（典型 std::unique_ptr，8B）
+// 直接降级成 i64 寄存器传值，绕过 byval。但 clang 的 caller 仍按"非平凡析构
+// 对象"模型，在栈上构造一个备份临时 %tmp，把指针存进去，调用后析构它：
+//   store %src, %tmp            ; move-construct 备份临时
+//   %arg = ptrtoint (load %tmp) ; 取出指针 i64 化给 callee（或直接 ptrtoint %src）
+//   call @callee(i64 %arg)      ; callee 拿到指针，move 到自己成员
+//   call @~unique_ptr(%tmp)     ; ~备份：tmp 仍是该指针 → delete → double-free
+// %tmp 是多余备份——它的值已交给 callee（callee 拥有），析构它即 double-free
+// 那个已被 move 走的指针。
+//
+// >8B 的非平凡析构 by-value 参数（string 24B、shared_ptr 16B）不走此路：它们
+// 走 byval/ptr，callee 共享 caller 临时、move 时置空，caller 析构 noop。本 bug
+// 只影响 ≤8B 被 i64 化的那类（唯一常见的是 unique_ptr）。
+//
+// 修复：在 dtor 前插入 store null, %tmp，让析构对 null noop。load/保留不变
+// （load 在置空之前，仍读到原值）。
+//
+// 识别 %tmp 是备份临时而非普通局部对象：clang 对普通局部 unique_ptr 通常内联
+// ~unique_ptr（不出现 call 形式），故【call @~unique_ptr(%tmp) 形式的析构】基
+// 本只出现在备份临时场景。再加 hasLoad（%tmp 被读出交给 callee）作为确认：备
+// 份临时的值必被 load 后交给 callee（经 ptrtoint 给 call，或 store 到内联
+// callee 的成员）；不会被 load 的纯临时不存在（clang 直接构造即析构无意义）。
+// 普通 sret 构造（call @f(ptr writable %tmp)）、lifetime、store 等 use 不影响。
+// ===========================================================================
+
+bool eliminateByvalScalarTemporaries(Module &M) {
+    bool changed = false;
+
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            SmallVector<std::pair<AllocaInst *, CallInst *>, 8> toErase;
+
+            for (Instruction &I : BB) {
+                auto *dtor = dyn_cast<CallInst>(&I);
+                if (!dtor || !dtor->getCalledFunction())
+                    continue;
+                // dtor 返回 void（析构/reset 语义），arg0 是待析构 alloca
+                if (!dtor->getCalledFunction()->getReturnType()->isVoidTy())
+                    continue;
+                if (dtor->arg_size() < 1)
+                    continue;
+                auto *tmp = dyn_cast<AllocaInst>(dtor->getArgOperand(0));
+                if (!tmp)
+                    continue;
+                // ~T(%tmp)（1 参）或 reset(&%tmp, null/0)（2 参，clang 把 inline 后
+                // 的 ~unique_ptr 降级成 reset(nullptr)）。第 2 个及以后的参数必须是
+                // 常量 0/null（reset 的"清空"实参），避免误伤 reset(new_ptr) 这类。
+                bool constTail = true;
+                for (unsigned i = 1; i < dtor->arg_size(); ++i) {
+                    if (!isa<Constant>(dtor->getArgOperand(i))) {
+                        constTail = false;
+                        break;
+                    }
+                }
+                if (!constTail)
+                    continue;
+
+                // 只认 C++ 析构（mangling 含 D0/D1/D2）和 unique_ptr::reset(nullptr)
+                // （含 "5reset"），避免把 void(ptr alloca, const) 形式的普通调用
+                // （lambda operator()、构造 stub 等）误判为析构。
+                StringRef cn = dtor->getCalledFunction()->getName();
+                if (!(cn.starts_with("_Z") &&
+                      (cn.contains("D0") || cn.contains("D1") ||
+                       cn.contains("D2") || cn.contains("5reset"))))
+                    continue;
+
+                // %tmp 必被 load（值读出交给 callee）——确认是备份临时。
+                bool hasLoad = false;
+                for (User *U : tmp->users()) {
+                    if (isa<LoadInst>(U)) {
+                        hasLoad = true;
+                        break;
+                    }
+                }
+                if (!hasLoad)
+                    continue;
+
+                // 只处理 ≤8B 的备份临时。本 pass 的修复目标是被 BPF 后端 i64 化的
+                // by-value 非平凡析构参数（唯一常见的是 unique_ptr，{ptr}=8B）；
+                // >8B 的非平凡析构 by-value 参数（string 24B、shared_ptr 16B）走 byval/ptr
+                // 共享路径，不走此 i64 路径（见上方注释）。
+                // 不加这个约束会误伤普通局部对象：clang 对"call 形式析构 + alloca +
+                // 被 load 读字段"的普通局部（如 iostream 的 sentry(16B)、ostringstream
+                // (264B)、istringstream）同样匹配上面的判定，会被错误地插入
+                // store zeroinitializer 清零对象状态——析构读到全零对象崩溃。
+                const DataLayout &DL = M.getDataLayout();
+                if (DL.getTypeAllocSize(tmp->getAllocatedType()) > 8)
+                    continue;
+
+                toErase.push_back({tmp, dtor});
+            }
+
+            for (auto &[tmp, dtor] : toErase) {
+                IRBuilder<> B(dtor);
+                B.CreateStore(Constant::getNullValue(tmp->getAllocatedType()), tmp);
+                changed = true;
+            }
+        }
+    }
+
+    return changed;
+}
+
+// ===========================================================================
 // 变参函数（varargs）改写
 //
 // BPF 后端拒绝任何 isVarArg=true 的函数（BPFISelLowering::LowerFormalArguments
@@ -690,9 +1049,12 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         bool changed = false;
 
-        // 第 0 遍：剥离 sret，让"返回结构体"的函数能编译。
-        // 独立于 >5 参数处理，两者可叠加（sret 指针也算一个参数）。
+        // 第 0 遍：剥离 sret + 归一化聚合参数，让"返回结构体"和"按值传结构体参数"的函数
+        // 都能编译。独立于 >5 参数处理，可叠加（sret/聚合参数指针也算一个参数）。
+        // lowerAggregateParams 内含两条子路径：路径 A 剥大聚合的 byval 属性（参数已是 ptr）；
+        // 路径 B 把小聚合成值参数重建为裸 ptr（恒占 1 寄存器）。两路径参数不重叠。
         changed |= stripSret(M);
+        changed |= lowerAggregateParams(M);
 
         // ============ 第一阶段：函数体改写（签名 + 体内）============
         // 两条路径互斥（needsRewrite 排除 isVarArg；isVarArgFunction 只取变参），分别
@@ -1019,13 +1381,122 @@ public:
     }
 };
 
+// C. by-value ≤8B 非平凡析构参数（unique_ptr 等）double-free 修复。
+// 必须晚跑（OptimizerLastEP）：clang 的 move-construct 在 PipelineStartEP 时还是
+// 构造函数 call（@unique_ptr::unique_ptr(&&)），要等 -O1 把它 inline 成 store，
+// "备份临时"模式（store + dtor，从不 load）才浮现，eliminateByvalScalarTemporaries
+// 才能识别。与 BpfVlaPass 同处 OptimizerLastEP，无数据依赖。
+class BpfByvalTmpPass : public PassInfoMixin<BpfByvalTmpPass> {
+public:
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+        return eliminateByvalScalarTemporaries(M)
+                   ? PreservedAnalyses::none()
+                   : PreservedAnalyses::all();
+    }
+    static bool isRequired() { return true; }
+};
+
+// D. atomic load/store 降级（解锁 iostream/locale.cpp 等的 static guard）。
+//
+// 背景：eBPF 指令集（含 v4）只有 RMW 类原子指令（atomic_add/or/and/xor、xchg、
+// cmpxchg，全部 SEQ_CST），【没有】独立的 plain atomic load / atomic store 指令。
+// 因此 clang 的 BPF 后端对 IR 里的 `load atomic`/`store atomic` 报
+//   "Cannot select: ... AtomicLoad<... acquire ...>"
+// （AtomicRMW/AtomicCmpXchg 则能正常 select 成 BPF_ATOMIC 指令）。
+// 这一缺口直到 LLVM 21 才由新的 BPF_LOAD_ACQ(imm=0x100)/BPF_STORE_REL(imm=0x110)
+// 指令补上；本项目当前用 LLVM 19，且即便升级到 21 也需要 VM 侧识别这两个 imm。
+//
+// 阻塞场景：C++ 函数内 `static T x = init();` 的初始化 guard。clang IRGen 生成
+// fast-path 优化——先 `load atomic i8 acquire`（读 guard flag），非 0 直接返回，
+// 为 0 才走 slow path `call __cxa_guard_acquire`。locale.cpp/ios.cpp/iostream.cpp
+// 大量用 static 局部变量（locale::id、iostream Init 的 `static bool once` 等），
+// 全部撞上这个缺口。
+//
+// 为何降级（而非用 xchg/cmpxchg 模拟）是正确的：
+// 1) eBPF ISA 在 LLVM 19 下根本没有 plain atomic load 指令，物理上无法保留
+//    "原子 load" 语义；这是 target 约束，不是 VM 实现缺口（bpfvm 的 do_atomic
+//    完整支持 RMW/xchg/cmpxchg，见 insn.cpp）。
+// 2) guard 的 fast-path load 后紧跟的 __cxa_guard_acquire 在本项目的 cxxabi_stub
+//    里【本就是非原子实现】（cxxabi_stub.cpp："简化：不做线程安全
+//    （_LIBCPP_HAS_NO_THREADS）"）。整个 guard 机制在 _LIBCPP_HAS_NO_THREADS 下
+//    不保证多线程安全，fast-path 那一处原子是孤立的、无意义的。降级它不削弱任何
+//    现有语义——项目当前的语义就是单线程 guard。
+// 3) store atomic 理论上可用 eBPF xchg 实现（保留 SEQ_CST store 语义），但与
+//    load 配对时仍无法让 load 端原子，且 guard 的 store（__cxa_guard_release
+//    指向的 guard 字节写入）同样位于非原子的 slow path 之后。统一降级最简单一致。
+//
+// 范围：只处理 LoadInst/StoreInst 的 atomic 形式；不碰 AtomicRMW/AtomicCmpXchg
+// （后端能 select，且语义上 RMW 本就是 eBPF 原生支持的）。这些"漏网"的 plain
+// atomic load/store 多由 static guard、stdatomic 的 atomic_load/atomic_store 产生；
+// 真正需要多线程原子语义的代码应使用 atomic_fetch_*（RMW）或 cmpxchg。
+//
+// 时机：OptimizerLastEPCallback（晚跑，与 VLA/ByvalTmp 同列）。晚跑能让优化器
+// 先尝试消除可证明为单线程的 atomic（部分 guard 在 -O1 inline 后会被删），
+// 只改写真正漏到后端的。isRequired()=true 保证 -O0 也跑。
+class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
+public:
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+        if(F.isDeclaration())
+            return PreservedAnalyses::all();
+
+        bool Changed = false;
+        SmallVector<LoadInst *, 16> Loads;
+        SmallVector<StoreInst *, 16> Stores;
+        for(BasicBlock &BB : F) {
+            for(Instruction &I : BB) {
+                if(auto *LI = dyn_cast<LoadInst>(&I)) {
+                    if(LI->isAtomic())
+                        Loads.push_back(LI);
+                } else if(auto *SI = dyn_cast<StoreInst>(&I)) {
+                    if(SI->isAtomic())
+                        Stores.push_back(SI);
+                }
+            }
+        }
+
+        // load atomic T, ptr <order>, align A  →  load T, ptr, align A
+        // 直接构造普通 LoadInst（IRBuilder 的 CreateLoad 无带 Align 的重载），
+        // 复制对齐/volatile/调试元数据，order 设为 NotAtomic，插在原指令前再替换。
+        for(LoadInst *LI : Loads) {
+            LoadInst *New = new LoadInst(LI->getType(), LI->getPointerOperand(), "",
+                                          LI->isVolatile(), LI->getAlign(),
+                                          LI->getIterator());
+            New->setOrdering(AtomicOrdering::NotAtomic);
+            if(LI->hasMetadata())
+                New->setMetadata(LLVMContext::MD_dbg, LI->getMetadata(LLVMContext::MD_dbg));
+            LI->replaceAllUsesWith(New);
+            LI->eraseFromParent();
+            Changed = true;
+        }
+
+        // store atomic T v, ptr <order>, align A  →  store T v, ptr, align A
+        for(StoreInst *SI : Stores) {
+            StoreInst *New = new StoreInst(SI->getValueOperand(), SI->getPointerOperand(),
+                                            SI->isVolatile(), SI->getAlign(),
+                                            SI->getIterator());
+            New->setOrdering(AtomicOrdering::NotAtomic);
+            if(SI->hasMetadata())
+                New->setMetadata(LLVMContext::MD_dbg, SI->getMetadata(LLVMContext::MD_dbg));
+            SI->eraseFromParent();
+            Changed = true;
+        }
+
+        return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+    static bool isRequired() { return true; }
+};
+
 } // namespace
 
 // ---- 插件注册：支持新的 PassBuilder / -fpass-plugin 机制 ----
-// 一个 .so 注册两个独立 pass，挂在各自正确的 pipeline EP：
-//   - BpfWideArgsPass：PipelineStartEP（早，所有 -O 触发）—— 改签名/调用点。
-//   - BpfVlaPass：     OptimizerLastEP（晚）+ -O0 兜底的 PipelineStartEP ——
-//                      必须在 SROA/instcombine 之后，只处理漏网的动态 alloca。
+// 一个 .so 注册多个独立 pass，挂在各自正确的 pipeline EP：
+//   - BpfWideArgsPass： PipelineStartEP（早，所有 -O 触发）—— 改签名/调用点。
+//   - BpfVlaPass：      OptimizerLastEP（晚）+ -O0 兜底的 PipelineStartEP ——
+//                       必须在 SROA/instcombine 之后，只处理漏网的动态 alloca。
+//   - BpfByvalTmpPass： OptimizerLastEP（晚）—— by-value 标量析构 double-free 修复
+//                       （只命中 ≤8B 备份临时，避开普通局部对象的析构）。
+//   - BpfAtomicLowerPass: OptimizerLastEP（晚）—— 把 plain atomic load/store 降级
+//                       为普通 load/store（解锁 iostream/static guard；见 pass 注释）。
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "BpfWideArgs", LLVM_VERSION_STRING, [](PassBuilder &PB) {
@@ -1046,22 +1517,39 @@ llvmGetPassPluginInfo() {
             FPM.addPass(BpfVlaPass());
             MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
         };
+        // C. by-value 标量析构参数 double-free 修复：晚跑（见 BpfByvalTmpPass 注释）。
+        auto addByvalTmpPass = [](ModulePassManager &MPM) {
+            MPM.addPass(BpfByvalTmpPass());
+        };
+        // D. plain atomic load/store 降级：晚跑（见 BpfAtomicLowerPass 注释），让
+        //   优化器先消除可证明单线程的 atomic，只改写漏到后端的。与 B/C 无数据依赖，
+        //   挂同一个 OptimizerLastEP（顺序无要求：彼此操作的指令不相交）。
+        auto addAtomicLowerPass = [](ModulePassManager &MPM) {
+            FunctionPassManager FPM;
+            FPM.addPass(BpfAtomicLowerPass());
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+        };
         PB.registerOptimizerLastEPCallback(
 #if LLVM_VERSION_MAJOR >= 21
-            [addVlaPass](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
+            [addVlaPass, addByvalTmpPass, addAtomicLowerPass](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
 #else
-            [addVlaPass](ModulePassManager &MPM, OptimizationLevel) {
+            [addVlaPass, addByvalTmpPass, addAtomicLowerPass](ModulePassManager &MPM, OptimizationLevel) {
 #endif
                 addVlaPass(MPM);
+                addByvalTmpPass(MPM);
+                addAtomicLowerPass(MPM);
             });
         // -O0：clang 的 -O0 路径不经过常规 pass 管理器，OptimizerLastEP 实际不触发；
         // 在 PipelineStartEP 显式补一份（仅 O0）。本项目 test/Makefile 与 build_*.sh
         // 均用 -O1 编译，故 -O0 下不支持 VLA（与 BpfSoftFp 同限制）。
+        // atomic-lowering 的 isRequired()=true，常规管道必跑；这里同样给 -O0 补一份。
         // 本回调晚于上方 A（WideArgs）的 PipelineStartEP 回调注册。
         PB.registerPipelineStartEPCallback(
-            [addVlaPass](ModulePassManager &MPM, OptimizationLevel OL) {
-                if(OL == OptimizationLevel::O0)
+            [addVlaPass, addAtomicLowerPass](ModulePassManager &MPM, OptimizationLevel OL) {
+                if(OL == OptimizationLevel::O0) {
                     addVlaPass(MPM);
+                    addAtomicLowerPass(MPM);
+                }
             });
     }};
 }

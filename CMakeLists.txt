@@ -48,7 +48,9 @@ if(BUILD_TESTING)
         )
     endfunction()
 
-    file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/test/test_*.c")
+    file(GLOB TEST_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/test/test_*.c"
+        "${CMAKE_SOURCE_DIR}/test/test_*.cpp")
 
     set(BPF_TEST_HELPERS
         test_arg

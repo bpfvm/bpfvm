@@ -1,10 +1,15 @@
 test/*.a
+test/*.o
 test/*.so
 test/*.out
 test/*.linked
 test/*.host
 build/
 root/
+
+# libcxx 交叉构建产物（由 libcxx/build.sh 生成）
+libcxx/obj/
+libcxx/lib/
 
 .*~
 
