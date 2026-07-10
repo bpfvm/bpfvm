@@ -26,6 +26,7 @@ struct vmOptions option = {
     .argv = {},
     .envp = {},
     .sys = std::make_shared<EmptySyscall>(),
+    .root = {},
 };
 
 struct vmOptions posix_option = {
@@ -37,6 +38,7 @@ struct vmOptions posix_option = {
     .argv = {},
     .envp = {},
     .sys = std::make_shared<PosixSyscall>(),
+    .root = {},
 };
 
 // Helper function to load BPF program code into the VM's memory

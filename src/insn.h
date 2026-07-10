@@ -182,6 +182,9 @@ struct vmOptions {
     // host 接入器 + 信号路由器，始终非空。PTY 模式开真 pty（fd 0/1/2 接 slave）；
     // 非 PTY 模式退化为仅信号路由。pump 线程读 signalfd 后调 sys->host_signal。
     std::shared_ptr<Pty> pty = nullptr;
+    // chroot 根目录（宿主绝对路径）。非空时 guest 文件系统被限制在此目录下
+    // （--root）。空 = 不 chroot，维持现有行为。
+    std::string root;
 };
 
 struct TlbEntry {

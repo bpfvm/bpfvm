@@ -3,6 +3,7 @@
 #include "posix/posix_syscall.h"
 
 #include <iostream>
+#include <filesystem>
 
 #include <libgen.h>
 #include <getopt.h>
@@ -17,6 +18,7 @@ static struct option long_options[] = {
     {"step", no_argument, nullptr, 's'},
     {"insn-limit", required_argument, nullptr, 'l'},
     {"stack-size", required_argument, nullptr, 'S'},
+    {"root", required_argument, nullptr, 'R'},
     {"pty", no_argument, nullptr, 't'},
     {"no-pty", no_argument, nullptr, 'T'},
     {nullptr, 0, nullptr, 0}
@@ -36,7 +38,7 @@ int main(int argc, char** argv) {
     PtyMode pty_mode = PtyMode::Auto;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vb:sl:S:tT", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vb:sl:S:R:tT", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options.verbose = true;
@@ -53,6 +55,9 @@ int main(int argc, char** argv) {
         case 'S':
             options.stack_limit = std::stoull(optarg, nullptr, 0);
             break;
+        case 'R':
+            options.root = optarg;
+            break;
         case 't':
             pty_mode = PtyMode::On;
             break;
@@ -60,17 +65,29 @@ int main(int argc, char** argv) {
             pty_mode = PtyMode::Off;
             break;
         default:
-            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-R root_dir|--root root_dir] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
             return 1;
         }
     }
 
     if (optind >= argc) {
-        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-R root_dir|--root root_dir] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
         return 1;
     }
 
-    const char* elf_file_path = realpath(argv[optind], nullptr);
+    // 创建 syscall handler；指定了 --root 则进入 chroot（cwd 重置为 /）。
+    if(!options.root.empty()) {
+        set_loader_root(options.root);
+    }
+    // ELF 路径解析：chroot 模式下 argv[optind] 是 guest 视角路径（如 /bin/dash），
+    // 需拼上 root 前缀再解析为宿主路径；非 chroot 模式直接按宿主路径解析。
+    const char* elf_file_path;
+    if(!options.root.empty()) {
+        auto elf_resolved_storage = std::filesystem::path(options.root + argv[optind]);
+        elf_file_path = realpath(elf_resolved_storage.lexically_normal().c_str(), nullptr);
+    } else {
+        elf_file_path = realpath(argv[optind], nullptr);
+    }
     if(elf_file_path == nullptr) {
         std::cerr << "Failed to resolve path: " << argv[optind] << std::endl;
         return 1;
@@ -119,11 +136,18 @@ int main(int argc, char** argv) {
     for(int i = optind; i < argc; i++) {
         options.argv.emplace_back(argv[i]);
     }
-    char* cwd = getcwd(nullptr, 0);
-    options.envp.emplace_back(std::string("HOME=") + cwd);
-    free(cwd);
-    const char* dir = dirname((char*)elf_file_path);
-    options.envp.emplace_back(std::string("PATH=") + dir);
+    // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
+    if(!options.root.empty()) {
+        options.envp.emplace_back("HOME=/");
+        // argv[optind] 是 guest 视角路径，dirname 得其所在 guest 目录（如 /bin）。
+        options.envp.emplace_back(std::string("PATH=") + dirname((char*)argv[optind]));
+    } else {
+        char* cwd = getcwd(nullptr, 0);
+        options.envp.emplace_back(std::string("HOME=") + cwd);
+        free(cwd);
+        const char* dir = dirname((char*)elf_file_path);
+        options.envp.emplace_back(std::string("PATH=") + dir);
+    }
     // 透传 LD_LIBRARY_PATH 给 guest：bpfvm 自身（elf_loader）和 guest ldso 都用它搜库，
     if (const char* lp = getenv("LD_LIBRARY_PATH")) {
         options.envp.emplace_back(std::string("LD_LIBRARY_PATH=") + lp);

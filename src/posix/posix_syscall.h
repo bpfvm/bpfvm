@@ -135,6 +135,10 @@ class PosixSyscall: public SyscallHandler{
         std::string cwd;
         std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
         std::array<signal_action, NSIG> signal_actions{};
+        // chroot 根目录（宿主绝对路径，无尾斜杠）。空 = 不 chroot。
+        // 随 fork/clone 自动传播（与 cwd 同级）。ps->cwd 存 guest 视角路径，
+        // resolve_path 负责 cwd → 宿主路径时拼上此 root。
+        std::string root;
     };
 
     uint32_t umask_val = 0022;
@@ -197,13 +201,15 @@ class PosixSyscall: public SyscallHandler{
     static int futex_wake(ThreadGroup* tg, uint64_t addr, int val);
 public:
     PosixSyscall();
-    PosixSyscall(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened, std::string cwd,
-                 std::shared_ptr<ProcessGroup> pgrp, std::shared_ptr<Session> session);
+    PosixSyscall(uint64_t ppid, std::shared_ptr<ProcessGroup> pgrp, std::shared_ptr<Session> session);
 
     int allocate_fd(int min_fd = 0);
     bool read_c_string(vm* v, uint64_t addr, std::string& out, size_t max_len);
     bool read_c_string_array(vm* v, uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
     std::string resolve_path(const std::string& path);
+    // 把任意 guest 路径（相对则用 cwd）规范化为 guest 视角的绝对路径（不拼 root 前缀）。
+    // 用于 fd_handle::path 存储与特殊设备（/dev/ptmx 等）匹配 —— 这些都应基于 guest 命名空间。
+    std::string guest_abs_path(const std::string& path);
 
     // 宿主侧信号（物理终端 ^C/^Z/^\ / 终端挂断 / 外部 kill 给 bpfvm）转交 handler 路由。
     // 凭本 handler 掌握的 session/ctty/前台组决定目标：有控制终端->发到 ctty 的前台

@@ -30,6 +30,38 @@ memmap memmap::static_map(void* addr, size_t size, uint64_t paddr) {
 
 
 // ===== 库搜索 =====
+// 运行期 loader 的 chroot 根（由 main.cpp --root 经 set_loader_root 注入；默认空 = 宿主路径）。
+// 非空时 find_library 会在 root 内补搜，使动态主程序的 PT_INTERP 在 rootfs 内可定位。
+static std::string g_loader_root;
+
+void set_loader_root(const std::string& root) {
+    // realpath 规范化：与 PosixSyscall::init 里 ps->root 的来源保持一致（都经 realpath），
+    // 否则 guest_view 的前缀剥除会因相对路径/符号链接不匹配而失效，泄漏宿主绝对路径。
+    if (const char* rp = realpath(root.c_str(), nullptr)) {
+        g_loader_root = rp;
+        free((void*)rp);
+    } else {
+        g_loader_root = root;
+    }
+    if (!g_loader_root.empty() && g_loader_root.back() == '/') {
+        g_loader_root.pop_back();
+    }
+}
+
+// 把宿主路径（load_elf 实际打开的、拼了 root 前缀的路径）转回 guest 视角路径，用于诊断输出。
+// chroot 模式下诊断信息会进入 guest 可见的 stderr，不能泄漏 root 的宿主绝对路径
+// （如 /home/user/.../root/bin/ls）——剥掉 g_loader_root 前缀后只显示 guest 看到的 /bin/ls。
+// 非 chroot 模式原样返回。非 root 前缀开头的路径（如宿主搜索到的 .so）也原样返回。
+static std::string guest_view(const std::string& host_path) {
+    if (g_loader_root.empty()) return host_path;
+    if (host_path == g_loader_root) return "/";
+    const std::string prefix = g_loader_root + "/";
+    if (host_path.compare(0, prefix.size(), prefix) == 0) {
+        return "/" + host_path.substr(prefix.size());
+    }
+    return host_path;
+}
+
 static std::vector<std::string> default_lib_search_dirs() {
     std::vector<std::string> dirs;
     if (const char* env = getenv("LD_LIBRARY_PATH")) {
@@ -41,6 +73,12 @@ static std::vector<std::string> default_lib_search_dirs() {
     }
     dirs.push_back("lib");
     dirs.push_back(".");
+    // chroot 模式：在 rootfs 内补搜标准 lib 目录（优先于宿主，因 interp 在 rootfs 内）。
+    if (!g_loader_root.empty()) {
+        dirs.insert(dirs.begin(), g_loader_root + "/lib");
+        dirs.insert(dirs.begin(), g_loader_root + "/lib64");
+        dirs.insert(dirs.begin(), g_loader_root);
+    }
     return dirs;
 }
 
@@ -69,6 +107,14 @@ private:
     std::function<void()> func;
 };
 
+// 构造一个「加载失败」结果：entry=0 + err=<errno>。供 load_elf 各失败点统一使用，
+// 让 do_execve 能拿到精确 errno（ENOENT/EACCES/ENOEXEC...），替代历史上笼统的 ENOEXEC。
+static ElfLoadInfo fail(int err) {
+    ElfLoadInfo info;
+    info.err = err;
+    return info;
+}
+
 // 一个打开的 ELF 模块（主程序或 .so 依赖）
 struct ElfFile { std::string path; Elf* elf; int fd; };
 
@@ -84,15 +130,15 @@ struct Seg {
 
 bool validate_ehdr(const GElf_Ehdr& eh, const char* path) {
     if (eh.e_type == ET_REL) {
-        std::cerr << "bpfvm: ET_REL not supported; link with bpfvm-ld first: " << path << std::endl;
+        std::cerr << "bpfvm: ET_REL not supported; link with bpfvm-ld first: " << guest_view(path) << std::endl;
         return false;
     }
     if (eh.e_type != ET_EXEC && eh.e_type != ET_DYN) {
-        std::cerr << "Not an executable ELF file: " << path << " type: " << eh.e_type << std::endl;
+        std::cerr << "Not an executable ELF file: " << guest_view(path) << " type: " << eh.e_type << std::endl;
         return false;
     }
     if (eh.e_machine != EM_BPF) {
-        std::cerr << "Not a bpf ELF file: " << path << " machine: " << eh.e_machine << std::endl;
+        std::cerr << "Not a bpf ELF file: " << guest_view(path) << " machine: " << eh.e_machine << std::endl;
         return false;
     }
     return true;
@@ -171,7 +217,7 @@ bool map_segment(const Seg& s, const ElfFile& ef, memmap& m_out) {
 
     void* host = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (host == MAP_FAILED) {
-        std::cerr << "[load_elf] mmap failed for " << ef.path
+        std::cerr << "[load_elf] mmap failed for " << guest_view(ef.path)
                   << " @0x" << std::hex << s.vaddr << std::dec
                   << ": " << strerror(errno) << std::endl;
         return false;
@@ -179,7 +225,7 @@ bool map_segment(const Seg& s, const ElfFile& ef, memmap& m_out) {
     if (s.filesz > 0) {
         ssize_t n = pread(ef.fd, (char*)host + head_off, s.filesz, s.offset);
         if (n < 0 || (uint64_t)n != s.filesz) {
-            std::cerr << "[load_elf] short/failed pread of " << ef.path << ": "
+            std::cerr << "[load_elf] short/failed pread of " << guest_view(ef.path) << ": "
                       << n << "/" << s.filesz << std::endl;
             munmap(host, map_size);
             return false;
@@ -210,25 +256,26 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, GElf_Ehdr& main_ehdr, const char* in
     if (ldso_path.empty()) {
         std::cerr << "[load_elf] ldso not found: " << interp_path
                   << " (searched LD_LIBRARY_PATH + default dirs for " << interp_name << ")\n";
-        return ElfLoadInfo{};
+        // interp（动态链接器）找不到：对 guest 而言是程序所需的解释器不存在 → ENOENT。
+        return fail(ENOENT);
     }
     // open + elf_begin ldso。
     int ldso_fd = open(ldso_path.c_str(), O_RDONLY);
     if (ldso_fd < 0) {
-        std::cerr << "[load_elf] failed to open ldso: " << ldso_path << ": " << strerror(errno) << "\n";
-        return ElfLoadInfo{};
+        std::cerr << "[load_elf] failed to open ldso: " << guest_view(ldso_path) << ": " << strerror(errno) << "\n";
+        return fail(errno ? errno : ENOENT);
     }
     Elf* ldso_elf = elf_begin(ldso_fd, ELF_C_READ, nullptr);
     if (!ldso_elf) {
-        std::cerr << "[load_elf] elf_begin failed for ldso: " << ldso_path << "\n";
+        std::cerr << "[load_elf] elf_begin failed for ldso: " << guest_view(ldso_path) << "\n";
         close(ldso_fd);
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
     GElf_Ehdr ldso_ehdr;
     if (gelf_getehdr(ldso_elf, &ldso_ehdr) != &ldso_ehdr) {
-        std::cerr << "[load_elf] failed to get ldso ehdr: " << ldso_path << "\n";
+        std::cerr << "[load_elf] failed to get ldso ehdr: " << guest_view(ldso_path) << "\n";
         elf_end(ldso_elf); close(ldso_fd);
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
     opened.push_back({ldso_elf, ldso_fd});  // 交给 load_elf 的 defer_close 统一关闭
 
@@ -246,16 +293,16 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, GElf_Ehdr& main_ehdr, const char* in
     }
     if (segs.empty()) {
         std::cerr << "[load_elf] no PT_LOAD segments (ldso mode)\n";
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
-    if (!check_overlaps(segs, elves)) return ElfLoadInfo{};
+    if (!check_overlaps(segs, elves)) return fail(ENOEXEC);
 
     // mmap 每段。所有段强制加 PF_W（guest ldso 重定位时要写 text/data 段的 lddw imm，
     //    VM 的 mmu_w 按 memmap.flags 检查写权限，text 段 p_flags 无 W 会被拦截）。
     //    重定位完成后由 ldso 的 RELRO/mprotect 逻辑收紧权限（标准 ldso 模型）。
     for (const auto& s : segs) {
         memmap m;
-        if (!map_segment(s, elves[s.file_idx], m)) return ElfLoadInfo{};
+        if (!map_segment(s, elves[s.file_idx], m)) return fail(ENOEXEC);
         m.flags = s.flags | PF_W;
         add(std::move(m));
     }
@@ -284,19 +331,20 @@ ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
     // 运行时处理 .rela.dyn（数据/lddw 重定位）和 .rela.plt（GOT 槽）。
     if (elf_version(EV_CURRENT) == EV_NONE) {
         std::cerr << "Failed to initialize libelf: " << elf_errmsg(-1) << std::endl;
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
 
     int main_fd = open(path, O_RDONLY);
     if (main_fd < 0) {
-        std::cerr << "Failed to open: " << path << ": " << strerror(errno) << std::endl;
-        return ElfLoadInfo{};
+        std::cerr << "Failed to open: " << guest_view(path) << ": " << strerror(errno) << std::endl;
+        // 文件不存在/无权限等：传真实 errno（ENOENT/EACCES...），让 execve 报准。
+        return fail(errno);
     }
     Elf* main_elf = elf_begin(main_fd, ELF_C_READ, nullptr);
     if (!main_elf) {
         std::cerr << "Failed to open ELF file: " << elf_errmsg(-1) << std::endl;
         close(main_fd);
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
     std::vector<std::pair<Elf*, int>> opened = {{main_elf, main_fd}};
     Defer defer_close([&]() {
@@ -304,15 +352,15 @@ ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
     });
 
     if (elf_kind(main_elf) != ELF_K_ELF) {
-        std::cerr << "Not an ELF file: " << path << std::endl;
-        return ElfLoadInfo{};
+        std::cerr << "Not an ELF file: " << guest_view(path) << std::endl;
+        return fail(ENOEXEC);
     }
     GElf_Ehdr ehdr;
     if (gelf_getehdr(main_elf, &ehdr) != &ehdr) {
         std::cerr << "Failed to get ELF header: " << elf_errmsg(-1) << std::endl;
-        return ElfLoadInfo{};
+        return fail(ENOEXEC);
     }
-    if (!validate_ehdr(ehdr, path)) return ElfLoadInfo{};
+    if (!validate_ehdr(ehdr, path)) return fail(ENOEXEC);
 
     // 动态链接检测：主程序有 PT_INTERP → ldso 模式（VM 只 mmap 主程序+ldso，依赖加载/
     // 重定位/TLS/init_array 全由 guest ldso 在 VM 内完成）。无 PT_INTERP → 静态，走原路径。
@@ -347,14 +395,14 @@ ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
         layout_module(elves[fi].elf, fi, eh.e_type == ET_DYN, next_alloc, load_base[fi], segs);
     }
     if (segs.empty()) {
-        std::cerr << "[load_elf] no PT_LOAD segments in " << path << std::endl;
-        return ElfLoadInfo{};
+        std::cerr << "[load_elf] no PT_LOAD segments in " << guest_view(path) << std::endl;
+        return fail(ENOEXEC);
     }
-    if (!check_overlaps(segs, elves)) return ElfLoadInfo{};
+    if (!check_overlaps(segs, elves)) return fail(ENOEXEC);
 
     for (const auto& s : segs) {
         memmap m;
-        if (!map_segment(s, elves[s.file_idx], m)) return ElfLoadInfo{};
+        if (!map_segment(s, elves[s.file_idx], m)) return fail(ENOEXEC);
         add(std::move(m));
     }
 

@@ -50,7 +50,8 @@ bool PosixSyscall::do_execve(vm* v) {
     options(fresh.get()).raw_stack   = options(v).raw_stack;
     ElfLoadInfo load_info = fresh->load_elf(resolve_path(path).c_str());
     if(load_info.entry == 0) {
-        v->r(0) = -ENOEXEC;
+        // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
+        v->r(0) = load_info.err ? -load_info.err : -ENOEXEC;
         return true;
     }
     const uint64_t entry = load_info.entry;
@@ -145,12 +146,12 @@ bool PosixSyscall::do_clone(vm* v) {
             child_fds[entry.first] = new_handle;
         }
     }
-    auto child_sys = std::make_shared<PosixSyscall>(
-        is_thread ? ppid.load() : tg->tgid,
-        is_thread ? ps->fds : child_fds,
-        ps->cwd, pgrp, session);
+    auto child_sys = std::make_shared<PosixSyscall>(is_thread ? ppid.load() : tg->tgid, pgrp, session);
     if(!is_thread) {
+        child_sys->ps->fds = child_fds;
         child_sys->ps->signal_actions = ps->signal_actions;
+        child_sys->ps->root = ps->root;
+        child_sys->ps->cwd = ps->cwd;
     } else {
         child_sys->ps = ps;
         child_sys->tg = tg;

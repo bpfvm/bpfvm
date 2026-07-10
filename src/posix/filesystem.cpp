@@ -45,16 +45,39 @@ bool PosixSyscall::read_c_string_array(vm* v, uint64_t addr, std::vector<std::st
     return false;
 }
 
-std::string PosixSyscall::resolve_path(const std::string& path) {
+std::string PosixSyscall::guest_abs_path(const std::string& path) {
     if(path.empty()) {
         return path;
     }
+    // 求 guest 视角的绝对路径（ps->cwd 已是 guest 视角），lexically_normal 消除
+    // '..'，使 '/../../etc/passwd' 规范化为 '/etc/passwd' —— 仍被限制在 root 下，无法逃逸。
     std::filesystem::path input(path);
+    std::string guest_abs;
     if(input.is_absolute()) {
-        return input.lexically_normal().string();
+        guest_abs = input.lexically_normal().string();
+    } else {
+        std::filesystem::path base = ps->cwd.empty() ? std::filesystem::path("/") : std::filesystem::path(ps->cwd);
+        guest_abs = (base / input).lexically_normal().string();
     }
-    std::filesystem::path base = ps->cwd.empty() ? std::filesystem::path("/") : std::filesystem::path(ps->cwd);
-    return (base / input).lexically_normal().string();
+    // lexically_normal 对根目录 "/" 会返回空，补回。
+    if(guest_abs.empty()) {
+        guest_abs = "/";
+    }
+    return guest_abs;
+}
+
+std::string PosixSyscall::resolve_path(const std::string& path) {
+    std::string guest_abs = guest_abs_path(path);
+    if(guest_abs.empty()) {
+        return guest_abs;
+    }
+    // 非 chroot 模式：直接返回 guest 绝对路径（= 原行为）。
+    // chroot 模式：拼上宿主 root 前缀得到实际宿主路径。
+    if(ps->root.empty()) {
+        return guest_abs;
+    }
+    // root 已去尾斜杠；guest_abs 以 '/' 开头，两者拼接即宿主路径。
+    return ps->root + guest_abs;
 }
 
 bool PosixSyscall::do_unlinkat(vm* v) {

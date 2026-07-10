@@ -54,19 +54,24 @@ bool PosixSyscall::do_openat(vm* v) {
     }
     int flags = arg_s32(v->r(3));
     mode_t mode = (mode_t)(arg_u32(v->r(4)) & ~umask_val);
-    std::string resolved = (dirfd == AT_FDCWD) ? resolve_path(path) : path;
+    // guest_abs：guest 命名空间的绝对路径（用于 pty 特殊设备匹配 + fd_handle::path 存储后者
+    // 经 do_fchdir 会进 cwd，故必须保持 guest 视角，而非拼了 root 的宿主路径）。
+    // host_path：实际 openat 用的宿主路径（AT_FDCWD 时 = resolve_path，已含 root 前缀）。
+    std::string guest_abs = (dirfd == AT_FDCWD) ? guest_abs_path(path) : path;
+    std::string host_path = (dirfd == AT_FDCWD) ? resolve_path(path) : path;
 
     // —— guest pty 合成：tmux/posix_openpt/openpty 都走 open("/dev/ptmx") + ioctl(TIOCGPTN) +
     // open("/dev/pts/N")。bpfvm 拦截这两个特殊路径，合成 host pty（canonical/echo 全交 host
     // 内核）。GuestTty 按 pts 编号登记进 ptmx_registry，open("/dev/pts/N") 复用之。
-    // 注：ptmx 不看 dirfd（它必是绝对路径特殊设备）。
+    // 注：ptmx 不看 dirfd（它必是绝对路径特殊设备）。特殊设备按 guest 路径匹配，不受 chroot
+    // 影响（root 内通常没有 /dev）。
     // —— /dev/tty：guest job-control（dash setjobctl）打开它拿控制终端做 tcgetpgrp/tcsetpgrp。
     // 真 /dev/tty 在 host 侧是 bpfvm 自身的 ctty（非 guest pty slave），fd_handle.tty 为空，
     // 后续 TIOCGPGRP 会因 tty 字段不匹配 session->ctty 而 ENOTTY → dash 报 "can't access tty;
     // job control turned off"。故拦截：本会话有 ctty 时，复用一个已绑同一 ctty 的 fd（dup 它
     // 的 host fd，携带同一 GuestTty），使该 fd 就是 ctty 端。无 ctty → ENXIO（与
     // Linux 无 ctty 进程开 /dev/tty 的行为一致）。
-    if(resolved == "/dev/tty") {
+    if(guest_abs == "/dev/tty") {
         if(!session || !session->ctty) {
             v->r(0) = -ENXIO;
             return true;
@@ -86,14 +91,14 @@ bool PosixSyscall::do_openat(vm* v) {
         }
         int host_fd = dup(ps->fds[src_guest_fd]->fd);
         if(host_fd < 0) { v->r(0) = -errno; return true; }
-        auto handle = std::make_shared<fd_handle>(host_fd, resolved, ctty);
+        auto handle = std::make_shared<fd_handle>(host_fd, guest_abs, ctty);
         if(flags & O_CLOEXEC) handle->cloexec = true;
         int guest_fd = allocate_fd();
         ps->fds[guest_fd] = handle;
         v->r(0) = guest_fd;
         return true;
     }
-    if(resolved == "/dev/ptmx") {
+    if(guest_abs == "/dev/ptmx") {
         int master = posix_openpt(O_RDWR | O_NOCTTY);
         if(master < 0) { v->r(0) = -errno; return true; }
         if(grantpt(master) < 0 || unlockpt(master) < 0) {
@@ -109,7 +114,7 @@ bool PosixSyscall::do_openat(vm* v) {
             ptmx_registry[ptn] = tty;
         }
         // master token：仅由 master fd 持有（use_count = master fd 数），最后一个关闭触发 SIGHUP。
-        auto handle = std::make_shared<fd_handle>(master, resolved, tty, std::make_shared<PtySide>());
+        auto handle = std::make_shared<fd_handle>(master, guest_abs, tty, std::make_shared<PtySide>());
         if(flags & O_CLOEXEC) handle->cloexec = true;
         int guest_fd = allocate_fd();
         ps->fds[guest_fd] = handle;
@@ -117,9 +122,9 @@ bool PosixSyscall::do_openat(vm* v) {
         return true;
     }
     // rfind(...,0) == 0 即 starts_with：前缀匹配 "/dev/pts/"（9 字符）。
-    if(resolved.rfind("/dev/pts/", 0) == 0) {
+    if(guest_abs.rfind("/dev/pts/", 0) == 0) {
         // /dev/pts/N：查 registry 取该编号的 GuestTty，打开对应 host slave，包成 fd_handle。
-        int ptn = atoi(resolved.c_str() + 9);  // 数字从 index 9 起
+        int ptn = atoi(guest_abs.c_str() + 9);  // 数字从 index 9 起
         std::shared_ptr<GuestTty> tty;
         {
             std::lock_guard<std::mutex> lk(ptmx_registry_mutex);
@@ -132,7 +137,7 @@ bool PosixSyscall::do_openat(vm* v) {
         snprintf(slave_name, sizeof(slave_name), "/dev/pts/%d", ptn);
         int slave = open(slave_name, flags & ~O_CREAT, mode);
         if(slave < 0) { v->r(0) = -errno; return true; }
-        auto handle = std::make_shared<fd_handle>(slave, resolved, tty);
+        auto handle = std::make_shared<fd_handle>(slave, guest_abs, tty);
         if(flags & O_CLOEXEC) handle->cloexec = true;
         int guest_fd = allocate_fd();
         ps->fds[guest_fd] = handle;
@@ -142,7 +147,7 @@ bool PosixSyscall::do_openat(vm* v) {
 
     int fd = -1;
     if(dirfd == AT_FDCWD) {
-        fd = openat(AT_FDCWD, resolved.c_str(), flags, mode);
+        fd = openat(AT_FDCWD, host_path.c_str(), flags, mode);
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
@@ -151,14 +156,14 @@ bool PosixSyscall::do_openat(vm* v) {
         }
         fd = openat(it->second->fd, path.c_str(), flags, mode);
         if(!it->second->path.empty()) {
-            resolved = (std::filesystem::path(it->second->path) / path).lexically_normal().string();
+            guest_abs = (std::filesystem::path(it->second->path) / path).lexically_normal().string();
         }
     }
     if(fd == -1) {
         v->r(0) = -errno;
         return true;
     }
-    auto handle = std::make_shared<fd_handle>(fd, std::move(resolved));
+    auto handle = std::make_shared<fd_handle>(fd, std::move(guest_abs));
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
     }

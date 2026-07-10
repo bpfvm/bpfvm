@@ -24,14 +24,11 @@ PosixSyscall::PosixSyscall() {
     pgrp = std::make_shared<ProcessGroup>(pid, session);
 }
 
-PosixSyscall::PosixSyscall(uint64_t ppid, const std::unordered_map<int, std::shared_ptr<fd_handle>>& opened, std::string cwd_,
-                           std::shared_ptr<ProcessGroup> pgrp_, std::shared_ptr<Session> session_)
+PosixSyscall::PosixSyscall(uint64_t ppid, std::shared_ptr<ProcessGroup> pgrp_, std::shared_ptr<Session> session_)
     : pgrp(std::move(pgrp_)), session(std::move(session_)) {
     pid = next_pid.fetch_add(1);
     tg = std::make_shared<ThreadGroup>(pid);
     this->ppid = ppid;
-    ps->fds = opened;
-    ps->cwd = cwd_;
     // 子进程经 fork 继承父的 pgrp/session（shared_ptr 共享同一对象），其控制终端由
     // session->ctty 表达（同样共享）。GuestTty随 fd 句柄的 tty 字段
     // 共享——fork 后子进程的 pty slave fd（fd_handle::clone）携带同一 GuestTty 引用。
@@ -42,34 +39,46 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
     // 只有 pid 1（主进程）在此注册自身：它没有父 task 替它 push 到 threads。
     // 其余 task（fork / clone 产生的子）由创建方在 do_fork / do_clone 持 tg->mtx 注册，
     // 避免子线程 host 尚未跑到 init() 时 leader 就 exit_group 漏杀它。
-    if(pid == 1) {
+    if(pid != 1) {
+        return;
+    }
+    {
         std::lock_guard<std::mutex> lock(tg->mtx);
         tg->threads.push_back(v);
     }
     std::lock_guard<std::mutex> lock(pid_map_mutex);
     //这里只对1号进程添加，其他进程由fork添加，因为推迟到这里就太晚了
-    if(pid == 1) {
-        pid_map[pid] = v;
-        // guest fd 0/1/2 播种：PTY 模式取 Pty 的 slave fd 包成 fd_handle 并绑 ctty；否则 dup 宿主 stdio。
-        // 注意：pump 线程由 main 在 vm->run() 前启动（host 接入职责），此处只消费 Pty 的 slave 产物
-        // 做 guest 侧播种。测试（insn_test）不设 pty，nullptr 退化走 dup stdio。
-        auto& pty = options(v.get()).pty;
-        if(pty && pty->master_fd() >= 0) {
-            int slave_fd = pty->take_slave_fd();
-            auto tty = std::make_shared<GuestTty>();
-            tty->owner_ = session.get();
-            tty->fg_pgrp.store(pgrp->pgid);
-            session->ctty = tty;
-            auto mk = [&](int host_fd){ return std::make_shared<fd_handle>(host_fd, "", tty); };
-            ps->fds.emplace(0, mk(dup(slave_fd)));
-            ps->fds.emplace(1, mk(dup(slave_fd)));
-            ps->fds.emplace(2, mk(dup(slave_fd)));
-            close(slave_fd);
-        } else {
-            ps->fds.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
-            ps->fds.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
-            ps->fds.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
-        }
+    pid_map[pid] = v;
+    // guest fd 0/1/2 播种：PTY 模式取 Pty 的 slave fd 包成 fd_handle 并绑 ctty；否则 dup 宿主 stdio。
+    // 注意：pump 线程由 main 在 vm->run() 前启动（host 接入职责），此处只消费 Pty 的 slave 产物
+    // 做 guest 侧播种。测试（insn_test）不设 pty，nullptr 退化走 dup stdio。
+    auto& pty = options(v.get()).pty;
+    if(pty && pty->master_fd() >= 0) {
+        int slave_fd = pty->take_slave_fd();
+        auto tty = std::make_shared<GuestTty>();
+        tty->owner_ = session.get();
+        tty->fg_pgrp.store(pgrp->pgid);
+        session->ctty = tty;
+        auto mk = [&](int host_fd){ return std::make_shared<fd_handle>(host_fd, "", tty); };
+        ps->fds.emplace(0, mk(dup(slave_fd)));
+        ps->fds.emplace(1, mk(dup(slave_fd)));
+        ps->fds.emplace(2, mk(dup(slave_fd)));
+        close(slave_fd);
+    } else {
+        ps->fds.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
+        ps->fds.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
+        ps->fds.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
+    }
+    if(!ps->root.empty()) {
+        return;
+    }
+    const char* rp = realpath(options(v.get()).root.c_str(), nullptr);
+    if(rp == nullptr) {
+        ps->root = "/";
+    } else {
+        ps->root = rp;
+        free((void*)rp);
+        ps->cwd = "/";
     }
 }
 

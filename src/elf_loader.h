@@ -52,9 +52,16 @@ struct memmap {
 // name 若是绝对路径或当前目录可直接访问的文件，原样返回。找不到返回空串。
 std::string find_library(const std::vector<std::string>& extra_dirs, const std::string& name);
 
+// 设定运行期 loader 的 chroot 根目录（--root）。非空时 find_library 的默认搜索路径
+// 与 load_elf_ldso 的 ldso 查找会在 root 内（root/lib、root/lib64 …）补搜，使动态主程序
+// 的 PT_INTERP（/lib/ld-bpf.so）在 rootfs 内可被定位。仅 bpfvm 运行时调用；bpfvm-ld 不调。
+void set_loader_root(const std::string& root);
+
 // 主程序加载结果：除入口地址外，还带 auxv 启动所需的信息（musl/glibc 的
 // __init_tls 靠 AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 program headers 与 TLS）。
-// entry 为 0 表示加载失败；phdr 为 0 表示主程序无 PT_PHDR（lib/动态链接器场景）。
+// entry 为 0 表示加载失败；此时 err 给出失败原因（正 errno 值，如 ENOENT/EACCES/ENOEXEC），
+// 供 do_execve 等调用方映射为精确的 guest errno（替代历史上笼统的 ENOEXEC）。
+// err 为 0 表示未设置（成功，或极早期失败回退到 ENOEXEC）。phdr 为 0 表示主程序无 PT_PHDR。
 struct ElfLoadInfo {
     uint64_t entry = 0;
     uint64_t phdr = 0;     // program header table 的运行时 guest 虚拟地址
@@ -68,6 +75,7 @@ struct ElfLoadInfo {
                              // _dlstart（VM 从那里开始执行动态链接流程），而 AT_ENTRY 必须是
                              // 主程序入口——ldso 的 CRTJMP(aux[AT_ENTRY]) 跳到它移交控制权。
                              // 两者不同；0 表示回退用 entry（保持旧行为）。
+    int err = 0;           // 加载失败 errno（ENOENT/EACCES/ENOEXEC...）；成功时为 0。
 };
 
 // 加载 ELF：有 PT_INTERP 走 ldso 模式（只 mmap 主程序+ldso，依赖加载/重定位由 guest

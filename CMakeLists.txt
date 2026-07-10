@@ -31,15 +31,20 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
-    # test_name / program / lib_path / variant / jit_env
     # 每个用例一个 ctest 条目，内部串行跑 4 变体（静态/动态 × JIT 开/关）。
     # 不同用例之间由 ctest -j 并发；同用例变体串行，不冲突文件。
+    # ROOT 参数非空时走 chroot 模式（建临时 rootfs + --root 启动 + marker 落位校验）。
     function(add_bpf_program_test name)
+        set(extra_args)
+        if(name IN_LIST BPF_ROOT_TESTS)
+            list(APPEND extra_args -DROOT=1)
+        endif()
         add_test(NAME ${name}
             COMMAND ${CMAKE_COMMAND}
                 -DBPFVM=$<TARGET_FILE:bpfvm>
                 -DNAME=${name}
                 -DWORKDIR=${CMAKE_SOURCE_DIR}
+                ${extra_args}
                 -P ${CMAKE_SOURCE_DIR}/cmake/RunBpfProgram.cmake)
         set_tests_properties(${name} PROPERTIES
             FIXTURES_REQUIRED bpf_programs_built
@@ -52,14 +57,22 @@ if(BUILD_TESTING)
         "${CMAKE_SOURCE_DIR}/test/test_*.c"
         "${CMAKE_SOURCE_DIR}/test/test_*.cpp")
 
+    # 不自动注册为独立测试的辅助程序（被其他测试调用）。
     set(BPF_TEST_HELPERS
         test_arg
         test_cloexec_child
     )
 
+    # 辅助程序里需要 --root chroot 隔离跑的：用标准 runner 的 ROOT 模式注册
+    # （建临时 rootfs + --root 启动 + 校验写操作落在 rootfs 内）。
+    set(BPF_ROOT_TESTS
+        test_root
+    )
+
     foreach(test_source IN LISTS TEST_SOURCES)
         get_filename_component(test_name "${test_source}" NAME_WE)
 
+        # ROOT 测试虽在 helpers，但单独注册（带 ROOT=1）。
         if(test_name IN_LIST BPF_TEST_HELPERS)
             continue()
         endif()

@@ -66,12 +66,22 @@ configure() {
         sed -i "s|^${cfg}=y|# ${cfg} is not set|" .config
     done
 
+    # 显式启用的 config：defconfig 默认关、但 BPF/VM 环境需要的。
+    local enable=(
+        CONFIG_FEATURE_SH_STANDALONE
+        CONFIG_FEATURE_SH_NOFORK
+    )
+    for cfg in "${enable[@]}"; do
+        sed -i "s|^# ${cfg} is not set|${cfg}=y|" .config
+        sed -i "s|^${cfg}=.*|${cfg}=y|" .config
+    done
+
     # olddefconfig 同步依赖关系
     make HOSTCC=gcc CC="${CLANG_WRAPPER}" olddefconfig >/dev/null 2>&1 || true
     # 清理上次构建的陈旧 .o（config 改变后，被禁 applet 的 .o 仍会残留并参与链接）
     make clean >/dev/null 2>&1 || true
     echo "=== Config 关键项检查 ==="
-    command grep -E 'CONFIG_(SH_IS_ASH|ASH|HUSH|CAT|LS|ECHO|TRUE|FALSE|SLEEP|DATE|ID|UNAME|STATIC|TC|INET|HTTPD|MOUNT|LOGIN|SU|DPKG)=y' .config || true
+    command grep -E 'CONFIG_(SH_IS_ASH|ASH|HUSH|CAT|LS|ECHO|TRUE|FALSE|SLEEP|DATE|ID|UNAME|STATIC|TC|INET|HTTPD|MOUNT|LOGIN|SU|DPKG|FEATURE_SH_STANDALONE|FEATURE_SH_NOFORK)=y' .config || true
 }
 
 build() {
