@@ -81,7 +81,7 @@ public:
     // Compile or find a JIT function starting at pc.
     // Returns nullptr if the instruction cannot be JIT-compiled.
     JitFunction* compile(vm* v, uint64_t gpa) override;
-    void clear() override { functions_.clear(); failed_.clear(); }
+    void clear() override { functions_.clear(); failed_.clear(); call_counts_.clear(); }
 
 private:
     // VM field offsets
@@ -95,6 +95,9 @@ private:
     std::unordered_map<uint64_t, JitFunction> functions_;
     std::unordered_set<uint64_t> failed_;
     bool enabled_ = true;
+    // 热点检测阈值：每个 pc 的 compile() 调用计数达到阈值才编译。
+    uint32_t threshold_ = 100;
+    std::unordered_map<uint64_t, uint32_t> call_counts_;
 
     // JIT runtime helpers — called from JIT-generated code via function pointer.
     static int helper_safepoint(vm* v);

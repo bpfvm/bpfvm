@@ -2,6 +2,8 @@
 
 永远不要使用git checkout, 只能使用git stash作为替代
 
+如果grep报错"指定了互相冲突的匹配器"，那是因为在 zcode 里 `grep` 是一个被重定义过的函数，与标准 GNU grep 行为不同。这时候需要 grep 时改用 `command grep ...`、`/usr/bin/grep ...`，或优先使用专门的搜索工具(rg)。
+
 ## Project Structure & Module Organization
 - `main.cpp`: VM entry point, command-line parsing, signal setup.
 - `insn.h`: core VM class (`vm`), abstract `SyscallHandler` interface, TLB, and instruction definitions.
@@ -74,6 +76,7 @@ The VM uses a hybrid interpreter/JIT execution model:
 
 ### JIT Environment Variables
 - `JIT_ENABLE`: set to `0` to disable JIT and force interpreter-only execution; defaults to enabled (any other value or unset enables JIT).
+- `JIT_THRESHOLD`: hot-pc detection threshold (default `100`; `0` disables it, compiling every pc as before). A guest pc must be reached this many times (counted in `compile()`, which `step()` single-stepping and JIT `helper_call_bpf` both drive) before it is JIT-compiled. Loop back-edge targets reach the threshold quickly and get compiled at the loop header — an implicit OSR (the JIT prologue loads `vm->reg[]`, so it can enter at any pc and the interpreter's current state is preserved); cold pcs never reach it and stay in the interpreter, so compile time is not wasted on template-bloat cold code. The threshold trades OSR latency against compile savings: compute-bound programs (large loops) OSR after `threshold` iterations, so `test_compute` is unchanged; `test_stl_filesystem`-style programs (many cold functions) speed up ~25×. Higher values slow OSR (e.g. `test_compute` 0.16s at 100 → 1.0s at 2000).
 - `BPF_DEBUG`: set to any value to print VM execution statistics (instruction counts, JIT compilation info, timing) to stderr at VM exit. Also enables instruction counting in JIT-compiled code.
 
 ### Instruction Budget

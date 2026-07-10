@@ -39,6 +39,7 @@ template<typename EmitterT>
 JitCompiler<EmitterT>::JitCompiler() {
     const char* env = getenv("JIT_ENABLE");
     enabled_ = (env == nullptr || strcmp(env, "0") != 0);
+    if (const char* e = getenv("JIT_THRESHOLD")) threshold_ = (uint32_t)atoi(e);
 }
 
 template<typename EmitterT>
@@ -438,6 +439,15 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         return nullptr;
     }
 
+    // 热点检测：未达阈值的 pc 走解释器（返回 nullptr）。计数器在每次 compile()
+    // 调用时递增——step() 单步与 JIT helper_call_bpf 都经过这里，所以循环回边
+    // 目标会被反复计数，达到阈值即在循环头编译（OSR：prologue 从 vm->reg[] 加载
+    // 解释器当前状态，JIT 接管剩余循环）。冷 pc 永不达阈值，始终走解释器。
+    if (threshold_ > 0) {
+        auto& cnt = call_counts_[gpa];
+        if (++cnt < threshold_) return nullptr;
+    }
+
     auto compile_start = std::chrono::high_resolution_clock::now();
     auto record_compile_time = [&] {
         stats.compile_ns += (uint64_t)std::chrono::duration_cast<
@@ -467,36 +477,6 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     int num_insns = 0;
     auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, loop_body_sizes, num_insns);
     if (reachable.empty() || num_insns <= 0) { record_compile_time(); return nullptr; }
-
-    // 跳转 target 预检：emit 阶段会为每条跳转指令生成 placeholder，patch 阶段再回填
-    // target。当 gpa 是某个函数的"中间地址"（step() 的解释器单步把函数体中部当新入口），
-    // 相对入口的跳转 target 会落在 [0, num_insns) 之外或指向不可达槽，patch 必失败。
-    // 对 test_varargs 这类"密集小函数调用"程序，每次函数调用/返回都退出 JIT 回到解释器，
-    // 单步推进的每个中间 pc 都会触发一次完整 compile——其中 emit（生成几百条 x86 指令）
-    // 占了 patch_fail 路径约 97% 的耗时。这里在昂贵的 emit 之前先廉价扫描一遍可达指令，
-    // 若发现任一跳转 target 越界，直接判失败，避免白做 emit。
-    for (int i = 0; i < num_insns; i++) {
-        if (!reachable[i]) continue;
-        const bpf_insn* insn = entry_pc + i;
-        uint8_t cls = insn->code & 0x07;
-        if (cls != BPF_JMP && cls != BPF_JMP32) continue;
-        uint8_t op = insn->code & 0xf0;
-        // 只关心会产生 placeholder 的跳转（emit_ja/emit_jmp/emit_ja32）。
-        // BPF_CALL/BPF_EXIT 不产生跳转 placeholder。
-        if (op == BPF_CALL || op == BPF_EXIT) continue;
-        int target;
-        if (cls == BPF_JMP32 && op == BPF_JA) {
-            target = i + 1 + insn->imm;
-        } else {
-            target = i + 1 + insn->off;
-        }
-        // patch 阶段要求 target ∈ [0, num_insns) 且该槽可达（被 emit）。
-        if (target < 0 || target >= num_insns || !reachable[target]) {
-            failed_.insert(gpa);
-            record_compile_time();
-            return nullptr;
-        }
-    }
 
     // Set up emitter
     bool insn_count_enabled = getenv("BPF_DEBUG") || v->options.insn_limit != 0;
