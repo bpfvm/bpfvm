@@ -477,6 +477,32 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, loop_body_sizes, num_insns);
     if (reachable.empty() || num_insns <= 0) { record_compile_time(); return nullptr; }
 
+    // 跳转 target 预检（仅 threshold_==1 启用）：gpa 若是函数中间地址——单次执行的 pc
+    // 只在 threshold=1 下被编译——其相对入口的跳转 target 会越界，patch 阶段必失败。
+    // 在昂贵的 emit 之前廉价扫描，越界即判失败，省掉无用的 emit。
+    for (int i = 0; threshold_ == 1 &&  i < num_insns; i++) {
+        if (!reachable[i]) continue;
+        const bpf_insn* insn = entry_pc + i;
+        uint8_t cls = insn->code & 0x07;
+        if (cls != BPF_JMP && cls != BPF_JMP32) continue;
+        uint8_t op = insn->code & 0xf0;
+        // 只关心会产生 placeholder 的跳转（emit_ja/emit_jmp/emit_ja32）。
+        // BPF_CALL/BPF_EXIT 不产生跳转 placeholder。
+        if (op == BPF_CALL || op == BPF_EXIT) continue;
+        int target;
+        if (cls == BPF_JMP32 && op == BPF_JA) {
+            target = i + 1 + insn->imm;
+        } else {
+            target = i + 1 + insn->off;
+        }
+        // patch 阶段要求 target ∈ [0, num_insns) 且该槽可达（被 emit）。
+        if (target < 0 || target >= num_insns || !reachable[target]) {
+            failed_.insert(gpa);
+            record_compile_time();
+            return nullptr;
+        }
+    }
+
     // Set up emitter
     bool insn_count_enabled = getenv("BPF_DEBUG") || v->options.insn_limit != 0;
     bool budget_enabled = v->options.insn_limit != 0;

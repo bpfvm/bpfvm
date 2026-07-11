@@ -16,16 +16,18 @@ if(NOT DEFINED WORKDIR)
     set(WORKDIR "${CMAKE_CURRENT_LIST_DIR}/..")
 endif()
 
-# label|program_suffix|BPF_TEST_VARIANT|JIT_ENABLE  ("-" 占位空值)
+# label|program_suffix|BPF_TEST_VARIANT|JIT_ENABLE|JIT_THRESHOLD  ("-" 占位空值)
 # 前 4 个走 bpfvm（静态/动态 × JIT/解释器）。
+# JIT 变体设 JIT_THRESHOLD=1：每个 pc 命中一次即编译，最大化 JIT 覆盖（暴露冷代码
+# 路径里的 JIT 缺陷，而非只在热点循环上验证）。
 # 第 5 个 host 变体直接运行宿主 gcc 原生二进制（test/Makefile 的 *.host），
 # 作为 BPF/musl/bpfvm 实现的对照基线：同一测试逻辑在标准 glibc 下也应通过。
 set(variants
-    "static_jit|out|-|-"
-    "dynamic_jit|linked|linked|-"
-    "static_interp|out|-|0"
-    "dynamic_interp|linked|linked|0"
-    "host|host|host|-"
+    "static_jit|out|-|-|1"
+    "dynamic_jit|linked|linked|-|1"
+    "static_interp|out|-|0|-"
+    "dynamic_interp|linked|linked|0|-"
+    "host|host|host|-|-"
 )
 
 # chroot 模式下需要 root/lib（libc.so = ld-bpf.so，供动态变体 PT_INTERP 解析）。
@@ -39,6 +41,7 @@ foreach(v ${variants})
     list(GET fields 1 suffix)
     list(GET fields 2 variant_env)
     list(GET fields 3 jit_env)
+    list(GET fields 4 threshold_env)
 
     # chroot 模式跳过 host 变体（chroot 无宿主对照意义）。
     if(DEFINED ROOT AND label STREQUAL "host")
@@ -56,6 +59,11 @@ foreach(v ${variants})
         unset(ENV{JIT_ENABLE})
     else()
         set(ENV{JIT_ENABLE} "${jit_env}")
+    endif()
+    if(threshold_env STREQUAL "-")
+        unset(ENV{JIT_THRESHOLD})
+    else()
+        set(ENV{JIT_THRESHOLD} "${threshold_env}")
     endif()
     # 运行时库搜索路径（bpfvm 自身与 guest ldso 都用 LD_LIBRARY_PATH 搜库）：
     #   - root/lib：libc.so/libcxx.so（build_root.sh 复制到此，供 rootfs 与 ctest 共用）。
