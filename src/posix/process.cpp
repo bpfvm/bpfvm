@@ -84,12 +84,9 @@ bool PosixSyscall::do_execve(vm* v) {
     decltype(ps->signal_actions) new_actions{};
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
     const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
+    // execve：被忽略的信号保留 SIG_IGN（POSIX），其余恢复 SIG_DFL。
     for(size_t i = 0; i < new_actions.size(); i++) {
-        if(ps->signal_actions[i].handler == sig_ign) {
-            new_actions[i].handler = sig_ign;
-        } else {
-            new_actions[i].handler = sig_dfl;
-        }
+        new_actions[i].handler = handler_is_ignored(ps->signal_actions[i].handler) ? sig_ign : sig_dfl;
     }
     ps->signal_actions = new_actions;
     signal_depth(v) = 0;

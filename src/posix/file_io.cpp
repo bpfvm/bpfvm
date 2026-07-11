@@ -25,9 +25,8 @@ bool PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<fd_handle>& fd, boo
         // tcgetattr 失败或 TOSTOP 置位：走下面的 SIGTTOU 路径。
     }
     int sig = is_read ? SIGTTIN : SIGTTOU;
-    uint64_t handler = ps->signal_actions[static_cast<size_t>(sig)].handler;
-    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
-    if(handler == sig_ign) {
+    const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
+    if(handler_is_ignored(act.handler)) {
         // SIG_IGN：信号被忽略。
         //   写 → I/O 照常完成（放行，do_write 真正 write）。
         //   读 → Linux 返回 -EIO（后台读被忽略视为非法）。

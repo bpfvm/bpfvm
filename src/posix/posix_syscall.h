@@ -167,6 +167,11 @@ class PosixSyscall: public SyscallHandler{
     std::shared_ptr<ProcessGroup> pgrp;
     std::shared_ptr<Session> session;
 
+    // 信号默认动作判定：是否为"可忽略"信号——即 SIG_IGN，或 SIG_DFL 且默认动作为
+    // Ign(SIGCHLD/SIGURG/SIGWINCH)/Cont(SIGCONT)。这类信号投递给进程不会改变其状态，
+    // 也不会打断阻塞中的系统调用（对齐 Linux：get_signal 不让 Ign/Cont 信号产生 EINTR）。
+    // SIGKILL/SIGSTOP 调用方已特判，不会进入此函数。
+    bool signal_ignorable(int sig);
     // 把信号投给指定 vm 的内部接口
     void queue_signal(vm* v, int sig);
     // 停止整个线程组（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）：设 tg 级停止状态 + 组内每线程

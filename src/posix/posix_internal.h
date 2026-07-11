@@ -64,4 +64,11 @@ static inline size_t arg_size(uint64_t v) {
     return static_cast<size_t>(v);
 }
 
+static inline bool handler_is_default(uint64_t handler) {
+    return handler == static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
+}
+static inline bool handler_is_ignored(uint64_t handler) {
+    return handler == static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
+}
+
 #endif

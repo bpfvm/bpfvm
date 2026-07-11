@@ -37,12 +37,54 @@ void PosixSyscall::stop_process(int sig) {
     }
 }
 
+static bool is_default_term(int sig) {
+    // SIG_DFL 默认动作为"终止"的信号（signal(7) Term/Core 列表）。bpfvm 不区分 core dump，
+    // 统一走 do_exit_group 终止整个线程组（handle_signals 的 SIG_DFL 分支）。
+    switch(sig) {
+    case SIGHUP: case SIGINT: case SIGQUIT: case SIGILL: case SIGTRAP:
+    case SIGABRT: case SIGBUS: case SIGFPE: case SIGUSR1: case SIGSEGV:
+    case SIGUSR2: case SIGPIPE: case SIGALRM: case SIGTERM: case SIGSTKFLT:
+    case SIGVTALRM: case SIGPROF: case SIGXCPU: case SIGXFSZ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_default_stop(int sig) {
+    // SIG_DFL 默认动作为"停止作业"的信号（signal(7) Stop 列表）。SIGSTOP 不可捕获/忽略，
+    // 恒为停止，但调用方（queue_signal）已特判，不进此函数。
+    return sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
+bool PosixSyscall::signal_ignorable(int sig) {
+    // SIG_IGN 显式忽略，或 SIG_DFL 且默认动作 = Ign(SIGCHLD/SIGURG/SIGWINCH)/Cont(SIGCONT)。
+    // 这些信号投递不会改变进程状态，Linux 也不让它们打断阻塞系统调用：get_signal 不让
+    // Ign/Cont 信号产生 EINTR。判定复用 is_default_term/is_default_stop 单一来源。
+    // SIGKILL/SIGSTOP 调用方已特判，不会进入此函数。
+    if(sig <= 0 || sig >= NSIG) {
+        return false;
+    }
+    const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
+    if(handler_is_ignored(act.handler)) {
+        return true;
+    }
+    if(!handler_is_default(act.handler)) {
+        return false;  // 已 catch：投递需中断系统调用
+    }
+    // SIG_DFL：默认动作非 Term/Stop 的即 Ign/Cont（可忽略）。
+    return !is_default_term(sig) && !is_default_stop(sig);
+}
+
 void PosixSyscall::queue_signal(vm* v, int sig) {
+    bool stop_dfl = is_default_stop(sig) &&
+                    handler_is_default(ps->signal_actions[static_cast<size_t>(sig)].handler);
     if(sig == SIGKILL) {
         flags(v).fetch_or(vm::VM_KILLED, std::memory_order_release);
         v->wakeup(false);
-    } else if(sig == SIGSTOP) {
-        stop_process(SIGSTOP);   // 进程级停止：设 tg 状态 + 整组 VM_STOPPED + SIGCHLD
+    } else if(sig == SIGSTOP || stop_dfl) {
+        stop_process(sig);
+        return;              // STOP 不踢 host syscall
     } else if(sig == SIGCONT) {
         // 恢复整个线程组：清 tg 停止状态 + 组内每线程清 VM_STOPPED + wakeup(true) 让 safepoint
         // 的 cond_wait 返回。stop_sig 不清（waitpid 已消费或不再查询；下次停止会覆盖）。
@@ -59,14 +101,17 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
                 tvm->wakeup(false);  // 唤醒 safepoint 的停止 cond_wait；
             }
         }
-    } else {
+        return;
+    } else if(signal_ignorable(sig)) {
+        return;
+    } else if(pending_signals.try_push(sig)) {
         // Best-effort: drop if the queue is full to avoid blocking the VM thread.
-        if(pending_signals.try_push(sig)) {
-            flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
-            // 排队信号也要 wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1
-            // 无法可靠打断 pthread_cond_wait（glibc 内部重试 EINTR）
-            v->wakeup(false);
-        }
+        flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
+        // 排队信号也要 wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1
+        // 无法可靠打断 pthread_cond_wait（glibc 内部重试 EINTR）
+        v->wakeup(false);
+    } else {
+        return; // 队列满：丢弃信号，不处理
     }
     if (tid != 0) {
         pthread_kill(tid, SIGUSR1);
@@ -124,57 +169,37 @@ bool PosixSyscall::handle_signals(vm* v) {
     if(sig <= 0 || sig >= NSIG) {
         return true;
     }
-    const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
-    const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
-    uint64_t handler = ps->signal_actions[static_cast<size_t>(sig)].handler;
+    const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
+    uint64_t handler = act.handler;
     if(options(v).verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
                id(), sig, static_cast<unsigned long>(handler), pc(v));
     }
-    if(handler == sig_ign) {
+    if(handler_is_ignored(handler)) {
         return true;
     }
-    if(handler == sig_dfl) {
-        switch(sig) {
-        // 默认动作为"终止"（Term）的信号（见 signal(7)）。bpfvm 不区分 core dump，
-        // 统一走 do_exit_group 终止整个线程组（POSIX：default action of fatal signals
-        // is process termination，等价 exit_group），不只杀当前线程。退出码 128+sig。
-        case SIGHUP:
-        case SIGINT:
-        case SIGQUIT:
-        case SIGILL:
-        case SIGTRAP:
-        case SIGABRT:
-        case SIGBUS:
-        case SIGFPE:
-        case SIGUSR1:
-        case SIGSEGV:
-        case SIGUSR2:
-        case SIGPIPE:
-        case SIGALRM:
-        case SIGTERM:
-        case SIGSTKFLT:
-        case SIGVTALRM:
-        case SIGPROF:
-        case SIGXCPU:
-        case SIGXFSZ:
+    if(handler_is_default(handler)) {
+        // 默认动作分类（单一来源 = is_default_term/is_default_stop）。
+        if(is_default_term(sig)) {
+            // 默认动作为"终止"（Term）的信号（见 signal(7)）。bpfvm 不区分 core dump，
+            // 统一走 do_exit_group 终止整个线程组（POSIX：default action of fatal signals
+            // is process termination，等价 exit_group），不只杀当前线程。退出码 128+sig。
             v->r(1) = 128 + static_cast<uint64_t>(sig);
             return do_exit_group(v);
-        case SIGTSTP:
-        case SIGTTIN:
-        case SIGTTOU:
+        }
+        if(is_default_stop(sig)) {
             // 默认动作 = 停止作业（进程级）。stop_process 设 tg 状态 + 整组 VM_STOPPED +
             // 给父进程投 SIGCHLD，让父（如 dash）经 waitpid(WUNTRACED) 报告 WIFSTOPPED。
             stop_process(sig);
             return true;
-        default:
-            // SIGCHLD（忽略）、SIGURG（忽略）、SIGWINCH（忽略）等默认动作为忽略的信号，
-            // 以及任何未列出的信号：默认动作 = 丢弃，进程继续。
-            return true;
         }
+        // SIGCHLD（忽略）、SIGURG（忽略）、SIGWINCH（忽略）等默认动作为忽略的信号，
+        // 以及任何未列出的信号：默认动作 = 丢弃，进程继续。
+        return true;
     }
 
+    // 已 catch：跳转到 handler。
     if(!v->mmu(handler)) {
         v->r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
         return do_exit_group(v);
