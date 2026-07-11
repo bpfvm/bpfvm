@@ -92,6 +92,10 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
         futex_detach(tg, addr, v);
         flags(v).fetch_and(~vm::VM_BLOCKED, std::memory_order_release);
     }
+    // 对齐 Linux 内核 FUTEX_WAIT 的 ERESTARTSYS 语义。超时（-ETIMEDOUT）/唤醒（0）原样返回。
+    if(rc == -EINTR) {
+        return SYSCALL_RESTART;
+    }
     return rc;
 }
 

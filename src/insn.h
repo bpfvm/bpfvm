@@ -145,7 +145,10 @@ template<typename T> class JitCompiler;
 struct sig_info {
     int sig = 0;
     uint64_t handler = 0;   // guest handler 地址
+    uint64_t sa_flags = 0;  // 投递信号的 sa_flags（含 SA_RESTART），供重启判定
 };
+
+inline constexpr int64_t SYSCALL_RESTART = -512;
 
 class SyscallHandler{
 protected:
@@ -227,6 +230,11 @@ private:
 
     std::unique_ptr<JitCompilerBase> jit_;
 
+    // ERESTARTSYS：可重启 syscall 被信号打断后，syscall() 返回 SYSCALL_RESTART，
+    // do_syscall 在此记录该 syscall 指令地址。0 = 无待决重启。deliver_signal 投递
+    // 信号时据此 + SA_RESTART 决定重启（PC 回该地址）或转 -EINTR，随后清零。
+    uint64_t restart_syscall_pc_ = 0;
+
     bool ld(const bpf_insn* cur);
     bool ldx(const bpf_insn* cur);
     bool st(const bpf_insn* cur);
@@ -239,7 +247,12 @@ private:
 
     // 处理 syscall 形式的 BPF call 指令（src_reg=0）。
     bool do_syscall(uint32_t call) {
-        r(0) = (uint64_t)options.sys->syscall(this, call);
+        int64_t ret = options.sys->syscall(this, call);
+        if(ret == SYSCALL_RESTART) {
+            restart_syscall_pc_ = pc;
+        } else {
+            r(0) = (uint64_t)ret;
+        }
         if(flags.load(std::memory_order_acquire) & (VM_EXITED | VM_KILLED)) {
             return false;
         }

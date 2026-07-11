@@ -176,7 +176,7 @@ int64_t PosixSyscall::do_read(vm* v) {
     }
     ssize_t rc = read(it->second->fd, buf, count);
     if(rc == -1) {
-        return -errno;
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     return rc;
 }
@@ -196,7 +196,7 @@ int64_t PosixSyscall::do_write(vm* v) {
     }
     ssize_t rc = write(it->second->fd, buf, count);
     if(rc == -1) {
-        return -errno;
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     return rc;
 }
@@ -283,7 +283,7 @@ int64_t PosixSyscall::do_readv(vm* v) {
     }
     ssize_t rc = readv(it->second->fd, host_vec.data(), (int)host_vec.size());
     if(rc < 0) {
-        return -errno;
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     return rc;
 }
@@ -321,7 +321,7 @@ int64_t PosixSyscall::do_writev(vm* v) {
     }
     ssize_t rc = writev(it->second->fd, host_vec.data(), (int)host_vec.size());
     if(rc < 0) {
-        return -errno;
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     return rc;
 }

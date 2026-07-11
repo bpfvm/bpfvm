@@ -201,8 +201,10 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     }
 
     // 已 catch：带回 sig 与 handler 地址，由 vm::deliver_signal 压栈跳转。
+    // 同时带回 sa_flags：投递信号的 SA_RESTART 位用于 ERESTARTSYS 重启判定。
     info->sig = sig;
     info->handler = handler;
+    info->sa_flags = static_cast<uint64_t>(act.flags);
     return true;
 }
 
@@ -318,29 +320,45 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
         return -EINVAL;
     }
 
+    // guest（musl）经 __libc_sigaction 把用户态 struct sigaction 转成内核 k_sigaction
+    // 布局（arch/bpf/ksigaction.h，复制自 x86_64）再调本 syscall，故此处按 k_sigaction
+    // 布局解析，而非项目 include/signal.h 的 struct sigaction。布局：
+    //   offset 0  handler  (8B)
+    //   offset 8  flags    (8B, unsigned long；musl 已 OR 进 SA_RESTORER)
+    //   offset 16 restorer (8B)
+    //   offset 24 mask     (8B, _NSIG/8 = 8)
+    struct k_sigaction {
+        uint64_t handler;
+        uint64_t flags;
+        uint64_t restorer;
+        uint64_t mask;
+    };
+    static_assert(sizeof(k_sigaction) == 32, "k_sigaction layout");
+
     if(oldact_addr != 0) {
-        auto oldact = static_cast<struct bpf::sigaction*>(v->mmu_w(oldact_addr, sizeof(struct bpf::sigaction)));
+        auto* oldact = static_cast<k_sigaction*>(v->mmu_w(oldact_addr, sizeof(k_sigaction)));
         if(oldact == nullptr) {
             return -EFAULT;
         }
         const auto& current = ps->signal_actions[static_cast<size_t>(signo)];
-        oldact->sa_handler = reinterpret_cast<void (*)(int)>(static_cast<uintptr_t>(current.handler));
-        oldact->sa_mask = static_cast<bpf::sigset_t>(current.mask);
-        oldact->sa_flags = current.flags;
+        oldact->handler = current.handler;
+        oldact->flags = static_cast<uint64_t>(current.flags);
+        oldact->restorer = 0;  // VM 用信号帧机制，无 restorer；musl 读 old 时忽略
+        oldact->mask = current.mask;
     }
 
     if(act_addr != 0) {
-        auto action = static_cast<const struct bpf::sigaction*>(v->mmu(act_addr));
+        const auto* action = static_cast<const k_sigaction*>(v->mmu(act_addr, sizeof(k_sigaction)));
         if(action == nullptr) {
             return -EFAULT;
         }
-        if(reinterpret_cast<uintptr_t>(action->sa_handler) == reinterpret_cast<uintptr_t>(SIG_ERR)) {
+        if(action->handler == reinterpret_cast<uint64_t>(SIG_ERR)) {
             return -EINVAL;
         }
         auto& current = ps->signal_actions[static_cast<size_t>(signo)];
-        current.handler = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(action->sa_handler));
-        current.mask = static_cast<uint64_t>(action->sa_mask);
-        current.flags = action->sa_flags;
+        current.handler = action->handler;
+        current.mask = action->mask;
+        current.flags = static_cast<int>(action->flags);
     }
 
     return 0;

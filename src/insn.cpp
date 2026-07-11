@@ -326,12 +326,34 @@ bool vm::deliver_signal() {
         return false;
     }
     if(info.sig == 0) {
+        // 无可投递信号。若有待决 ERESTARTSYS（典型场景：停止后由 SIGCONT 恢复，
+        // 或所有 pending 信号被 sigmask 阻塞），默认重启：pc 回到 syscall 指令，
+        // step 随后取指即重执行。Linux 内核在 arch_do_signal_or_restart 中对
+        // ERESTARTSYS* 的处理同此（无信号投递时一律 restart）。
+        if(restart_syscall_pc_ != 0) {
+            pc = restart_syscall_pc_;
+            restart_syscall_pc_ = 0;
+        }
         return true;
     }
     if(!mmu(info.handler)) {
         return false;
     }
-    if(!push_frame(pc, true)) {
+    // 信号帧的返回地址。无待决重启时用当前 pc（被中断处）；有待决 ERESTARTSYS 时
+    // 按 SA_RESTART 决定：置 SA_RESTART → 返回 syscall 指令（重启）；否则返回 syscall
+    // 的下一条指令，并填 r(0) = -EINTR（语义同 Linux：未带 SA_RESTART 的信号打断
+    // 可重启 syscall 后向用户态返回 -EINTR）。
+    uint64_t ret_addr = pc;
+    if(restart_syscall_pc_ != 0) {
+        if(info.sa_flags & SA_RESTART) {
+            ret_addr = restart_syscall_pc_;
+        } else {
+            r(0) = (uint64_t)(int64_t)-EINTR;
+            ret_addr = restart_syscall_pc_ + sizeof(bpf_insn);
+        }
+        restart_syscall_pc_ = 0;
+    }
+    if(!push_frame(ret_addr, true)) {
         return false;
     }
     r(1) = static_cast<uint64_t>(info.sig);

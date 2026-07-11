@@ -87,8 +87,15 @@ bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
         v->pc += sizeof(bpf_insn);
         return false;
     }
+    // ERESTARTSYS：可重启 syscall 被信号打断。pc 保持 = saved_pc（syscall 指令）,不推进
+    // 此判定必须在下面"推进 pc"的 flag 退出分支之前：重启场景下 VM_SIGNAL_PENDING
+    // 必然同时置位（信号入队即设），若先命中则会错误推进 pc。
+    if (v->restart_syscall_pc_ != 0) {
+        return false;
+    }
+    // 其余 flag（退出/被杀/停止/待决信号）一律推进 pc 越过 syscall 指令并退出 JIT：
     uint32_t f = v->flags.load(std::memory_order_acquire);
-    if (f & (vm::VM_EXITED | vm::VM_KILLED | vm::VM_STOPPED)) {
+    if (f & (vm::VM_EXITED | vm::VM_KILLED | vm::VM_STOPPED | vm::VM_SIGNAL_PENDING)) {
         v->pc += sizeof(bpf_insn);
         return false;
     }

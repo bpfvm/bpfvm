@@ -411,11 +411,11 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
                 child = candidate;
                 break;
             }
-            // 调用者自身被 VM_KILL 或收到信号 → EINTR 让线程回 safepoint 处理。
+            // 调用者自身被 VM_KILL 或收到信号 -> 标记为可重启。
             // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 waitpid 内部时恒为假。
             if(!pending_signals.empty() ||
                (flags(v).load(std::memory_order_acquire) & (vm::VM_KILLED | vm::VM_STOPPED))) {
-                return -EINTR;
+                return SYSCALL_RESTART;
             }
         }
     }
