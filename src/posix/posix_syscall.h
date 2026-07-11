@@ -193,7 +193,7 @@ class PosixSyscall: public SyscallHandler{
 
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
-    virtual bool handle_signals(vm* v) override;
+    virtual bool handle_signals(vm* v, sig_info* info) override;
     virtual int64_t syscall(vm* v, uint32_t call) override;
     virtual int id() override {
         return (int)pid;

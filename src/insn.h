@@ -140,6 +140,13 @@ class vm;
 class JitCompilerBase;
 class Pty;
 template<typename T> class JitCompiler;
+
+// handle_signals 通过本结构带回待投递信号：sig==0 表示无信号投递。
+struct sig_info {
+    int sig = 0;
+    uint64_t handler = 0;   // guest handler 地址
+};
+
 class SyscallHandler{
 protected:
     static auto& maps(vm* v);
@@ -161,7 +168,7 @@ public:
     // 前台进程组，无 ctty 退化为投给该 vm 自身。默认实现 = 直接 queue 给该 vm。
     // 调用方（如 main.cpp 的信号 handler）不再关心"PTY 模式"等 host 侧接入细节。
     virtual void host_signal(vm* v, int sig) { (void)v; (void)sig; }
-    virtual bool handle_signals(vm* v) = 0;
+    virtual bool handle_signals(vm* v, sig_info* info) = 0;
     virtual int id() = 0;
 };
 
@@ -268,6 +275,8 @@ public:
     bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
                      const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
+    // 调用 handle_signals 决策并通过 push_frame 投递信号 handler（压信号帧、r(1)=sig、pc=handler）。
+    bool deliver_signal();
     int64_t alloca(int64_t inc);
     // 通用阻塞原语：调用方先置 VM_BLOCKED（与其等待注册原子），再调用本函数。自身阻塞
     // 直至 wakeup(true) 清 VM_BLOCKED、或 VM_KILLED/VM_SIGNAL_PENDING 置位、或超时。

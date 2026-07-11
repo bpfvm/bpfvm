@@ -320,6 +320,25 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
     return true;
 }
 
+bool vm::deliver_signal() {
+    sig_info info;
+    if(!options.sys->handle_signals(this, &info)) {
+        return false;
+    }
+    if(info.sig == 0) {
+        return true;
+    }
+    if(!mmu(info.handler)) {
+        return false;
+    }
+    if(!push_frame(pc, true)) {
+        return false;
+    }
+    r(1) = static_cast<uint64_t>(info.sig);
+    pc = info.handler;
+    return true;
+}
+
 uint64_t vm::pop_frame() {
     uint64_t sp = r(10);
     uint64_t* frame_base = (uint64_t*)mmu(sp);
@@ -1189,7 +1208,7 @@ bool vm::alu(const bpf_insn* cur) {
 bool vm::safepoint() {
     // 仅在非信号上下文中处理新信号，避免信号处理嵌套
     if(signal_depth == 0) {
-        if(!options.sys->handle_signals(this)) {
+        if(!deliver_signal()) {
             //be killed
             return false;
         }
@@ -1213,7 +1232,7 @@ bool vm::safepoint() {
     // 唤醒后投递停止期间挂起的信号（POSIX：SIGCONT 恢复运行时在返回用户态前 get_signal
     // 投递 pending）。否则停止态收到的 SIGTERM 滞留队列，子进程已先执行到阻塞系统调用
     // （nanosleep），就会卡死。
-    return options.sys->handle_signals(this);
+    return deliver_signal();
 }
 
 bool vm::step() {

@@ -13,8 +13,8 @@ public:
     virtual int id() override {
         return 1;
     }
-    virtual bool handle_signals(vm* v) override {
-        (void)v;
+    virtual bool handle_signals(vm*, sig_info* info) override {
+        if(info) info->sig = 0;
         return true;
     }
 };

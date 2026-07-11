@@ -118,7 +118,7 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
     }
 }
 
-bool PosixSyscall::handle_signals(vm* v) {
+bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     // 实时信号统一模型：队列 + 掩码过滤。从 pending_signals 逐个 pop，被 sigmask 阻塞
     // 的信号暂存到 deferred（函数末尾回挂队列，保持 FIFO），找到第一个未阻塞的即投递。
     // 队列空 / 全部被阻塞 → 收尾：阻塞信号留在队里，VM_SIGNAL_PENDING 保留，待
@@ -200,19 +200,9 @@ bool PosixSyscall::handle_signals(vm* v) {
         return true;
     }
 
-    // 已 catch：跳转到 handler。
-    if(!v->mmu(handler)) {
-        v->r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
-        v->r(0) = (uint64_t)do_exit_group(v);  // 置 VM_EXITED + 写退出码
-        return false;
-    }
-    if(!v->push_frame(pc(v), true)) {
-        v->r(1) = 128 + static_cast<uint64_t>(SIGBUS);
-        v->r(0) = (uint64_t)do_exit_group(v);  // 置 VM_EXITED + 写退出码
-        return false;
-    }
-    v->r(1) = static_cast<uint64_t>(sig);
-    pc(v) = handler;
+    // 已 catch：带回 sig 与 handler 地址，由 vm::deliver_signal 压栈跳转。
+    info->sig = sig;
+    info->handler = handler;
     return true;
 }
 
