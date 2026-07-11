@@ -230,34 +230,29 @@ void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<fd_handle>& h) {
 // —— 进程级杂项属性 / 系统信息类 syscall ——
 // clock_gettime/nanosleep（时间）、getrandom（随机源）既不属 fd 操作也不属文件
 
-bool PosixSyscall::do_clock_gettime(vm* v) {
+int64_t PosixSyscall::do_clock_gettime(vm* v) {
     clockid_t clock_id = (clockid_t)arg_s32(v->r(1));
     struct timespec* tp = (struct timespec*)v->mmu_w(v->r(2), sizeof(*tp));
     if(tp == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     if(clock_gettime(clock_id, tp) == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_nanosleep(vm* v) {
+int64_t PosixSyscall::do_nanosleep(vm* v) {
     const struct timespec* req = static_cast<const struct timespec*>(v->mmu(v->r(1)));
     if(req == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
 
     struct timespec* rem = nullptr;
     if(v->r(2) != 0) {
         rem = static_cast<struct timespec*>(v->mmu_w(v->r(2), sizeof(*rem)));
         if(rem == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
     }
 
@@ -272,44 +267,37 @@ bool PosixSyscall::do_nanosleep(vm* v) {
         if(rem != nullptr) {
             *rem = host_rem;
         }
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_getrandom(vm* v) {
+int64_t PosixSyscall::do_getrandom(vm* v) {
     size_t buflen = arg_size(v->r(2));
     if(buflen == 0) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
     void* buf = v->mmu_w(v->r(1), buflen);
     if(buf == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     unsigned int flags = (unsigned int)arg_u32(v->r(3));
     // 用 syscall(SYS_getrandom) 而非 libc wrapper：bionic 的 getrandom() 是
     // __INTRODUCED_IN(28)，在 target API < 28（如 Termux 默认）时声明被隐藏。
     ssize_t rc = ::syscall(SYS_getrandom, buf, buflen, flags);
     if(rc < 0) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = (uint64_t)rc;
-    return true;
+    return rc;
 }
 
 // alloca(inc) 的 syscall 入口
-bool PosixSyscall::do_alloca(vm* v) {
+int64_t PosixSyscall::do_alloca(vm* v) {
     int64_t inc = (int64_t)v->r(1);
-    v->r(0) = (uint64_t)v->alloca(inc);
-    return true;
+    return (int64_t)v->alloca(inc);
 }
 
-bool PosixSyscall::syscall(vm* v, uint32_t call) {
+int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
         sys_id = BPF_CALL_TO_ID(call);
@@ -386,7 +374,6 @@ bool PosixSyscall::syscall(vm* v, uint32_t call) {
          * 时打印，避免每次启动刷屏（这些调用大多 musl 会主动忽略返回值）。 */
         if (getenv("BPF_DEBUG"))
             fprintf(stderr, "unsupported func: 0x%x\n", call);
-        v->r(0) = -ENOSYS;
-        return true;
+        return -ENOSYS;
     }
 }

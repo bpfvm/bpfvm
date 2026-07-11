@@ -95,7 +95,7 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
     return rc;
 }
 
-bool PosixSyscall::do_futex(vm* v) {
+int64_t PosixSyscall::do_futex(vm* v) {
     uint64_t uaddr = v->r(1);
     int op = arg_s32(v->r(2));
     uint32_t val = (uint32_t)v->r(3);
@@ -104,8 +104,7 @@ bool PosixSyscall::do_futex(vm* v) {
     uint64_t val3 = v->r(0);  // 第 6 参走 r0（BpfWideArgs syscall 6 参路径）
 
     if((uaddr & 0x3) != 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     int op_base = op & ~FUTEX2_PRIVATE;
@@ -115,8 +114,7 @@ bool PosixSyscall::do_futex(vm* v) {
         const struct timespec* gts = static_cast<const struct timespec*>(
             v->mmu(timeout_ptr, sizeof(struct timespec)));
         if(!gts) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         ts_buf = *gts;
         timeout = &ts_buf;
@@ -124,26 +122,19 @@ bool PosixSyscall::do_futex(vm* v) {
 
     switch(op_base) {
     case FUTEX_WAIT: {
-        int rc = futex_wait(v, tg.get(), uaddr, val, timeout);
-        v->r(0) = (uint64_t)rc;
-        return true;
+        return futex_wait(v, tg.get(), uaddr, val, timeout);
     }
     case FUTEX_WAKE: {
-        int woken = futex_wake(tg.get(), uaddr, (int)val);
-        v->r(0) = (uint64_t)woken;
-        return true;
+        return futex_wake(tg.get(), uaddr, (int)val);
     }
     case FUTEX_REQUEUE: {
         // 简化：唤醒 addr 上所有等待者（忽略 requeue 到 uaddr2）。
         // musl condvar 用 FUTEX_REQUEUE 避免 thundering herd；全唤醒正确但效率低。
         (void)uaddr2; (void)val3;
-        int woken = futex_wake(tg.get(), uaddr, 0x10000);
-        v->r(0) = (uint64_t)woken;
-        return true;
+        return futex_wake(tg.get(), uaddr, 0x10000);
     }
     default:
         // PI 系列（LOCK_PI/UNLOCK_PI 等）及 WAKE_OP 暂不支持，返回 -ENOSYS 让 musl 降级。
-        v->r(0) = -ENOSYS;
-        return true;
+        return -ENOSYS;
     }
 }

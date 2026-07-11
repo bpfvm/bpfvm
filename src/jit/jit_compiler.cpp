@@ -78,9 +78,8 @@ uint64_t JitCompiler<EmitterT>::helper_pop_frame(vm* v) {
 template<typename EmitterT>
 bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
     uint64_t saved_pc = v->pc;
-    bool ok = v->do_syscall(call_id);
-    if (!ok) {
-        v->flags.fetch_or(vm::VM_EXITED, std::memory_order_release);
+    // do_syscall 内部已检测 VM_EXITED|VM_KILLED 并据此返回 false，无需在此补设 flag。
+    if (!v->do_syscall(call_id)) {
         if (v->pc == saved_pc) v->pc += sizeof(bpf_insn);
         return false;
     }

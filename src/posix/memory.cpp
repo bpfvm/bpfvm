@@ -44,7 +44,7 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
     }
 }
 
-bool PosixSyscall::do_mmap(vm* v) {
+int64_t PosixSyscall::do_mmap(vm* v) {
     /* 标准 Linux mmap 调用约定：mmap(addr, len, prot, flags, fd, offset)。
      *   前 5 个用户参数（addr, len, prot, flags, fd）落在 r1..r5；第 6 个 offset
      *   经 BpfWideArgs pass 用前置内联 asm 写到 r0（syscall 6 参特例 ABI：
@@ -69,22 +69,19 @@ bool PosixSyscall::do_mmap(vm* v) {
     static constexpr size_t PAGE = 0x1000;
     len = (len + PAGE - 1) & ~(PAGE - 1);
     if (len == 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     const bool fixed = flags & MAP_FIXED;
     if (fixed && (addr_hint % PAGE) != 0) {
-        v->r(0) = -EINVAL;   // MAP_FIXED 要求 addr 页对齐
-        return true;
+        return -EINVAL;   // MAP_FIXED 要求 addr 页对齐
     }
 
     int host_fd = -1;
     if (!(flags & MAP_ANONYMOUS)) {
         auto it = ps->fds.find(fd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         host_fd = it->second->fd;
     }
@@ -93,8 +90,7 @@ bool PosixSyscall::do_mmap(vm* v) {
     // 用 MAP_FIXED，避免 guest 间接控制 host 地址布局）。
     void* addr = mmap(nullptr, len, prot, flags & ~MAP_FIXED, host_fd, offset);
     if(addr == MAP_FAILED) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
 
     // MAP_FIXED：按 Linux 语义先 unmap 与 [addr_hint, addr_hint+len) 重叠的旧 guest
@@ -121,9 +117,10 @@ bool PosixSyscall::do_mmap(vm* v) {
     if(prot & PROT_EXEC) {
         mem.flags |= PF_X;
     }
+    int64_t result;
     if (fixed) {
         mem.paddr = addr_hint;   // guest 空间固定地址
-        v->r(0) = mem.paddr;
+        result = (int64_t)mem.paddr;
         v->addmem(std::move(mem));
     } else {
         // 非 fixed：guest 地址「接在上一个映射尾部」分配。必须把「算地址 + 插入」
@@ -140,7 +137,7 @@ bool PosixSyscall::do_mmap(vm* v) {
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
         uint64_t next = ml.back().paddr + ml.back().size;
         mem.paddr = (next + PAGE - 1) & ~(PAGE - 1);
-        v->r(0) = mem.paddr;
+        result = (int64_t)mem.paddr;
         auto it = ml.begin();
         while(it != ml.end() && it->paddr < mem.paddr) {
             it++;
@@ -148,19 +145,17 @@ bool PosixSyscall::do_mmap(vm* v) {
         ml.insert(it, std::move(mem));
     }
     v->flush_tlb();
-    return true;
+    return result;
 }
 
-bool PosixSyscall::do_munmap(vm* v) {
+int64_t PosixSyscall::do_munmap(vm* v) {
     if(!v->unmap(v->r(1))) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_mprotect(vm* v) {
+int64_t PosixSyscall::do_mprotect(vm* v) {
     uint64_t addr = v->r(1);
     size_t len = arg_size(v->r(2));
     int prot = arg_s32(v->r(3));
@@ -188,8 +183,7 @@ bool PosixSyscall::do_mprotect(vm* v) {
         // 不允许去掉可执行（安全）：text 段不能改成非 X。但允许加 W（TEXTREL 需要
         // 给 text 加 W 写 lddw imm）；原「PF_X 段一律拒绝」过严，会挡掉 TEXTREL。
         if ((m.flags & PF_X) && !(new_flags & PF_X)) {
-            v->r(0) = -EACCES;
-            return true;
+            return -EACCES;
         }
         any = true;
         const bool own_host = m.data.get_deleter().owned;
@@ -225,8 +219,7 @@ bool PosixSyscall::do_mprotect(vm* v) {
             if (own_host) {
                 unsigned char* host_base = base + (sub_lo - m.paddr);
                 if (mprotect(host_base, mid.size, prot) == -1) {
-                    v->r(0) = -errno;
-                    return true;
+                    return -errno;
                 }
             }
             // 按 paddr 升序插回 next 前：先 left、再 mid、再 right。每次 insert(next,X)
@@ -242,8 +235,7 @@ bool PosixSyscall::do_mprotect(vm* v) {
             if (new_flags == (m.flags & kProtMask)) { ++it; continue; }  // no-op
             if (own_host) {
                 if (mprotect(m.data.get(), m.size, prot) == -1) {
-                    v->r(0) = -errno;
-                    return true;
+                    return -errno;
                 }
             }
             m.flags = (m.flags & ~kProtMask) | new_flags;
@@ -251,12 +243,10 @@ bool PosixSyscall::do_mprotect(vm* v) {
         }
     }
     v->flush_tlb();
-    v->r(0) = any ? 0 : -ENOMEM;
-    return true;
+    return any ? 0 : -ENOMEM;
 }
 
-bool PosixSyscall::do_madvise(vm* v) {
+int64_t PosixSyscall::do_madvise(vm*) {
     // 主要用于 malloc MADV_DONTNEED；缺省语义可忽略。
-    v->r(0) = 0;
-    return true;
+    return 0;
 }

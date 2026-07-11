@@ -8,65 +8,56 @@ int PosixSyscall::allocate_fd(int min_fd) {
     return fd;
 }
 
-bool PosixSyscall::do_umask(vm* v) {
+int64_t PosixSyscall::do_umask(vm* v) {
     uint32_t new_mask = arg_u32(v->r(1));
-    v->r(0) = umask_val;
+    int old = umask_val;
     umask_val = new_mask & 0777;
-    return true;
+    return old;
 }
 
-bool PosixSyscall::do_dup(vm* v) {
+int64_t PosixSyscall::do_dup(vm* v) {
     int old_fd = arg_s32(v->r(1));
     if(old_fd < 0) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
 
     auto it = ps->fds.find(old_fd);
     if(it == ps->fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
 
     auto new_handle = it->second->clone();  // host dup host fd；GuestTty共享
     if(!new_handle) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
 
     int new_fd = allocate_fd();
     ps->fds[new_fd] = new_handle;
-    v->r(0) = new_fd;
-    return true;
+    return new_fd;
 }
 
-bool PosixSyscall::do_dup3(vm* v) {
+int64_t PosixSyscall::do_dup3(vm* v) {
     int old_fd = arg_s32(v->r(1));
     int new_fd = arg_s32(v->r(2));
     int flags = arg_s32(v->r(3));
     if(old_fd < 0 || new_fd < 0) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
     if(old_fd == new_fd) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
     if(flags & ~O_CLOEXEC) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     auto it = ps->fds.find(old_fd);
     if(it == ps->fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
 
     auto handle = it->second->clone();
     if(!handle) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
@@ -78,15 +69,13 @@ bool PosixSyscall::do_dup3(vm* v) {
         drop_fd_handle(v, existing->second);
     }
     ps->fds[new_fd] = handle;
-    v->r(0) = new_fd;
-    return true;
+    return new_fd;
 }
 
-bool PosixSyscall::do_pipe2(vm* v) {
+int64_t PosixSyscall::do_pipe2(vm* v) {
     int* pipefd = static_cast<int*>(v->mmu_w(v->r(1), 2 * sizeof(int)));
     if(pipefd == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
 
     int flags = arg_s32(v->r(2));
@@ -94,8 +83,7 @@ bool PosixSyscall::do_pipe2(vm* v) {
 
     int rc = pipe2(host_fds, flags);
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
 
     int guest_fd0 = allocate_fd();
@@ -114,28 +102,24 @@ bool PosixSyscall::do_pipe2(vm* v) {
 
     pipefd[0] = guest_fd0;
     pipefd[1] = guest_fd1;
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_fcntl(vm* v) {
+int64_t PosixSyscall::do_fcntl(vm* v) {
     auto it = ps->fds.find(arg_s32(v->r(1)));
     if(it == ps->fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
     int cmd = arg_s32(v->r(2));
     if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         int min_fd = arg_s32(v->r(3));
         if (min_fd < 0) {
-            v->r(0) = -EINVAL;
-            return true;
+            return -EINVAL;
         }
 
         auto new_handle = it->second->clone();
         if(!new_handle) {
-            v->r(0) = -errno;
-            return true;
+            return -errno;
         }
 
         int new_fd = allocate_fd(min_fd);
@@ -143,17 +127,14 @@ bool PosixSyscall::do_fcntl(vm* v) {
             new_handle->cloexec = true;
         }
         ps->fds[new_fd] = new_handle;
-        v->r(0) = new_fd;
-        return true;
+        return new_fd;
     }
     if (cmd == F_GETFD) {
-        v->r(0) = it->second->cloexec ? FD_CLOEXEC : 0;
-        return true;
+        return it->second->cloexec ? FD_CLOEXEC : 0;
     }
     if (cmd == F_SETFD) {
         it->second->cloexec = (v->r(3) & FD_CLOEXEC) != 0;
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
 
     uint64_t arg = v->r(3);
@@ -161,15 +142,13 @@ bool PosixSyscall::do_fcntl(vm* v) {
     if (cmd == F_GETLK) {
             void* guest_arg = v->mmu_w(arg, sizeof(struct flock));
             if(guest_arg == nullptr) {
-                v->r(0) = -EFAULT;
-                return true;
+                return -EFAULT;
             }
             rc = fcntl(it->second->fd, cmd, guest_arg);
     } else if (cmd == F_SETLK || cmd == F_SETLKW) {
             void* guest_arg = v->mmu(arg, sizeof(struct flock));
             if(guest_arg == nullptr) {
-                v->r(0) = -EFAULT;
-                return true;
+                return -EFAULT;
             }
             rc = fcntl(it->second->fd, cmd, guest_arg);
     } else {
@@ -177,18 +156,15 @@ bool PosixSyscall::do_fcntl(vm* v) {
     }
 
     if(rc == -1) {
-        v->r(0) = -errno;
-    } else {
-        v->r(0) = rc;
+        return -errno;
     }
-    return true;
+    return rc;
 }
 
-bool PosixSyscall::do_ioctl(vm* v) {
+int64_t PosixSyscall::do_ioctl(vm* v) {
     auto it = ps->fds.find(arg_s32(v->r(1)));
     if(it == ps->fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
     unsigned long request = v->r(2);
 
@@ -200,26 +176,22 @@ bool PosixSyscall::do_ioctl(vm* v) {
         // 占用时绑定。前提：调用者须是 session leader（setsid 后），fd 是 pty 设备，否则错。
         const auto& tty = it->second->tty;
         if(!tty) {
-            v->r(0) = -ENOTTY;
-            return true;
+            return -ENOTTY;
         }
         if(!session || session->sid != pid) {  // session leader 检查
-            v->r(0) = -EPERM;
-            return true;
+            return -EPERM;
         }
         int force = arg_s32(v->r(3));
         // 本会话已绑同一 tty：幂等成功。
         if(session->ctty.get() == tty.get()) {
-            v->r(0) = 0;
-            return true;
+            return 0;
         }
         // tty 已被别的 session 占用？持 pid_map_mutex 保护 owner_ 读写（防抢夺竞态）。
         {
             std::lock_guard<std::mutex> lock(pid_map_mutex);
             if(tty->owner_ != nullptr && tty->owner_ != session.get()) {
                 if(!force) {
-                    v->r(0) = -EPERM;
-                    return true;
+                    return -EPERM;
                 }
                 // force 抢夺：解除原 session 的 ctty 引用。
                 tty->owner_->ctty.reset();
@@ -229,25 +201,21 @@ bool PosixSyscall::do_ioctl(vm* v) {
             tty->owner_ = session.get();
         }
         tty->fg_pgrp.store(pgrp->pgid, std::memory_order_release);
-        v->r(0) = 0;
-        return true;
+        return 0;
     } else if (request == TIOCSPGRP) {
         // 设置前台进程组（tcsetpgrp）。musl 的 tcsetpgrp 传指向 int 的指针（&pgrp），
         // 故 r(3) 是 guest 指针，需 mmu 取值。仅更新本 ctty 的 fg_pgrp，供 deliver_tty_signal
         // 选目标组。POSIX：fd 必须是本会话 ctty，否则 ENOTTY。
         if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
-            v->r(0) = -ENOTTY;
-            return true;
+            return -ENOTTY;
         }
         const pid_t* in = (const pid_t*)v->mmu(v->r(3), sizeof(pid_t));
         if(in == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         pid_t g_pgid = *in;
         if(g_pgid <= 0) {
-            v->r(0) = -EINVAL;
-            return true;
+            return -EINVAL;
         }
         // 校验目标 pgrp 存在且同 session（Linux：不存在/跨 session→EPERM）。
         bool found = false;
@@ -262,26 +230,21 @@ bool PosixSyscall::do_ioctl(vm* v) {
             }
         }
         if(!found) {
-            v->r(0) = -EPERM;
-            return true;
+            return -EPERM;
         }
         session->ctty->fg_pgrp.store(static_cast<uint64_t>(g_pgid), std::memory_order_release);
-        v->r(0) = 0;
-        return true;
+        return 0;
     } else if (request == TIOCGPGRP) {
         // 读取前台进程组（tcgetpgrp）。fd 必须是本会话 ctty，否则 ENOTTY。
         if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
-            v->r(0) = -ENOTTY;
-            return true;
+            return -ENOTTY;
         }
         pid_t* out = (pid_t*)v->mmu_w(v->r(3), sizeof(pid_t));
         if(out == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         *out = (pid_t)session->ctty->fg_pgrp.load(std::memory_order_acquire);
-        v->r(0) = 0;
-        return true;
+        return 0;
     } else {
         // 通用 ioctl（含 TCGETS/TCSETS/TIOCGWINSZ/TIOCSPTLCK/TIOCGPTN...）：把 guest 指针按
         // 方向翻译成 host 指针，再透传 host 内核。这些是 ldisc/设备属性，host n_tty 处理得
@@ -309,23 +272,20 @@ bool PosixSyscall::do_ioctl(vm* v) {
         if(psize) {
             arg = write_back ? v->mmu_w(v->r(3), psize) : v->mmu(v->r(3), psize);
             if(arg == nullptr) {
-                v->r(0) = -EFAULT;
-                return true;
+                return -EFAULT;
             }
         } else {
             arg = (void*)v->r(3);
         }
         int rc = ioctl(it->second->fd, request, arg);
         if(rc == -1) {
-            v->r(0) = -errno;
-        } else {
-            v->r(0) = rc;
+            return -errno;
         }
-        return true;
+        return rc;
     }
 }
 
-bool PosixSyscall::do_poll(vm* v) {
+int64_t PosixSyscall::do_poll(vm* v) {
     // guest/host 的 struct pollfd 布局一致（{int fd; short events; short revents;}），
     // 故把 guest 数组当作 host 数组就地读写；唯一要做的是 guest fd → host fd 翻译。
     nfds_t n = arg_size(v->r(2));
@@ -334,8 +294,7 @@ bool PosixSyscall::do_poll(vm* v) {
     // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE → EINVAL。bpfvm 无 rlimit 概念，
     // 给一个固定上限，避免 guest 传极大 n 导致下面的 vector(n) 全量构造时 bad_alloc/OOM。
     if(n > 1024) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     struct pollfd* gfds = nullptr;
@@ -343,8 +302,7 @@ bool PosixSyscall::do_poll(vm* v) {
         // 翻译整段数组（mmu_w 校验 [addr, addr+size) 全在映射范围内）。
         gfds = static_cast<struct pollfd*>(v->mmu_w(v->r(1), sizeof(struct pollfd) * n));
         if(gfds == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
     }
 
@@ -382,8 +340,7 @@ bool PosixSyscall::do_poll(vm* v) {
     // 非阻塞，否则当所有合法 fd 未就绪时会等满 timeout（timeout<0 时甚至永久挂起）。
     int rc = ::poll(hfds.data(), n, invalid_count > 0 ? 0 : timeout);
     if(rc == -1) {
-        v->r(0) = -errno;             // EINTR/EFAULT/ENOMEM 等
-        return true;
+        return -errno;             // EINTR/EFAULT/ENOMEM 等
     }
 
     // 把 host revents 写回 guest（仅对翻译过的合法条目）。
@@ -394,6 +351,5 @@ bool PosixSyscall::do_poll(vm* v) {
         gfds[i].revents = hfds[i].revents;
     }
     // POLLNVAL 条目按 POSIX 也算"有事件"，加入返回计数。
-    v->r(0) = (uint64_t)(rc + invalid_count);
-    return true;
+    return rc + invalid_count;
 }

@@ -1,17 +1,16 @@
 #include "posix_internal.h"
 
-bool PosixSyscall::do_exit(vm* v) {
+int64_t PosixSyscall::do_exit(vm* v) {
     int code = arg_s32(v->r(1));
-    v->r(0) = (uint64_t)(unsigned int)code;
     // CAS(-1 -> code)：首个正常退出者赢，后续不覆盖。致命信号默认动作走 do_exit_group，不经过此函数。
     int expected = -1;
     tg->exit_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel);
-    return false;  // fini 减 live_threads + clear-child-tid
+    flags(v).fetch_or(vm::VM_EXITED, std::memory_order_release);  // fini 减 live_threads + clear-child-tid
+    return code;
 }
 
-bool PosixSyscall::do_exit_group(vm* v) {
+int64_t PosixSyscall::do_exit_group(vm* v) {
     int code = arg_s32(v->r(1));
-    v->r(0) = (uint64_t)(unsigned int)code;
     // CAS(-1 -> code)：首个正常退出者赢，被置 VM_KILLED 的线程不走 do_exit，不会覆盖。
     int expected = -1;
     tg->exit_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel);
@@ -25,24 +24,22 @@ bool PosixSyscall::do_exit_group(vm* v) {
             }
         }
     }
-    return false;  // 调用线程退出 → fini
+    flags(v).fetch_or(vm::VM_EXITED, std::memory_order_release);  // 调用线程退出 → fini
+    return code;
 }
 
-bool PosixSyscall::do_execve(vm* v) {
+int64_t PosixSyscall::do_execve(vm* v) {
     std::string path;
     std::vector<std::string> argv_strings;
     std::vector<std::string> envp_strings;
     if(!read_c_string(v, v->r(1), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     if(!read_c_string_array(v, v->r(2), argv_strings, 1024, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     if(!read_c_string_array(v, v->r(3), envp_strings, 1024, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
 
     auto fresh = vm::create();
@@ -51,19 +48,16 @@ bool PosixSyscall::do_execve(vm* v) {
     ElfLoadInfo load_info = fresh->load_elf(resolve_path(path).c_str());
     if(load_info.entry == 0) {
         // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
-        v->r(0) = load_info.err ? -load_info.err : -ENOEXEC;
-        return true;
+        return load_info.err ? -load_info.err : -ENOEXEC;
     }
     const uint64_t entry = load_info.entry;
     // setup_stack 直接接收 load_info，用它合成 auxv（musl __init_tls 靠
     // AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 PT_TLS）。
     if(!fresh->setup_stack(argv_strings, envp_strings, load_info)) {
-        v->r(0) = -E2BIG;
-        return true;
+        return -E2BIG;
     }
     if(!fresh->mmu(entry)) {
-        v->r(0) = -ENOEXEC;
-        return true;
+        return -ENOEXEC;
     }
     // execve 替换整个 guest 地址空间为新程序：同步 v->options 里「跑什么程序」的字段
     //（entry/argv/envp），让后续 dump_stats/调试读到的是新程序而非旧残留。
@@ -105,11 +99,10 @@ bool PosixSyscall::do_execve(vm* v) {
     pc(v) = entry;
     v->push_frame(0);
     pc(v) -= sizeof(bpf_insn);
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_clone(vm* v) {
+int64_t PosixSyscall::do_clone(vm* v) {
     uint64_t flags  = v->r(1);
     uint64_t stack  = v->r(2);
     uint64_t ptid   = v->r(3);
@@ -136,8 +129,7 @@ bool PosixSyscall::do_clone(vm* v) {
             // fork：host dup 得独立 host fd；GuestTty共享。
             auto new_handle = entry.second->clone();
             if(!new_handle) {
-                v->r(0) = -errno;
-                return true;
+                return -errno;
             }
             new_handle->cloexec = entry.second->cloexec;
             child_fds[entry.first] = new_handle;
@@ -254,14 +246,12 @@ bool PosixSyscall::do_clone(vm* v) {
     pthread_t worker;
     int rc = pthread_attr_init(&attr);
     if(rc != 0) {
-        v->r(0) = -rc;
-        return true;
+        return -rc;
     }
     rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     if(rc != 0) {
         pthread_attr_destroy(&attr);
-        v->r(0) = -rc;
-        return true;
+        return -rc;
     }
     auto* holder = new std::shared_ptr<vm>(child);
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
@@ -274,8 +264,7 @@ bool PosixSyscall::do_clone(vm* v) {
     if(rc != 0) {
         delete holder;
         if(is_thread) tg->live_threads.fetch_sub(1);
-        v->r(0) = -rc;
-        return true;
+        return -rc;
     }
     {
         std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
@@ -285,18 +274,15 @@ bool PosixSyscall::do_clone(vm* v) {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         pid_map[child_sys->pid] = child;
     }
-    v->r(0) = child_sys->pid;
-    return true;
+    return (int64_t)child_sys->pid;
 }
 
-bool PosixSyscall::do_getpid(vm* v) {
-    v->r(0) = tg->tgid;
-    return true;
+int64_t PosixSyscall::do_getpid(vm*) {
+    return (int64_t)tg->tgid;
 }
 
-bool PosixSyscall::do_getppid(vm* v) {
-    v->r(0) = ppid.load();
-    return true;
+int64_t PosixSyscall::do_getppid(vm*) {
+    return (int64_t)ppid.load();
 }
 
 // 在 pid_map 中按 pid 查找 task，返回 vm shared_ptr（持锁内取出，调用方持有期间 vm 不会析构）。
@@ -309,29 +295,26 @@ std::shared_ptr<vm> PosixSyscall::find_task(uint64_t target_pid) {
     return it->second;
 }
 
-bool PosixSyscall::do_waitpid(vm* v) {
+int64_t PosixSyscall::do_waitpid(vm* v) {
     int64_t target_pid = static_cast<int64_t>(arg_s32(v->r(1)));
     uint64_t status_addr = v->r(2);
     int32_t options = arg_s32(v->r(3));
 
     // 接受 WNOHANG（非阻塞）与 WUNTRACED（报告停止子进程）。其余选项（WCONTINUED 等）暂不支持。
     if((options & ~(WNOHANG | WUNTRACED)) != 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     // waitpid(self) 无意义
     if(target_pid == (int64_t)pid) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     int* status_ptr = nullptr;
     if(status_addr != 0) {
         status_ptr = static_cast<int*>(v->mmu_w(status_addr, sizeof(*status_ptr)));
         if(status_ptr == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
     }
 
@@ -368,13 +351,11 @@ bool PosixSyscall::do_waitpid(vm* v) {
         if(target_pid > 0) {
             auto it = pid_map.find(static_cast<uint64_t>(target_pid));
             if(it == pid_map.end()) {
-                v->r(0) = -ECHILD;
-                return true;
+                return -ECHILD;
             }
             auto child_sys = sys(it->second.get());
             if(child_sys == nullptr || child_sys->ppid.load() != tg->tgid) {
-                v->r(0) = -ECHILD;
-                return true;
+                return -ECHILD;
             }
             children.push_back(it->second);
         } else {
@@ -393,8 +374,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
     }
 
     if(children.empty()) {
-        v->r(0) = -ECHILD;
-        return true;
+        return -ECHILD;
     }
 
     // 选一个有事件的子进程。无事件且非阻塞 → 立即返 0；否则轮询 tg->cv 等事件。
@@ -406,8 +386,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
         }
     }
     if((child == nullptr) && options & WNOHANG) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
 
     while(child == nullptr) {
@@ -436,8 +415,7 @@ bool PosixSyscall::do_waitpid(vm* v) {
             // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 waitpid 内部时恒为假。
             if(!pending_signals.empty() ||
                (flags(v).load(std::memory_order_acquire) & (vm::VM_KILLED | vm::VM_STOPPED))) {
-                v->r(0) = -EINTR;
-                return true;
+                return -EINTR;
             }
         }
     }
@@ -476,44 +454,38 @@ bool PosixSyscall::do_waitpid(vm* v) {
         }
         cs->tg->stop_reported.store(false, std::memory_order_release);
     }
-    v->r(0) = cs->pid;  // leader 的 pid（== tg->tgid）；停止/退出均返此值
-    return true;
+    return (int64_t)cs->pid;  // leader 的 pid（== tg->tgid）；停止/退出均返此值
 }
 
-bool PosixSyscall::do_set_tid_address(vm* v) {
+int64_t PosixSyscall::do_set_tid_address(vm* v) {
     tid_address_ = v->r(1);
     // 这里返回 PID，让 musl __init_libc 认为 tid_address 已注册即可。
     // tid_address_ 由 fini() 的 clear-child-tid 路径读取（清零 + futex_wake）。
-    v->r(0) = pid;
-    return true;
+    return (int64_t)pid;
 }
 
-bool PosixSyscall::do_sched_yield(vm* v) {
+int64_t PosixSyscall::do_sched_yield(vm*) {
     sched_yield();
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_gettid(vm* v) {
+int64_t PosixSyscall::do_gettid(vm*) {
     // 单线程进程语义下 gettid == getpid；fork 出去的子 VM 也是各自独立单线程，
     // 同样满足 gettid==getpid。
-    v->r(0) = pid;
-    return true;
+    return (int64_t)pid;
 }
 
-bool PosixSyscall::do_set_tls(vm* v) {
+int64_t PosixSyscall::do_set_tls(vm* v) {
     // 设置 thread pointer（musl __init_tp → __set_thread_area 在启动时调用）。
     // BPF 无 TLS 寄存器，用一个 VM 字段 tp_ 模拟；guest 侧 __get_tp() 经
     // BPF_SYS_GET_TLS 读回同一值。
     // 必须返回 0（成功），否则 musl __init_tls.c:149 会 a_crash()。
     tp(v) = v->r(1);
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_get_tls(vm* v) {
+int64_t PosixSyscall::do_get_tls(vm* v) {
     // 读取 thread pointer（guest 侧 __get_tp 用）。单线程下调用稀疏
     // （stdio getc/putc 热路径因 f->lock==0 短路，不触发 __pthread_self）。
-    v->r(0) = tp(v);
-    return true;
+    return (int64_t)tp(v);
 }

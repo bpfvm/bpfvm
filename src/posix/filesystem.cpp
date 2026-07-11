@@ -80,12 +80,11 @@ std::string PosixSyscall::resolve_path(const std::string& path) {
     return ps->root + guest_abs;
 }
 
-bool PosixSyscall::do_unlinkat(vm* v) {
+int64_t PosixSyscall::do_unlinkat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int flags = arg_s32(v->r(3));
     int rc = -1;
@@ -94,25 +93,21 @@ bool PosixSyscall::do_unlinkat(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = unlinkat(it->second->fd, path.c_str(), flags);
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_mkdirat(vm* v) {
+int64_t PosixSyscall::do_mkdirat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     mode_t mode = (mode_t)(arg_u32(v->r(3)) & ~umask_val);
     int rc;
@@ -121,25 +116,21 @@ bool PosixSyscall::do_mkdirat(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = mkdirat(it->second->fd, path.c_str(), mode);
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_symlinkat(vm* v) {
+int64_t PosixSyscall::do_symlinkat(vm* v) {
     std::string target;
     std::string linkpath;
     if(!read_c_string(v, v->r(1), target, 4096) || !read_c_string(v, v->r(3), linkpath, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int new_dirfd = arg_s32(v->r(2));
     int rc = -1;
@@ -148,25 +139,21 @@ bool PosixSyscall::do_symlinkat(vm* v) {
     } else {
         auto it = ps->fds.find(new_dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = symlinkat(target.c_str(), it->second->fd, linkpath.c_str());
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_linkat(vm* v) {
+int64_t PosixSyscall::do_linkat(vm* v) {
     std::string oldpath;
     std::string newpath;
     if(!read_c_string(v, v->r(2), oldpath, 4096) || !read_c_string(v, v->r(4), newpath, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int olddirfd = arg_s32(v->r(1));
     int newdirfd = arg_s32(v->r(3));
@@ -176,8 +163,7 @@ bool PosixSyscall::do_linkat(vm* v) {
     if (olddirfd != AT_FDCWD) {
         auto it = ps->fds.find(olddirfd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         host_olddirfd = it->second->fd;
     }
@@ -186,8 +172,7 @@ bool PosixSyscall::do_linkat(vm* v) {
     if (newdirfd != AT_FDCWD) {
         auto it = ps->fds.find(newdirfd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         host_newdirfd = it->second->fd;
     }
@@ -203,19 +188,16 @@ bool PosixSyscall::do_linkat(vm* v) {
 
     int rc = linkat(host_olddirfd, resolved_old.c_str(), host_newdirfd, resolved_new.c_str(), flags);
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_renameat2(vm* v) {
+int64_t PosixSyscall::do_renameat2(vm* v) {
     std::string old_path;
     std::string new_path;
     if(!read_c_string(v, v->r(2), old_path, 4096) || !read_c_string(v, v->r(4), new_path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int old_dirfd = arg_s32(v->r(1));
     int new_dirfd = arg_s32(v->r(3));
@@ -225,8 +207,7 @@ bool PosixSyscall::do_renameat2(vm* v) {
     if (old_dirfd != AT_FDCWD) {
         auto it = ps->fds.find(old_dirfd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         host_old_dirfd = it->second->fd;
     }
@@ -235,8 +216,7 @@ bool PosixSyscall::do_renameat2(vm* v) {
     if (new_dirfd != AT_FDCWD) {
         auto it = ps->fds.find(new_dirfd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         host_new_dirfd = it->second->fd;
     }
@@ -258,25 +238,21 @@ bool PosixSyscall::do_renameat2(vm* v) {
                        host_new_dirfd, resolved_new.c_str(), flags);
 #endif
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_readlinkat(vm* v) {
+int64_t PosixSyscall::do_readlinkat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     size_t bufsiz = arg_size(v->r(4));
     char* buf = (char*)v->mmu_w(v->r(3), bufsiz);
     if(buf == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     ssize_t rc;
     if(dirfd == AT_FDCWD) {
@@ -284,72 +260,59 @@ bool PosixSyscall::do_readlinkat(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = readlinkat(it->second->fd, path.c_str(), buf, bufsiz);
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = rc;
-    return true;
+    return rc;
 }
 
-bool PosixSyscall::do_fchdir(vm* v) {
+int64_t PosixSyscall::do_fchdir(vm* v) {
     int fd = arg_s32(v->r(1));
     auto it = ps->fds.find(fd);
     if(it == ps->fds.end()) {
-        v->r(0) = -EBADF;
-        return true;
+        return -EBADF;
     }
     struct stat st = {};
     if(fstat(it->second->fd, &st) == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
     if(!S_ISDIR(st.st_mode)) {
-        v->r(0) = -ENOTDIR;
-        return true;
+        return -ENOTDIR;
     }
     if(it->second->path.empty()) {
-        v->r(0) = -ENOENT;
-        return true;
+        return -ENOENT;
     }
     ps->cwd = it->second->path;
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_getcwd(vm* v) {
+int64_t PosixSyscall::do_getcwd(vm* v) {
     uint64_t buf_addr = v->r(1);
     size_t size = arg_size(v->r(2));
     if(size == 0) {
-        v->r(0) = -ERANGE;
-        return true;
+        return -ERANGE;
     }
     char* buf = static_cast<char*>(v->mmu_w(buf_addr, size));
     if(buf == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     std::string path = ps->cwd.empty() ? "/" : ps->cwd;
     if(size <= path.size()) {
-        v->r(0) = -ERANGE;
-        return true;
+        return -ERANGE;
     }
     memcpy(buf, path.c_str(), path.size() + 1);
-    v->r(0) = path.size() + 1;
-    return true;
+    return (int64_t)(path.size() + 1);
 }
 
-bool PosixSyscall::do_statx(vm* v) {
+int64_t PosixSyscall::do_statx(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int flags = arg_s32(v->r(3));
     unsigned int mask = arg_u32(v->r(4));
@@ -358,8 +321,7 @@ bool PosixSyscall::do_statx(vm* v) {
      * 也不必依赖 guest 头 include/sys/stat.h。 */
     auto out = static_cast<struct statx*>(v->mmu_w(v->r(5), sizeof(struct statx)));
     if(out == nullptr) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     struct statx stx = {};
     int rc = -1;
@@ -373,8 +335,7 @@ bool PosixSyscall::do_statx(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
 #if defined(__ANDROID__)
         rc = (int)::syscall(SYS_statx, it->second->fd, path.c_str(), flags, mask, &stx);
@@ -383,20 +344,17 @@ bool PosixSyscall::do_statx(vm* v) {
 #endif
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
     std::memcpy(out, &stx, sizeof(stx));
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_fchmodat(vm* v) {
+int64_t PosixSyscall::do_fchmodat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     mode_t mode = (mode_t)arg_u32(v->r(3));
     int flags = arg_s32(v->r(4));
@@ -406,28 +364,24 @@ bool PosixSyscall::do_fchmodat(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = fchmodat(it->second->fd, path.c_str(), mode, flags);
     }
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_utimensat(vm* v) {
+int64_t PosixSyscall::do_utimensat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     bool has_path = (v->r(2) != 0);
 
     if (has_path) {
         if(!read_c_string(v, v->r(2), path, 4096)) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
     }
 
@@ -440,8 +394,7 @@ bool PosixSyscall::do_utimensat(vm* v) {
     if (times_addr != 0) {
         int64_t* raw = (int64_t*)v->mmu(times_addr);
         if (raw == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         pts[0].tv_sec = raw[0];
         pts[0].tv_nsec = raw[1];
@@ -453,15 +406,13 @@ bool PosixSyscall::do_utimensat(vm* v) {
     int rc = -1;
     if (dirfd == AT_FDCWD) {
         if (!has_path) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         rc = utimensat(AT_FDCWD, resolve_path(path).c_str(), times_ptr, flags);
     } else {
         auto it = ps->fds.find(dirfd);
         if (it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         // utimensat(2) 允许 path=NULL（配合 AT_EMPTY_PATH 作用于 fd 自身），
         // 但 glibc 头声明为 nonnull，编译器误报，这里局部抑制。
@@ -472,19 +423,16 @@ bool PosixSyscall::do_utimensat(vm* v) {
     }
 
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_faccessat(vm* v) {
+int64_t PosixSyscall::do_faccessat(vm* v) {
     int dirfd = arg_s32(v->r(1));
     std::string path;
     if(!read_c_string(v, v->r(2), path, 4096)) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     int mode = arg_s32(v->r(3));
     int flags = arg_s32(v->r(4));
@@ -495,16 +443,13 @@ bool PosixSyscall::do_faccessat(vm* v) {
     } else {
         auto it = ps->fds.find(dirfd);
         if(it == ps->fds.end()) {
-            v->r(0) = -EBADF;
-            return true;
+            return -EBADF;
         }
         rc = faccessat(it->second->fd, path.c_str(), mode, flags);
     }
 
     if(rc == -1) {
-        v->r(0) = -errno;
-        return true;
+        return -errno;
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }

@@ -1,11 +1,10 @@
 #include "posix_internal.h"
 
-bool PosixSyscall::do_setpgid(vm* v) {
+int64_t PosixSyscall::do_setpgid(vm* v) {
     pid_t pid_arg = arg_s32(v->r(1));
     pid_t pgrp_arg = arg_s32(v->r(2));
     if(pgrp_arg < 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     // 解析目标 task：pid_arg==0 → 自身；否则必须是自身或子进程。
@@ -16,35 +15,29 @@ bool PosixSyscall::do_setpgid(vm* v) {
     } else {
         target_vm = find_task(static_cast<uint64_t>(pid_arg));
         if(!target_vm) {
-            v->r(0) = -ESRCH;
-            return true;
+            return -ESRCH;
         }
         target = sys(target_vm.get()).get();
         if(!target) {
-            v->r(0) = -ESRCH;
-            return true;
+            return -ESRCH;
         }
         // 仅允许改自身或子进程（ppid 记的是父 tg->tgid，故用 tg->tgid 匹配）
         if(static_cast<uint64_t>(pid_arg) != tg->tgid && target->ppid.load() != tg->tgid) {
-            v->r(0) = -ESRCH;
-            return true;
+            return -ESRCH;
         }
     }
 
     // 跨 session 禁止
     if(target->session.get() != session.get()) {
-        v->r(0) = -EPERM;
-        return true;
+        return -EPERM;
     }
     // session leader 不可改 pgrp
     if(target->session->sid == target->pid) {
-        v->r(0) = -EPERM;
-        return true;
+        return -EPERM;
     }
     // 已是目标组成员且 pgid 一致：no-op
     if(target->pgrp->pgid == static_cast<uint64_t>(pgrp_arg) && pgrp_arg != 0) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
 
     // 解析新 pgid：pgrp_arg==0 → 目标自身 pid（新建组）
@@ -55,75 +48,61 @@ bool PosixSyscall::do_setpgid(vm* v) {
     if(new_pgid != target->pid) {
         std::shared_ptr<vm> leader_vm = find_task(new_pgid);
         if(!leader_vm) {
-            v->r(0) = -EPERM;
-            return true;
+            return -EPERM;
         }
         auto leader = sys(leader_vm.get());
         if(!leader || leader->session.get() != session.get()) {
-            v->r(0) = -EPERM;
-            return true;
+            return -EPERM;
         }
     }
 
     target->pgrp = std::make_shared<ProcessGroup>(new_pgid, target->session);
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_getpgid(vm* v) {
+int64_t PosixSyscall::do_getpgid(vm* v) {
     pid_t pid_arg = arg_s32(v->r(1));
     if(pid_arg == 0) {
-        v->r(0) = pgrp->pgid;
-        return true;
+        return (int64_t)pgrp->pgid;
     }
     auto target_vm = find_task(static_cast<uint64_t>(pid_arg));
     if(!target_vm) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
     auto target = sys(target_vm.get());
     if(!target) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
-    v->r(0) = target->pgrp->pgid;
-    return true;
+    return (int64_t)target->pgrp->pgid;
 }
 
-bool PosixSyscall::do_getpgrp(vm* v) {
-    v->r(0) = pgrp->pgid;
-    return true;
+int64_t PosixSyscall::do_getpgrp(vm*) {
+    return (int64_t)pgrp->pgid;
 }
 
-bool PosixSyscall::do_setsid(vm* v) {
+int64_t PosixSyscall::do_setsid(vm*) {
     // 已是进程组 leader → EPERM
     if(pgrp->pgid == pid) {
-        v->r(0) = -EPERM;
-        return true;
+        return -EPERM;
     }
     auto new_session = std::make_shared<Session>(pid);
     pgrp = std::make_shared<ProcessGroup>(pid, new_session);
     session = new_session;
-    v->r(0) = pid;
-    return true;
+    return (int64_t)pid;
 }
 
-bool PosixSyscall::do_getsid(vm* v) {
+int64_t PosixSyscall::do_getsid(vm* v) {
     pid_t pid_arg = arg_s32(v->r(1));
     if(pid_arg == 0) {
-        v->r(0) = session->sid;
-        return true;
+        return (int64_t)session->sid;
     }
     auto target_vm = find_task(static_cast<uint64_t>(pid_arg));
     if(!target_vm) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
     auto target = sys(target_vm.get());
     if(!target) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
-    v->r(0) = target->session->sid;
-    return true;
+    return (int64_t)target->session->sid;
 }

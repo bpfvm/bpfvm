@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <optional>
 #include <unistd.h>
 
 #define BPF_SIGNAL_QUE_SIZE 1024
@@ -193,7 +194,7 @@ class PosixSyscall: public SyscallHandler{
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
     virtual bool handle_signals(vm* v) override;
-    virtual bool syscall(vm* v, uint32_t call) override;
+    virtual int64_t syscall(vm* v, uint32_t call) override;
     virtual int id() override {
         return (int)pid;
     }
@@ -221,74 +222,75 @@ public:
     // 进程组所有成员（tty 信号语义）；无 ctty->退化为投给该 vm 自身。
     virtual void host_signal(vm* v, int sig) override;
 
-    bool do_clock_gettime(vm* v);
-    bool do_mmap(vm* v);
-    bool do_munmap(vm* v);
-    bool do_exit(vm* v);
-    bool do_nanosleep(vm* v);
-    bool do_openat(vm* v);
     // job-control 门控：检查对 fd 的后台 tty 访问是否需要投 SIGTTIN(read)/SIGTTOU(write)。
-    // 返回 true 表示已处理（已投信号并按 POSIX 设好 r(0)，调用方直接 return true）；
-    // false 表示放行。仅当 fd 是本 session ctty 且调用者非前台组时触发。
-    bool tty_bg_check(vm* v, const std::shared_ptr<fd_handle>& fd, bool is_read);
-    bool do_read(vm* v);
-    bool do_write(vm* v);
-    bool do_lseek(vm* v);
-    bool do_truncate(vm* v);
-    bool do_ftruncate(vm* v);
-    bool do_close(vm* v);
-    bool do_unlinkat(vm* v);
-    bool do_mkdirat(vm* v);
-    bool do_symlinkat(vm* v);
-    bool do_linkat(vm* v);
-    bool do_renameat2(vm* v);
-    bool do_readlinkat(vm* v);
-    bool do_execve(vm* v);
-    bool do_clone(vm* v);
-    bool do_getpid(vm* v);
-    bool do_getppid(vm* v);
-    bool do_waitpid(vm* v);
-    bool do_dup(vm* v);
-    bool do_dup3(vm* v);
-    bool do_pipe2(vm* v);
-    bool do_fchdir(vm* v);
-    bool do_getcwd(vm* v);
-    bool do_statx(vm* v);
-    bool do_fchmodat(vm* v);
-    bool do_utimensat(vm* v);
-    bool do_faccessat(vm* v);
-    bool do_kill(vm* v);
-    bool do_tkill(vm* v);
-    bool do_tgkill(vm* v);
-    bool do_sigaction(vm* v);
-    bool do_sigprocmask(vm* v);
-    bool do_setpgid(vm* v);
-    bool do_getpgid(vm* v);
-    bool do_getpgrp(vm* v);
-    bool do_setsid(vm* v);
-    bool do_getsid(vm* v);
-    bool do_fcntl(vm* v);
-    bool do_ioctl(vm* v);
-    bool do_umask(vm* v);
-    bool do_sigsetjmp(vm* v);
-    bool do_siglongjmp(vm* v);
-    bool do_mprotect(vm* v);
-    bool do_readv(vm* v);
-    bool do_writev(vm* v);
-    bool do_pread(vm* v);
-    bool do_pwrite(vm* v);
-    bool do_getrandom(vm* v);
-    bool do_getdents64(vm* v);
-    bool do_set_tid_address(vm* v);
-    bool do_exit_group(vm* v);
-    bool do_madvise(vm* v);
-    bool do_sched_yield(vm* v);
-    bool do_gettid(vm* v);
-    bool do_set_tls(vm* v);
-    bool do_get_tls(vm* v);
-    bool do_futex(vm* v);
-    bool do_alloca(vm* v);
-    bool do_poll(vm* v);
+    // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
+    // 仅当 fd 是本 session ctty 且调用者非前台组时触发。
+    std::optional<int64_t> tty_bg_check(vm* v, const std::shared_ptr<fd_handle>& fd, bool is_read);
+
+    int64_t do_clock_gettime(vm* v);
+    int64_t do_mmap(vm* v);
+    int64_t do_munmap(vm* v);
+    int64_t do_exit(vm* v);
+    int64_t do_nanosleep(vm* v);
+    int64_t do_openat(vm* v);
+    int64_t do_read(vm* v);
+    int64_t do_write(vm* v);
+    int64_t do_lseek(vm* v);
+    int64_t do_truncate(vm* v);
+    int64_t do_ftruncate(vm* v);
+    int64_t do_close(vm* v);
+    int64_t do_unlinkat(vm* v);
+    int64_t do_mkdirat(vm* v);
+    int64_t do_symlinkat(vm* v);
+    int64_t do_linkat(vm* v);
+    int64_t do_renameat2(vm* v);
+    int64_t do_readlinkat(vm* v);
+    int64_t do_execve(vm* v);
+    int64_t do_clone(vm* v);
+    int64_t do_getpid(vm*);
+    int64_t do_getppid(vm*);
+    int64_t do_waitpid(vm* v);
+    int64_t do_dup(vm* v);
+    int64_t do_dup3(vm* v);
+    int64_t do_pipe2(vm* v);
+    int64_t do_fchdir(vm* v);
+    int64_t do_getcwd(vm* v);
+    int64_t do_statx(vm* v);
+    int64_t do_fchmodat(vm* v);
+    int64_t do_utimensat(vm* v);
+    int64_t do_faccessat(vm* v);
+    int64_t do_kill(vm* v);
+    int64_t do_tkill(vm* v);
+    int64_t do_tgkill(vm* v);
+    int64_t do_sigaction(vm* v);
+    int64_t do_sigprocmask(vm* v);
+    int64_t do_setpgid(vm* v);
+    int64_t do_getpgid(vm* v);
+    int64_t do_getpgrp(vm*);
+    int64_t do_setsid(vm*);
+    int64_t do_getsid(vm* v);
+    int64_t do_fcntl(vm* v);
+    int64_t do_ioctl(vm* v);
+    int64_t do_umask(vm* v);
+    int64_t do_sigsetjmp(vm* v);
+    int64_t do_siglongjmp(vm* v);
+    int64_t do_mprotect(vm* v);
+    int64_t do_readv(vm* v);
+    int64_t do_writev(vm* v);
+    int64_t do_pread(vm* v);
+    int64_t do_pwrite(vm* v);
+    int64_t do_getrandom(vm* v);
+    int64_t do_getdents64(vm* v);
+    int64_t do_set_tid_address(vm* v);
+    int64_t do_exit_group(vm* v);
+    int64_t do_madvise(vm*);
+    int64_t do_sched_yield(vm*);
+    int64_t do_gettid(vm*);
+    int64_t do_set_tls(vm* v);
+    int64_t do_get_tls(vm* v);
+    int64_t do_futex(vm* v);
+    int64_t do_alloca(vm* v);
+    int64_t do_poll(vm* v);
 };
 
 #endif

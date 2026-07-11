@@ -186,7 +186,8 @@ bool PosixSyscall::handle_signals(vm* v) {
             // 统一走 do_exit_group 终止整个线程组（POSIX：default action of fatal signals
             // is process termination，等价 exit_group），不只杀当前线程。退出码 128+sig。
             v->r(1) = 128 + static_cast<uint64_t>(sig);
-            return do_exit_group(v);
+            v->r(0) = (uint64_t)do_exit_group(v);  // 置 VM_EXITED + 写退出码到 r(0)
+            return false;
         }
         if(is_default_stop(sig)) {
             // 默认动作 = 停止作业（进程级）。stop_process 设 tg 状态 + 整组 VM_STOPPED +
@@ -202,23 +203,24 @@ bool PosixSyscall::handle_signals(vm* v) {
     // 已 catch：跳转到 handler。
     if(!v->mmu(handler)) {
         v->r(1) = 128 + static_cast<uint64_t>(SIGSEGV);
-        return do_exit_group(v);
+        v->r(0) = (uint64_t)do_exit_group(v);  // 置 VM_EXITED + 写退出码
+        return false;
     }
     if(!v->push_frame(pc(v), true)) {
         v->r(1) = 128 + static_cast<uint64_t>(SIGBUS);
-        return do_exit_group(v);
+        v->r(0) = (uint64_t)do_exit_group(v);  // 置 VM_EXITED + 写退出码
+        return false;
     }
     v->r(1) = static_cast<uint64_t>(sig);
     pc(v) = handler;
     return true;
 }
 
-bool PosixSyscall::do_kill(vm* v) {
+int64_t PosixSyscall::do_kill(vm* v) {
     int target_pid = arg_s32(v->r(1));
     int sig = arg_s32(v->r(2));
     if(sig < 0 || sig >= NSIG) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     // 收集目标 task 列表。Linux 语义：
@@ -264,86 +266,72 @@ bool PosixSyscall::do_kill(vm* v) {
     }
 
     if(targets.empty()) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
 
     // sig == 0：仅存在性检查，不发信号。
     if(sig == 0) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
 
     for(auto& t : targets) {
         if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
     }
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_tkill(vm* v) {
+int64_t PosixSyscall::do_tkill(vm* v) {
     int tid = arg_s32(v->r(1));
     int sig = arg_s32(v->r(2));
     if(sig < 0 || sig >= NSIG || tid <= 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
     auto target_vm = find_task(static_cast<uint64_t>(tid));
     if(!target_vm) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
     if(sig == 0) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
     if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), sig);
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_tgkill(vm* v) {
+int64_t PosixSyscall::do_tgkill(vm* v) {
     int tgid_arg = arg_s32(v->r(1));
     int tid = arg_s32(v->r(2));
     int sig = arg_s32(v->r(3));
     if(sig < 0 || sig >= NSIG || tid <= 0 || tgid_arg <= 0) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
     auto target_vm = find_task(static_cast<uint64_t>(tid));
     if(!target_vm) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
     auto target = sys(target_vm.get());
     if(!target || target->tg->tgid != static_cast<uint64_t>(tgid_arg)) {
-        v->r(0) = -ESRCH;
-        return true;
+        return -ESRCH;
     }
     if(sig == 0) {
-        v->r(0) = 0;
-        return true;
+        return 0;
     }
     target->queue_signal(target_vm.get(), sig);
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_sigaction(vm* v) {
+int64_t PosixSyscall::do_sigaction(vm* v) {
     int signo = arg_s32(v->r(1));
     uint64_t act_addr = v->r(2);
     uint64_t oldact_addr = v->r(3);
 
     if(signo <= 0 || signo >= NSIG || signo == SIGKILL || signo == SIGSTOP) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     if(oldact_addr != 0) {
         auto oldact = static_cast<struct bpf::sigaction*>(v->mmu_w(oldact_addr, sizeof(struct bpf::sigaction)));
         if(oldact == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         const auto& current = ps->signal_actions[static_cast<size_t>(signo)];
         oldact->sa_handler = reinterpret_cast<void (*)(int)>(static_cast<uintptr_t>(current.handler));
@@ -354,12 +342,10 @@ bool PosixSyscall::do_sigaction(vm* v) {
     if(act_addr != 0) {
         auto action = static_cast<const struct bpf::sigaction*>(v->mmu(act_addr));
         if(action == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         if(reinterpret_cast<uintptr_t>(action->sa_handler) == reinterpret_cast<uintptr_t>(SIG_ERR)) {
-            v->r(0) = -EINVAL;
-            return true;
+            return -EINVAL;
         }
         auto& current = ps->signal_actions[static_cast<size_t>(signo)];
         current.handler = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(action->sa_handler));
@@ -367,11 +353,10 @@ bool PosixSyscall::do_sigaction(vm* v) {
         current.flags = action->sa_flags;
     }
 
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_sigprocmask(vm* v) {
+int64_t PosixSyscall::do_sigprocmask(vm* v) {
     // rt_sigprocmask(how, set, old, sigsetsize)。how ∈ {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}。
     // sigset_t 在 bpf/musl 是 128 位（16 字节，2 个 unsigned long）；guest 指针指向 16 字节
     // 区域，本 host 仅用低 8 字节（信号 1..63），高 8 字节恒 0（NSIG=32）。
@@ -382,16 +367,14 @@ bool PosixSyscall::do_sigprocmask(vm* v) {
     // r(4) = sigsetsize（musl 传 _NSIG/8=8）。本 host 固定按 16 字节 解释，故忽略 size 校验。
 
     if(how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
-        v->r(0) = -EINVAL;
-        return true;
+        return -EINVAL;
     }
 
     // oldset 总是反映当前 mask，写回 16 字节 sigset_t（低 long = mask，高 long = 0）。
     if(old_addr != 0) {
         auto* old_ptr = static_cast<uint64_t*>(v->mmu_w(old_addr, 2 * sizeof(uint64_t)));
         if(old_ptr == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         old_ptr[0] = sigmask.load(std::memory_order_relaxed);
         old_ptr[1] = 0;
@@ -401,8 +384,7 @@ bool PosixSyscall::do_sigprocmask(vm* v) {
         // 读 guest sigset_t 低 8 字节（信号 1..63 足够覆盖 NSIG=32）。
         auto* set_ptr = static_cast<const uint64_t*>(v->mmu(set_addr, sizeof(uint64_t)));
         if(set_ptr == nullptr) {
-            v->r(0) = -EFAULT;
-            return true;
+            return -EFAULT;
         }
         uint64_t bits = *set_ptr;
         // 仅保留有效位（bit (sig-1), sig ∈ [1, NSIG-1]）；SIGKILL/SIGSTOP 不可阻塞。
@@ -428,17 +410,15 @@ bool PosixSyscall::do_sigprocmask(vm* v) {
         }
     }
 
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_sigsetjmp(vm* v) {
+int64_t PosixSyscall::do_sigsetjmp(vm* v) {
     uint64_t env_addr = v->r(1);
     int savemask = arg_s32(v->r(2));
     uint64_t* env = (uint64_t*)v->mmu_w(env_addr, 10 * sizeof(uint64_t));
     if (!env) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     env[0] = v->r(6);
     env[1] = v->r(7);
@@ -451,17 +431,15 @@ bool PosixSyscall::do_sigsetjmp(vm* v) {
     env[8] = savemask ? 1 : 0;    // __fl
     if (savemask)
         env[9] = sigmask.load(std::memory_order_relaxed);   // __ss[0]
-    v->r(0) = 0;
-    return true;
+    return 0;
 }
 
-bool PosixSyscall::do_siglongjmp(vm* v) {
+int64_t PosixSyscall::do_siglongjmp(vm* v) {
     uint64_t env_addr = v->r(1);
     int32_t val = arg_s32(v->r(2));
     uint64_t* env = (uint64_t*)v->mmu(env_addr, 10 * sizeof(uint64_t));
     if (!env) {
-        v->r(0) = -EFAULT;
-        return true;
+        return -EFAULT;
     }
     v->r(6) = env[0];
     v->r(7) = env[1];
@@ -490,6 +468,5 @@ bool PosixSyscall::do_siglongjmp(vm* v) {
         }
     }
 
-    v->r(0) = (val == 0) ? 1 : val;
-    return true;
+    return (val == 0) ? 1 : val;
 }
