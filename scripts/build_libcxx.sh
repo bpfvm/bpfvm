@@ -14,7 +14,8 @@
 #      20 个弱符号变体，含 nothrow/对齐版）。
 #
 # 用法：./scripts/build_libcxx.sh
-# 产物：libcxx/lib/libcxx.a
+# 产物：root/lib/libcxx.a（最终库安装到 root/lib，与 musl 的 libc.a/libc.so 同目录）
+# 中间：build/libcxx_obj/*.o（编译对象，被 .gitignore 的 build/ 覆盖）
 #
 # 配合系统 clang 自带的 libc++ 头文件（header-only 部分）+ BpfLibcallLower pass，
 # 支持 vector/string/map/sort/optional/expected/memory_resource/variant/
@@ -42,7 +43,7 @@ if ! [ -f "$LIBCXX_INC/vector" ]; then
 fi
 echo "==> libc++ headers: $LIBCXX_INC"
 
-mkdir -p libcxx/lib libcxx/obj
+mkdir -p root/lib build/libcxx_obj
 
 # 编译 libc++ 源文件（algorithm/string/vector/regex/iostream/thread/...）。
 # 这些源文件来自系统 libc++，用 STL_CXX_FLAGS（含 libc++ 头 + 绕过宏）编译。
@@ -71,7 +72,7 @@ STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-b
     -D_LIBCPP_HARDENING_MODE_DEFAULT=0 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
     -D_LIBCPP_BUILDING_LIBRARY -DLIBCXX_BUILDING_LIBCXXABI \
     -isystem $LIBCXX_INC \
-    -isystem libc/include/ -isystem include \
+    -isystem root/include/ -isystem include \
     -I $LIBCXX_SRC \
     -fpass-plugin=${PASS_LIBCALLLOWER} -fpass-plugin=${PASS_WIDEARGS} \
     -fpass-plugin=${PASS_SOFTFP}"
@@ -98,8 +99,8 @@ if [ -d "$LIBCXX_SRC" ]; then
     for src in "$LIBCXX_SRC"/*.cpp; do
         b=$(basename "$src")
         case " $EXCLUDE " in *" $b "*) continue;; esac
-        clang++ $STL_CXX_FLAGS -c "$src" -o "libcxx/obj/${b%.cpp}.o"
-        OBJS="$OBJS libcxx/obj/${b%.cpp}.o"
+        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/${b%.cpp}.o"
+        OBJS="$OBJS build/libcxx_obj/${b%.cpp}.o"
         n=$((n+1))
     done
     echo "   [OK] libc++ sources ($n, excluded: $EXCLUDE)"
@@ -114,8 +115,8 @@ if [ -d "$LIBCXX_SRC" ]; then
     # .o 命名加 fs_ 前缀避免与同名文件冲突。
     for src in "$LIBCXX_SRC"/filesystem/*.cpp; do
         b=$(basename "$src")
-        clang++ $STL_CXX_FLAGS -c "$src" -o "libcxx/obj/fs_${b%.cpp}.o"
-        OBJS="$OBJS libcxx/obj/fs_${b%.cpp}.o"
+        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/fs_${b%.cpp}.o"
+        OBJS="$OBJS build/libcxx_obj/fs_${b%.cpp}.o"
     done
     echo "   [OK] filesystem"
 else
@@ -167,8 +168,8 @@ if [ -n "$LIBCXXABI_SRC" ]; then
     for src in "$LIBCXXABI_SRC"/*.cpp; do
         b=$(basename "$src")
         case " $ABI_EXCLUDE " in *" $b "*) continue;; esac
-        clang++ $ABI_FLAGS -c "$src" -o "libcxx/obj/abi_${b%.cpp}.o"
-        OBJS="$OBJS libcxx/obj/abi_${b%.cpp}.o"
+        clang++ $ABI_FLAGS -c "$src" -o "build/libcxx_obj/abi_${b%.cpp}.o"
+        OBJS="$OBJS build/libcxx_obj/abi_${b%.cpp}.o"
         n=$((n+1))
     done
     echo "   [OK] libc++abi ($n, excluded: $ABI_EXCLUDE)"
@@ -179,7 +180,7 @@ fi
 
 # 打成静态库。先清空旧 .a：ar rcs 不会删除已存在但本次未列出的成员，
 # 否则上次构建的陈旧 .o（如旧 pass 编的）会残留累积。
-echo "==> creating libcxx/lib/libcxx.a"
-rm -f libcxx/lib/libcxx.a
-ar rcs libcxx/lib/libcxx.a $OBJS
-echo "==> done: libcxx/lib/libcxx.a ($(wc -c < libcxx/lib/libcxx.a) bytes)"
+echo "==> creating root/lib/libcxx.a"
+rm -f root/lib/libcxx.a
+ar rcs root/lib/libcxx.a $OBJS
+echo "==> done: root/lib/libcxx.a ($(wc -c < root/lib/libcxx.a) bytes)"

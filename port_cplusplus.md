@@ -74,18 +74,18 @@ https://github.com/llvm/llvm-project/issues/207686 ，clang 19→23 trunk 全复
 - **`BpfEmutls`**：emutls，见上。
 
 > **pass 重建后必须全量重编** musl（`find musl/build/obj -name '*.o' -delete && sh musl/build.sh`）
-> → 重建 `libc.so` → `sh libcxx/build.sh` → `make -C test`。Make/CMake 的 musl/libcxx 构建只
+> → 重建 `libc.so` → `sh scripts/build_libcxx.sh` → `make -C test`。Make/CMake 的 musl/libcxx 构建只
 > 看 `.c` 源码 mtime，不跟踪 `.so` 时间戳。
 
-## 2. STL 子集（libc++ + `libcxx_bpf.a`）
+## 2. STL 子集（libc++ + `libcxx.a`）
 
 musl `libc.a` 不含任何 C++ runtime 符号。本项目用系统自带的 libc++ 头文件（header-only 部分）
-+ 自建的极简静态库 `libcxx/lib/libcxx_bpf.a` 提供库符号。
++ 自建的极简静态库 `root/lib/libcxx.a` 提供库符号。
 
 ### libc++ 头配置
 
 `#include <vector>` 之类需要绕过 libc++ `__config` 的若干检查。在 `test/Makefile` 的
-`CXX_FLAGS` 和 `libcxx/build.sh` 的 `STL_CXX_FLAGS` 里统一用命令行 `-D` 宏（**不用**
+`CXX_FLAGS` 和 `scripts/build_libcxx.sh` 的 `STL_CXX_FLAGS` 里统一用命令行 `-D` 宏（**不用**
 `__config_site` 头——实测经 `-isystem` 配置后未被 `__config` 自动 include）：
 
 | 宏 | 作用 |
@@ -94,7 +94,7 @@ musl `libc.a` 不含任何 C++ runtime 符号。本项目用系统自带的 libc
 | `_LIBCPP_HAS_MUSL_LIBC` | 派生 musl 的 rune table，解锁 `<__locale>` |
 | `_LIBCPP_HAS_NO_INT128` | 关闭 libc++ 的 `__int128` 支持。BPF 后端不支持 `__int128` 乘除法（`__multi3`/`__divti3`/`__muloti4`，ISel 拒绝），而 `file_clock::rep` 默认是 `__int128_t`（`__chrono/file_clock.h` 的 `#if !defined(_LIBCPP_HAS_NO_INT128)`）。定义该宏让 `file_clock::rep` 退化为 `long long`，`<filesystem>` 的时间戳运算链不再触发后端拒绝；`int128_builtins.cpp` 整体被 `#if` 包裹变空 TU（不产 `__muloti4` 符号，无冲突） |
 | `_LIBCPP_HARDENING_MODE=...NONE` | 关 libc++ 硬化检查 |
-| `_LIBCPP_BUILDING_LIBRARY` | 编译 libc++ 源码时用（仅 `libcxx/build.sh`） |
+| `_LIBCPP_BUILDING_LIBRARY` | 编译 libc++ 源码时用（仅 `scripts/build_libcxx.sh`） |
 | `_GNU_SOURCE` | 让 musl 头暴露 `locale_t` 等 |
 
 `-isystem` 顺序：**libc++ 头在 musl 之前**（cstddef 的 `#include_next <stddef.h>` 要求
@@ -102,7 +102,7 @@ libc++ 的 `stddef.h` 先找到再串到 musl）。探测 libc++ 头时排除 `w
 namespace 是 `__2`，与用户代码 `__1` 不匹配会链接报 undefined）。ABI namespace 用系统
 `__config_site` 的默认 `__1`，两边都不显式设 `_LIBCPP_ABI_NAMESPACE`。
 
-### `libcxx_bpf.a` 组成（`libcxx/build.sh`）
+### `libcxx.a` 组成（`scripts/build_libcxx.sh`）
 
 全量编译 + 排除少数编不过/冲突的，`set -e` 保证失败即退出（无 try/skip）。由两部分组成：
 
@@ -166,7 +166,7 @@ namespace 是 `__2`，与用户代码 `__1` 不匹配会链接报 undefined）�
 | `<format>` (C++20) | "too many arguments" 已由 `lowerAggregateParams` 消除，但遇下一个 BPF 后端限制（`Do not know how to expand this operator's operand`，疑似向量/i128 展开），暂缓 |
 | 异常 `throw`/`try`/`catch` | `-fno-exceptions`，见下节 |
 
-> libc++ 源排除清单（`libcxx/build.sh` 的 `EXCLUDE`）：`barrier.cpp`（上）、`charconv.cpp`
+> libc++ 源排除清单（`scripts/build_libcxx.sh` 的 `EXCLUDE`）：`barrier.cpp`（上）、`charconv.cpp`
 > （上）、`new.cpp`（与 `stdlib_new_delete.cpp` 符号完全重叠，二选一取 libc++abi 版）。
 >
 > libc++abi 源排除清单（`ABI_EXCLUDE`）：`cxa_exception.cpp`（有异常版 `__cxa_*`，与
@@ -184,7 +184,7 @@ VM mmap 本就页对齐。
 ### `<expected>` (C++23) 启用要点
 
 `<expected>` 整体被 libc++ 的 `#if _LIBCPP_STD_VER >= 23` 门控，必须用 `-std=c++23`。
-项目默认即 c++23（`libcxx/build.sh` 的 `STL_CXX_FLAGS`、`test/Makefile` 的 `CXX_FLAGS`/
+项目默认即 c++23（`scripts/build_libcxx.sh` 的 `STL_CXX_FLAGS`、`test/Makefile` 的 `CXX_FLAGS`/
 `HOST_CXXFLAGS` 均是），`expected.cpp` 随主循环编译。c++23 是 c++20 的超集，现有测试无回归。
 
 `expected<T,E>` 主体全是模板（在用户 TU 实例化），库只补 `bad_expected_access` 的
@@ -267,7 +267,7 @@ syscall、不直接用 getdents64），故 musl+VM 栈已覆盖其全部依赖�
 
 ### 启用要点
 
-1. **`libcxx/build.sh`**：去掉 `-D_LIBCPP_HAS_NO_FILESYSTEM`，新增 7 个 filesystem 源文件
+1. **`scripts/build_libcxx.sh`**：去掉 `-D_LIBCPP_HAS_NO_FILESYSTEM`，新增 7 个 filesystem 源文件
    编译循环（`int128_builtins`/`path`/`filesystem_error`/`filesystem_clock`/
    `directory_entry`/`directory_iterator`/`operations`，源在 `$LIBCXX_SRC/filesystem/`
    子目录，`.o` 加 `fs_` 前缀避免同名冲突）。
@@ -302,7 +302,7 @@ C++ 代码加 `-g` 编译时，clang BPF 后端会改坏某些成员函数 `decl
   （含复现用例、版本矩阵、crash 栈）
 - **绕过**：`test/Makefile` 的 `CXX_FLAGS` 去掉 `-g`（C 的 `CC_FLAGS` 保留 `-g`，C 不受此
   bug 影响）。代价：C++ 测试无源级调试信息（`bpf-objdump -S` 对 C++ 二进制不可用）。
-  `libcxx/build.sh` 的 `STL_CXX_FLAGS` 本就不带 `-g`，库符号不受影响。
+  `scripts/build_libcxx.sh` 的 `STL_CXX_FLAGS` 本就不带 `-g`，库符号不受影响。
 
 ## 6. 异常支持可行性评估（未实现）
 

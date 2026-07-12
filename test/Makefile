@@ -17,16 +17,16 @@ CXX_TARGETS := $(CXX_SOURCES:.cpp=.out)
 CXX_DYN_TARGETS := $(CXX_SOURCES:.cpp=.linked)
 CXX_HOST_TARGETS := $(CXX_SOURCES:.cpp=.host)
 
-# libcxx.a 由 libcxx/build.sh 产出（C++ runtime：operator new/delete + __cxa_*
+# libcxx.a 由 scripts/build_libcxx.sh 产出（C++ runtime：operator new/delete + __cxa_*
 # stub + libc++ 库符号）。所有 C++ 测试统一链入——即使该用例不直接用 STL，链入也无害
 # （静态库 first-wins：用例自定义的 operator new/delete 优先于库内的 cxxabi_stub 版）。
-LIBCXX_BPFA := ../libcxx/lib/libcxx.a
+LIBCXX_BPFA := ../root/lib/libcxx.a
 # libcxx.so 由 build_root.sh 的 build_libcxx 从 libcxx.a 合成（依赖 libc.so，DT_NEEDED），
-# 放 ../libc/lib/；动态链接用例链它，test 只引用，不自己构建。
-LIBCXX_BPFSO := ../libcxx/lib/libcxx.so
+# 放 ../root/lib/；动态链接用例链它，test 只引用，不自己构建。
+LIBCXX_BPFSO := ../root/lib/libcxx.so
 # libc.so 由 build_root.sh 的 build_libc_bpfso 产出（从 musl libc.a 合成，含 _start），
-# 放 ../libc/lib/；test 只引用，不自己构建（也不构建 libc.a，由 musl/build.sh 产出）。
-LIBC_BPFSO := ../libc/lib/libc.so
+# 放 ../root/lib/；test 只引用，不自己构建（也不构建 libc.a，由 musl/build.sh 产出）。
+LIBC_BPFSO := ../root/lib/libc.so
 
 # === BPF pass 插件（clang -fpass-plugin=，语言无关，C/C++ 共用） ===
 # 路径用 wildcard 探测，存在则注入（缺失时跳过，不报错——便于在 pass 未构建的环境复用）。
@@ -62,7 +62,7 @@ CXX_PASS_FLAGS += -fpass-plugin=$(EMUTLS)
 endif
 
 # === C 编译 flags ===
-# -nostdinc: 不用宿主 glibc 头，只用 musl(../libc/include) + BPF guest 头(../include)。
+# -nostdinc: 不用宿主 glibc 头，只用 musl(../root/include) + BPF guest 头(../include)。
 # -std=gnu11: gnu11 不定义 __STRICT_ANSI__，musl features.h 启用默认 feature 宏
 #   （_GNU_SOURCE 等），struct sigaction 等类型可见。同时让 GNU 扩展
 #   （`, ##__VA_ARGS__`）可用 —— 用户侧 syscall 宏（arch/bpf/bits/syscall.h.in）
@@ -76,7 +76,7 @@ endif
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
 CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
             -nostdinc -fno-builtin -fno-math-errno \
-            -isystem ../libc/include/ -isystem ../include -g \
+            -isystem ../root/include/ -isystem ../include -g \
             $(PASS_FLAGS)
 
 # === C++ 编译 flags ===
@@ -102,7 +102,7 @@ CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
              -D_LIBCPP_HARDENING_MODE_DEFAULT=0 \
              -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
              $(if $(LIBCXX_INC),-isystem $(LIBCXX_INC)) \
-             -isystem ../libc/include/ -isystem ../include \
+             -isystem ../root/include/ -isystem ../include \
              $(CXX_PASS_FLAGS)
 
 # === Host 原生构建 ===
@@ -161,13 +161,13 @@ all: $(TARGETS) $(DYN_TARGETS) $(CXX_TARGETS) $(CXX_DYN_TARGETS) host-build
 STATIC_OUT     := $(filter-out test_dyn_data.out,$(TARGETS))
 STATIC_LINKED  := $(filter-out test_dyn_data.linked,$(DYN_TARGETS))
 $(STATIC_OUT): %.out: %.o
-	../build/bpfvm-ld -static $< -L ../libc/lib -l:libc.a -o $@
+	../build/bpfvm-ld -static $< -L ../root/lib -l:libc.a -o $@
 $(STATIC_LINKED): %.linked: %.o $(LIBC_BPFSO)
-	../build/bpfvm-ld $< -L ../libc/lib -l:libc.so -o $@
+	../build/bpfvm-ld $< -L ../root/lib -l:libc.so -o $@
 $(CXX_TARGETS): %.out: %.o $(LIBCXX_BPFA)
-	../build/bpfvm-ld -static $< $(LIBCXX_BPFA) -L ../libc/lib -l:libc.a -o $@
+	../build/bpfvm-ld -static $< $(LIBCXX_BPFA) -L ../root/lib -l:libc.a -o $@
 $(CXX_DYN_TARGETS): %.linked: %.o $(LIBCXX_BPFSO) $(LIBC_BPFSO)
-	../build/bpfvm-ld $< -L ../libcxx/lib -l:libcxx.so -L ../libc/lib -l:libc.so -o $@
+	../build/bpfvm-ld $< -L ../root/lib -l:libcxx.so -L ../root/lib -l:libc.so -o $@
 
 %.o: %.c
 	clang $(CC_FLAGS) $< -c
@@ -179,7 +179,7 @@ $(CXX_DYN_TARGETS): %.linked: %.o $(LIBCXX_BPFSO) $(LIBC_BPFSO)
 # libgot 建成 .so：导出 got_add/got_counter/got_hash（不带 _start，PIE）。
 # 内部调 libc strlen → 依赖 libc.so（DT_NEEDED），构造主程序→libgot→libc 的链式依赖。
 $(GOT_SO): libgot.o $(LIBC_BPFSO)
-	../build/bpfvm-ld -shared --soname libgot.so $< -L ../libc/lib -l:libc.so -o $@
+	../build/bpfvm-ld -shared --soname libgot.so $< -L ../root/lib -l:libc.so -o $@
 libgot.a: libgot.o
 	ar rcs $@ $<
 
@@ -187,9 +187,9 @@ libgot.a: libgot.o
 #              + 链式依赖（got_hash 内部调 libc strlen，由 loader 递归 DT_NEEDED 解析）
 # 覆盖通用规则：需要 libgot.so/libgot.a 依赖，且链接命令带 -l:libgot.so / libgot.a
 test_dyn_data.linked: test_dyn_data.o $(GOT_SO)
-	../build/bpfvm-ld $< -L ../libc/lib -l:libc.so -L . -l:libgot.so -o $@
+	../build/bpfvm-ld $< -L ../root/lib -l:libc.so -L . -l:libgot.so -o $@
 test_dyn_data.out: test_dyn_data.o libgot.a
-	../build/bpfvm-ld -static $< libgot.a -L ../libc/lib -l:libc.a -o $@
+	../build/bpfvm-ld -static $< libgot.a -L ../root/lib -l:libc.a -o $@
 
 # 标记 .o 为中间文件，make 构建后会自动删除（和其他 .o 行为一致）
 .INTERMEDIATE: libgot.o test_dyn_data.o libgot.host.o

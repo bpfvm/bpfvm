@@ -2,7 +2,7 @@
 
 `bpfvm` 是一个基于 C++20 实现的 BPF (eBPF) 虚拟机，旨在在用户态加载并运行 BPF ELF 二进制文件。
 
-与内核中的 BPF 运行时不同，本项目致力于提供一个类似 POSIX 的运行环境，通过集成 [PDCLib](https://uclibc.org/pdclib/) (Public Domain C Library) 和模拟常见的系统调用 (syscalls)，使得标准的 C 语言程序（如 `dash` shell 和 `sbase` 工具集）能够通过交叉编译运行在此虚拟机上。
+与内核中的 BPF 运行时不同，本项目致力于提供一个类似 POSIX 的运行环境，通过集成 [PDCLib](https://uclibc.org/pdclib/) (Public Domain C Library) 和模拟常见的系统调用 (syscalls)，使得标准的 C 语言程序（如 `dash` shell 和 `busybox` 工具集）能够通过交叉编译运行在此虚拟机上。
 
 ## 核心特性
 
@@ -14,8 +14,8 @@
 *   **标准库支持**: 深度集成了 `PDCLib`，为 BPF 程序提供标准 C 库支持 (stdio, stdlib, string 等)。
 *   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用。
 *   **内存安全**: 提供内存越界检查机制。
-*   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `sbase` (coreutils) 等复杂程序。
-*   **Demo Rootfs**: 提供脚本一键构建 `dash + sbase` 的最小 rootfs，并安装到 `root/`。
+*   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `busybox` (coreutils) 等复杂程序。
+*   **Demo Rootfs**: 提供脚本一键构建 `dash + busybox` 的最小 rootfs，并安装到 `root/`。
 
 ## 构建指南
 
@@ -41,18 +41,16 @@ cmake --build build
 #     需 LLVM 开发头；缺失时跳过，不影响 VM 本体）
 ```
 
-### 编译 PDCLib (Guest 标准库)
+### 编译 Guest 标准库 (musl)
 
-在编译任何 BPF Guest 程序之前，需要先构建针对 BPF 目标的 PDCLib：
+在编译任何 BPF Guest 程序之前，需要先构建针对 BPF 目标的 C 标准库（默认 musl）：
 
 ```bash
-cd pdclib
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=bpf-toolchain.cmake
-cmake --build build
-cmake --install build --prefix build/install
-cd ..
+sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，及头文件）
 ```
-*注意：项目根目录下的 `libc` 是指向 `pdclib/build/install` 的符号链接，安装完成后即可通过 `-Ilibc/include` 使用。*
+*默认安装前缀是项目根目录的 `root/`，所有构建脚本/Makefile 统一引用 `-Iroot/include`、`-Lroot/lib`。*
+
+> PDCLib 是可选的替代 C 库（默认不构建）。如需改用 PDCLib，详见 `AGENTS.md` 的 "Default C Library (musl) & Optional PDCLib" 一节，将其头文件与库装入 `root/`。
 
 ## 运行与测试
 
@@ -72,12 +70,12 @@ VM 自身的指令集单元测试：
 ./build/bpfvm_test
 ```
 
-### 构建 Demo Rootfs (dash + sbase)
+### 构建 Demo Rootfs (dash + busybox)
 
-一键构建 `dash` 和 `sbase`，并将产物安装到 `root/bin`：
+一键构建 `dash` 和 `busybox`，并将 C/C++ 运行时（musl、libcxx）与可执行文件统一安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
 
 ```bash
-./build_root.sh
+./scripts/build_root.sh   # = 构建 musl → root/{include,lib}；合成 libc.so/libcxx.so；构建 dash/busybox → root/bin
 # 运行 dash（示例）
 ./build/bpfvm root/bin/dash
 ```
@@ -114,6 +112,7 @@ make -C test
 ├── cmake/                # CMake 辅助脚本（CTest 集成等）
 ├── pdclib/               # PDCLib 标准 C 库 (子模块)
 ├── dash/                 # dash shell (子模块)
+├── busybox/              # busybox
 ├── sbase/                # sbase coreutils
 ├── test/                 # BPF 集成测试用例
 └── root/                 # Demo rootfs 输出目录
@@ -138,13 +137,13 @@ VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp
 ```bash
 # 编译（clang 直接，无 wrapper）
 clang -target bpf -mcpu=v4 -O1 -nostdinc -fno-builtin \
-      -isystem libc/include -isystem include -g \
+      -isystem root/include -isystem include -g \
       foo.c -c -o foo.o
 
 # 链接（三种模式）
-bpfvm-ld -static foo.o -l:libpdclib.a -o foo.linked        # 静态：自包含 ET_EXEC
-bpfvm-ld --shared --soname libc.so libpdclib.a -o libc.so  # 共享库：PIE .so
-bpfvm-ld foo.o -l libc.so -o foo.linked                    # 动态（默认）：PIE + DT_NEEDED
+bpfvm-ld -static foo.o -L root/lib -l:libc.a -o foo.linked   # 静态：自包含 ET_EXEC
+bpfvm-ld --shared --soname libc.so libc.a -o libc.so         # 共享库：PIE .so（实际由 build_root.sh 合成）
+bpfvm-ld foo.o -L root/lib -l:libc.so -o foo.linked          # 动态（默认）：PIE + DT_NEEDED
 
 # 运行
 bpfvm foo.linked    # 或 foo.dyn

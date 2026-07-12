@@ -97,7 +97,7 @@ build() {
          CROSS_COMPILE= \
          KBUILD_VERBOSE=0 \
          CFLAGS="${COMMON_CFLAGS}" \
-         LDFLAGS="-target bpf -nostdlib -L${ROOT_DIR}/libc/lib" \
+         LDFLAGS="-target bpf -nostdlib -L${ROOT_DIR}/root/lib" \
          busybox_unstripped || true
     local rc=${PIPESTATUS[0]}
     echo "=== make 退出码 ${rc}（链接阶段失败是预期的，检查 .o 产物）==="
@@ -120,13 +120,13 @@ collect_objs() {
 }
 
 # 动态链接：与 build_root.sh 的 dash 一致，生成 PIE ET_DYN，libc.so 作为 DT_NEEDED 依赖。
-# 运行时 bpfvm 从 libc/lib/（或 LD_LIBRARY_PATH）解析 libc.so；多个动态可执行文件共享
+# 运行时 bpfvm 从 root/lib/（或 LD_LIBRARY_PATH）解析 libc.so；多个动态可执行文件共享
 # 同一份 libc.so，整体体积比静态链接小（busybox 自身不含 musl 代码）。
 link_dyn() {
     echo "=== 手动链接 busybox (动态，bpfvm-ld) ==="
     cd "${BB_DIR}"
     collect_objs
-    "${BPFVM_LD}" -L "${ROOT_DIR}/libc/lib" -l c "${OBJS[@]}" -o busybox.linked
+    "${BPFVM_LD}" -L "${ROOT_DIR}/root/lib" -l c "${OBJS[@]}" -o busybox.linked
     local rc=${PIPESTATUS[0]}
     echo "=== 链接退出码 ${rc} ==="
     if [ -f busybox.linked ]; then
@@ -140,7 +140,7 @@ link_static() {
     echo "=== 手动链接 busybox (静态，bpfvm-ld) ==="
     cd "${BB_DIR}"
     collect_objs
-    "${BPFVM_LD}" -static  "${OBJS[@]}" "${ROOT_DIR}/libc/lib/libc.a" -o busybox.out
+    "${BPFVM_LD}" -static  "${OBJS[@]}" "${ROOT_DIR}/root/lib/libc.a" -o busybox.out
     local rc=${PIPESTATUS[0]}
     echo "=== 链接退出码 ${rc} ==="
     if [ -f busybox.out ]; then

@@ -7,10 +7,6 @@ test/*.host
 build/
 root/
 
-# libcxx 交叉构建产物（由 libcxx/build.sh 生成）
-libcxx/obj/
-libcxx/lib/
-
 .*~
 
 # busybox 上游源码树（本地 clone，不纳入版本控制；构建由根目录 build_busybox.sh 驱动）

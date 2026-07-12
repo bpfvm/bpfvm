@@ -26,12 +26,11 @@
 - `passes/`: LLVM pass plugins (compiled into `build/lib*.so`, loaded by `clang -fpass-plugin=...`).
     - `BpfWideArgs.cpp`: lifts the BPF limit (5-arg, struct return, variadic).
     - `BpfSoftFp.cpp`: rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support.
-- `musl/`: default C library for BPF targets (musl 1.2.6 port); built via `sh musl/build.sh` → `musl/build/install/{include,lib}`.
-- `libc/`: symlink → `musl/build/install` (default); exposes headers (`-Ilibc/include`) and archives (`-Llibc/lib`).
+- `musl/`: default C library for BPF targets (musl 1.2.6 port); built via `sh musl/build.sh` → installs to `root/{include,lib}` (headers + `libc.a`/`libm.a`/... + ldso objects).
 - `pdclib/`: alternative C library (optional, not built by default); sources + `bpf-toolchain.cmake` kept for manual builds.
 - `dash/`: shell sources for the BPF cross-build.
 - `sbase/`: sbase coreutils sources for the BPF cross-build.
-- `root/`: demo rootfs output directory (binaries installed to `root/bin`).
+- `root/`: unified install root for the C/C++ toolchain + rootfs. `root/include` (musl headers), `root/lib` (`libc.a`/`libc.so`/`ld-bpf.so`/`libcxx.a`/`libcxx.so`/...), `root/bin` (dash/sbase/busybox). Built by `sh musl/build.sh` + `./scripts/build_root.sh`.
 - `test/`: small BPF test programs (`.c`) and expected outputs (`.out`), built via a local Makefile.
 - `pdclib/test_support/`, `pdclib/build/test_support/testdrivers/`: PDCLib test drivers and helpers; treat as upstream-style fixtures.
 - `build/`: local build outputs (CMake and cross-build artifacts).
@@ -337,12 +336,12 @@ The BPF backend in upstream LLVM has several defects this project works around. 
 
 ## Default C Library (musl) & Optional PDCLib
 
-The default C library for BPF targets is **musl** (`musl/`). Build it with `sh musl/build.sh`; the `libc` symlink at the project root points to `musl/build/install`, so `-Ilibc/include` and `-Llibc/lib` resolve to musl's headers and `libc.a` (with crt merged in, containing `_start`).
+The default C library for BPF targets is **musl** (`musl/`). Build it with `sh musl/build.sh` (default prefix `$TOP/root`); headers and `libc.a` (with crt merged in, containing `_start`) install to `root/include` and `root/lib`, so `-Iroot/include` and `-Lroot/lib` resolve to musl's headers and `libc.a`.
 
 ### Building musl (default)
 ```bash
-sh musl/build.sh          # → musl/build/install/{include,lib}
-./scripts/build_root.sh           # also runs build_musl + synthesizes libc.so (= ld-bpf.so, single binary; see below)
+sh musl/build.sh          # → root/{include,lib}
+./scripts/build_root.sh   # also runs build_musl + synthesizes libc.so (= ld-bpf.so, single binary; see below)
 ```
 
 ### Building PDCLib (optional alternative)
@@ -354,25 +353,25 @@ PDCLib is kept as an optional C library but is **not built by default**. To use 
     cmake --build build
     cmake --install build --prefix build/install
     ```
-2.  **Switch the `libc` symlink**: `ln -sfn pdclib/build/install libc`
-3.  BPF compilers then reference PDCLib via `-Ilibc/include` and `-Llibc/lib64 -l:libpdclib.a`.
+2.  Install PDCLib's headers/libraries into `root/` (e.g. copy `pdclib/build/install/include/*` → `root/include/`, `pdclib/build/install/lib64/libpdclib.a` → `root/lib/`), or point the build scripts at the PDCLib install tree.
+3.  BPF compilers then reference PDCLib via `-Iroot/include` and `-Lroot/lib -l:libpdclib.a`.
 
 ## musl Porting (`musl/`)
 
-The project ships a port of musl 1.2.6 as the **default** C library for the BPF target. Build with `sh musl/build.sh` — produces `musl/build/install/lib/libc.a` (with `crt1.o`/`crti.o`/`crtn.o` merged in, so it contains `_start`) + standalone `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`, and headers in `musl/build/install/include/`. `test/Makefile` and `scripts/build_root.sh` build against this musl directly (static `.out` + dynamic `.linked`).
+The project ships a port of musl 1.2.6 as the **default** C library for the BPF target. Build with `sh musl/build.sh` (default prefix `$TOP/root`) — produces `root/lib/libc.a` (with `crt1.o`/`crti.o`/`crtn.o` merged in, so it contains `_start`) + standalone `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`, and headers in `root/include/`. `test/Makefile` and `scripts/build_root.sh` build against this musl directly (static `.out` + dynamic `.linked`).
 
 ### musl build (`musl/build.sh`)
 - **`--disable-shared`**: musl's `.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (in `scripts/build_root.sh`'s `build_libc_bpfso`), not by musl's own build.
 - **`-mllvm -bpf-stack-size=16384`**: musl's `crypt_blowfish` (`BF_crypt`) has ~8.5KB local structs; the default 4096 overflows.
-- **rcrt1.o / crti.o / crtn.o / Scrt1.o skipped**: `make install` compiles `rcrt1.o` (static PIE self-start, depends on `dlstart` dynamic linker logic — BPF can't support it; `_start_c` signature mismatch + `GETFUNCSYM` has no forward decl) and fails. The script builds **only `crt1.o`** via per-target `make obj/crt/crt1.o`. The other crt objects are unnecessary on BPF: `crti.o`/`crtn.o` compile to empty `.o` (BPF has no `.init_array`/`.fini_array` framework), and `Scrt1.o` is identical to `crt1.o` on BPF (clang always emits relocations for address refs, so `-fPIC` doesn't change the output). Headers are copied manually to `install/include/` (generic/bits first, then bpf/bits so BPF-specific overrides win).
+- **rcrt1.o / crti.o / crtn.o / Scrt1.o skipped**: `make install` compiles `rcrt1.o` (static PIE self-start, depends on `dlstart` dynamic linker logic — BPF can't support it; `_start_c` signature mismatch + `GETFUNCSYM` has no forward decl) and fails. The script builds **only `crt1.o`** via per-target `make obj/crt/crt1.o`. The other crt objects are unnecessary on BPF: `crti.o`/`crtn.o` compile to empty `.o` (BPF has no `.init_array`/`.fini_array` framework), and `Scrt1.o` is identical to `crt1.o` on BPF (clang always emits relocations for address refs, so `-fPIC` doesn't change the output). Headers are copied manually to `root/include/` (generic/bits first, then bpf/bits so BPF-specific overrides win).
 - **crt1 merged into libc.a**: BPF's `_start` lives in `crt1.o` (pure C, `arch/bpf/crt_arch.h`). The script runs `ar rcs lib/libc.a lib/crt1.o` so `libc.a` carries `_start` itself — like pdclib, linkers only pass `libc.a`/`libc.so` and need no separate crt files or ordering. `crt1.o` covers both static and PIE/.so modes (BPF `-fPIC` doesn't change crt1's output).
-- **ldso objects (`dlstart.lo`/`dynlink.lo`) built separately; merged with libc into one binary**: standard musl puts ldso code (`ldso/dlstart.c`, `ldso/dynlink.c`) into `libc.so`, not `libc.a` (statically-linked programs don't need a dynamic linker). Since BPF's `libc.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (not by musl's build), these objects would otherwise be lost. The script builds them via `make obj/ldso/dlstart.lo obj/ldso/dynlink.lo` and installs them alongside `libc.a`.
-- **`libc.so` == `ld-bpf.so` (single binary, mirrors upstream musl `libc.so` == `ld.so`)**: the ldso must function before any other library is relocated, so the libc it depends on (`malloc`/`memcpy`/TLS setup/`__libc_start_main`/...) must be linked into it — it cannot import these from a separate `libc.so`. `scripts/build_root.sh`'s `build_libc_bpfso` therefore builds **one** binary from `libc.a + dlstart.lo + dynlink.lo`, `--soname libc.so`, entry `_dlstart` (`-e _dlstart`), output to `libc/lib/libc.so`. `root/lib/libc.so` and `root/lib/ld-bpf.so` are both symlinks to this single file. This is not wasteful duplication: at runtime `load_library("libc.so")` hits the `is_self` short-circuit in musl's ldso (`ldso.name` is hardcoded to `"libc.so"` in `__dls2`, and `"libc"` is in the reserved-name table), so a program's `DT_NEEDED libc.so` reuses the already-mapped ldso rather than opening the file — a separate on-disk `libc.so` would be dead weight. The single file serves three paths: link-time (`-l:libc.so` reads its dynsym + `DT_SONAME=libc.so`), `DT_NEEDED libc.so` (→ `is_self`), and `PT_INTERP=/lib/ld-bpf.so` (VM loader resolves `ld-bpf.so`, entry = `load_base + e_entry` → `_dlstart`). ldso does its own stage-1 self-relocation (`_dlstart_c` in `dlstart.c`); the VM loader only mmaps segments + sets up auxv.
-- **install layout**: `install/{include,lib}` mirrors pdclib's layout so the project-root `libc` symlink abstracts the choice; `install/lib` holds `libc.a` (with crt1 merged), `crt1.o`, and the ldso objects `dlstart.lo`/`dynlink.lo`.
+- **ldso objects (`dlstart.lo`/`dynlink.lo`) built separately; merged with libc into one binary**: standard musl puts ldso code (`ldso/dlstart.c`, `ldso/dynlink.c`) into `libc.so`, not `libc.a` (statically-linked programs don't need a dynamic linker). Since BPF's `libc.so` is synthesized from `libc.a` by `bpfvm-ld -shared` (not by musl's build), these objects would otherwise be lost. The script builds them via `make obj/ldso/dlstart.lo obj/ldso/dynlink.lo` and installs them alongside `libc.a` in `root/lib/`.
+- **`libc.so` == `ld-bpf.so` (single binary, mirrors upstream musl `libc.so` == `ld.so`)**: the ldso must function before any other library is relocated, so the libc it depends on (`malloc`/`memcpy`/TLS setup/`__libc_start_main`/...) must be linked into it — it cannot import these from a separate `libc.so`. `scripts/build_root.sh`'s `build_libc_bpfso` therefore builds **one** binary from `libc.a + dlstart.lo + dynlink.lo`, `--soname libc.so`, entry `_dlstart` (`-e _dlstart`), output to `root/lib/ld-bpf.so`, with `root/lib/libc.so` a relative symlink to it. This is not wasteful duplication: at runtime `load_library("libc.so")` hits the `is_self` short-circuit in musl's ldso (`ldso.name` is hardcoded to `"libc.so"` in `__dls2`, and `"libc"` is in the reserved-name table), so a program's `DT_NEEDED libc.so` reuses the already-mapped ldso rather than opening the file — a separate on-disk `libc.so` would be dead weight. The single file serves three paths: link-time (`-l:libc.so` reads its dynsym + `DT_SONAME=libc.so`), `DT_NEEDED libc.so` (→ `is_self`), and `PT_INTERP=/lib/ld-bpf.so` (VM loader resolves `ld-bpf.so`, entry = `load_base + e_entry` → `_dlstart`). ldso does its own stage-1 self-relocation (`_dlstart_c` in `dlstart.c`); the VM loader only mmaps segments + sets up auxv.
+- **install layout**: `root/{include,lib}` is the unified install tree shared with libcxx and the rootfs; `root/lib` holds `libc.a` (with crt1 merged), `crt1.o`, and the ldso objects `dlstart.lo`/`dynlink.lo`.
 
 ### Pass rebuild after `.so` changes
 **musl (Make, default) and pdclib (CMake, optional) do NOT track `libBpfWideArgs.so`/`libBpfSoftFp.so` timestamp changes** — they only look at `.c` source mtimes. After modifying either pass, force a full rebuild:
-- musl (default): `find musl/build/obj -name '*.o' -delete && sh musl/build.sh` (re-runs `make lib/libc.a` + crt + merge crt into libc.a + ldso objects + header/lib install), then `./scripts/build_root.sh` to regenerate the merged `libc.so` (= `ld-bpf.so`) and its `root/lib/` symlinks.
-- pdclib (optional): `rm -rf pdclib/build`, then rebuild pdclib + `bpfvm-ld -shared` to regenerate `libc.so`.
+- musl (default): `find musl/build/obj -name '*.o' -delete && sh musl/build.sh` (re-runs `make lib/libc.a` + crt + merge crt into libc.a + ldso objects + header/lib install to `root/`), then `./scripts/build_root.sh` to regenerate the merged `libc.so` (= `ld-bpf.so`) and its `root/lib/` symlinks.
+- pdclib (optional): `rm -rf pdclib/build`, then rebuild pdclib + `bpfvm-ld -shared` to regenerate `libc.so` and copy it into `root/lib/`.
 
 Skipping this reuses stale `.o` compiled with the old pass (a past incident: deleting `__va_arg` left old `.o` still referencing it, causing `_va_arg` undefined at link).

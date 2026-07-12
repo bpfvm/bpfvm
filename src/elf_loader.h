@@ -3,7 +3,7 @@
 //
 // ld_main（构建期 -l 解析）和 VM（运行期加载 ELF）共用。
 //
-// 搜索顺序：命令行 -L 目录 → LD_LIBRARY_PATH → 内置默认（libc/lib64, libc/lib, lib, .）
+// 搜索顺序：命令行 -L 目录 → LD_LIBRARY_PATH → 内置默认（lib, .；chroot --root 模式额外补搜 root/lib64, root/lib, root）
 //
 // load_elf 通过 std::function 回调把映射好的 memmap 交给调用方，
 //

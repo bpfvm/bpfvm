@@ -14,7 +14,7 @@ PASS_SOFTFP="${ROOT_DIR}/build/libBpfSoftFp.so"
 PASS_LIBCALLLOWER="${ROOT_DIR}/build/libBpfLibcallLower.so"
 
 # BPF 交叉编译 flags（C 源：musl/dash/sbase/busybox）。
-# -nostdinc：不用宿主 glibc 头，只用 musl(libc/include) + BPF guest 头(include)。
+# -nostdinc：不用宿主 glibc 头，只用 musl(root/include，由 musl/build.sh 安装) + BPF guest 头(include)。
 # -fno-builtin：必须保留。否则 clang 会把 mempcpy/strchr/stpcpy/... 等 builtin
 #   优化成对 memcpy 等的调用，而 BPF 后端在 ISel 拒绝这类 builtin lowering
 #   （实测 dash 的 arith_yylex.c:mempcpy 即触发）。强制走 libc 的库实现即可。
@@ -27,7 +27,7 @@ COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -nostdinc -
 [ -f "$PASS_SOFTFP" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_SOFTFP"
 # BpfLibcallLower：intrinsic → musl libcall（memcpy/memmove/memset/trap/floor/ceil/trunc/round）。
 [ -f "$PASS_LIBCALLLOWER" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_LIBCALLLOWER"
-COMMON_CFLAGS="$COMMON_CFLAGS -isystem ${ROOT_DIR}/libc/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
+COMMON_CFLAGS="$COMMON_CFLAGS -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
 
 COMMON_LDFLAGS="-target bpf -nostdlib"
 
