@@ -13,6 +13,7 @@ namespace bpf{
     #undef __unused
 #endif
     #include "include/signal.h"
+    #include "include/sys/epoll.h"
 }
 
 #include <errno.h>
@@ -36,9 +37,9 @@ namespace bpf{
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sched.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
 #include <linux/futex.h>
-#include <algorithm>
-#include <vector>
 
 #undef sa_handler
 #undef sa_sigaction

@@ -16,6 +16,7 @@ add_library(posix_obj OBJECT
     file_io.cpp
     filesystem.cpp
     fd_ops.cpp
+    socket.cpp
     process.cpp
     session.cpp
     signal.cpp

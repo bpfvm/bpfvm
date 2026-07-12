@@ -291,6 +291,24 @@ public:
     int64_t do_futex(vm* v);
     int64_t do_alloca(vm* v);
     int64_t do_poll(vm* v);
+    int64_t do_socket(vm* v);
+    int64_t do_socketpair(vm* v);
+    int64_t do_bind(vm* v);
+    int64_t do_listen(vm* v);
+    int64_t do_connect(vm* v);
+    int64_t do_accept4(vm* v);
+    int64_t do_sendto(vm* v);
+    int64_t do_recvfrom(vm* v);
+    int64_t do_sendmsg(vm* v);
+    int64_t do_recvmsg(vm* v);
+    int64_t do_shutdown(vm* v);
+    int64_t do_setsockopt(vm* v);
+    int64_t do_getsockopt(vm* v);
+    int64_t do_getsockname(vm* v);
+    int64_t do_getpeername(vm* v);
+    int64_t do_epoll_create1(vm* v);
+    int64_t do_epoll_ctl(vm* v);
+    int64_t do_epoll_pwait(vm* v);
 };
 
 #endif

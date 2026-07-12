@@ -7,12 +7,12 @@
 #ifdef PATH_MAX
 #define MAXPATHLEN PATH_MAX
 #else
-#define MAXPATHLEN 1024
+#define MAXPATHLEN 4096
 #endif
 #endif
 
 #ifndef PATH_MAX
-#define PATH_MAX 1024
+#define PATH_MAX 4096
 #endif
 
 #endif

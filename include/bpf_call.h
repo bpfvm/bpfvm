@@ -76,6 +76,27 @@ enum bpf_syscall_id {
     BPF_SYS_SIGPROCMASK,    // rt_sigprocmask(how, set, old, sigsetsize)
     BPF_SYS_ALLOCA,         // alloca(inc) — 当前栈帧 alloca 区增量调整；返回调整后下界
     BPF_SYS_POLL,           // poll(pollfd*, nfds_t, int timeout_ms)
+    // —— 网络（BSD socket API，透传 host socket fd）——
+    BPF_SYS_SOCKET,         // socket(domain, type, protocol)
+    BPF_SYS_SOCKETPAIR,     // socketpair(domain, type, protocol, int sv[2])
+    BPF_SYS_BIND,           // bind(fd, sockaddr*, addrlen)
+    BPF_SYS_LISTEN,         // listen(fd, backlog)
+    BPF_SYS_CONNECT,        // connect(fd, sockaddr*, addrlen)
+    BPF_SYS_ACCEPT4,        // accept4(fd, sockaddr*, socklen_t*, flags) — musl accept() 覆盖后也走此号
+    BPF_SYS_SENDTO,         // sendto(fd, buf, len, flags, sockaddr*, addrlen) — send() 复用
+    BPF_SYS_RECVFROM,       // recvfrom(fd, buf, len, flags, sockaddr*, socklen_t*) — recv() 复用
+    BPF_SYS_SENDMSG,        // sendmsg(fd, msghdr*, flags) — 含 SCM_RIGHTS fd 传递
+    BPF_SYS_RECVMSG,        // recvmsg(fd, msghdr*, flags) — 含 SCM_RIGHTS fd 接收
+    BPF_SYS_SHUTDOWN,       // shutdown(fd, how)
+    BPF_SYS_SETSOCKOPT,     // setsockopt(fd, level, optname, optval, optlen)
+    BPF_SYS_GETSOCKOPT,     // getsockopt(fd, level, optname, optval, socklen_t*)
+    BPF_SYS_GETSOCKNAME,    // getsockname(fd, sockaddr*, socklen_t*)
+    BPF_SYS_GETPEERNAME,    // getpeername(fd, sockaddr*, socklen_t*)
+    // —— epoll（事件多路复用）——
+    BPF_SYS_EPOLL_CREATE1,  // epoll_create1(flags) — epoll_create() 复用
+    BPF_SYS_EPOLL_CTL,      // epoll_ctl(epfd, op, fd, epoll_event*)
+    BPF_SYS_EPOLL_PWAIT,    // epoll_pwait(epfd, ev, maxev, timeout_ms, sigset, sigsetsize)
+                            //   — epoll_wait() 复用；第 6 参 sigsetsize 走 r0
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -142,6 +163,27 @@ enum bpf_syscall_id {
 #define BPF_CALL_SIGPROCMASK BPF_CALL_ID(BPF_SYS_SIGPROCMASK)
 #define BPF_CALL_ALLOCA      BPF_CALL_ID(BPF_SYS_ALLOCA)
 #define BPF_CALL_POLL        BPF_CALL_ID(BPF_SYS_POLL)
+// —— 网络 ——
+#define BPF_CALL_SOCKET      BPF_CALL_ID(BPF_SYS_SOCKET)
+#define BPF_CALL_SOCKETPAIR  BPF_CALL_ID(BPF_SYS_SOCKETPAIR)
+#define BPF_CALL_BIND        BPF_CALL_ID(BPF_SYS_BIND)
+#define BPF_CALL_LISTEN      BPF_CALL_ID(BPF_SYS_LISTEN)
+#define BPF_CALL_CONNECT     BPF_CALL_ID(BPF_SYS_CONNECT)
+#define BPF_CALL_ACCEPT4     BPF_CALL_ID(BPF_SYS_ACCEPT4)
+#define BPF_CALL_SENDTO      BPF_CALL_ID(BPF_SYS_SENDTO)
+#define BPF_CALL_RECVFROM    BPF_CALL_ID(BPF_SYS_RECVFROM)
+#define BPF_CALL_SHUTDOWN    BPF_CALL_ID(BPF_SYS_SHUTDOWN)
+#define BPF_CALL_SETSOCKOPT  BPF_CALL_ID(BPF_SYS_SETSOCKOPT)
+#define BPF_CALL_GETSOCKOPT  BPF_CALL_ID(BPF_SYS_GETSOCKOPT)
+#define BPF_CALL_GETSOCKNAME BPF_CALL_ID(BPF_SYS_GETSOCKNAME)
+#define BPF_CALL_GETPEERNAME BPF_CALL_ID(BPF_SYS_GETPEERNAME)
+// —— epoll ——
+#define BPF_CALL_EPOLL_CREATE1 BPF_CALL_ID(BPF_SYS_EPOLL_CREATE1)
+#define BPF_CALL_EPOLL_CTL     BPF_CALL_ID(BPF_SYS_EPOLL_CTL)
+#define BPF_CALL_EPOLL_PWAIT   BPF_CALL_ID(BPF_SYS_EPOLL_PWAIT)
+// —— msg 系列 ——
+#define BPF_CALL_SENDMSG       BPF_CALL_ID(BPF_SYS_SENDMSG)
+#define BPF_CALL_RECVMSG       BPF_CALL_ID(BPF_SYS_RECVMSG)
 
 // ===========================================================================
 // 虚拟浮点指令（src_reg=2）

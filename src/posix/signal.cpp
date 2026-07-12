@@ -320,23 +320,12 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
         return -EINVAL;
     }
 
-    // guest（musl）经 __libc_sigaction 把用户态 struct sigaction 转成内核 k_sigaction
-    // 布局（arch/bpf/ksigaction.h，复制自 x86_64）再调本 syscall，故此处按 k_sigaction
-    // 布局解析，而非项目 include/signal.h 的 struct sigaction。布局：
-    //   offset 0  handler  (8B)
-    //   offset 8  flags    (8B, unsigned long；musl 已 OR 进 SA_RESTORER)
-    //   offset 16 restorer (8B)
-    //   offset 24 mask     (8B, _NSIG/8 = 8)
-    struct k_sigaction {
-        uint64_t handler;
-        uint64_t flags;
-        uint64_t restorer;
-        uint64_t mask;
-    };
-    static_assert(sizeof(k_sigaction) == 32, "k_sigaction layout");
-
+    // guest（musl）经 __libc_sigaction 把用户态 struct sigaction 转成内核 sigaction
+    // 布局（arch/bpf/ksigaction.h，复制自 x86_64）再调本 syscall，故此处按内核
+    // sigaction 布局解析，而非 guest 用户态 struct sigaction。布局定义见
+    // include/signal.h（bpf::sigaction）。
     if(oldact_addr != 0) {
-        auto* oldact = static_cast<k_sigaction*>(v->mmu_w(oldact_addr, sizeof(k_sigaction)));
+        auto* oldact = static_cast<bpf::sigaction*>(v->mmu_w(oldact_addr, sizeof(bpf::sigaction)));
         if(oldact == nullptr) {
             return -EFAULT;
         }
@@ -348,7 +337,7 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
     }
 
     if(act_addr != 0) {
-        const auto* action = static_cast<const k_sigaction*>(v->mmu(act_addr, sizeof(k_sigaction)));
+        const auto* action = static_cast<const bpf::sigaction*>(v->mmu(act_addr, sizeof(bpf::sigaction)));
         if(action == nullptr) {
             return -EFAULT;
         }

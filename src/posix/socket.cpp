@@ -1,0 +1,601 @@
+#include "posix_internal.h"
+
+int64_t PosixSyscall::do_socket(vm* v) {
+    int domain   = arg_s32(v->r(1));
+    int type     = arg_s32(v->r(2));
+    int protocol = arg_s32(v->r(3));
+
+    int host_fd = ::socket(domain, type, protocol);
+    if(host_fd < 0) {
+        return -errno;
+    }
+    int guest_fd = allocate_fd();
+    auto handle = std::make_shared<fd_handle>(host_fd);
+    // cloexec 仅是 VM 的 fd 表属性，同步登记以便 execve 时关闭。
+    if(type & SOCK_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    ps->fds[guest_fd] = handle;
+    return guest_fd;
+}
+
+int64_t PosixSyscall::do_socketpair(vm* v) {
+    int domain   = arg_s32(v->r(1));
+    int type     = arg_s32(v->r(2));
+    int protocol = arg_s32(v->r(3));
+    int* sv = static_cast<int*>(v->mmu_w(v->r(4), 2 * sizeof(int)));
+    if(sv == nullptr) {
+        return -EFAULT;
+    }
+
+    int host_fds[2] = {-1, -1};
+    if(::socketpair(domain, type, protocol, host_fds) < 0) {
+        return -errno;
+    }
+
+    int guest_fd0 = allocate_fd();
+    auto handle0 = std::make_shared<fd_handle>(host_fds[0]);
+    if(type & SOCK_CLOEXEC) {
+        handle0->cloexec = true;
+    }
+    ps->fds[guest_fd0] = handle0;
+
+    int guest_fd1 = allocate_fd(guest_fd0 + 1);
+    auto handle1 = std::make_shared<fd_handle>(host_fds[1]);
+    if(type & SOCK_CLOEXEC) {
+        handle1->cloexec = true;
+    }
+    ps->fds[guest_fd1] = handle1;
+
+    sv[0] = guest_fd0;
+    sv[1] = guest_fd1;
+    return 0;
+}
+
+// ===========================================================================
+// bind / listen / connect / shutdown —— 单 fd + 可选 sockaddr
+// ===========================================================================
+
+int64_t PosixSyscall::do_bind(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    socklen_t addrlen = (socklen_t)arg_u32(v->r(3));
+    const struct sockaddr* addr = static_cast<const struct sockaddr*>(v->mmu(v->r(2), addrlen));
+    if(addr == nullptr) {
+        return -EFAULT;
+    }
+    if(::bind(it->second->fd, addr, addrlen) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_listen(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    int backlog = arg_s32(v->r(2));
+    if(::listen(it->second->fd, backlog) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_connect(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    socklen_t addrlen = (socklen_t)arg_u32(v->r(3));
+    const struct sockaddr* addr = static_cast<const struct sockaddr*>(v->mmu(v->r(2), addrlen));
+    if(addr == nullptr) {
+        return -EFAULT;
+    }
+    if(::connect(it->second->fd, addr, addrlen) < 0) {
+        // EINPROGRESS（非阻塞 socket，连接建立中）按 errno 透传；
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_shutdown(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    int how = arg_s32(v->r(2));
+    if(::shutdown(it->second->fd, how) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+// ===========================================================================
+// accept4 —— 返回新 fd；addr/addrlen 可空（in-out）
+// ===========================================================================
+
+int64_t PosixSyscall::do_accept4(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    uint64_t addr_arg = v->r(2);
+    uint64_t addrlen_arg = v->r(3);
+    int flags = arg_s32(v->r(4));
+
+    struct sockaddr* addr = nullptr;
+    socklen_t* addrlen = nullptr;
+    if(addr_arg != 0 && addrlen_arg != 0) {
+        addrlen = static_cast<socklen_t*>(v->mmu_w(addrlen_arg, sizeof(socklen_t)));
+        if(addrlen == nullptr) {
+            return -EFAULT;
+        }
+        socklen_t curlen = *addrlen;   // 入参：缓冲区容量
+        if(curlen > 0) {
+            addr = static_cast<struct sockaddr*>(v->mmu_w(addr_arg, curlen));
+            if(addr == nullptr) {
+                return -EFAULT;
+            }
+        }
+    }
+
+    int new_host = ::accept4(it->second->fd, addr, addrlen, flags);
+    if(new_host < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    // addrlen 已被 host 写回（实际对端地址长度），host 直接写进了 guest 内存。
+
+    int new_guest = allocate_fd();
+    auto handle = std::make_shared<fd_handle>(new_host);
+    if(flags & SOCK_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    ps->fds[new_guest] = handle;
+    return new_guest;
+}
+
+// ===========================================================================
+// sendto / recvfrom —— buf 必填；addr/sendto 的 addr 为入参，recvfrom 的 addr 出参
+// ===========================================================================
+
+int64_t PosixSyscall::do_sendto(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    size_t len = arg_size(v->r(3));
+    const void* buf = v->mmu(v->r(2), len);
+    if(buf == nullptr) {
+        return -EFAULT;
+    }
+    int flags = arg_s32(v->r(4));
+
+    const struct sockaddr* addr = nullptr;
+    socklen_t addrlen = 0;
+    if(v->r(5) != 0) {
+        addrlen = (socklen_t)arg_u32(v->r(0));
+        addr = static_cast<const struct sockaddr*>(v->mmu(v->r(5), addrlen));
+        if(addr == nullptr) {
+            return -EFAULT;
+        }
+    }
+
+    ssize_t rc = ::sendto(it->second->fd, buf, len, flags, addr, addrlen);
+    if(rc < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    return rc;
+}
+
+int64_t PosixSyscall::do_recvfrom(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    size_t len = arg_size(v->r(3));
+    void* buf = v->mmu_w(v->r(2), len);
+    if(buf == nullptr) {
+        return -EFAULT;
+    }
+    int flags = arg_s32(v->r(4));
+
+    struct sockaddr* addr = nullptr;
+    socklen_t* addrlen = nullptr;
+    if(v->r(5) != 0) {
+        addrlen = static_cast<socklen_t*>(v->mmu_w(v->r(0), sizeof(socklen_t)));
+        if(addrlen == nullptr) {
+            return -EFAULT;
+        }
+        socklen_t curlen = *addrlen;
+        if(curlen > 0) {
+            addr = static_cast<struct sockaddr*>(v->mmu_w(v->r(5), curlen));
+            if(addr == nullptr) {
+                return -EFAULT;
+            }
+        }
+    }
+
+    ssize_t rc = ::recvfrom(it->second->fd, buf, len, flags, addr, addrlen);
+    if(rc < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    // addrlen 已被 host 写回（实际来源地址长度）。
+    return rc;
+}
+
+// ===========================================================================
+// sendmsg / recvmsg —— scatter-gather + cmsg 辅助数据
+// ===========================================================================
+//
+// msghdr 不能整体 cast 给 host：msg_name/msg_iov/msg_control 三个字段都是 guest
+// 虚拟地址，host 内核解引用会访问错误地址。必须逐字段重建 host msghdr，把 guest
+// 指针经 mmu()/mmu_w() 翻译成 host 指针。msghdr/cmsghdr/iovec 的结构体布局 guest
+// 与 host 二进制兼容（都是 Linux 64 位标准布局），但内部指针和 cmsg 里的 fd 要翻译。
+//
+// SCM_RIGHTS（fd 传递）：
+// VM 只在边界翻译 fd 编号——cmsg 里 guest 塞的是 guest fd，host 内核认 host fd：
+//   sendmsg: guest cmsg 的 SCM_RIGHTS fd → 查 fd 表得 host fd → 写进 cmsg → host 内核
+//   recvmsg: host 内核在本进程安装 host fd → VM allocate_fd 登记进接收方 guest fd 表
+//            → 得 guest fd → 写回 guest cmsg
+//
+// FIXME: 目前只翻译 SCM_RIGHTS 的 fd，其余 cmsg 类型原样透传（如 SCM_TIMESTAMP 的
+// timeval/timespec 纯数据，host 直接读写 guest 的 control 缓冲区即可）。但以下需要类似
+// 边界翻译、尚未实现：
+//   - SCM_CREDENTIALS（ucred{pid,uid,gid}）：send 侧 guest pid 是 VM 内 guest 编号，host 内核
+//     不认；recv 侧 host 内核填的是 VM 进程的 host pid（恒定），guest 期望对端 guest pid。
+//     两侧都需 guest pid ↔ host pid 翻译。uid/gid 在无 user namespace 时一致，可不翻译。
+//   - SO_PEERCRED（getsockopt 获取对端凭据）有同样的 pid 问题。
+
+// 把 guest 的 msghdr 翻译成 host msghdr。writable=true 时 iov/control/name 的缓冲区
+// 用 mmu_w（recvmsg 需要写回）；false 用 mmu（sendmsg 只读）。返回 host msghdr；
+// hmsg.msg_iov 指向 caller 提供的 vector<iovec>（已填好翻译后的 iov_base）。
+// 失败（指针越界/iov 过多）返回 false 并设 *err 为负 errno。
+static bool translate_msghdr(vm* v, const struct msghdr* gmsg, struct msghdr* hmsg,
+                             std::vector<iovec>& hiov, bool writable, int64_t* err) {
+    memset(hmsg, 0, sizeof(*hmsg));
+    // msg_name + msg_namelen
+    hmsg->msg_namelen = gmsg->msg_namelen;
+    if(gmsg->msg_name != 0 && gmsg->msg_namelen > 0) {
+        hmsg->msg_name = writable
+            ? v->mmu_w(reinterpret_cast<uint64_t>(gmsg->msg_name), gmsg->msg_namelen)
+            : v->mmu(reinterpret_cast<uint64_t>(gmsg->msg_name), gmsg->msg_namelen);
+        if(hmsg->msg_name == nullptr) { *err = -EFAULT; return false; }
+    }
+    // msg_iov + msg_iovlen（guest 的 iovec 数组，逐个翻译 iov_base）
+    int niov = gmsg->msg_iovlen;
+    if(niov < 0) { *err = -EINVAL; return false; }
+    if(niov > 1024) { *err = -EMSGSIZE; return false; }   // UIO_MAXIOV
+    if(niov > 0 && gmsg->msg_iov != 0) {
+        const iovec* giov = static_cast<const iovec*>(
+            v->mmu(reinterpret_cast<uint64_t>(gmsg->msg_iov), sizeof(iovec) * (size_t)niov));
+        if(giov == nullptr) { *err = -EFAULT; return false; }
+        hiov.resize(niov);
+        for(int i = 0; i < niov; ++i) {
+            hiov[i].iov_len = giov[i].iov_len;
+            if(giov[i].iov_base != 0 && giov[i].iov_len > 0) {
+                hiov[i].iov_base = writable
+                    ? v->mmu_w(reinterpret_cast<uint64_t>(giov[i].iov_base), giov[i].iov_len)
+                    : v->mmu(reinterpret_cast<uint64_t>(giov[i].iov_base), giov[i].iov_len);
+                if(hiov[i].iov_base == nullptr) { *err = -EFAULT; return false; }
+            } else {
+                hiov[i].iov_base = nullptr;
+            }
+        }
+        hmsg->msg_iov = hiov.data();
+        hmsg->msg_iovlen = niov;
+    }
+    // msg_control + msg_controllen（cmsg 缓冲区，send 用 mmu / recv 用 mmu_w）
+    hmsg->msg_controllen = gmsg->msg_controllen;
+    if(gmsg->msg_control != 0 && gmsg->msg_controllen > 0) {
+        hmsg->msg_control = writable
+            ? v->mmu_w(reinterpret_cast<uint64_t>(gmsg->msg_control), gmsg->msg_controllen)
+            : v->mmu(reinterpret_cast<uint64_t>(gmsg->msg_control), gmsg->msg_controllen);
+        if(hmsg->msg_control == nullptr) { *err = -EFAULT; return false; }
+    }
+    return true;
+}
+
+int64_t PosixSyscall::do_sendmsg(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    const struct msghdr* gmsg = static_cast<const struct msghdr*>(
+        v->mmu(v->r(2), sizeof(struct msghdr)));
+    if(gmsg == nullptr) {
+        return -EFAULT;
+    }
+
+    struct msghdr hmsg;
+    std::vector<iovec> hiov;
+    int64_t err;
+    if(!translate_msghdr(v, gmsg, &hmsg, hiov, /*writable=*/false, &err)) {
+        return err;
+    }
+    // cmsg 缓冲区需可写（SCM_RIGHTS 要把 guest fd 改写成 host fd），但 translate_msghdr
+    // 用 mmu（只读语义）翻译的。拷一份到本地再改，避免污染 guest 的 cmsg（guest 的 fd
+    // 原样保留，重复 sendmsg 时还能用）。
+    std::vector<char> cmsg_buf;
+    if(hmsg.msg_control != nullptr && hmsg.msg_controllen > 0) {
+        cmsg_buf.resize(hmsg.msg_controllen);
+        memcpy(cmsg_buf.data(), hmsg.msg_control, hmsg.msg_controllen);
+        hmsg.msg_control = cmsg_buf.data();
+        // SCM_RIGHTS: guest fd → host fd（在本地副本上改）
+        for(struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hmsg); cmsg; cmsg = CMSG_NXTHDR(&hmsg, cmsg)) {
+            if(cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+                continue;
+            }
+            int* fds = reinterpret_cast<int*>(CMSG_DATA(cmsg));
+            int nfds = static_cast<int>((cmsg->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int));
+            for(int i = 0; i < nfds; ++i) {
+                auto fdit = ps->fds.find(fds[i]);
+                if(fdit == ps->fds.end()) {
+                    return -EBADF;
+                }
+                fds[i] = fdit->second->fd;   // guest fd → host fd
+            }
+        }
+    }
+
+    ssize_t rc = ::sendmsg(it->second->fd, &hmsg, arg_s32(v->r(3)));
+    if(rc < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    return rc;
+}
+
+int64_t PosixSyscall::do_recvmsg(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    struct msghdr* gmsg = static_cast<struct msghdr*>(
+        v->mmu_w(v->r(2), sizeof(struct msghdr)));
+    if(gmsg == nullptr) {
+        return -EFAULT;
+    }
+
+    struct msghdr hmsg;
+    std::vector<iovec> hiov;
+    int64_t err;
+    if(!translate_msghdr(v, gmsg, &hmsg, hiov, /*writable=*/true, &err)) {
+        return err;
+    }
+
+    ssize_t rc = ::recvmsg(it->second->fd, &hmsg, arg_s32(v->r(3)));
+    if(rc < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    // host 写回的状态拷给 guest msghdr
+    gmsg->msg_flags = hmsg.msg_flags;
+    gmsg->msg_namelen = hmsg.msg_namelen;
+    gmsg->msg_controllen = hmsg.msg_controllen;
+    // SCM_RIGHTS: host fd → guest fd（host 内核已在本进程安装 host fd，登记进接收方 fd 表）
+    for(struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hmsg); cmsg; cmsg = CMSG_NXTHDR(&hmsg, cmsg)) {
+        if(cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
+            continue;
+        }
+        int* fds = reinterpret_cast<int*>(CMSG_DATA(cmsg));
+        int nfds = static_cast<int>((cmsg->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int));
+        for(int i = 0; i < nfds; ++i) {
+            int host_fd = fds[i];
+            int new_guest = allocate_fd();
+            ps->fds[new_guest] = std::make_shared<fd_handle>(host_fd);
+            fds[i] = new_guest;   // host fd → guest fd，写回 guest 的 cmsg 缓冲区
+        }
+    }
+    return rc;
+}
+
+// ===========================================================================
+// setsockopt / getsockopt —— optval；getsockopt 的 optlen 是 in-out
+// ===========================================================================
+
+int64_t PosixSyscall::do_setsockopt(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    int level   = arg_s32(v->r(2));
+    int optname = arg_s32(v->r(3));
+    socklen_t optlen = (socklen_t)arg_u32(v->r(5));
+    const void* optval = v->mmu(v->r(4), optlen);
+    if(optval == nullptr && optlen > 0) {
+        return -EFAULT;
+    }
+    if(::setsockopt(it->second->fd, level, optname, optval, optlen) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_getsockopt(vm* v) {
+    int guest_fd = arg_s32(v->r(1));
+    auto it = ps->fds.find(guest_fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    int level   = arg_s32(v->r(2));
+    int optname = arg_s32(v->r(3));
+
+    socklen_t* optlen = static_cast<socklen_t*>(v->mmu_w(v->r(5), sizeof(socklen_t)));
+    if(optlen == nullptr) {
+        return -EFAULT;
+    }
+    socklen_t curlen = *optlen;
+    void* optval = nullptr;
+    if(curlen > 0) {
+        optval = v->mmu_w(v->r(4), curlen);
+        if(optval == nullptr) {
+            return -EFAULT;
+        }
+    }
+    if(::getsockopt(it->second->fd, level, optname, optval, optlen) < 0) {
+        return -errno;
+    }
+    // optlen 已被 host 写回（实际选项值长度）。
+    return 0;
+}
+
+// ===========================================================================
+// getsockname / getpeername —— addr + in-out addrlen（同 accept4 模式）
+// ===========================================================================
+
+// getsockname / getpeername：addr 缓冲区按入参 *addrlen 容量映射（而非固定
+// sizeof(struct sockaddr)=16B）。否则 AF_UNIX（sockaddr_un=110B）等大地址族会让
+// host 内核按 *addrlen 写越界。模式同 do_accept4。
+static inline int64_t do_sockname_common(vm* v, int host_fd,
+        int (*host_call)(int, struct sockaddr*, socklen_t*)) {
+    socklen_t* addrlen = static_cast<socklen_t*>(v->mmu_w(v->r(3), sizeof(socklen_t)));
+    if(addrlen == nullptr) {
+        return -EFAULT;
+    }
+    socklen_t curlen = *addrlen;   // 入参：缓冲区容量
+    struct sockaddr* addr = nullptr;
+    if(curlen > 0) {
+        addr = static_cast<struct sockaddr*>(v->mmu_w(v->r(2), curlen));
+        if(addr == nullptr) {
+            return -EFAULT;
+        }
+    }
+    if(host_call(host_fd, addr, addrlen) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_getsockname(vm* v) {
+    auto it = ps->fds.find(arg_s32(v->r(1)));
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    return do_sockname_common(v, it->second->fd, ::getsockname);
+}
+
+int64_t PosixSyscall::do_getpeername(vm* v) {
+    auto it = ps->fds.find(arg_s32(v->r(1)));
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    return do_sockname_common(v, it->second->fd, ::getpeername);
+}
+
+// ===========================================================================
+// epoll
+// ===========================================================================
+//
+// epoll_event 布局陷阱：guest（BPF arch）的非 packed 16B 布局定义在
+// include/sys/epoll.h（bpf::epoll_event，经 bpf:: 命名空间引用），host（x86_64）的
+// struct epoll_event 是 packed 12B。故：
+//   guest(BPF, bpf::epoll_event)：offsetof(events)=0, offsetof(data)=8, sizeof=16
+//   host(x86_64)：offsetof(events)=0, offsetof(data)=4, sizeof=12
+//
+// 解法：用显式结构体代表 host 侧紧凑布局，逐元素拷贝 events + data（data 是 opaque
+// union，VM 不解析，用户存什么 wait 就返回什么）。guest 侧直接用 bpf::epoll_event。
+
+int64_t PosixSyscall::do_epoll_create1(vm* v) {
+    int flags = arg_s32(v->r(1));
+    int host_fd = ::epoll_create1(flags);
+    if(host_fd < 0) {
+        return -errno;
+    }
+    int guest_fd = allocate_fd();
+    auto handle = std::make_shared<fd_handle>(host_fd);
+    // EPOLL_CLOEXEC == O_CLOEXEC；host 已处理，VM 登记 cloexec 属性。
+    if(flags & EPOLL_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    ps->fds[guest_fd] = handle;
+    return guest_fd;
+}
+
+int64_t PosixSyscall::do_epoll_ctl(vm* v) {
+    int epfd = arg_s32(v->r(1));
+    auto it_ep = ps->fds.find(epfd);
+    if(it_ep == ps->fds.end()) {
+        return -EBADF;
+    }
+    int op = arg_s32(v->r(2));
+    int target_guest = arg_s32(v->r(3));
+    auto it_tg = ps->fds.find(target_guest);
+    if(op != EPOLL_CTL_DEL && it_tg == ps->fds.end()) {
+        return -EBADF;
+    }
+
+    // 读 guest 的 16B 非紧凑 epoll_event，转成 host 12B 紧凑。
+    bpf::epoll_event* gev = static_cast<bpf::epoll_event*>(
+        v->mmu(v->r(4), sizeof(bpf::epoll_event)));
+    if(gev == nullptr) {
+        return -EFAULT;
+    }
+    epoll_event hev;
+    hev.events = gev->events;
+    // bpf::epoll_data_t 与 host epoll_data_t 是不同类型（分属 bpf:: 与全局命名空间），
+    // 但都是 8B opaque union、布局一致。按 u64 整体搬运，不解析 data 语义。
+    hev.data.u64 = gev->data.u64;
+
+    int target_host = (it_tg == ps->fds.end()) ? -1 : it_tg->second->fd;
+    if(::epoll_ctl(it_ep->second->fd, op, target_host,
+                   reinterpret_cast<struct epoll_event*>(&hev)) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_epoll_pwait(vm* v) {
+    int epfd = arg_s32(v->r(1));
+    auto it = ps->fds.find(epfd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    int maxev = arg_s32(v->r(3));
+    int timeout = arg_s32(v->r(4));
+    if(maxev <= 0) {
+        return -EINVAL;
+    }
+
+    // sigset 可空（epoll_wait 经 epoll_pwait(...,NULL) 调来）。sigsetsize（第 6 参，走
+    // r0）host epoll_pwait 不需要 VM 显式传，host 内核按自身 _NSIG 处理，忽略。
+    const sigset_t* sigs = nullptr;
+    if(v->r(5) != 0) {
+        sigs = static_cast<const sigset_t*>(v->mmu(v->r(5), sizeof(sigset_t)));
+        if(sigs == nullptr) {
+            return -EFAULT;
+        }
+    }
+
+    std::vector<epoll_event> hev(maxev);
+    int n = ::epoll_pwait(it->second->fd, reinterpret_cast<struct epoll_event*>(hev.data()),
+                          maxev, timeout, sigs);
+    if(n < 0) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+
+    bpf::epoll_event* gev = static_cast<bpf::epoll_event*>(
+        v->mmu_w(v->r(2), sizeof(bpf::epoll_event) * (size_t)maxev));
+    if(gev == nullptr) {
+        return -EFAULT;
+    }
+    for(int i = 0; i < n; ++i) {
+        gev[i].events = hev[i].events;
+        // 同 do_epoll_ctl：data 按 u64 整体搬运（bpf::epoll_data_t 与 host epoll_data_t
+        // 是不同类型但同布局的 8B opaque union）。
+        gev[i].data.u64 = hev[i].data.u64;
+        // _pad 字段保持为 0（mmu_w 的内存不保证已清零；显式写更安全）
+        gev[i]._pad   = 0;
+    }
+    return n;
+}

@@ -82,30 +82,25 @@
 #endif
 
 typedef int sig_atomic_t;
-typedef uint64_t sigset_t;
+
+// sigaction 内核布局（rt_sigaction syscall 契约）。guest（musl）经 __libc_sigaction
+// 把用户态 struct sigaction 转成本布局（musl/arch/bpf/ksigaction.h，复制自 x86_64）
+// 再调 syscall，VM 的 do_sigaction 按此布局解析 guest 内存。
+//   offset 0  handler  (8B)
+//   offset 8  flags    (8B)
+//   offset 16 restorer (8B)
+//   offset 24 mask     (8B)
+// 注：mask 用 uint64_t（VM 侧）；musl 端是 unsigned mask[2]（2×4B），二者二进制兼容
+// （总大小均 32B）。
 struct sigaction {
-    void (*sa_handler)(int);
-    sigset_t sa_mask;
-    int sa_flags;
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t restorer;
+    uint64_t mask;
 };
 
 #ifndef SIG_SETMASK
 #define SIG_SETMASK 2
-#endif
-
-#ifndef BPF_NO_SYSCALL
-int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact);
-int kill(pid_t pid, int sig);
-
-typedef void (*sighandler_t)(int);
-sighandler_t signal(int signum, sighandler_t handler);
-int raise(int sig);
-int sigemptyset(sigset_t *set);
-int sigfillset(sigset_t *set);
-int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
-int sigsetmask(int mask);
-int sigsuspend(const sigset_t *set);
-extern const char *const sys_siglist[NSIG];
 #endif
 
 #endif

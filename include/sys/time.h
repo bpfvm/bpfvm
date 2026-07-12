@@ -1,7 +1,7 @@
 #ifndef SYS_TIME_H
 #define SYS_TIME_H
 
-#include <time.h>
+#include <sys/types.h>
 
 struct timeval {
     time_t tv_sec;

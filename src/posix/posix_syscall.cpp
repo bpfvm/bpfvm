@@ -368,6 +368,26 @@ int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_FUTEX:          return do_futex(v);
     case BPF_SYS_ALLOCA:         return do_alloca(v);
     case BPF_SYS_POLL:           return do_poll(v);
+    // —— 网络（透传 host socket fd）——
+    case BPF_SYS_SOCKET:         return do_socket(v);
+    case BPF_SYS_SOCKETPAIR:     return do_socketpair(v);
+    case BPF_SYS_BIND:           return do_bind(v);
+    case BPF_SYS_LISTEN:         return do_listen(v);
+    case BPF_SYS_CONNECT:        return do_connect(v);
+    case BPF_SYS_ACCEPT4:        return do_accept4(v);
+    case BPF_SYS_SENDTO:         return do_sendto(v);
+    case BPF_SYS_RECVFROM:       return do_recvfrom(v);
+    case BPF_SYS_SENDMSG:        return do_sendmsg(v);
+    case BPF_SYS_RECVMSG:        return do_recvmsg(v);
+    case BPF_SYS_SHUTDOWN:       return do_shutdown(v);
+    case BPF_SYS_SETSOCKOPT:     return do_setsockopt(v);
+    case BPF_SYS_GETSOCKOPT:     return do_getsockopt(v);
+    case BPF_SYS_GETSOCKNAME:    return do_getsockname(v);
+    case BPF_SYS_GETPEERNAME:    return do_getpeername(v);
+    // —— epoll ——
+    case BPF_SYS_EPOLL_CREATE1:  return do_epoll_create1(v);
+    case BPF_SYS_EPOLL_CTL:      return do_epoll_ctl(v);
+    case BPF_SYS_EPOLL_PWAIT:    return do_epoll_pwait(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG

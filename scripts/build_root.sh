@@ -42,6 +42,7 @@ build_libc_bpfso() {
         "${ROOT_DIR}/root/lib/dynlink.lo" \
         -o "${ROOT_DIR}/root/lib/ld-bpf.so"
     ln -sf ld-bpf.so "${ROOT_DIR}/root/lib/libc.so"
+    rm "${ROOT_DIR}/root/lib/dlstart.lo" "${ROOT_DIR}/root/lib/dynlink.lo"
 }
 
 # 构建 C++ 运行时（libcxx.a + libcxx.so）。
