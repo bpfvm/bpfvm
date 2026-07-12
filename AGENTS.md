@@ -131,9 +131,6 @@ llvm-dwarfdump --verify foo.linked                  # verify DWARF
 - **Symbol table**: all three modes now emit a static `.symtab`/`.strtab` containing both GLOBAL symbols and `STB_LOCAL` FUNC/OBJECT symbols (so `objdump -d` can label local function boundaries). `sh_info` points at the first GLOBAL per the ELF convention. Runtime symbol resolution still uses `.dynsym` in PIE modes.
 - `.BTF`/`.BTF.ext` (BPF kernel metadata) and `.llvm_addrsig` are still dropped (VM has no use for them).
 
-## Historical Note
-Earlier versions depended on `binutils-bpf` `bpf-ld`, which had a `.rodata.str1.1` merge bug (Debian #1126689). `bpfvm-ld` makes this workaround unnecessary.
-
 ## BPF Architecture Constraints & Developer Guide
 
 ### 1. Floating Point Number Support
@@ -312,7 +309,7 @@ On the host, `__mythread` expands to real `thread_local`, so the same source ser
 1. ✅ Language subset (this section).
 2. ✅ Emulated TLS via `address_space(256)` (this subsection; `test/test_cpp_tls.cpp`).
 3. ✅ Global ctors/dtors via `.init_array`/`.fini_array` (this subsection; `test/test_cpp_ctor.cpp`).
-4. ✅ STL via libc++ + `libcxx.a`/`libcxx.so` (the `test/test_stl_*.cpp` suite). The standard library works (containers, algorithms, `<iostream>`, `<regex>`, `<thread>`/`<mutex>`/`<future>`, `<filesystem>`, RTTI). Mechanism: `lowerAggregateParams` (by-value aggregate params → ptr) + `BpfAtomicLowerPass` (lower plain atomic load/store — eBPF ISA has only RMW atomics; unlocks static guards in locale/iostream) + `BpfByvalTmpPass` (≤8B by-value unique_ptr double-free fix; avoids clobbering iostream locals like sentry/ostringstream) + `BpfLibcallLower` (memcpy/memmove/memset/trap + floor/ceil/trunc/round → musl calls) + libc++ pthread backend over musl pthread + `uncaught_exceptions` stub override.
+4. ✅ STL via libc++ + `libcxx.a`/`libcxx.so` (the `test/test_stl_*.cpp` suite). The standard library works (containers, algorithms, `<iostream>`, `<regex>`, `<thread>`/`<mutex>`/`<future>`, `<filesystem>`, RTTI). Mechanism: `lowerAggregateParams` (by-value aggregate params → ptr) + `BpfAtomicLowerPass` (lower plain atomic load/store — eBPF ISA has only RMW atomics; unlocks static guards in locale/iostream) + `BpfByvalTmpPass` (≤8B by-value unique_ptr double-free fix; LLVM bug workaround, see §5) + `BpfLibcallLower` (memcpy/memmove/memset/trap + floor/ceil/trunc/round → musl calls) + libc++ pthread backend over musl pthread + `uncaught_exceptions` stub override.
 
 #### Global ctors/dtors via `.init_array`/`.fini_array`
 
@@ -325,6 +322,18 @@ Global objects with non-trivial constructors/destructors are supported through l
 4. musl's `__libc_start_main` → `__libc_start_init` iterates `[__init_array_start, __init_array_end)` calling each ctor; `exit` → `__libc_exit_fini` iterates `[__fini_array_start, __fini_array_end)` in reverse, plus the `__cxa_atexit` chain.
 
 **Ordering**: ctors run in definition order within a TU; dtors run in reverse order (LIFO), interleaved with `__cxa_atexit`-registered dtors. Cross-TU order follows link order (standard `ld` semantics, no guarantee).
+
+### 5. Known LLVM BPF backend bugs (workarounds in this repo)
+
+The BPF backend in upstream LLVM has several defects this project works around. The detailed mechanism for each is below (symptom → root cause → workaround → upstream issue). Other sections reference this one rather than repeating the details. (The 5-arg / no-FP / no-varargs limits in §1–2 are by-design architecture constraints, not bugs.)
+
+- **Conditional branch into a zero-instruction successor → silent miscompile.** A conditional branch whose target lowers to zero instructions (an `unreachable` block, or a `barrier()`-only MBB that `MachineBlockPlacement` tail-duplicates with no terminator) gets an offset computed against that empty block's address, so it lands past the function end (or on the preceding instruction). Triggers in a ~13-instruction function; reproduces on clang 19/21/23 trunk; distinct from the 16-bit-offset overflow issues (#48509 etc.). **Hit by**: busybox `ash.c` `ash_main` (inlines `INT_ON`; the miscompiled branch forms an `exitreset`↔`INT_ON` loop → Ctrl+C exits the shell instead of returning to the prompt). **Workaround**: `scripts/build_busybox.sh` marks `popstackmark` `__attribute__((noinline))` (idempotent `perl` patch) so the trailing-barrier block is not inlined. **Upstream**: [#208984](https://github.com/llvm/llvm-project/issues/208984).
+
+- **`-g` mangles member-function `declare`: `this` promoted to value, aggregate params lost ([#208141](https://github.com/llvm/llvm-project/issues/208141)).** With debug info, clang rewrites the `declare` of certain member functions so the `this` pointer becomes a value type and later by-value aggregate parameters disappear from the declaration, while the `call` keeps the right arg count → declare/call mismatch (clang 19/20 miscompile, 21/22 crash). Manifests on libc++ `<filesystem>` (`path::__compare(string_view)`). **Status**: no workaround in this repo currently needed — `test/test_stl_filesystem.cpp` compiles cleanly on clang 19 with `-g` (the trigger path is narrow); revisit if the test starts hitting the miscompiled `path` comparison. **Upstream**: [#208141](https://github.com/llvm/llvm-project/issues/208141), OPEN.
+
+- **≤8B by-value non-trivially-destructible parameters double-free ([#207686](https://github.com/llvm/llvm-project/issues/207686)).** The BPF backend lowers a ≤8B non-trivially-destructible by-value parameter (e.g. `std::unique_ptr`, 8B) directly to `i64`, bypassing byval; clang's caller still emits a backup temporary and destroys it after the call, but the callee (receiving the value, not a pointer) can't null the temp → double-free. Silent. **Workaround**: `BpfByvalTmpPass` in `src/passes/BpfWideArgs.cpp` (runs at OptimizerLastEP) inserts `store null, %tmp` before the destructor of identified backup temporaries (≤8B, has a load, C++ dtor/reset call shape). Detailed mechanism in the pass comments. **Upstream**: [#207686](https://github.com/llvm/llvm-project/issues/207686), OPEN.
+
+- **`binutils-bpf` `bpf-ld` `.rodata.str1.1` merge bug (Debian [#1126689](https://bugs.debian.org/1126689)).** The historical `bpf-ld` mis-merged `.rodata.str1.1`, corrupting string constants. **Workaround**: this project ships its own linker `bpfvm-ld` (see "BPF Linker" above), fully replacing `bpf-ld`; the bug is no longer reachable. No source-level patch needed.
 
 ## Default C Library (musl) & Optional PDCLib
 

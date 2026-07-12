@@ -151,6 +151,16 @@ link_static() {
 
 LINK_MODE="${LINK_MODE:-dyn}"
 configure
+
+# === 移植补丁：ash Ctrl+C 退出 bug（LLVM BPF 后端 miscompile workaround）===
+# 给 popstackmark 加 noinline 阻断内联，绕过后端 bug。根因/机制/upstream issue
+# 详见 AGENTS.md §5 "Known LLVM BPF backend bugs"。
+# 幂等：已是 noinline 则跳过（perl s/// 不匹配已改过的行）。
+if ! perl -0777 -ne 'exit 0 if /static void __attribute__\(\(noinline\)\)\npopstackmark/; exit 1' "${BB_DIR}/shell/ash.c"; then
+    echo "=== Patching ash.c: popstackmark -> noinline (Ctrl+C bug fix) ==="
+    perl -0777 -i -pe 's/^static void\n(popstackmark\(struct stackmark)/static void __attribute__((noinline))\n$1/m' "${BB_DIR}/shell/ash.c"
+fi
+
 build
 if [ "${LINK_MODE}" = "static" ]; then
     link_static
