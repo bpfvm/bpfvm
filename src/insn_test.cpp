@@ -1407,7 +1407,7 @@ void test_syscall_fork_waitpid() {
         { BPF_ALU64 | BPF_MOV | BPF_X, 1, 6, 0, 0 },             // r1 = pid
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
         { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = waited pid
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAIT4 },         // r0 = waited pid
         { BPF_JMP | BPF_JNE | BPF_X, 0, 6, 4, 0 },               // if r0 != r6 jump to fail
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
@@ -1433,7 +1433,7 @@ void test_syscall_waitpid_self() {
         { BPF_ALU64 | BPF_MOV | BPF_X, 1, 0, 0, 0 },              // r1 = pid (self)
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },              // r2 = status = NULL
         { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },              // r3 = options = 0
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },        // r0 = -EINVAL
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAIT4 },          // r0 = -EINVAL
         { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -EINVAL },          // if r0 == -EINVAL jump to success
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },              // fail
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
@@ -1464,13 +1464,13 @@ void test_syscall_waitpid_any_twice() {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
         { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = waited pid (first)
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAIT4 },         // r0 = waited pid (first)
         { BPF_JMP | BPF_JNE | BPF_X, 0, 6, 6, 0 },               // if r0 != r6 jump to fail
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
         { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, 0 },             // r3 = options = 0
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = -ECHILD (second)
-        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },          // if r0 == -ECHILD jump to success
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAIT4 },         // r0 = -ECHILD (second)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },         // if r0 == -ECHILD jump to success
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },             // fail
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success
@@ -1494,8 +1494,8 @@ void test_syscall_waitpid_any_no_child_wnohang() {
         { BPF_ALU64 | BPF_MOV | BPF_K, 1, 0, 0, -1 },            // r1 = -1 (any child)
         { BPF_ALU64 | BPF_MOV | BPF_K, 2, 0, 0, 0 },             // r2 = status = NULL
         { BPF_ALU64 | BPF_MOV | BPF_K, 3, 0, 0, WNOHANG },       // r3 = options = WNOHANG
-        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAITPID },       // r0 = -ECHILD (no children)
-        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },          // if r0 == -ECHILD jump to success
+        { BPF_JMP | BPF_CALL, 0, 0, 0, BPF_CALL_WAIT4 },         // r0 = -ECHILD (no children)
+        { BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 2, -ECHILD },         // if r0 == -ECHILD jump to success
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0 },             // fail
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 },
         { BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1 },             // success

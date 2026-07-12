@@ -325,7 +325,8 @@ int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_CLONE:         return do_clone(v);
     case BPF_SYS_GETPID:        return do_getpid(v);
     case BPF_SYS_GETPPID:       return do_getppid(v);
-    case BPF_SYS_WAITPID:       return do_waitpid(v);
+    case BPF_SYS_WAIT4:       return do_wait4(v);
+    case BPF_SYS_WAITID:        return do_waitid(v);
     case BPF_SYS_DUP:           return do_dup(v);
     case BPF_SYS_DUP3:          return do_dup3(v);
     case BPF_SYS_PIPE2:         return do_pipe2(v);

@@ -295,48 +295,31 @@ std::shared_ptr<vm> PosixSyscall::find_task(uint64_t target_pid) {
     return it->second;
 }
 
-int64_t PosixSyscall::do_waitpid(vm* v) {
-    int64_t target_pid = static_cast<int64_t>(arg_s32(v->r(1)));
-    uint64_t status_addr = v->r(2);
-    int32_t options = arg_s32(v->r(3));
-
-    // 接受 WNOHANG（非阻塞）与 WUNTRACED（报告停止子进程）。其余选项（WCONTINUED 等）暂不支持。
-    if((options & ~(WNOHANG | WUNTRACED)) != 0) {
-        return -EINVAL;
-    }
-
-    // waitpid(self) 无意义
-    if(target_pid == (int64_t)pid) {
-        return -EINVAL;
-    }
-
-    int* status_ptr = nullptr;
-    if(status_addr != 0) {
-        status_ptr = static_cast<int*>(v->mmu_w(status_addr, sizeof(*status_ptr)));
-        if(status_ptr == nullptr) {
-            return -EFAULT;
-        }
-    }
-
+// wait4/waitid 共享的等待核心。idtype/id 用 POSIX 语义（P_ALL=0/P_PID=1/P_PGID=2），
+// 由两个 handler 把各自的 syscall 参数归一化后传入。options 已经过 handler 校验。
+// 选定 child 后只填充 out，不写 status/siginfo、不 erase pid_map（由 handler 按 WNOWAIT 决定）。
+// 返回值：负 errno=失败；SYSCALL_RESTART=被信号打断可重启；0=成功（out.child 可能为空，
+//   表示 WNOHANG 且无事件，handler 据此返回 0 pid）。
+int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options, wait_event& out) {
     // 收集候选子进程。Linux 语义：
-    //   pid > 0  → 指定 task（必须是自身子进程的线程组 leader）
-    //   pid == 0 → 调用者进程组里任意子进程
-    //   pid == -1→ 任意子进程
-    //   pid < -1 → 进程组 -pid 里任意子进程
-    // 只有 leader（pid == tg->tgid）可被 waitpid；非 leader 线程退出不产生可 wait 状态。
+    //   P_PID  (id > 0) → 指定 task（必须是自身子进程的线程组 leader）
+    //   P_PGID (id >=0) → 进程组 id 里任意子进程（wait4 的 pid==0 表示调用者进程组）
+    //   P_ALL         → 任意子进程
+    // 只有 leader（pid == tg->tgid）可被 wait；非 leader 线程退出不产生可 wait 状态。
+    // wait4 的 pid==0 映射为 P_PGID + 调用者 pgid，已由 do_wait4 转好。
     auto match_child = [&](const std::shared_ptr<vm>& task_vm) -> bool {
         auto s = sys(task_vm.get());
         if(!s || s->ppid.load() != tg->tgid) return false;
         if(s->pid != s->tg->tgid) return false;  // 仅 leader 可 wait
-        if(target_pid == -1) return true;
-        if(target_pid == 0) return s->pgrp->pgid == pgrp->pgid;
-        if(target_pid < -1) return s->pgrp->pgid == static_cast<uint64_t>(-target_pid);
+        if(idtype == 0 /*P_ALL*/) return true;
+        if(idtype == 1 /*P_PID*/)  return s->pid == static_cast<uint64_t>(id);
+        if(idtype == 2 /*P_PGID*/) return s->pgrp->pgid == static_cast<uint64_t>(id);
         return false;
     };
 
     // 子进程是否有可报告事件：已退出（WIFEXITED/WIFSIGNALED）或已停止且 stop_reported（WIFSTOPPED）。
-    // stop_reported 由 stop_process 投 SIGCHLD 时置 true，waitpid 消费后清——它兼做"该停止已通知过"
-    // 的去重标志：只有 stop_reported 为真的停止才可被本函数报告（避免重复报告同一停止）。
+    // stop_reported 由 stop_process 投 SIGCHLD 时置 true，消费后清——它兼做"该停止已通知过"
+    // 的去重标志：只有 stop_reported 为真的停止才可被报告（避免重复报告同一停止）。
     auto child_has_event = [](const std::shared_ptr<vm>& task_vm) -> bool {
         auto s = sys(task_vm.get());
         if(!s) return false;
@@ -348,8 +331,8 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
     std::vector<std::shared_ptr<vm>> children;
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
-        if(target_pid > 0) {
-            auto it = pid_map.find(static_cast<uint64_t>(target_pid));
+        if(idtype == 1 /*P_PID*/) {
+            auto it = pid_map.find(static_cast<uint64_t>(id));
             if(it == pid_map.end()) {
                 return -ECHILD;
             }
@@ -377,7 +360,7 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
         return -ECHILD;
     }
 
-    // 选一个有事件的子进程。无事件且非阻塞 → 立即返 0；否则轮询 tg->cv 等事件。
+    // 选一个有事件的子进程。无事件且非阻塞 → 立即返空 child；否则轮询 tg->cv 等事件。
     std::shared_ptr<vm> child;
     for(auto& c : children) {
         if(child_has_event(c)) {
@@ -385,8 +368,8 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
             break;
         }
     }
-    if((child == nullptr) && options & WNOHANG) {
-        return 0;
+    if((child == nullptr) && (options & WNOHANG)) {
+        return 0;  // out.child 保持空，handler 据此返回 0
     }
 
     while(child == nullptr) {
@@ -412,7 +395,7 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
                 break;
             }
             // 调用者自身被 VM_KILL 或收到信号 -> 标记为可重启。
-            // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 waitpid 内部时恒为假。
+            // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
             if(!pending_signals.empty() ||
                (flags(v).load(std::memory_order_acquire) & (vm::VM_KILLED | vm::VM_STOPPED))) {
                 return SYSCALL_RESTART;
@@ -420,41 +403,196 @@ int64_t PosixSyscall::do_waitpid(vm* v) {
         }
     }
 
-    //wait不能加锁，否则会死锁
+    //wait 不能加锁，否则会死锁
     auto cs = sys(child.get());
+    out.child = child;
     // exited 优先于 stopped：被 SIGKILL 的已停止进程，fini 设 tg->exited 但不清
     // tg->stopped（只有 SIGCONT 清），必须按退出报告，否则父进程（如 dash `kill -9 %1`）
     // 永不回收作业。
     if(cs->tg->exited.load(std::memory_order_acquire)) {
-        // 报告退出。exit_code 编码：< 128 为正常退出码（WIFEXITED，bits 8-15）；
-        // >= 128 为信号致死（do_kill/致命信号默认动作走 do_exit_group 存 128+sig），
-        // 此时 status = sig & 0x7f（WIFSIGNALED）。
-        uint64_t exit_code = static_cast<uint64_t>(cs->tg->exit_code.load(std::memory_order_acquire));
-        if(status_ptr != nullptr) {
-            int status;
-            if(exit_code >= 128) {
-                status = static_cast<int>(exit_code - 128) & 0x7f;  // WIFSIGNALED
-            } else {
-                status = (static_cast<int>(exit_code) & 0xff) << 8;  // WIFEXITED
-            }
-            *status_ptr = status;
-        }
-        uint64_t child_pid = cs->pid;
-        {
-            std::lock_guard<std::mutex> lock(pid_map_mutex);
-            pid_map.erase(child_pid);
-        }
+        out.exited = true;
+        out.exit_code = static_cast<uint64_t>(cs->tg->exit_code.load(std::memory_order_acquire));
     } else {
-        // 报告停止：status = (stop_sig << 8) | 0x7f（musl WIFSTOPPED 判定低字节 == 0x7f，
-        // WSTOPSIG 取高字节）。进程仍存活：不 erase pid_map，不清 stopped（SIGCONT 才清），
+        // 报告停止。进程仍存活：不 erase pid_map，不清 stopped（SIGCONT 才清），
         // 清 stop_reported 使下次停止能再投 SIGCHLD + 再被报告。
-        int ssig = cs->tg->stop_sig.load(std::memory_order_acquire);
-        if(status_ptr != nullptr) {
-            *status_ptr = ((ssig & 0xff) << 8) | 0x7f;
-        }
+        out.exited = false;
+        out.stop_sig = cs->tg->stop_sig.load(std::memory_order_acquire);
         cs->tg->stop_reported.store(false, std::memory_order_release);
     }
+    return 0;
+}
+
+// 把子进程 exit_code 编码成 wait4 的 int status（WIFEXITED/WIFSIGNALED）。
+// exit_code < 128=正常退出码（bits 8-15）；>=128=128+sig（信号致死），status=sig&0x7f。
+static int wait4_exit_status(uint64_t exit_code) {
+    if(exit_code >= 128) {
+        return static_cast<int>(exit_code - 128) & 0x7f;  // WIFSIGNALED
+    }
+    return (static_cast<int>(exit_code) & 0xff) << 8;  // WIFEXITED
+}
+
+int64_t PosixSyscall::do_wait4(vm* v) {
+    int64_t target_pid = static_cast<int64_t>(arg_s32(v->r(1)));
+    uint64_t status_addr = v->r(2);
+    int32_t options = arg_s32(v->r(3));
+    // wait4 不接受 waitid 专属选项位（WEXITED/WSTOPPED/WNOWAIT 等），其余选项（WCONTINUED 等）暂不支持。
+    if((options & ~(WNOHANG | WUNTRACED)) != 0) {
+        return -EINVAL;
+    }
+
+    // waitpid(self) 无意义
+    if(target_pid == (int64_t)pid) {
+        return -EINVAL;
+    }
+
+    int* status_ptr = nullptr;
+    if(status_addr != 0) {
+        status_ptr = static_cast<int*>(v->mmu_w(status_addr, sizeof(*status_ptr)));
+        if(status_ptr == nullptr) {
+            return -EFAULT;
+        }
+    }
+
+    // wait4 的 pid 编码归一化为 (idtype, id)：
+    //   pid > 0  → P_PID
+    //   pid == 0 → P_PGID（调用者进程组）
+    //   pid == -1→ P_ALL
+    //   pid < -1 → P_PGID（进程组 -pid）
+    int idtype;
+    int64_t id;
+    if(target_pid > 0) {
+        idtype = 1 /*P_PID*/;
+        id = target_pid;
+    } else if(target_pid == -1) {
+        idtype = 0 /*P_ALL*/;
+        id = 0;
+    } else if(target_pid == 0) {
+        idtype = 2 /*P_PGID*/;
+        id = static_cast<int64_t>(pgrp->pgid);
+    } else {
+        idtype = 2 /*P_PGID*/;
+        id = -target_pid;
+    }
+
+    wait_event ev;
+    int64_t rc = do_wait_common(v, idtype, id, options, ev);
+    if(rc != 0) {
+        return rc;  // 负 errno / SYSCALL_RESTART
+    }
+    if(ev.child == nullptr) {
+        return 0;  // WNOHANG 且无事件
+    }
+
+    auto cs = sys(ev.child.get());
+    if(status_ptr != nullptr) {
+        if(ev.exited) {
+            *status_ptr = wait4_exit_status(ev.exit_code);
+        } else {
+            // 停止：status = (stop_sig << 8) | 0x7f（musl WIFSTOPPED 判定低字节 == 0x7f，
+            // WSTOPSIG 取高字节）。
+            *status_ptr = ((ev.stop_sig & 0xff) << 8) | 0x7f;
+        }
+    }
+
+    // 退出的子进程回收 pid_map；停止的进程仍存活，不 erase。
+    if(ev.exited) {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map.erase(cs->pid);
+    }
     return (int64_t)cs->pid;  // leader 的 pid（== tg->tgid）；停止/退出均返此值
+}
+
+int64_t PosixSyscall::do_waitid(vm* v) {
+    int idtype = arg_s32(v->r(1));
+    int64_t id = static_cast<int64_t>(v->r(2));
+    uint64_t info_addr = v->r(3);
+    int32_t options = arg_s32(v->r(4));
+
+    // idtype 必须是已知值（P_ALL=0/P_PID=1/P_PGID=2）。P_PIDFD（=3）VM 不支持。
+    if(idtype < 0 || idtype > 2) {
+        return -EINVAL;
+    }
+
+    // waitid 选项：WEXITED/WSTOPPED/WCONTINUED 至少置一，可加 WNOHANG/WNOWAIT。
+    // 当前实现不支持 WCONTINUED（停止/退出已覆盖常见用法）。
+    const int WAITID_VALID = WNOHANG | WUNTRACED /*=WSTOPPED*/ | WEXITED | WNOWAIT;
+    if((options & ~WAITID_VALID) != 0 || (options & (WEXITED | WUNTRACED)) == 0) {
+        return -EINVAL;
+    }
+
+    // P_ALL 时 id 被忽略；P_PID/P_PGID 时 id 须非负。
+    if(idtype != 0 && id < 0) {
+        return -EINVAL;
+    }
+
+    // waitid(P_PGID, 0) 与 wait4 的 pid==0 同义：表示调用者进程组。
+    // do_wait_common 的 match_child 按 pgid 数值匹配（pgid==0 的进程组不存在），
+    // 故这里把 id==0 归一化为调用者 pgid，与 do_wait4 行为对齐。
+    if(idtype == 2 /*P_PGID*/ && id == 0) {
+        id = static_cast<int64_t>(pgrp->pgid);
+    }
+
+    // 映射 waitid 的 idtype 到 do_wait_common 用的同一套（0/1/2 一致）。
+    wait_event ev;
+    // do_wait_common 内部用 WNOHANG/WUNTRACED；waitid 的 WEXITED 对应"报告退出"，
+    // 是 do_wait_common 默认行为（exited 优先），无需额外位；WNOWAIT 由本函数处理（不回收）。
+    int common_opts = (options & WNOHANG) | ((options & WUNTRACED) ? WUNTRACED : 0);
+    int64_t rc = do_wait_common(v, idtype, id, common_opts, ev);
+    if(rc != 0) {
+        return rc;  // 负 errno / SYSCALL_RESTART
+    }
+
+    // 成功。即使 info_addr==0（合法：仅回收不取细节），waitid 成功返 0。
+    // 无可报告事件（WNOHANG）：返 0 且不填 siginfo（与 Linux 一致：0 表示无事件）。
+    if(ev.child != nullptr && info_addr != 0) {
+        auto cs = sys(ev.child.get());
+        // siginfo 布局（musl 默认 ABI，非 mips swap）：
+        //   si_signo@0(int) si_errno@4(int) si_code@8(int) 填充@12
+        //   si_pid@16(int) si_uid@20(int) si_status@24(int)
+        // 全部按 int（4 字节）写。
+        // si_status 语义与 wait4 的 int status 不同：对 SIGCHLD 事件，waitid 的
+        // si_status 存的是【原始值】（CLD_EXITED=退出码、CLD_KILLED/CLD_DUMPED=信号号、
+        // CLD_STOPPED=停止信号号），不是 wait4 的 (code<<8|sig) 状态字——不能用
+        // WEXITSTATUS/WTERMSIG 解码 si_status（实测 Linux：_exit(42)→si_status=42，
+        // SIGKILL→si_status=9）。局部变量加 out_ 前缀避开 glibc <signal.h> 宏。
+        int out_signo = 17 /*SIGCHLD*/;
+        int out_code;
+        int out_status;
+        if(ev.exited) {
+            // exit_code：<128=正常退出码，>=128=128+sig（信号致死）。
+            if(ev.exit_code >= 128) {
+                out_code = 2 /*CLD_KILLED*/;
+                out_status = static_cast<int>(ev.exit_code - 128);  // 原始信号号
+            } else {
+                out_code = 1 /*CLD_EXITED*/;
+                out_status = static_cast<int>(ev.exit_code);  // 原始退出码
+            }
+        } else {
+            out_code = 5 /*CLD_STOPPED*/;
+            out_status = ev.stop_sig;  // 原始停止信号号
+        }
+        int out_pid = static_cast<int>(cs->pid);
+        // 用 mmu_w 取一整块（28 字节，覆盖到 si_status）逐字段写。
+        if(auto* p = static_cast<int*>(v->mmu_w(info_addr, 28))) {
+            p[0] = out_signo;   // @0  si_signo
+            p[1] = 0;           // @4  si_errno
+            p[2] = out_code;    // @8  si_code
+            // @12 对齐填充，保持 0
+            p[4] = out_pid;     // @16 si_pid
+            p[5] = 0;           // @20 si_uid（VM 无真实 uid）
+            p[6] = out_status;  // @24 si_status（原始值，见上）
+        } else {
+            return -EFAULT;
+        }
+    }
+
+    // 回收：退出事件且未要求 WNOWAIT 才 erase。停止事件不回收（进程仍存活）。
+    if(ev.child != nullptr && ev.exited && !(options & WNOWAIT)) {
+        auto cs = sys(ev.child.get());
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map.erase(cs->pid);
+    }
+    return 0;  // waitid 成功返 0（不是 pid）
 }
 
 int64_t PosixSyscall::do_set_tid_address(vm* v) {

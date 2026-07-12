@@ -205,6 +205,14 @@ class PosixSyscall: public SyscallHandler{
     static int futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val,
                           const struct timespec* timeout);
     static int futex_wake(ThreadGroup* tg, uint64_t addr, int val);
+
+    struct wait_event {
+        std::shared_ptr<vm> child;
+        bool exited = false;      // true=报告退出（WIFEXITED/WIFSIGNALED），false=报告停止
+        int stop_sig = 0;         // 停止信号（仅 exited==false 有效）
+        uint64_t exit_code = 0;   // 子 exit_code：<128=正常退出码，>=128=128+sig（信号致死）
+    };
+    int64_t do_wait_common(vm* v, int idtype, int64_t id, int options, wait_event& out);
 public:
     PosixSyscall();
     PosixSyscall(uint64_t ppid, std::shared_ptr<ProcessGroup> pgrp, std::shared_ptr<Session> session);
@@ -249,7 +257,8 @@ public:
     int64_t do_clone(vm* v);
     int64_t do_getpid(vm*);
     int64_t do_getppid(vm*);
-    int64_t do_waitpid(vm* v);
+    int64_t do_wait4(vm* v);
+    int64_t do_waitid(vm* v);
     int64_t do_dup(vm* v);
     int64_t do_dup3(vm* v);
     int64_t do_pipe2(vm* v);
