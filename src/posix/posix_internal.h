@@ -52,6 +52,13 @@ namespace bpf{
 // 表的访问集中在一处（fini 在 posix_syscall.cpp，看不到 futex.cpp 的 static 表）。
 void futex_child_tid_clear(ThreadGroup* tg, int* ctid, uint64_t tid_address);
 
+// —— procfs 虚拟文件系统（实现在 procfs.cpp）——
+// open/readlink/statx 三类"按路径"操作经 ResolvePath→Path 虚方法统一入口（按 /proc|/dev|host 前缀分发），
+// lookup 与节点类型（ProcFile/ProcDir/ProcLink）都是 procfs.cpp 的内部细节。
+// 经 PosixSyscall 的 public 进程标识字段（pid/ppid/tg/...）与 *_of 静态转发读 vm 内部。
+// comm = basename(path) 截断 15 字节（Linux TASK_COMM_LEN-1）。do_execve / init 共用。
+std::string make_comm(const std::string& path);
+
 // 把 64 位寄存器实参按有符号/无符号/大小解释。各 do_* 普遍使用。
 static inline int32_t arg_s32(uint64_t v) {
     return static_cast<int32_t>(v);

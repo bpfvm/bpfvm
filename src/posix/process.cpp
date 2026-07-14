@@ -45,7 +45,11 @@ int64_t PosixSyscall::do_execve(vm* v) {
     auto fresh = vm::create();
     options(fresh.get()).stack_limit = options(v).stack_limit;
     options(fresh.get()).raw_stack   = options(v).raw_stack;
-    ElfLoadInfo load_info = fresh->load_elf(resolve_path(path).c_str());
+    auto exec_path = this->guest_abs_path(path);
+    if(! ps->root.empty()) {
+        exec_path = std::filesystem::path(ps->root + exec_path).lexically_normal().string();
+    }
+    ElfLoadInfo load_info = fresh->load_elf(exec_path.c_str());
     if(load_info.entry == 0) {
         // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
         return load_info.err ? -load_info.err : -ENOEXEC;
@@ -65,6 +69,8 @@ int64_t PosixSyscall::do_execve(vm* v) {
     options(v).entry = entry;
     options(v).argv = std::move(argv_strings);
     options(v).envp = std::move(envp_strings);
+    ps->exe_path = guest_abs_path(path);
+    comm_ = make_comm(path);
     {
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
         maps(v).swap(maps(fresh.get()));
@@ -85,7 +91,7 @@ int64_t PosixSyscall::do_execve(vm* v) {
     ps->signal_actions = new_actions;
     signal_depth(v) = 0;
 
-    std::unordered_map<int, std::shared_ptr<fd_handle>> new_fds;
+    std::unordered_map<int, std::shared_ptr<Fd>> new_fds;
     for (const auto& entry : ps->fds) {
         if (!entry.second->cloexec) {
             new_fds.insert(entry);
@@ -123,7 +129,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
      * CLONE_THREAD: 整体共享 ps（musl 总是同时传 CLONE_FILES|SIGHAND|FS|THREAD）。
      * 非 CLONE_THREAD: 拷贝 ps（同 fork 语义）——dup 父 fd 成独立 host fd，
      *   否则子进程会丢掉所有打开的文件描述符。 */
-    std::unordered_map<int, std::shared_ptr<fd_handle>> child_fds;
+    std::unordered_map<int, std::shared_ptr<Fd>> child_fds;
     if(!is_thread) {
         for(const auto& entry : ps->fds) {
             // fork：host dup 得独立 host fd；GuestTty共享。
@@ -135,18 +141,19 @@ int64_t PosixSyscall::do_clone(vm* v) {
             child_fds[entry.first] = new_handle;
         }
     }
-    auto child_sys = std::make_shared<PosixSyscall>(is_thread ? ppid.load() : tg->tgid, pgrp, session);
+    auto child_sys = std::make_shared<PosixSyscall>(pgrp, session);
     if(!is_thread) {
-        child_sys->ps->fds = child_fds;
-        child_sys->ps->signal_actions = ps->signal_actions;
-        child_sys->ps->root = ps->root;
-        child_sys->ps->cwd = ps->cwd;
+        // 整体拷贝而非逐字段罗列，避免新增 ps 字段时漏拷
+        child_sys->ps = std::make_shared<SharedState>(*ps);
+        child_sys->ps->fds = std::move(child_fds);
+        child_sys->tg->ppid.store(tg->tgid);
     } else {
         child_sys->ps = ps;
         child_sys->tg = tg;
         tg->live_threads.fetch_add(1);
     }
-    child_sys->umask_val = umask_val;
+    // comm 是 per-thread：fork/CLONE_THREAD 都继承 creator 的 comm。
+    child_sys->comm_ = comm_;
     // fork/clone 都继承父的信号掩码（Linux：clone 不论 CLONE_THREAD 都按 fork 语义拷贝 mask）。
     child_sys->sigmask.store(sigmask.load(std::memory_order_relaxed), std::memory_order_relaxed);
     options(child.get()).sys = child_sys;
@@ -282,7 +289,7 @@ int64_t PosixSyscall::do_getpid(vm*) {
 }
 
 int64_t PosixSyscall::do_getppid(vm*) {
-    return (int64_t)ppid.load();
+    return (int64_t)tg->ppid.load();
 }
 
 // 在 pid_map 中按 pid 查找 task，返回 vm shared_ptr（持锁内取出，调用方持有期间 vm 不会析构）。
@@ -293,6 +300,17 @@ std::shared_ptr<vm> PosixSyscall::find_task(uint64_t target_pid) {
         return nullptr;
     }
     return it->second;
+}
+
+// 枚举存活 pid（pid_map 的 key 快照）。供 procfs 列举 /proc 顶层 [pid] 目录。
+std::vector<uint64_t> PosixSyscall::list_pids() {
+    std::lock_guard<std::mutex> lock(pid_map_mutex);
+    std::vector<uint64_t> pids;
+    pids.reserve(pid_map.size());
+    for(const auto& kv : pid_map) {
+        pids.push_back(kv.first);
+    }
+    return pids;
 }
 
 // wait4/waitid 共享的等待核心。idtype/id 用 POSIX 语义（P_ALL=0/P_PID=1/P_PGID=2），
@@ -309,7 +327,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
     // wait4 的 pid==0 映射为 P_PGID + 调用者 pgid，已由 do_wait4 转好。
     auto match_child = [&](const std::shared_ptr<vm>& task_vm) -> bool {
         auto s = sys(task_vm.get());
-        if(!s || s->ppid.load() != tg->tgid) return false;
+        if(!s || s->tg->ppid.load() != tg->tgid) return false;
         if(s->pid != s->tg->tgid) return false;  // 仅 leader 可 wait
         if(idtype == 0 /*P_ALL*/) return true;
         if(idtype == 1 /*P_PID*/)  return s->pid == static_cast<uint64_t>(id);
@@ -337,7 +355,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
                 return -ECHILD;
             }
             auto child_sys = sys(it->second.get());
-            if(child_sys == nullptr || child_sys->ppid.load() != tg->tgid) {
+            if(child_sys == nullptr || child_sys->tg->ppid.load() != tg->tgid) {
                 return -ECHILD;
             }
             children.push_back(it->second);

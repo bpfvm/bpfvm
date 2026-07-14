@@ -4,15 +4,13 @@
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
 std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map{};
 std::mutex PosixSyscall::pid_map_mutex;
-std::unordered_map<int, std::shared_ptr<GuestTty>> PosixSyscall::ptmx_registry{};
-std::mutex PosixSyscall::ptmx_registry_mutex{};
 
-PosixSyscall::PosixSyscall() {
-    pid = next_pid.fetch_add(1);
+PosixSyscall::PosixSyscall() : pid(next_pid.fetch_add(1)) {
     tg = std::make_shared<ThreadGroup>(pid);
     // guest fd 0/1/2 在 init(pid==1) 内播种（构造函数拿不到 vm/options）；fork/clone 子进程
     // 经带参构造函数注入 fds，不走此路径。
 
+    ps = std::make_shared<SharedState>();
     char buf[PATH_MAX];
     if(::getcwd(buf, sizeof(buf)) != nullptr) {
         ps->cwd = buf;
@@ -24,14 +22,12 @@ PosixSyscall::PosixSyscall() {
     pgrp = std::make_shared<ProcessGroup>(pid, session);
 }
 
-PosixSyscall::PosixSyscall(uint64_t ppid, std::shared_ptr<ProcessGroup> pgrp_, std::shared_ptr<Session> session_)
-    : pgrp(std::move(pgrp_)), session(std::move(session_)) {
-    pid = next_pid.fetch_add(1);
+PosixSyscall::PosixSyscall(std::shared_ptr<ProcessGroup> pgrp_, std::shared_ptr<Session> session_):
+    pid(next_pid.fetch_add(1)), pgrp(std::move(pgrp_)), session(std::move(session_)) {
     tg = std::make_shared<ThreadGroup>(pid);
-    this->ppid = ppid;
     // 子进程经 fork 继承父的 pgrp/session（shared_ptr 共享同一对象），其控制终端由
     // session->ctty 表达（同样共享）。GuestTty随 fd 句柄的 tty 字段
-    // 共享——fork 后子进程的 pty slave fd（fd_handle::clone）携带同一 GuestTty 引用。
+    // 共享——fork 后子进程的 pty slave fd（DevFd::clone）携带同一 GuestTty 引用。
 }
 
 void PosixSyscall::init(const std::shared_ptr<vm>& v){
@@ -49,9 +45,9 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
     std::lock_guard<std::mutex> lock(pid_map_mutex);
     //这里只对1号进程添加，其他进程由fork添加，因为推迟到这里就太晚了
     pid_map[pid] = v;
-    // guest fd 0/1/2 播种：PTY 模式取 Pty 的 slave fd 包成 fd_handle 并绑 ctty；否则 dup 宿主 stdio。
-    // 注意：pump 线程由 main 在 vm->run() 前启动（host 接入职责），此处只消费 Pty 的 slave 产物
-    // 做 guest 侧播种。测试（insn_test）不设 pty，nullptr 退化走 dup stdio。
+    // guest fd 0/1/2 播种：PTY 模式取 Pty 的 slave fd 包成 DevFd 并绑 ctty；否则 dup 宿主 stdio
+    // 包成普通 HostFd（无 tty，纯直通）。pump 线程由 main 在 vm->run() 前启动（host 接入职责），
+    // 此处只消费 Pty 的 slave 产物做 guest 侧播种。测试（insn_test）不设 pty，nullptr 退化走 dup stdio。
     auto& pty = options(v.get()).pty;
     if(pty && pty->master_fd() >= 0) {
         int slave_fd = pty->take_slave_fd();
@@ -59,15 +55,14 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         tty->owner_ = session.get();
         tty->fg_pgrp.store(pgrp->pgid);
         session->ctty = tty;
-        auto mk = [&](int host_fd){ return std::make_shared<fd_handle>(host_fd, "", tty); };
-        ps->fds.emplace(0, mk(dup(slave_fd)));
-        ps->fds.emplace(1, mk(dup(slave_fd)));
-        ps->fds.emplace(2, mk(dup(slave_fd)));
+        ps->fds.emplace(0, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+        ps->fds.emplace(1, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+        ps->fds.emplace(2, std::make_shared<DevFd>(dup(slave_fd), "", tty));
         close(slave_fd);
     } else {
-        ps->fds.emplace(0, std::make_shared<fd_handle>(dup(STDIN_FILENO)));
-        ps->fds.emplace(1, std::make_shared<fd_handle>(dup(STDOUT_FILENO)));
-        ps->fds.emplace(2, std::make_shared<fd_handle>(dup(STDERR_FILENO)));
+        ps->fds.emplace(0, std::make_shared<HostFd>(dup(STDIN_FILENO)));
+        ps->fds.emplace(1, std::make_shared<HostFd>(dup(STDOUT_FILENO)));
+        ps->fds.emplace(2, std::make_shared<HostFd>(dup(STDERR_FILENO)));
     }
     if(!ps->root.empty()) {
         return;
@@ -79,6 +74,14 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         ps->root = rp;
         free((void*)rp);
         ps->cwd = "/";
+    }
+    // /proc 进程标识：main.cpp 经 options.exe 传入 guest 视角 exe 路径；comm 从 exe 派生
+    // （basename + 截断，与 do_execve 共用 make_comm）。只有 pid 1 走到这里；fork 子进程
+    // 经 ps 整体拷贝（exe_path）+ comm_ 拷贝继承。
+    auto& opt = options(v.get());
+    if(!opt.exe.empty()) {
+        ps->exe_path = opt.exe;
+        comm_ = make_comm(opt.exe);
     }
 }
 
@@ -135,15 +138,15 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     // 行为正确（父不必轮询）。
     notify_parent_sigchld();
 
-    // 把本组派生的孤儿重定向到 pid 1。children 的 ppid 记的是本组 tg->tgid（leader pid），
+    // 把本组派生的孤儿重定向到 pid 1。children 的 tg->ppid 记的是本组 tg->tgid（leader pid），
     // 故用 tg->tgid 匹配；由最后一个退出的线程执行即可——不必是 leader，规避 leader 先于
-    // last 退出时漏 reparent 的窗口。
+    // last 退出时漏 reparent 的窗口。改 tg->ppid（进程级），同组所有线程立即一致。
     {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         for(auto& entry : pid_map) {
             auto child_sys = sys(entry.second.get());
-            if(child_sys && child_sys->ppid.load() == tg->tgid) {
-                child_sys->ppid.store(1);
+            if(child_sys && child_sys->tg->ppid.load() == tg->tgid) {
+                child_sys->tg->ppid.store(1);
             }
         }
     }
@@ -217,12 +220,14 @@ void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
     }
 }
 
-void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<fd_handle>& h) {
+void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h) {
     // 所有 fd 销毁路径（do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
-    // master fd（master_token 非空）且是最后一个引用（use_count()==1）时，向 ctty 前台组投
-    // SIGHUP（对齐 Linux pty_close → tty_vhangup）。
-    if(h->master_token && h->master_token.use_count() == 1) {
-        deliver_to_ctty_fg(v, h->tty.get(), SIGHUP);
+    // pty master fd（master_token() 非空）且是最后一个引用（use_count()==1，即只剩 h 持有，
+    // erase 析构后归零）时，向 ctty 前台组投 SIGHUP（对齐 Linux pty_close → tty_vhangup）。
+    // ProcFd::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
+    auto mt = h->master_token();
+    if(mt && mt.use_count() == 1) {
+        deliver_to_ctty_fg(v, h->tty().get(), SIGHUP);
     }
 }
 
@@ -325,7 +330,7 @@ int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_CLONE:         return do_clone(v);
     case BPF_SYS_GETPID:        return do_getpid(v);
     case BPF_SYS_GETPPID:       return do_getppid(v);
-    case BPF_SYS_WAIT4:       return do_wait4(v);
+    case BPF_SYS_WAIT4:         return do_wait4(v);
     case BPF_SYS_WAITID:        return do_waitid(v);
     case BPF_SYS_DUP:           return do_dup(v);
     case BPF_SYS_DUP3:          return do_dup3(v);

@@ -21,8 +21,8 @@ int64_t PosixSyscall::do_setpgid(vm* v) {
         if(!target) {
             return -ESRCH;
         }
-        // 仅允许改自身或子进程（ppid 记的是父 tg->tgid，故用 tg->tgid 匹配）
-        if(static_cast<uint64_t>(pid_arg) != tg->tgid && target->ppid.load() != tg->tgid) {
+        // 仅允许改自身或子进程（ppid 在 tg，记的是父 tg->tgid，故用 tg->tgid 匹配）
+        if(static_cast<uint64_t>(pid_arg) != tg->tgid && target->tg->ppid.load() != tg->tgid) {
             return -ESRCH;
         }
     }

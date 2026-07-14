@@ -10,7 +10,7 @@ int64_t PosixSyscall::do_socket(vm* v) {
         return -errno;
     }
     int guest_fd = allocate_fd();
-    auto handle = std::make_shared<fd_handle>(host_fd);
+    auto handle = std::make_shared<HostFd>(host_fd);
     // cloexec 仅是 VM 的 fd 表属性，同步登记以便 execve 时关闭。
     if(type & SOCK_CLOEXEC) {
         handle->cloexec = true;
@@ -34,14 +34,14 @@ int64_t PosixSyscall::do_socketpair(vm* v) {
     }
 
     int guest_fd0 = allocate_fd();
-    auto handle0 = std::make_shared<fd_handle>(host_fds[0]);
+    auto handle0 = std::make_shared<HostFd>(host_fds[0]);
     if(type & SOCK_CLOEXEC) {
         handle0->cloexec = true;
     }
     ps->fds[guest_fd0] = handle0;
 
     int guest_fd1 = allocate_fd(guest_fd0 + 1);
-    auto handle1 = std::make_shared<fd_handle>(host_fds[1]);
+    auto handle1 = std::make_shared<HostFd>(host_fds[1]);
     if(type & SOCK_CLOEXEC) {
         handle1->cloexec = true;
     }
@@ -67,7 +67,7 @@ int64_t PosixSyscall::do_bind(vm* v) {
     if(addr == nullptr) {
         return -EFAULT;
     }
-    if(::bind(it->second->fd, addr, addrlen) < 0) {
+    if(::bind(it->second->host_fd(), addr, addrlen) < 0) {
         return -errno;
     }
     return 0;
@@ -80,7 +80,7 @@ int64_t PosixSyscall::do_listen(vm* v) {
         return -EBADF;
     }
     int backlog = arg_s32(v->r(2));
-    if(::listen(it->second->fd, backlog) < 0) {
+    if(::listen(it->second->host_fd(), backlog) < 0) {
         return -errno;
     }
     return 0;
@@ -97,7 +97,7 @@ int64_t PosixSyscall::do_connect(vm* v) {
     if(addr == nullptr) {
         return -EFAULT;
     }
-    if(::connect(it->second->fd, addr, addrlen) < 0) {
+    if(::connect(it->second->host_fd(), addr, addrlen) < 0) {
         // EINPROGRESS（非阻塞 socket，连接建立中）按 errno 透传；
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -111,7 +111,7 @@ int64_t PosixSyscall::do_shutdown(vm* v) {
         return -EBADF;
     }
     int how = arg_s32(v->r(2));
-    if(::shutdown(it->second->fd, how) < 0) {
+    if(::shutdown(it->second->host_fd(), how) < 0) {
         return -errno;
     }
     return 0;
@@ -147,14 +147,14 @@ int64_t PosixSyscall::do_accept4(vm* v) {
         }
     }
 
-    int new_host = ::accept4(it->second->fd, addr, addrlen, flags);
+    int new_host = ::accept4(it->second->host_fd(), addr, addrlen, flags);
     if(new_host < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     // addrlen 已被 host 写回（实际对端地址长度），host 直接写进了 guest 内存。
 
     int new_guest = allocate_fd();
-    auto handle = std::make_shared<fd_handle>(new_host);
+    auto handle = std::make_shared<HostFd>(new_host);
     if(flags & SOCK_CLOEXEC) {
         handle->cloexec = true;
     }
@@ -189,7 +189,7 @@ int64_t PosixSyscall::do_sendto(vm* v) {
         }
     }
 
-    ssize_t rc = ::sendto(it->second->fd, buf, len, flags, addr, addrlen);
+    ssize_t rc = ::sendto(it->second->host_fd(), buf, len, flags, addr, addrlen);
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -225,7 +225,7 @@ int64_t PosixSyscall::do_recvfrom(vm* v) {
         }
     }
 
-    ssize_t rc = ::recvfrom(it->second->fd, buf, len, flags, addr, addrlen);
+    ssize_t rc = ::recvfrom(it->second->host_fd(), buf, len, flags, addr, addrlen);
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -343,12 +343,12 @@ int64_t PosixSyscall::do_sendmsg(vm* v) {
                 if(fdit == ps->fds.end()) {
                     return -EBADF;
                 }
-                fds[i] = fdit->second->fd;   // guest fd → host fd
+                fds[i] = fdit->second->host_fd();   // guest fd → host fd
             }
         }
     }
 
-    ssize_t rc = ::sendmsg(it->second->fd, &hmsg, arg_s32(v->r(3)));
+    ssize_t rc = ::sendmsg(it->second->host_fd(), &hmsg, arg_s32(v->r(3)));
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -374,7 +374,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
         return err;
     }
 
-    ssize_t rc = ::recvmsg(it->second->fd, &hmsg, arg_s32(v->r(3)));
+    ssize_t rc = ::recvmsg(it->second->host_fd(), &hmsg, arg_s32(v->r(3)));
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -392,7 +392,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
         for(int i = 0; i < nfds; ++i) {
             int host_fd = fds[i];
             int new_guest = allocate_fd();
-            ps->fds[new_guest] = std::make_shared<fd_handle>(host_fd);
+            ps->fds[new_guest] = std::make_shared<HostFd>(host_fd);
             fds[i] = new_guest;   // host fd → guest fd，写回 guest 的 cmsg 缓冲区
         }
     }
@@ -416,7 +416,7 @@ int64_t PosixSyscall::do_setsockopt(vm* v) {
     if(optval == nullptr && optlen > 0) {
         return -EFAULT;
     }
-    if(::setsockopt(it->second->fd, level, optname, optval, optlen) < 0) {
+    if(::setsockopt(it->second->host_fd(), level, optname, optval, optlen) < 0) {
         return -errno;
     }
     return 0;
@@ -443,7 +443,7 @@ int64_t PosixSyscall::do_getsockopt(vm* v) {
             return -EFAULT;
         }
     }
-    if(::getsockopt(it->second->fd, level, optname, optval, optlen) < 0) {
+    if(::getsockopt(it->second->host_fd(), level, optname, optval, optlen) < 0) {
         return -errno;
     }
     // optlen 已被 host 写回（实际选项值长度）。
@@ -482,7 +482,7 @@ int64_t PosixSyscall::do_getsockname(vm* v) {
     if(it == ps->fds.end()) {
         return -EBADF;
     }
-    return do_sockname_common(v, it->second->fd, ::getsockname);
+    return do_sockname_common(v, it->second->host_fd(), ::getsockname);
 }
 
 int64_t PosixSyscall::do_getpeername(vm* v) {
@@ -490,7 +490,7 @@ int64_t PosixSyscall::do_getpeername(vm* v) {
     if(it == ps->fds.end()) {
         return -EBADF;
     }
-    return do_sockname_common(v, it->second->fd, ::getpeername);
+    return do_sockname_common(v, it->second->host_fd(), ::getpeername);
 }
 
 // ===========================================================================
@@ -513,7 +513,7 @@ int64_t PosixSyscall::do_epoll_create1(vm* v) {
         return -errno;
     }
     int guest_fd = allocate_fd();
-    auto handle = std::make_shared<fd_handle>(host_fd);
+    auto handle = std::make_shared<HostFd>(host_fd);
     // EPOLL_CLOEXEC == O_CLOEXEC；host 已处理，VM 登记 cloexec 属性。
     if(flags & EPOLL_CLOEXEC) {
         handle->cloexec = true;
@@ -547,8 +547,8 @@ int64_t PosixSyscall::do_epoll_ctl(vm* v) {
     // 但都是 8B opaque union、布局一致。按 u64 整体搬运，不解析 data 语义。
     hev.data.u64 = gev->data.u64;
 
-    int target_host = (it_tg == ps->fds.end()) ? -1 : it_tg->second->fd;
-    if(::epoll_ctl(it_ep->second->fd, op, target_host,
+    int target_host = (it_tg == ps->fds.end()) ? -1 : it_tg->second->host_fd();
+    if(::epoll_ctl(it_ep->second->host_fd(), op, target_host,
                    reinterpret_cast<struct epoll_event*>(&hev)) < 0) {
         return -errno;
     }
@@ -578,7 +578,7 @@ int64_t PosixSyscall::do_epoll_pwait(vm* v) {
     }
 
     std::vector<epoll_event> hev(maxev);
-    int n = ::epoll_pwait(it->second->fd, reinterpret_cast<struct epoll_event*>(hev.data()),
+    int n = ::epoll_pwait(it->second->host_fd(), reinterpret_cast<struct epoll_event*>(hev.data()),
                           maxev, timeout, sigs);
     if(n < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;

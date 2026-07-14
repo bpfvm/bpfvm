@@ -1,57 +1,18 @@
 #ifndef POSIX_SYSCALL_H__
 #define POSIX_SYSCALL_H__
 #include "insn.h"
+#include "posix/fs.h"   // Fd/Path 多态层次及 ProcNode/GuestTty/PtySide 等（实现见 fs.cpp/procfs.cpp）
 
 #include <unordered_map>
 #include <array>
 #include <memory>
-#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <optional>
 #include <unistd.h>
+#include <fcntl.h>   // AT_FDCWD（guest_abs_path/resolve_path 的 dirfd 默认值）
 
 #define BPF_SIGNAL_QUE_SIZE 1024
-
-// pty master 端的共享 token。fd_handle 持有它的 shared_ptr，use_count 即 master fd 引用数
-// （对应内核 master tty_struct::count）。归零（drop_fd_handle 里 use_count()==1 判断，
-// erase 析构后）触发 SIGHUP。slave fd 不持有 PtySide——slave 关闭不发 SIGHUP，故无需计数。
-struct PtySide {};
-
-struct GuestTty;
-struct fd_handle {
-    const int fd = -1;
-    bool cloexec = false;
-    std::string path;
-    // 非空表示本 fd 是某 pty 设备的一端（master/slave）；空表示普通文件/pipe/socket。
-    // dup/fork 后多份 fd 共享同一 GuestTty
-    std::shared_ptr<GuestTty> tty;
-    // 仅 master fd 设此字段（多个 master fd 副本共享同一 PtySide，use_count = master fd 数）；
-    std::shared_ptr<PtySide> master_token;
-    explicit fd_handle(int fd_, std::string path_ = {}, std::shared_ptr<GuestTty> t = {},
-                       std::shared_ptr<PtySide> m = {})
-        : fd(fd_), path(std::move(path_)), tty(std::move(t)), master_token(std::move(m)) {}
-    ~fd_handle(){ if(fd >= 0) close(fd); }
-    // 复制本 fd 句柄（dup/dup2/fork 用）：host dup 得独立 host fd
-    // 不复制 cloexec（由调用方按需设置）。失败返回 nullptr。
-    std::shared_ptr<fd_handle> clone() const {
-        int new_fd = ::dup(fd);
-        if(new_fd < 0) return nullptr;
-        return std::make_shared<fd_handle>(new_fd, path, tty, master_token);
-    }
-    bool is_tty() const { return tty != nullptr || ::isatty(fd) == 1; }
-};
-
-// guest tty 设备的 bpfvm 侧状态。
-// 本对象只持有 bpfvm 必须管的进程语义：
-//   fg_pgrp  —— 本设备当前前台进程组。tty 信号（SIGINT/SIGTSTP/...）发给 fg_pgrp 的所有成员。
-//   owner_   —— 当前归属 session（裸指针，不参与生命周期：TIOCSCTTY 抢夺判定用）。
-struct Session;
-struct GuestTty {
-    std::atomic<uint64_t> fg_pgrp{0};
-    Session* owner_ = nullptr;
-    GuestTty() = default;
-};
 
 // 会话（session）：setsid 创建，sid == leader->pid。
 // 持有控制终端 ctty（shared_ptr<GuestTty>，nullptr = 无 ctty）。前台组挂在 GuestTty 上。
@@ -75,6 +36,10 @@ struct ProcessGroup {
 // tgid = leader 的 tid。live_threads 归 0 时进程可被 waitpid 回收。
 struct ThreadGroup {
     uint64_t tgid;
+    // 父进程 pid（进程级：同组所有线程共享同一父进程，getppid 对所有线程返回同值）。
+    // CLONE_THREAD 共享父 tg 自动继承；fork 新建 tg 时由 do_clone 显式 store 父 tgid；
+    // 孤儿 reparent 时整组改。
+    std::atomic<uint64_t> ppid{0};
     std::atomic<size_t> live_threads{1};
     std::atomic<bool> exited{false};
     // 整组对外报告的退出码（waitpid 读此值）。初值 -1 = 未设。
@@ -134,27 +99,22 @@ class PosixSyscall: public SyscallHandler{
     // CLONE_THREAD: 整体共享。fork: 整体拷贝（make_shared + 复制内容）。
     struct SharedState {
         std::string cwd;
-        std::unordered_map<int, std::shared_ptr<fd_handle>> fds;
+        std::unordered_map<int, std::shared_ptr<Fd>> fds;
         std::array<signal_action, NSIG> signal_actions{};
         // chroot 根目录（宿主绝对路径，无尾斜杠）。空 = 不 chroot。
         // 随 fork/clone 自动传播（与 cwd 同级）。ps->cwd 存 guest 视角路径，
         // resolve_path 负责 cwd → 宿主路径时拼上此 root。
         std::string root;
+        // guest 程序路径（/proc/[pid]/exe symlink 目标，guest 视角绝对路径）。
+        // 进程级（mm_struct::exe_file）：do_execve 成功后更新；main.cpp 初次加载时补写。
+        std::string exe_path;
+        // 文件创建掩码（进程级，fs_struct::umask）。openat/mkdir 等按 mode & ~umask 生效。
+        uint32_t umask = 0022;
     };
-
-    uint32_t umask_val = 0022;
-    std::shared_ptr<SharedState> ps = std::make_shared<SharedState>();
 
     static std::atomic<uint64_t> next_pid;
     static std::unordered_map<uint64_t, std::shared_ptr<vm>> pid_map;
     static std::mutex pid_map_mutex;
-    // ptmx 注册表：guest open("/dev/ptmx") 合成的 host pty，按 pts 编号(=TIOCGPTN 返回值)
-    // 索引到 GuestTty。后续 open("/dev/pts/N") 用 N 查此表，复用同一 GuestTty。
-    static std::unordered_map<int, std::shared_ptr<GuestTty>> ptmx_registry;
-    static std::mutex ptmx_registry_mutex;
-    uint64_t pid = 0;          // task id（== tid）。gettid 返回此值。
-    std::shared_ptr<ThreadGroup> tg;  // 线程组生命周期（CLONE_THREAD 共享；fork 新建）。
-    std::atomic<uint64_t> ppid{0};
     pthread_t tid = 0;
     // 信号掩码（POSIX sigprocmask）：bit (sig-1) 表示信号 sig 被阻塞（与 Linux 内核/
     // musl sigset_t ABI 一致）。SIGKILL/SIGSTOP 不可阻塞（do_sigprocmask 强制清对应位）。
@@ -164,9 +124,6 @@ class PosixSyscall: public SyscallHandler{
     MpscQueue pending_signals;
     // set_tid_address / CLONE_CHILD_CLEARTID 设置；线程退出时清零并 futex_wake。
     uint64_t tid_address_ = 0;
-    // 进程组/会话。fork 继承父的 shared_ptr（共享同一对象）；setpgid/setsid 替换为新对象。
-    std::shared_ptr<ProcessGroup> pgrp;
-    std::shared_ptr<Session> session;
 
     // 信号默认动作判定：是否为"可忽略"信号——即 SIG_IGN，或 SIG_DFL 且默认动作为
     // Ign(SIGCHLD/SIGURG/SIGWINCH)/Cont(SIGCONT)。这类信号投递给进程不会改变其状态，
@@ -185,11 +142,22 @@ class PosixSyscall: public SyscallHandler{
     // 调用者 session 选目标组。host_signal（宿主→guest 路由）与 do_close 的 pty master
     // 关闭发 SIGHUP（对齐 Linux tty_vhangup 语义）共用此路径。
     void deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig);
-    // 销毁一个 fd_handle 前的 master SIGHUP 处理：若是 master 端且是最后一个引用
-    // （side.use_count()==1），向 ctty 前台组投 SIGHUP。所有 fd 销毁路径（do_close、
-    // dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数，避免重复实现。返回后
-    // 调用方再 erase 析构（side shared_ptr 自动 -1）。
-    void drop_fd_handle(vm* v, const std::shared_ptr<fd_handle>& h);
+    // 销毁一个 Fd 前的 master SIGHUP 处理：若是 pty master 端且是最后一个引用
+    // （master_token().use_count()==1），向 ctty 前台组投 SIGHUP。所有 fd 销毁路径
+    // （do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
+    // ProcFd::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
+    void drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h);
+
+public:
+    const uint64_t pid;          // task id（== tid）。gettid 返回此值。
+    // 程序名（/proc/[pid]/comm，basename(exe)，≤15 字节，Linux TASK_COMM_LEN-1）。
+    std::string comm_;
+    // —— 进程标识（procfs 自由函数直接读，字段 public 不加 getter 包装）——
+    std::shared_ptr<SharedState> ps;
+    std::shared_ptr<ThreadGroup> tg;  // 线程组生命周期（CLONE_THREAD 共享；fork 新建）。
+    // 进程组/会话。fork 继承父的 shared_ptr（共享同一对象）；setpgid/setsid 替换为新对象。
+    std::shared_ptr<ProcessGroup> pgrp;
+    std::shared_ptr<Session> session;
 
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
@@ -200,6 +168,9 @@ class PosixSyscall: public SyscallHandler{
     }
     static std::shared_ptr<PosixSyscall> sys(vm* v_);
     static std::shared_ptr<vm> find_task(uint64_t target_pid);
+    // 枚举当前存活的所有 guest pid（pid_map 的 key 快照，持锁内拷贝）。
+    // 供 procfs 枚举 /proc 顶层 [pid] 目录（pid_map 本身 private，不暴露内部表示）。
+    static std::vector<uint64_t> list_pids();
     // futex 实现：等待者阻塞在 vm 自身 wait_cv 上，由 VM_BLOCKED 标志协调唤醒。
     // 见 posix/futex.cpp 中 futex_wait/futex_wake。
     static int futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val,
@@ -213,17 +184,17 @@ class PosixSyscall: public SyscallHandler{
         uint64_t exit_code = 0;   // 子 exit_code：<128=正常退出码，>=128=128+sig（信号致死）
     };
     int64_t do_wait_common(vm* v, int idtype, int64_t id, int options, wait_event& out);
-public:
+
     PosixSyscall();
-    PosixSyscall(uint64_t ppid, std::shared_ptr<ProcessGroup> pgrp, std::shared_ptr<Session> session);
+    // fork/clone 子进程构造：继承父的 pgrp/session（shared_ptr 共享同一对象）。
+    PosixSyscall(std::shared_ptr<ProcessGroup> pgrp, std::shared_ptr<Session> session);
 
     int allocate_fd(int min_fd = 0);
     bool read_c_string(vm* v, uint64_t addr, std::string& out, size_t max_len);
     bool read_c_string_array(vm* v, uint64_t addr, std::vector<std::string>& out, size_t max_count, size_t max_str_len);
-    std::string resolve_path(const std::string& path);
-    // 把任意 guest 路径（相对则用 cwd）规范化为 guest 视角的绝对路径（不拼 root 前缀）。
-    // 用于 fd_handle::path 存储与特殊设备（/dev/ptmx 等）匹配 —— 这些都应基于 guest 命名空间。
-    std::string guest_abs_path(const std::string& path);
+    // 把任意 guest 路径（相对则用 dirfd 对应目录或 cwd）规范化为 guest 视角的绝对路径
+    // 用于 Fd::path 存储与特殊设备（/dev/ptmx 等）匹配 —— 这些都应基于 guest 命名空间。
+    std::string guest_abs_path(const std::string& path, int dirfd = AT_FDCWD);
 
     // 宿主侧信号（物理终端 ^C/^Z/^\ / 终端挂断 / 外部 kill 给 bpfvm）转交 handler 路由。
     // 凭本 handler 掌握的 session/ctty/前台组决定目标：有控制终端->发到 ctty 的前台
@@ -233,7 +204,14 @@ public:
     // job-control 门控：检查对 fd 的后台 tty 访问是否需要投 SIGTTIN(read)/SIGTTOU(write)。
     // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
     // 仅当 fd 是本 session ctty 且调用者非前台组时触发。
-    std::optional<int64_t> tty_bg_check(vm* v, const std::shared_ptr<fd_handle>& fd, bool is_read);
+    std::optional<int64_t> tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read);
+
+    // —— SyscallHandler protected 静态访问器的公开转发：procfs 自由函数要读 vm* 的
+    //    options/maps/flags（protected），非成员够不到，经此转发。——
+    static auto& options_of(vm* v) { return options(v); }
+    static auto& maps_of(vm* v) { return maps(v); }
+    static auto& maps_mutex_of(vm* v) { return maps_mutex(v); }
+    static auto& flags_of(vm* v) { return flags(v); }
 
     int64_t do_clock_gettime(vm* v);
     int64_t do_mmap(vm* v);

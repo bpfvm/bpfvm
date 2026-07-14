@@ -4,8 +4,8 @@ void PosixSyscall::notify_parent_sigchld() {
     // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm（leader），sys() downcast 后调其
     // queue_signal(SIGCHLD)。父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
     // （测试，sys() 返 nullptr）、或正常 PosixSyscall。前两者降级 no-op。
-    // ppid 从 this 取（本进程的父 pid），不需传 v。
-    uint64_t parent_pid = ppid.load();
+    // ppid 进程级（在 tg）：从 tg->ppid 取本进程的父 pid。
+    uint64_t parent_pid = tg->ppid.load();
     if(parent_pid == 0) return;  // pid 1 无父（init）
     auto parent_vm = find_task(parent_pid);
     if(!parent_vm) return;

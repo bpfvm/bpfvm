@@ -136,6 +136,13 @@ int main(int argc, char** argv) {
     for(int i = optind; i < argc; i++) {
         options.argv.emplace_back(argv[i]);
     }
+    // /proc 用的 exe 路径：经 vmOptions 传给 handler（PosixSyscall::init 消费）。
+    // main 不感知具体 handler 实现，只填 options.exe；comm 由 PosixSyscall 自己派生。
+    // elf_file_path 是 realpath(argv[optind])（宿主绝对路径）。guest 视角的 exe 应是
+    // guest 能看到的路径：chroot 模式用 argv[optind]（如 /bin/dash），否则用 realpath。
+    options.exe = options.root.empty()
+                  ? (elf_file_path ? std::string(elf_file_path) : std::string(argv[optind]))
+                  : std::string(argv[optind]);
     // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
     if(!options.root.empty()) {
         options.envp.emplace_back("HOME=/");

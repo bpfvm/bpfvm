@@ -10,8 +10,8 @@ int PosixSyscall::allocate_fd(int min_fd) {
 
 int64_t PosixSyscall::do_umask(vm* v) {
     uint32_t new_mask = arg_u32(v->r(1));
-    int old = umask_val;
-    umask_val = new_mask & 0777;
+    int old = ps->umask;
+    ps->umask = new_mask & 0777;
     return old;
 }
 
@@ -87,14 +87,14 @@ int64_t PosixSyscall::do_pipe2(vm* v) {
     }
 
     int guest_fd0 = allocate_fd();
-    auto handle0 = std::make_shared<fd_handle>(host_fds[0]);
+    auto handle0 = std::make_shared<HostFd>(host_fds[0]);
     if (flags & O_CLOEXEC) {
         handle0->cloexec = true;
     }
     ps->fds[guest_fd0] = handle0;
 
     int guest_fd1 = allocate_fd(guest_fd0 + 1);
-    auto handle1 = std::make_shared<fd_handle>(host_fds[1]);
+    auto handle1 = std::make_shared<HostFd>(host_fds[1]);
     if (flags & O_CLOEXEC) {
         handle1->cloexec = true;
     }
@@ -136,23 +136,28 @@ int64_t PosixSyscall::do_fcntl(vm* v) {
         it->second->cloexec = (v->r(3) & FD_CLOEXEC) != 0;
         return 0;
     }
+    // 虚拟 /proc fd（host_fd() < 0）：其余 fcntl cmd（F_GETFL/F_GETLK/...）无意义，返回 EINVAL。
+    int hfd = it->second->host_fd();
+    if(hfd < 0) {
+        return -EINVAL;
+    }
 
     uint64_t arg = v->r(3);
     int rc = -1;
     if (cmd == F_GETLK) {
-            void* guest_arg = v->mmu_w(arg, sizeof(struct flock));
-            if(guest_arg == nullptr) {
-                return -EFAULT;
-            }
-            rc = fcntl(it->second->fd, cmd, guest_arg);
+        void* guest_arg = v->mmu_w(arg, sizeof(struct flock));
+        if(guest_arg == nullptr) {
+            return -EFAULT;
+        }
+        rc = fcntl(hfd, cmd, guest_arg);
     } else if (cmd == F_SETLK || cmd == F_SETLKW) {
-            void* guest_arg = v->mmu(arg, sizeof(struct flock));
-            if(guest_arg == nullptr) {
-                return -EFAULT;
-            }
-            rc = fcntl(it->second->fd, cmd, guest_arg);
+        void* guest_arg = v->mmu(arg, sizeof(struct flock));
+        if(guest_arg == nullptr) {
+            return -EFAULT;
+        }
+        rc = fcntl(hfd, cmd, guest_arg);
     } else {
-            rc = fcntl(it->second->fd, cmd, arg);
+        rc = fcntl(hfd, cmd, arg);
     }
 
     if(rc == -1) {
@@ -174,7 +179,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
     if (request == TIOCSCTTY) {
         // 绑定控制终端。语义：arg==1 强制（即使已被别的 session 占也夺），arg==0 仅在无人
         // 占用时绑定。前提：调用者须是 session leader（setsid 后），fd 是 pty 设备，否则错。
-        const auto& tty = it->second->tty;
+        const auto tty = it->second->tty();
         if(!tty) {
             return -ENOTTY;
         }
@@ -206,7 +211,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         // 设置前台进程组（tcsetpgrp）。musl 的 tcsetpgrp 传指向 int 的指针（&pgrp），
         // 故 r(3) 是 guest 指针，需 mmu 取值。仅更新本 ctty 的 fg_pgrp，供 deliver_tty_signal
         // 选目标组。POSIX：fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
+        if(!session || !session->ctty || it->second->tty().get() != session->ctty.get()) {
             return -ENOTTY;
         }
         const pid_t* in = (const pid_t*)v->mmu(v->r(3), sizeof(pid_t));
@@ -236,7 +241,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         return 0;
     } else if (request == TIOCGPGRP) {
         // 读取前台进程组（tcgetpgrp）。fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || it->second->tty.get() != session->ctty.get()) {
+        if(!session || !session->ctty || it->second->tty().get() != session->ctty.get()) {
             return -ENOTTY;
         }
         pid_t* out = (pid_t*)v->mmu_w(v->r(3), sizeof(pid_t));
@@ -246,6 +251,11 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         *out = (pid_t)session->ctty->fg_pgrp.load(std::memory_order_acquire);
         return 0;
     } else {
+        // 虚拟 /proc fd（host_fd() < 0）：无 host fd，ioctl 无意义，返回 ENOTTY。
+        int hfd = it->second->host_fd();
+        if(hfd < 0) {
+            return -ENOTTY;
+        }
         // 通用 ioctl（含 TCGETS/TCSETS/TIOCGWINSZ/TIOCSPTLCK/TIOCGPTN...）：把 guest 指针按
         // 方向翻译成 host 指针，再透传 host 内核。这些是 ldisc/设备属性，host n_tty 处理得
         // 比我们正确。旧式终端 ioctl（TCGETS/TIOCGWINSZ/...）用固定方向编码：明确方向以便
@@ -277,7 +287,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         } else {
             arg = (void*)v->r(3);
         }
-        int rc = ioctl(it->second->fd, request, arg);
+        int rc = ioctl(hfd, request, arg);
         if(rc == -1) {
             return -errno;
         }
@@ -311,7 +321,8 @@ int64_t PosixSyscall::do_poll(vm* v) {
     // guest fd<0（POSIX：忽略此条）同样置 host fd=-1，但 revents 清零。
     std::vector<struct pollfd> hfds(n);
     std::vector<char> valid(n, 0);
-    nfds_t invalid_count = 0;
+    nfds_t invalid_count = 0;  // POLLNVAL 条目数（非法 guest fd）
+    nfds_t ready_count = 0;    // 已就地回填 revents 的条目数（虚拟 /proc fd 立即就绪）
     for(nfds_t i = 0; i < n; ++i) {
         hfds[i].events = gfds[i].events;
         hfds[i].revents = 0;
@@ -329,16 +340,23 @@ int64_t PosixSyscall::do_poll(vm* v) {
             invalid_count++;
             continue;
         }
-        hfds[i].fd = it->second->fd;
+        int hfd = it->second->host_fd();
+        if(hfd < 0) {
+            hfds[i].fd = -1;
+            gfds[i].revents = gfds[i].events & (POLLIN | POLLOUT);
+            valid[i] = 0;  // 不走 host revents 回写，直接用上面设的值
+            ready_count++;  // 计入"已就绪"使 poll 立即返回（与 POLLNVAL 同效果，分离计数以求清晰）
+            continue;
+        }
+        hfds[i].fd = hfd;
         valid[i] = 1;
     }
 
     // 直接阻塞在宿主 poll。timeout(ms) 直接透传；信号路径下 queue_signal 会
-    // pthread_kill(SIGUSR1) 把宿主 poll 踢出 EINTR，符合 poll 不被 SA_RESTART 重启的语义，
-    // POLLNVAL 是"就绪事件"，POSIX 要求 poll 见到就绪条目立即返回——而我们已把非法 fd 屏蔽
-    // 成 fd=-1，宿主 poll 感知不到它们。若已手握 invalid_count 条 POLLNVAL，强制 timeout=0
-    // 非阻塞，否则当所有合法 fd 未就绪时会等满 timeout（timeout<0 时甚至永久挂起）。
-    int rc = ::poll(hfds.data(), n, invalid_count > 0 ? 0 : timeout);
+    // pthread_kill(SIGUSR1) 把宿主 poll 踢出 EINTR，符合 poll 不被 SA_RESTART 重启的语义。
+    // POLLNVAL 与虚拟 fd 的就地就绪都是"已发生事件"立即返回
+    nfds_t preset = invalid_count + ready_count;
+    int rc = ::poll(hfds.data(), n, preset > 0 ? 0 : timeout);
     if(rc == -1) {
         return -errno;             // EINTR/EFAULT/ENOMEM 等
     }
@@ -350,6 +368,6 @@ int64_t PosixSyscall::do_poll(vm* v) {
         }
         gfds[i].revents = hfds[i].revents;
     }
-    // POLLNVAL 条目按 POSIX 也算"有事件"，加入返回计数。
-    return rc + invalid_count;
+    // POLLNVAL 与就地就绪条目按 POSIX 都算"有事件"，加入返回计数。
+    return rc + preset;
 }

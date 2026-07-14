@@ -83,7 +83,7 @@ int64_t PosixSyscall::do_mmap(vm* v) {
         if (it == ps->fds.end()) {
             return -EBADF;
         }
-        host_fd = it->second->fd;
+        host_fd = it->second->host_fd();
     }
 
     // host 内存始终独立分配（addr_hint 是 guest 空间地址，与 host 无关；host 端不

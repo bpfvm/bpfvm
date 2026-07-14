@@ -45,39 +45,34 @@ bool PosixSyscall::read_c_string_array(vm* v, uint64_t addr, std::vector<std::st
     return false;
 }
 
-std::string PosixSyscall::guest_abs_path(const std::string& path) {
+std::string PosixSyscall::guest_abs_path(const std::string& path, int dirfd) {
     if(path.empty()) {
         return path;
     }
-    // 求 guest 视角的绝对路径（ps->cwd 已是 guest 视角），lexically_normal 消除
-    // '..'，使 '/../../etc/passwd' 规范化为 '/etc/passwd' —— 仍被限制在 root 下，无法逃逸。
+    // 求 guest 视角的绝对路径，lexically_normal 消除
+    // '..'，使 '/../../etc/passwd' 规范化为 '/etc/passwd'
     std::filesystem::path input(path);
     std::string guest_abs;
     if(input.is_absolute()) {
+        // 绝对路径忽略 dirfd（Linux openat 语义：绝对路径不看 dirfd）。
         guest_abs = input.lexically_normal().string();
     } else {
-        std::filesystem::path base = ps->cwd.empty() ? std::filesystem::path("/") : std::filesystem::path(ps->cwd);
-        guest_abs = (base / input).lexically_normal().string();
+        // 相对路径：dirfd != AT_FDCWD 时取 fd 对应的 guest 视角目录作 base
+        // fd 无 path 时退化为相对 cwd。
+        std::string base = ps->cwd.empty() ? std::string("/") : ps->cwd;
+        if(dirfd != AT_FDCWD) {
+            auto it = ps->fds.find(dirfd);
+            if(it != ps->fds.end() && !it->second->path.empty()) {
+                base = it->second->path;
+            }
+        }
+        guest_abs = (std::filesystem::path(base) / input).lexically_normal().string();
     }
     // lexically_normal 对根目录 "/" 会返回空，补回。
     if(guest_abs.empty()) {
         guest_abs = "/";
     }
     return guest_abs;
-}
-
-std::string PosixSyscall::resolve_path(const std::string& path) {
-    std::string guest_abs = guest_abs_path(path);
-    if(guest_abs.empty()) {
-        return guest_abs;
-    }
-    // 非 chroot 模式：直接返回 guest 绝对路径（= 原行为）。
-    // chroot 模式：拼上宿主 root 前缀得到实际宿主路径。
-    if(ps->root.empty()) {
-        return guest_abs;
-    }
-    // root 已去尾斜杠；guest_abs 以 '/' 开头，两者拼接即宿主路径。
-    return ps->root + guest_abs;
 }
 
 int64_t PosixSyscall::do_unlinkat(vm* v) {
@@ -87,20 +82,10 @@ int64_t PosixSyscall::do_unlinkat(vm* v) {
         return -EFAULT;
     }
     int flags = arg_s32(v->r(3));
-    int rc = -1;
-    if(dirfd == AT_FDCWD) {
-        rc = unlinkat(AT_FDCWD, resolve_path(path).c_str(), flags);
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = unlinkat(it->second->fd, path.c_str(), flags);
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    return ResolvePath(this, guest_abs_path(path, dirfd))->unlink(flags);
 }
 
 int64_t PosixSyscall::do_mkdirat(vm* v) {
@@ -109,21 +94,11 @@ int64_t PosixSyscall::do_mkdirat(vm* v) {
     if(!read_c_string(v, v->r(2), path, 4096)) {
         return -EFAULT;
     }
-    mode_t mode = (mode_t)(arg_u32(v->r(3)) & ~umask_val);
-    int rc;
-    if(dirfd == AT_FDCWD) {
-        rc = mkdir(resolve_path(path).c_str(), mode);
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = mkdirat(it->second->fd, path.c_str(), mode);
+    mode_t mode = (mode_t)(arg_u32(v->r(3)) & ~ps->umask);
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    return ResolvePath(this, guest_abs_path(path, dirfd))->mkdir(mode);
 }
 
 int64_t PosixSyscall::do_symlinkat(vm* v) {
@@ -133,20 +108,12 @@ int64_t PosixSyscall::do_symlinkat(vm* v) {
         return -EFAULT;
     }
     int new_dirfd = arg_s32(v->r(2));
-    int rc = -1;
-    if(new_dirfd == AT_FDCWD) {
-        rc = symlinkat(target.c_str(), AT_FDCWD, resolve_path(linkpath).c_str());
-    } else {
-        auto it = ps->fds.find(new_dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = symlinkat(target.c_str(), it->second->fd, linkpath.c_str());
+    // target 不与 dirfd 关联（原样透传）。
+    if(new_dirfd != AT_FDCWD && ps->fds.find(new_dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    return ResolvePath(this, guest_abs_path(linkpath, new_dirfd))
+        ->symlink(target);
 }
 
 int64_t PosixSyscall::do_linkat(vm* v) {
@@ -158,39 +125,15 @@ int64_t PosixSyscall::do_linkat(vm* v) {
     int olddirfd = arg_s32(v->r(1));
     int newdirfd = arg_s32(v->r(3));
     int flags = arg_s32(v->r(5));
-
-    int host_olddirfd = AT_FDCWD;
-    if (olddirfd != AT_FDCWD) {
-        auto it = ps->fds.find(olddirfd);
-        if (it == ps->fds.end()) {
-            return -EBADF;
-        }
-        host_olddirfd = it->second->fd;
+    if(olddirfd != AT_FDCWD && ps->fds.find(olddirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-
-    int host_newdirfd = AT_FDCWD;
-    if (newdirfd != AT_FDCWD) {
-        auto it = ps->fds.find(newdirfd);
-        if (it == ps->fds.end()) {
-            return -EBADF;
-        }
-        host_newdirfd = it->second->fd;
+    if(newdirfd != AT_FDCWD && ps->fds.find(newdirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-
-    std::string resolved_old = oldpath;
-    if (olddirfd == AT_FDCWD) {
-        resolved_old = resolve_path(oldpath);
-    }
-    std::string resolved_new = newpath;
-    if (newdirfd == AT_FDCWD) {
-        resolved_new = resolve_path(newpath);
-    }
-
-    int rc = linkat(host_olddirfd, resolved_old.c_str(), host_newdirfd, resolved_new.c_str(), flags);
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    auto oldp = ResolvePath(this, guest_abs_path(oldpath, olddirfd));
+    auto newp = ResolvePath(this, guest_abs_path(newpath, newdirfd));
+    return oldp->link(*newp, flags);
 }
 
 int64_t PosixSyscall::do_renameat2(vm* v) {
@@ -202,45 +145,15 @@ int64_t PosixSyscall::do_renameat2(vm* v) {
     int old_dirfd = arg_s32(v->r(1));
     int new_dirfd = arg_s32(v->r(3));
     unsigned int flags = arg_u32(v->r(5));
-
-    int host_old_dirfd = AT_FDCWD;
-    if (old_dirfd != AT_FDCWD) {
-        auto it = ps->fds.find(old_dirfd);
-        if (it == ps->fds.end()) {
-            return -EBADF;
-        }
-        host_old_dirfd = it->second->fd;
+    if(old_dirfd != AT_FDCWD && ps->fds.find(old_dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-
-    int host_new_dirfd = AT_FDCWD;
-    if (new_dirfd != AT_FDCWD) {
-        auto it = ps->fds.find(new_dirfd);
-        if (it == ps->fds.end()) {
-            return -EBADF;
-        }
-        host_new_dirfd = it->second->fd;
+    if(new_dirfd != AT_FDCWD && ps->fds.find(new_dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-
-    std::string resolved_old = old_path;
-    std::string resolved_new = new_path;
-    if(old_dirfd == AT_FDCWD) {
-        resolved_old = resolve_path(old_path);
-    }
-    if(new_dirfd == AT_FDCWD) {
-        resolved_new = resolve_path(new_path);
-    }
-#if defined(__ANDROID__)
-    // Android bionic 不暴露 renameat2() libc 包装函数，直接走 syscall。
-    int rc = (int)::syscall(SYS_renameat2, host_old_dirfd, resolved_old.c_str(),
-                            host_new_dirfd, resolved_new.c_str(), flags);
-#else
-    int rc = renameat2(host_old_dirfd, resolved_old.c_str(),
-                       host_new_dirfd, resolved_new.c_str(), flags);
-#endif
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    auto oldp = ResolvePath(this, guest_abs_path(old_path, old_dirfd));
+    auto newp = ResolvePath(this, guest_abs_path(new_path, new_dirfd));
+    return oldp->rename(*newp, flags);
 }
 
 int64_t PosixSyscall::do_readlinkat(vm* v) {
@@ -254,20 +167,13 @@ int64_t PosixSyscall::do_readlinkat(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc;
-    if(dirfd == AT_FDCWD) {
-        rc = readlink(resolve_path(path).c_str(), buf, bufsiz);
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = readlinkat(it->second->fd, path.c_str(), buf, bufsiz);
+    // dirfd 在 bpfvm 内解析（见 do_unlinkat 注释）。
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
-    }
-    return rc;
+    // readlink 由 Path 统一分发：/proc 符号链接（magic + ProcLink）bpfvm 自决目标，
+    // 其余走 host readlink（直写 buf）。dirfd 与 path 在 guest_abs_path 内合成 guest 绝对路径。
+    return ResolvePath(this, guest_abs_path(path, dirfd))->readlink(buf, bufsiz);
 }
 
 int64_t PosixSyscall::do_fchdir(vm* v) {
@@ -277,7 +183,7 @@ int64_t PosixSyscall::do_fchdir(vm* v) {
         return -EBADF;
     }
     struct stat st = {};
-    if(fstat(it->second->fd, &st) == -1) {
+    if(fstat(it->second->host_fd(), &st) == -1) {
         return -errno;
     }
     if(!S_ISDIR(st.st_mode)) {
@@ -323,28 +229,35 @@ int64_t PosixSyscall::do_statx(vm* v) {
     if(out == nullptr) {
         return -EFAULT;
     }
-    struct statx stx = {};
-    int rc = -1;
-    if(dirfd == AT_FDCWD) {
-#if defined(__ANDROID__)
-        rc = (int)::syscall(SYS_statx, AT_FDCWD, resolve_path(path).c_str(),
-                            flags, mask, &stx);
-#else
-        rc = statx(AT_FDCWD, resolve_path(path).c_str(), flags, mask, &stx);
-#endif
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-#if defined(__ANDROID__)
-        rc = (int)::syscall(SYS_statx, it->second->fd, path.c_str(), flags, mask, &stx);
-#else
-        rc = statx(it->second->fd, path.c_str(), flags, mask, &stx);
-#endif
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
+    // AT_EMPTY_PATH（或 path 为空）+ 有效 dirfd：纯 fd 操作
+    // 如 fstat 经 statx(fd,"", AT_EMPTY_PATH) 实现，不走路径解析，直接透传 host fd。
+    if(dirfd != AT_FDCWD && (flags & AT_EMPTY_PATH)) {
+        int hfd = ps->fds[dirfd]->host_fd();
+        if(hfd < 0) {
+            return -EBADF;  // 虚拟 /proc fd 无 host fd，AT_EMPTY_PATH 不适用
+        }
+        struct statx stx = {};
+#if defined(__ANDROID__)
+        int rc = (int)::syscall(SYS_statx, hfd, "", AT_EMPTY_PATH, mask, &stx);
+#else
+        int rc = statx(hfd, "", AT_EMPTY_PATH, mask, &stx);
+#endif
+        if(rc == -1) {
+            return -errno;
+        }
+        std::memcpy(out, &stx, sizeof(stx));
+        return 0;
+    }
+    // statx 由 Path 统一分发：/proc 虚拟节点由 ProcNode::statx 填充（真符号链接 ProcLink
+    // 自动报 S_IFLNK），其余走 host statx。dirfd 与 path 统一合成 guest 绝对路径。
+    struct statx stx = {};
+    int rc = ResolvePath(this, guest_abs_path(path, dirfd))
+                 ->statx(stx, mask, flags);
+    if(rc < 0) {
+        return rc;  // 负 errno
     }
     std::memcpy(out, &stx, sizeof(stx));
     return 0;
@@ -358,20 +271,10 @@ int64_t PosixSyscall::do_fchmodat(vm* v) {
     }
     mode_t mode = (mode_t)arg_u32(v->r(3));
     int flags = arg_s32(v->r(4));
-    int rc = -1;
-    if(dirfd == AT_FDCWD) {
-        rc = fchmodat(AT_FDCWD, resolve_path(path).c_str(), mode, flags);
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = fchmodat(it->second->fd, path.c_str(), mode, flags);
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    return ResolvePath(this, guest_abs_path(path, dirfd))->chmod(mode, flags);
 }
 
 int64_t PosixSyscall::do_utimensat(vm* v) {
@@ -403,29 +306,28 @@ int64_t PosixSyscall::do_utimensat(vm* v) {
         times_ptr = pts;
     }
 
-    int rc = -1;
-    if (dirfd == AT_FDCWD) {
-        if (!has_path) {
+    if (!has_path) {
+        // utimensat(2) 允许 path=NULL（配合 AT_EMPTY_PATH 作用于 fd 自身）——这是纯 fd 操作，
+        // 不走路径解析，必须透传 host fd。dirfd 必须有效（非 AT_FDCWD）。
+        if (dirfd == AT_FDCWD) {
             return -EFAULT;
         }
-        rc = utimensat(AT_FDCWD, resolve_path(path).c_str(), times_ptr, flags);
-    } else {
         auto it = ps->fds.find(dirfd);
         if (it == ps->fds.end()) {
             return -EBADF;
         }
-        // utimensat(2) 允许 path=NULL（配合 AT_EMPTY_PATH 作用于 fd 自身），
-        // 但 glibc 头声明为 nonnull，编译器误报，这里局部抑制。
+        // glibc 头声明 utimensat 的 path 为 nonnull，编译器误报，这里局部抑制。
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnonnull"
-        rc = utimensat(it->second->fd, has_path ? path.c_str() : nullptr, times_ptr, flags);
+        int rc = utimensat(it->second->host_fd(), nullptr, times_ptr, flags);
 #pragma GCC diagnostic pop
+        return rc == -1 ? -errno : 0;
     }
-
-    if(rc == -1) {
-        return -errno;
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-    return 0;
+    return ResolvePath(this, guest_abs_path(path, dirfd))
+        ->utimens(times_ptr, flags);
 }
 
 int64_t PosixSyscall::do_faccessat(vm* v) {
@@ -436,20 +338,8 @@ int64_t PosixSyscall::do_faccessat(vm* v) {
     }
     int mode = arg_s32(v->r(3));
     int flags = arg_s32(v->r(4));
-
-    int rc = -1;
-    if (dirfd == AT_FDCWD) {
-        rc = faccessat(AT_FDCWD, resolve_path(path).c_str(), mode, flags);
-    } else {
-        auto it = ps->fds.find(dirfd);
-        if(it == ps->fds.end()) {
-            return -EBADF;
-        }
-        rc = faccessat(it->second->fd, path.c_str(), mode, flags);
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
     }
-
-    if(rc == -1) {
-        return -errno;
-    }
-    return 0;
+    return ResolvePath(this, guest_abs_path(path, dirfd))->access(mode, flags);
 }

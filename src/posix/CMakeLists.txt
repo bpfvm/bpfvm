@@ -21,6 +21,8 @@ add_library(posix_obj OBJECT
     session.cpp
     signal.cpp
     futex.cpp
+    procfs.cpp
+    fs.cpp
 )
 target_include_directories(posix_obj PRIVATE
     ${CMAKE_SOURCE_DIR}/src
