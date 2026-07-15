@@ -106,7 +106,7 @@ class PosixSyscall: public SyscallHandler{
         // resolve_path 负责 cwd → 宿主路径时拼上此 root。
         std::string root;
         // guest 程序路径（/proc/[pid]/exe symlink 目标，guest 视角绝对路径）。
-        // 进程级（mm_struct::exe_file）：do_execve 成功后更新；main.cpp 初次加载时补写。
+        // 进程级（mm_struct::exe_file）：do_execveat 成功后更新；main.cpp 初次加载时补写。
         std::string exe_path;
         // 文件创建掩码（进程级，fs_struct::umask）。openat/mkdir 等按 mode & ~umask 生效。
         uint32_t umask = 0022;
@@ -231,7 +231,7 @@ public:
     int64_t do_linkat(vm* v);
     int64_t do_renameat2(vm* v);
     int64_t do_readlinkat(vm* v);
-    int64_t do_execve(vm* v);
+    int64_t do_execveat(vm* v);
     int64_t do_clone(vm* v);
     int64_t do_getpid(vm*);
     int64_t do_getppid(vm*);

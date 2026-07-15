@@ -108,7 +108,7 @@ private:
 };
 
 // 构造一个「加载失败」结果：entry=0 + err=<errno>。供 load_elf 各失败点统一使用，
-// 让 do_execve 能拿到精确 errno（ENOENT/EACCES/ENOEXEC...），替代历史上笼统的 ENOEXEC。
+// 让 do_execveat 能拿到精确 errno（ENOENT/EACCES/ENOEXEC...），替代历史上笼统的 ENOEXEC。
 static ElfLoadInfo fail(int err) {
     ElfLoadInfo info;
     info.err = err;

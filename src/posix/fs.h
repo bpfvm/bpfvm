@@ -205,6 +205,11 @@ struct Path {
 
     // open：返回已打开的 Fd（ProcFd/DevFd/HostFd），失败返 nullptr 且 errno 已设。
     virtual std::shared_ptr<Fd> open(int flags, mode_t mode) = 0;
+    // follow：返回 follow 符号链接后的 guest 路径（给 execve/execveat 用——它们需要真实
+    //   可加载文件，而非 /proc 符号链接）。HostPath/DevPath 不穿透，返回自身 guest；
+    //   ProcPath override：命中 ProcLink（/proc/<pid>/{exe,cwd,root}）返回目标 guest 路径，
+    //   其余（文件/目录/magic symlink，后者已被 normalize 成目录/文件）返回自身 guest。
+    virtual std::string follow() { return guest; }
     // readlink：把目标写入 buf（按 bufsiz 截断，不含 NUL，与 readlink(2) 一致）。
     //   返回写入字节数（>=0=成功）；<0=负 errno（ENOENT=目标进程已退出；EINVAL=非符号链接；...）。
     virtual ssize_t readlink(char* buf, size_t bufsiz) = 0;
@@ -261,6 +266,7 @@ struct DevPath: HostPath {
 struct ProcPath: Path {
     using Path::Path;
     std::shared_ptr<Fd> open(int flags, mode_t mode) override;               // ProcFd::open(guest,self)
+    std::string follow() override;                                           // 穿透 ProcLink（exe/cwd/root）
     ssize_t readlink(char* buf, size_t bufsiz) override;                     // magic_readlink + lookup
     int statx(struct statx& stx, unsigned int mask, int flags) override;     // lookup + node->statx
     int access(int mode, int flags) override;                                // lookup 存在性

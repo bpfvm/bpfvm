@@ -28,28 +28,57 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
     return code;
 }
 
-int64_t PosixSyscall::do_execve(vm* v) {
+// execveat(dirfd, path, argv, envp, flags) —— 唯一的 exec 入口。
+// execve(path,...) 在 musl 里等价转发为 execveat(AT_FDCWD, path, argv, envp, 0)，
+// 故本 VM 只实现 execveat，不再单独实现 execve。两种用法：
+//   AT_EMPTY_PATH + 空 path —— 执行 fd 指向的文件（fexecve 走此路）。fd→真实文件的解析
+//     属于 /proc/self/fd/<n> 的语义（一个指向目标文件的 ProcLink），应由 proc 层实现，
+//     而非在 exec 里用宿主 /proc/self/fd magic 路径绕过。当前 /proc/self/fd 尚未实现，
+//     故返回 ENOSYS —— musl fexecve 收到 ENOSYS 后回退到 execve("/proc/self/fd/<n>")，
+//     待 proc 实现 /proc/self/fd 的 follow() 后该回退路径自然打通。
+//   否则（有 path）—— dirfd+path 解析为 host/guest 路径，加载 ELF 替换地址空间。
+int64_t PosixSyscall::do_execveat(vm* v) {
+    int dirfd = arg_s32(v->r(1));
     std::string path;
-    std::vector<std::string> argv_strings;
-    std::vector<std::string> envp_strings;
-    if(!read_c_string(v, v->r(1), path, 4096)) {
+    if(!read_c_string(v, v->r(2), path, 4096)) {
         return -EFAULT;
     }
-    if(!read_c_string_array(v, v->r(2), argv_strings, 1024, 4096)) {
-        return -EFAULT;
-    }
-    if(!read_c_string_array(v, v->r(3), envp_strings, 1024, 4096)) {
-        return -EFAULT;
+    int flags = arg_s32(v->r(5));
+
+    std::string host_path, guest_abs;
+    if((flags & AT_EMPTY_PATH) && path.empty()) {
+        // fexecve：fd→文件解析属于 /proc/self/fd 语义，由 proc 负责。当前 stub，
+        // 返回 ENOSYS 让 musl 回退 execve("/proc/self/fd/<n>")（待 proc 实现后打通）。
+        return -ENOSYS;
     }
 
+    std::vector<std::string> argv_strings;
+    std::vector<std::string> envp_strings;
+    if(!read_c_string_array(v, v->r(3), argv_strings, 1024, 4096)) {
+        return -EFAULT;
+    }
+    if(!read_c_string_array(v, v->r(4), envp_strings, 1024, 4096)) {
+        return -EFAULT;
+    }
+    // 常规路径：dirfd+path 解析 + 符号链接穿透 + chroot 前缀。
+    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+        return -EBADF;
+    }
+    // follow 符号链接后取真实 guest 路径（/proc/self/exe→/bin/busybox 等），再拼 chroot 前缀
+    // 给 load_elf。不走这步则 /proc 路径会被当 host 文件（chroot 下不存在）→ ENOENT。
+    guest_abs = ResolvePath(this, guest_abs_path(path, dirfd))->follow();
+    host_path = guest_abs;
+    if(!ps->root.empty()) {
+        host_path = std::filesystem::path(ps->root + guest_abs).lexically_normal().string();
+    }
+
+    // 加载 ELF 并替换整个 guest 地址空间为新程序。
+    //   host_path   —— 传给 load_elf 的宿主路径（已含 chroot 前缀）。
+    //   guest_abs   —— guest 视角 exe 路径（写进 ps->exe_path，/proc/self/exe 目标；派生 comm）。
     auto fresh = vm::create();
     options(fresh.get()).stack_limit = options(v).stack_limit;
     options(fresh.get()).raw_stack   = options(v).raw_stack;
-    auto exec_path = this->guest_abs_path(path);
-    if(! ps->root.empty()) {
-        exec_path = std::filesystem::path(ps->root + exec_path).lexically_normal().string();
-    }
-    ElfLoadInfo load_info = fresh->load_elf(exec_path.c_str());
+    ElfLoadInfo load_info = fresh->load_elf(host_path.c_str());
     if(load_info.entry == 0) {
         // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
         return load_info.err ? -load_info.err : -ENOEXEC;
@@ -63,20 +92,20 @@ int64_t PosixSyscall::do_execve(vm* v) {
     if(!fresh->mmu(entry)) {
         return -ENOEXEC;
     }
-    // execve 替换整个 guest 地址空间为新程序：同步 v->options 里「跑什么程序」的字段
+    // exec 替换整个 guest 地址空间为新程序：同步 v->options 里「跑什么程序」的字段
     //（entry/argv/envp），让后续 dump_stats/调试读到的是新程序而非旧残留。
-    // 宿主侧配置（verbose/breakpoint/insn_limit/sys 等）跨 execve 保留不变。
+    // 宿主侧配置（verbose/breakpoint/insn_limit/sys 等）跨 exec 保留不变。
     options(v).entry = entry;
     options(v).argv = std::move(argv_strings);
     options(v).envp = std::move(envp_strings);
-    ps->exe_path = guest_abs_path(path);
-    comm_ = make_comm(path);
+    ps->exe_path = guest_abs;
+    comm_ = make_comm(guest_abs);
     {
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
         maps(v).swap(maps(fresh.get()));
     }
     v->flush_tlb();
-    // execve 替换了整个 guest 地址空间：旧程序编译的 JIT 函数全部失效。
+    // exec 替换了整个 guest 地址空间：旧程序编译的 JIT 函数全部失效。
     // 且新旧程序共享相同的 guest 地址区间（都从 0x400000 链接），必须清空缓存，
     // 否则会误命中旧程序的编译产物。
     v->clear_jit_cache();
@@ -84,7 +113,7 @@ int64_t PosixSyscall::do_execve(vm* v) {
     decltype(ps->signal_actions) new_actions{};
     const uint64_t sig_dfl = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_DFL));
     const uint64_t sig_ign = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(SIG_IGN));
-    // execve：被忽略的信号保留 SIG_IGN（POSIX），其余恢复 SIG_DFL。
+    // exec：被忽略的信号保留 SIG_IGN（POSIX），其余恢复 SIG_DFL。
     for(size_t i = 0; i < new_actions.size(); i++) {
         new_actions[i].handler = handler_is_ignored(ps->signal_actions[i].handler) ? sig_ign : sig_dfl;
     }

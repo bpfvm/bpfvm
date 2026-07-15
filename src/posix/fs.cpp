@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <set>
 
 // ptmx 注册表：guest open("/dev/ptmx") 合成的 host pty，按 pts 编号(=TIOCGPTN 返回值)
 // 索引到 GuestTty。后续 open("/dev/pts/N") 用 N 查此表，复用同一 GuestTty。
@@ -203,6 +204,14 @@ std::shared_ptr<Fd> ProcFd::clone() const {
 //   命中但失败 → 返回 nullptr、err=负 errno。
 // =====================================================================
 
+static const std::set<std::string> allowed_dev_paths = {
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/full",
+};
+
 std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t mode,
                                 PosixSyscall* self) {
     // —— guest pty 合成：tmux/posix_openpt/openpty 都走 open("/dev/ptmx") + ioctl(TIOCGPTN) +
@@ -278,9 +287,7 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
     // 标准设备：委托 HostFd::open 开宿主真设备（不经 chroot 前缀——这些是 bpfvm 进程自身的
     // 设备，chroot/非 chroot 行为一致）。标准设备不需 pty/tty 语义（不进 session->ctty 链，
     // tty_bg_check 对它们自然短路），故直接返 HostFd（已是 Fd 子类）。
-    if(guest_abs == "/dev/null" || guest_abs == "/dev/zero" ||
-       guest_abs == "/dev/urandom" || guest_abs == "/dev/random" ||
-       guest_abs == "/dev/full") {
+    if(allowed_dev_paths.count(guest_abs)) {
         // host_path 直接用 guest_abs（绝对路径 /dev/null，不拼 chroot root）。
         return HostFd::open(guest_abs, flags, mode, guest_abs);
     }

@@ -60,7 +60,7 @@ void set_loader_root(const std::string& root);
 // 主程序加载结果：除入口地址外，还带 auxv 启动所需的信息（musl/glibc 的
 // __init_tls 靠 AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 program headers 与 TLS）。
 // entry 为 0 表示加载失败；此时 err 给出失败原因（正 errno 值，如 ENOENT/EACCES/ENOEXEC），
-// 供 do_execve 等调用方映射为精确的 guest errno（替代历史上笼统的 ENOEXEC）。
+// 供 do_execveat 等调用方映射为精确的 guest errno（替代历史上笼统的 ENOEXEC）。
 // err 为 0 表示未设置（成功，或极早期失败回退到 ENOEXEC）。phdr 为 0 表示主程序无 PT_PHDR。
 struct ElfLoadInfo {
     uint64_t entry = 0;

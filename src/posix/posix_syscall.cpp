@@ -76,7 +76,7 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         ps->cwd = "/";
     }
     // /proc 进程标识：main.cpp 经 options.exe 传入 guest 视角 exe 路径；comm 从 exe 派生
-    // （basename + 截断，与 do_execve 共用 make_comm）。只有 pid 1 走到这里；fork 子进程
+    // （basename + 截断，与 do_execveat 共用 make_comm）。只有 pid 1 走到这里；fork 子进程
     // 经 ps 整体拷贝（exe_path）+ comm_ 拷贝继承。
     auto& opt = options(v.get());
     if(!opt.exe.empty()) {
@@ -326,7 +326,7 @@ int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_LINKAT:        return do_linkat(v);
     case BPF_SYS_RENAMEAT2:     return do_renameat2(v);
     case BPF_SYS_READLINKAT:    return do_readlinkat(v);
-    case BPF_SYS_EXECVE:        return do_execve(v);
+    case BPF_SYS_EXECVEAT:      return do_execveat(v);
     case BPF_SYS_CLONE:         return do_clone(v);
     case BPF_SYS_GETPID:        return do_getpid(v);
     case BPF_SYS_GETPPID:       return do_getppid(v);

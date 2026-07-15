@@ -517,8 +517,46 @@ std::shared_ptr<Fd> ProcFd::open(const std::string& guest_abs, int flags, PosixS
 // =====================================================================
 
 // open：命中 lookup 即构造 ProcFd（快照式）。/proc 下查不到节点 → ENOENT（设备封闭）。
-std::shared_ptr<Fd> ProcPath::open(int flags, mode_t /*mode*/) {
+// 真符号链接（exe/cwd/root）特殊处理：open 穿透（follow）到目标 guest 路径，经
+// ResolvePath 重新解析（套 chroot 前缀 + 按前缀分流）后 open，返回真实 fd（通常 HostFd）。
+// 这与 Linux 对 open 的符号链接自动 follow 语义一致——否则 ProcLink 的 generate() 返回
+// 空串，ProcFd 快照出空内容，read 立即 EOF（如 busybox open("/proc/self/exe") 读真实
+// ELF re-exec applet 会失败）。magic symlink（self/thread-self/mounts）已在 lookup 内经
+// normalize_proc_path 改写成目录/文件，落到 ProcDir/ProcFile，不进 is_link() 分支。
+std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
+    auto node = lookup(guest, self);
+    if(!node) {
+        errno = ENOENT;   // /proc 下不存在的路径
+        return nullptr;
+    }
+    if(node->is_link()) {
+        std::string target;
+        if(!node->readlink(self, target) || target.empty()) {
+            errno = ENOENT;   // 目标进程已退出 / exe_path 未设
+            return nullptr;
+        }
+        // target 是绝对 guest 路径；ResolvePath 套 chroot 前缀 + 按前缀分流
+        // （/proc→ProcPath / /dev→DevPath / 其它→HostPath），其 open 返回真实 fd。
+        return ResolvePath(self, target)->open(flags, mode);
+    }
+    // 文件/目录：走原快照路径（ProcFd::open 内部会再 lookup 一次，命中同一节点）。
     return ProcFd::open(guest, flags, self);
+}
+
+// follow：execve/execveat 用——/proc 符号链接必须穿透到真实可加载文件。
+// 真符号链接（ProcLink，如 /proc/self/exe→/bin/busybox）返回目标 guest 路径；其余
+// （文件/目录/magic symlink，后者已被 normalize 成目录/文件）返回自身 guest（execve
+// 对这些会失败：目录 ENOENT、文件 ENOEXEC；与 host 一致）。命中即返回（含空目标，
+// 由调用方按需处理——execve 对空 exe_path 会 load_elf 失败报 ENOENT）。
+std::string ProcPath::follow() {
+    if(auto node = lookup(guest, self)) {
+        if(node->is_link()) {
+            std::string target;
+            node->readlink(self, target);
+            return target;   // 空 = 进程已退出/exe_path 未设（execve 会据此报错）
+        }
+    }
+    return guest;
 }
 
 // readlink：magic symlink 必须先查（它们在 lookup 里被 normalize 成目录/文件，readlink 目标
