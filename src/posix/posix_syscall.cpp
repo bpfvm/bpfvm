@@ -224,7 +224,7 @@ void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h) {
     // 所有 fd 销毁路径（do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
     // pty master fd（master_token() 非空）且是最后一个引用（use_count()==1，即只剩 h 持有，
     // erase 析构后归零）时，向 ctty 前台组投 SIGHUP（对齐 Linux pty_close → tty_vhangup）。
-    // ProcFd::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
+    // ProcFile/ProcDir::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
     auto mt = h->master_token();
     if(mt && mt.use_count() == 1) {
         deliver_to_ctty_fg(v, h->tty().get(), SIGHUP);

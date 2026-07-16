@@ -1,5 +1,5 @@
 /* open(/proc/self/exe) 应穿透符号链接，读到真实 ELF 文件内容（防回归）。
- * ProcLink 节点曾只服务 readlink/statx，open 返回空 ProcFd，read 立即 EOF，
+ * 旧实现里 /proc 符号链接节点只服务 readlink/statx，open 返回空内容的 /proc fd，read 立即 EOF，
  * 导致依赖 open("/proc/self/exe") re-exec 的 multi-call 二进制（如 busybox）命令查找失败。 */
 #include <stdio.h>
 #include <string.h>

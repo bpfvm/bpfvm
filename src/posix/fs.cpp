@@ -2,15 +2,16 @@
 // fs.cpp — Fd / Path 多态层次的实现。
 //
 // 两部分：
-//   1) HostFd / DevFd / ProcFd 的 I/O 虚方法 + DevFd::open 工厂：
-//      把"host fd 直通"与"/proc 虚拟文件"两种 fd 的 I/O 动作各自封装——HostFd 调 host libc
-//      同名函数（EINTR 时返回 -EINTR，syscall 层转 SYSCALL_RESTART）；ProcFd 从 ProcInstance
-//      快照切片或返回 -EROFS（/proc 只读）。syscall 入口（do_read 等）只做指针翻译和 EINTR
+//   1) HostFd / DevFd 的 I/O 虚方法 + DevFd::open 工厂：
+//      把"host fd 直通"的 I/O 动作封装——HostFd 调 host libc
+//      同名函数（EINTR 时返回 -EINTR，syscall 层转 SYSCALL_RESTART）。
+//      syscall 入口（do_read 等）只做指针翻译和 EINTR
 //      处理，通过虚分派选择实现，不再判 is_proc()。
+//      （/proc 虚拟文件 fd——ProcFile/ProcDir——实现在 procfs.cpp。）
 //   2) Path 多态层次：ResolvePath 工厂 + HostPath/DevPath（按 guest 路径前缀 /proc|/dev|其它
 //      分类）。调用方（do_openat/do_statx/...）统一模式：
 //        ResolvePath(this, guest_abs_path(path, dirfd))->方法(...);
-//      ProcPath 实现在 procfs.cpp（复用本编译单元外不暴露的 lookup/magic_readlink）。
+//      ProcPath 实现在 procfs.cpp（复用本编译单元外不暴露的 lookup）。
 //
 
 #include "posix_internal.h"
@@ -71,16 +72,38 @@ ssize_t HostFd::writev(const struct iovec* iov, int iovcnt) {
     return rc;
 }
 
-ssize_t HostFd::getdents64(void* buf, size_t count, PosixSyscall* /*self*/) {
+ssize_t HostFd::getdents64(void* buf, size_t count) {
     int rc = (int)::syscall(SYS_getdents64, fd_, buf, (int)count);
     if(rc < 0) return -errno;
     return rc;
 }
 
+int HostFd::fstatx(struct statx* stx, unsigned int mask, int /*flags*/) {
+    // fstat 语义：始终 AT_EMPTY_PATH + 空 path，对 fd 自身的 inode 取属性（与内核
+    // fstat(fd) == statx(fd,"",AT_EMPTY_PATH) 等价）。flags 参数（如 AT_SYMLINK_NOFOLLOW）
+    // 对 fd 形式无意义——fd 已是 follow 后的结果，不可能是符号链接本身。
+#if defined(__ANDROID__)
+    int rc = (int)::syscall(SYS_statx, fd_, "", AT_EMPTY_PATH, mask, stx);
+#else
+    int rc = ::statx(fd_, "", AT_EMPTY_PATH, mask, stx);
+#endif
+    return rc == -1 ? -errno : 0;
+}
+
 int HostFd::ftruncate(off_t len) {
     int rc = ::ftruncate(fd_, len);
-    if(rc == -1) return -errno;
-    return 0;
+    return rc == -1 ? -errno : 0;
+}
+
+int HostFd::fchmod(mode_t mode) {
+    int rc = ::fchmod(fd_, mode);
+    return rc == -1 ? -errno : 0;
+}
+
+int HostFd::futimens(const struct timespec times[2], int /*flags*/) {
+    // AT_SYMLINK_NOFOLLOW 对 fd 形式无意义（fd 不可能是符号链接本身），host futimens 无 flags 参数。
+    int rc = ::futimens(fd_, times);
+    return rc == -1 ? -errno : 0;
 }
 
 std::shared_ptr<Fd> HostFd::clone() const {
@@ -109,92 +132,6 @@ std::shared_ptr<Fd> DevFd::clone() const {
     int new_fd = ::dup(fd_);
     if(new_fd < 0) return nullptr;
     return std::make_shared<DevFd>(new_fd, path, tty_, master_token_);
-}
-
-// =====================================================================
-// ProcFd —— 虚拟 /proc 文件（fd=-1，无 host fd）
-// =====================================================================
-
-ssize_t ProcFd::read(void* buf, size_t count) {
-    return instance->read(buf, count);
-}
-
-ssize_t ProcFd::write(const void* /*buf*/, size_t /*count*/) {
-    return -EROFS;  // /proc 只读
-}
-
-ssize_t ProcFd::pread(void* buf, size_t count, off_t off) {
-    // 按 off 读取快照（不推进 pos，与 pread 语义一致）。
-    if(off < 0) return -EINVAL;
-    const std::string& data = instance->data;
-    if((size_t)off >= data.size()) return 0;
-    size_t avail = data.size() - (size_t)off;
-    size_t n = count < avail ? count : avail;
-    memcpy(buf, data.data() + off, n);
-    return (ssize_t)n;
-}
-
-off_t ProcFd::lseek(off_t off, int whence) {
-    return instance->lseek(off, whence);
-}
-
-ssize_t ProcFd::readv(const struct iovec* iov, int iovcnt) {
-    // 按 iovec 顺序从快照切片填充（与 readv 语义一致）。
-    ssize_t total = 0;
-    for(int i = 0; i < iovcnt; ++i) {
-        size_t len = iov[i].iov_len;
-        if(len == 0) continue;
-        ssize_t rc = instance->read(iov[i].iov_base, len);
-        if(rc <= 0) break;
-        total += rc;
-        if((size_t)rc < len) break;  // EOF 或短读
-    }
-    return total;
-}
-
-ssize_t ProcFd::getdents64(void* buf, size_t count, PosixSyscall* self) {
-    // 用 instance->pos 作目录列举游标（条目索引）。重复调用从 pos 继续，耗尽返回 0。
-    auto entries = node->list(self);
-    size_t idx = (size_t)instance->pos;
-    // linux_dirent64 布局（host/guest UAPI 二进制兼容）：{u64 d_ino; s64 d_off;
-    // u16 d_reclen; u8 d_type; char d_name[];}。d_off 是 telldir cookie——指向"本条目
-    // 之后下一项的位置"。本虚拟目录用条目索引（idx+1）作 cookie，语义自洽：lseek 回到
-    // 某 d_off 即跳到对应条目继续列举（与用 pos 做游标一致），不依赖缓冲区内字节偏移。
-    struct linux_dirent64 {
-        uint64_t d_ino;
-        int64_t  d_off;
-        uint16_t d_reclen;
-        uint8_t  d_type;
-        char     d_name[];
-    };
-    char* cbuf = (char*)buf;
-    size_t bufpos = 0;
-    for(; idx < entries.size(); idx++) {
-        size_t namelen = entries[idx].first.size();
-        size_t reclen = (24 + namelen + 1 + 7) & ~(size_t)7;
-        if(bufpos + reclen > count) break;  // 缓冲区满，下次继续
-        auto* de = (linux_dirent64*)(cbuf + bufpos);
-        de->d_ino = 1 + idx;
-        de->d_off = (off_t)(idx + 1);  // telldir cookie = 下一项的条目索引
-        de->d_reclen = (uint16_t)reclen;
-        de->d_type = entries[idx].second;
-        memcpy(de->d_name, entries[idx].first.c_str(), namelen);
-        de->d_name[namelen] = '\0';
-        bufpos += reclen;
-    }
-    instance->pos = (off_t)idx;  // 推进游标
-    return (ssize_t)bufpos;      // 0 = EOF（全部读完）
-}
-
-int ProcFd::ftruncate(off_t /*len*/) {
-    return -EINVAL;  // 虚拟 /proc 不可截断
-}
-
-std::shared_ptr<Fd> ProcFd::clone() const {
-    // 复制快照得独立 instance（pos 从 0 起，与 host dup 一致：两 fd 独立 seek 但内容相同）。
-    auto new_inst = std::make_shared<ProcInstance>();
-    new_inst->data = instance->data;
-    return std::make_shared<ProcFd>(node, new_inst, path);
 }
 
 // =====================================================================
@@ -296,8 +233,6 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
     return nullptr;
 }
 
-// ProcFd::open 的实现在 procfs.cpp（与 lookup 路径分发同处一个编译单元）。
-
 // =====================================================================
 // Path 多态层次：ResolvePath 工厂 + HostPath/DevPath。
 // ProcPath 实现在 procfs.cpp。
@@ -342,11 +277,11 @@ ssize_t HostPath::readlink(char* buf, size_t bufsiz) {
     return rc < 0 ? -errno : rc;
 }
 
-int HostPath::statx(struct statx& stx, unsigned int mask, int flags) {
+int HostPath::statx(struct statx* stx, unsigned int mask, int flags) {
 #if defined(__ANDROID__)
-    int rc = (int)::syscall(SYS_statx, AT_FDCWD, host.c_str(), flags, mask, &stx);
+    int rc = (int)::syscall(SYS_statx, AT_FDCWD, host.c_str(), flags, mask, stx);
 #else
-    int rc = ::statx(AT_FDCWD, host.c_str(), flags, mask, &stx);
+    int rc = ::statx(AT_FDCWD, host.c_str(), flags, mask, stx);
 #endif
     return rc == -1 ? -errno : 0;
 }

@@ -1,7 +1,7 @@
 #ifndef POSIX_SYSCALL_H__
 #define POSIX_SYSCALL_H__
 #include "insn.h"
-#include "posix/fs.h"   // Fd/Path 多态层次及 ProcNode/GuestTty/PtySide 等（实现见 fs.cpp/procfs.cpp）
+#include "posix/fs.h"   // Fd/Path 多态层次及 GuestTty/PtySide 等（实现见 fs.cpp/procfs.cpp）
 
 #include <unordered_map>
 #include <array>
@@ -145,7 +145,7 @@ class PosixSyscall: public SyscallHandler{
     // 销毁一个 Fd 前的 master SIGHUP 处理：若是 pty master 端且是最后一个引用
     // （master_token().use_count()==1），向 ctty 前台组投 SIGHUP。所有 fd 销毁路径
     // （do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
-    // ProcFd::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
+    // ProcFile/ProcDir::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
     void drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h);
 
 public:

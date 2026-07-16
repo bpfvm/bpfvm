@@ -10,7 +10,7 @@
 //     SIG_DFL     → 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
 //     已 catch    → handler 返回后被中断的系统调用返回 -1/EINTR
 // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
-// ProcFd::tty() 返回 nullptr，第一行短路 → 对虚拟 /proc fd 永远放行（无后台门控）。
+// ProcFile/ProcDir::tty() 返回 nullptr，第一行短路 → 对虚拟 /proc fd 永远放行（无后台门控）。
 std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read) {
     const auto tty = fd->tty();
     if(!tty || !session || session->ctty.get() != tty.get()) return std::nullopt;
@@ -70,14 +70,14 @@ int64_t PosixSyscall::do_read(vm* v) {
         return -EBADF;
     }
     if(auto r = tty_bg_check(v, it->second, /*is_read=*/true)) {
-        return *r;  // 后台读 ctty：tty_bg_check 已投 SIGTTIN 并定好结果（ProcFd 自动放行）
+        return *r;  // 后台读 ctty：tty_bg_check 已投 SIGTTIN 并定好结果（/proc fd 自动放行）
     }
     size_t count = arg_size(v->r(3));
     void* buf = v->mmu_w(v->r(2), count);
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->read(buf, count);  // 虚分派：HostFd::read / ProcFd::read
+    ssize_t rc = it->second->read(buf, count);  // 虚分派：HostFd::read / ProcFile::read
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -97,7 +97,7 @@ int64_t PosixSyscall::do_write(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->write(buf, count);  // HostFd::write / ProcFd::write(-EROFS)
+    ssize_t rc = it->second->write(buf, count);  // HostFd::write / ProcFile/ProcDir::write(-EROFS)
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -109,11 +109,7 @@ int64_t PosixSyscall::do_lseek(vm* v) {
     if(it == ps->fds.end()) {
         return -EBADF;
     }
-    off_t rc = it->second->lseek((off_t)v->r(2), arg_s32(v->r(3)));
-    if(rc < 0) {
-        return rc;  // 负 errno（HostFd::lseek 或 ProcFd::lseek 返回 -errno/-EINVAL）
-    }
-    return rc;
+    return it->second->lseek((off_t)v->r(2), arg_s32(v->r(3)));
 }
 
 int64_t PosixSyscall::do_truncate(vm* v) {
@@ -121,8 +117,7 @@ int64_t PosixSyscall::do_truncate(vm* v) {
     if(!read_c_string(v, v->r(1), path, 4096)) {
         return -EFAULT;
     }
-    return ResolvePath(this, guest_abs_path(path))
-        ->truncate(static_cast<off_t>(v->r(2)));
+    return ResolvePath(this, guest_abs_path(path))->truncate(static_cast<off_t>(v->r(2)));
 }
 
 int64_t PosixSyscall::do_ftruncate(vm* v) {
@@ -130,11 +125,7 @@ int64_t PosixSyscall::do_ftruncate(vm* v) {
     if(it == ps->fds.end()) {
         return -EBADF;
     }
-    int rc = it->second->ftruncate(static_cast<off_t>(v->r(2)));
-    if(rc < 0) {
-        return rc;  // 负 errno（HostFd）或 -EINVAL（ProcFd）
-    }
-    return 0;
+    return it->second->ftruncate(static_cast<off_t>(v->r(2)));
 }
 
 int64_t PosixSyscall::do_close(vm* v) {
@@ -142,7 +133,7 @@ int64_t PosixSyscall::do_close(vm* v) {
     if(it == ps->fds.end()) {
         return -EBADF;
     }
-    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFd 的 on_close 为 no-op）
+    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFile/ProcDir 的 on_close 为 no-op）
     drop_fd_handle(v, it->second);
     ps->fds.erase(it);
     return 0;
@@ -177,7 +168,7 @@ int64_t PosixSyscall::do_readv(vm* v) {
         return -EBADF;
     }
     if(auto r = tty_bg_check(v, it->second, /*is_read=*/true)) {
-        return *r;  // 后台读 ctty：已投 SIGTTIN（ProcFd 自动放行）
+        return *r;  // 后台读 ctty：已投 SIGTTIN（/proc fd 自动放行）
     }
     int iovcnt = arg_s32(v->r(3));
     if(iovcnt <= 0) {
@@ -270,9 +261,5 @@ int64_t PosixSyscall::do_getdents64(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->getdents64(buf, count, this);  // HostFd 透传 / ProcFd 填充虚拟条目
-    if(rc < 0) {
-        return rc;
-    }
-    return rc;
+    return it->second->getdents64(buf, count);  // HostFd 透传 / ProcDir 填充虚拟条目
 }

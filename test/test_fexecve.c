@@ -1,46 +1,78 @@
-/* fexecve() 回归测试 —— 验证优雅降级（不崩溃、不换 ABI 错位）。
+/* fexecve() 回归测试。
  *
- * musl 的 fexecve 先试 SYS_execveat(fd,"",argv,envp,AT_EMPTY_PATH)。VM 实现了
- * execveat 的常规路径，但 AT_EMPTY_PATH（fd→文件）依赖尚未实现的 /proc/self/fd/<n>
- * 语义，故返回 ENOSYS。musl 收到 ENOSYS 回退到 execve("/proc/self/fd/<n>")——该路径
- * 同样待 /proc/self/fd 实现后打通，当前会失败。故 fexecve 最终返 -1 且 errno 被设置。
+ * musl 的 fexecve 先试 SYS_execveat(fd,"",argv,envp,AT_EMPTY_PATH)。VM 现已实现
+ * AT_EMPTY_PATH：经 fd->path（打开时存的 guest 绝对路径）+ ResolvePath(...)->follow()
+ * 穿透 /proc/self/exe 等 /proc 符号链接到真实可加载文件，加载 ELF 替换地址空间。不再依赖
+ * /proc/self/fd，也不再返回 ENOSYS。
  *
- * 本测试验证关键点：fexecve【不崩溃、不把 fd 当 path 读导致段错误】，返 -1 且 errno 被设置。
- * 旧行为（execveat 错配到 EXECVE handler）会把 fd 当 path 读，导致段错误或乱 exec。
- * 待 /proc/self/fd 实现后，本测试应改为验证成功替换映像。
+ * 两个用例：
+ *   1) 成功路径：fexecve 一个指向自身 ELF 的 fd（经 /proc/self/exe 取真实 ELF 路径）。
+ *      re-exec 后的新映像由哨兵 env（FEXECVE_REEXEC=1）识别，打印 ok 并 exit 0。
+ *      覆盖 AT_EMPTY_PATH 实现 + /proc/self/exe follow + 映像替换 + argv/envp 传递。
+ *   2) 优雅降级：fexecve 一个目录 fd（open(".")），目录非 ELF，execveat 返 -ENOEXEC，
+ *      fexecve 不替换映像、返 -1 且 errno 被设置。验证关键点：fexecve
+ *      【不崩溃、不把 fd 当 path 读导致段错误】。旧行为（execveat 错配到 EXECVE handler）
+ *      会把 fd 当 path 读，导致段错误或乱 exec。
  */
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+
+#define SENTINEL "FEXECVE_REEXEC=1"
 
 int main(void) {
-    /* 打开自身可执行文件，作为 fexecve 的 fd 参数。 */
-    int fd = open("/bin/test_fexecve", O_RDONLY);
-    if (fd < 0) {
-        /* rootfs 下路径可能不同，尝试用 argv 不依赖；这里只需一个有效 fd。
-         * open 失败本身不构成 fexecve 的验证失败，跳过：用一个必然无效的 fd。 */
-        fd = open(".", O_RDONLY);
-        if (fd < 0) {
-            printf("cannot open any file for fexecve test, skip\n");
-            return 0;
-        }
+    /* re-exec 后的新映像：哨兵 env 已设，说明用例 1 的 fexecve 成功替换了映像。
+     * 校验 argv[0] 与新 env 都已正确传递，打印 ok 退出。 */
+    if (getenv("FEXECVE_REEXEC")) {
+        printf("ok\n");
+        return 0;
     }
 
+    /* —— 用例 1：成功路径 —— */
+    /* /proc/self/exe 是 magic symlink → 真实 ELF。ProcPath::open 会 follow 到真实 ELF
+     * 路径并 open，得到的 HostFd 的 path 字段即真实 guest 绝对路径——这正是 do_execveat
+     * 的 AT_EMPTY_PATH 分支所读的 fd->path。 */
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        printf("FAIL: open /proc/self/exe: %s\n", strerror(errno));
+        return 1;
+    }
     char *argv[] = {"test_fexecve", NULL};
-    char *envp[] = {NULL};
+    /* 哨兵 env 让 re-exec 后的新映像能识别自己已被 fexecve 过。 */
+    char *envp[] = {SENTINEL, NULL};
     int r = fexecve(fd, argv, envp);
-    /* 到这里说明 fexecve 返回了（没替换进程映像）。当前 /proc/self/fd 未实现，
-     * 预期返 -1 且 errno 被设置（ENOSYS/ENOENT/EBADF 任一均可）。 */
-    if (r != -1) {
-        printf("fexecve returned %d, expected -1\n", r);
+    /* 走到这里说明 fexecve 失败（成功则映像已被替换，不会返回）。 */
+    printf("FAIL: fexecve(self exe) returned %d, expected not to return: %s\n",
+           r, strerror(errno));
+    close(fd);
+
+    /* —— 用例 2：优雅降级（目录 fd → ENOEXEC）—— */
+    /* open 一个目录 fd，目录非 ELF，load_elf 失败 → execveat 返 -ENOEXEC。
+     * 验证关键点：不崩溃、不把 fd 当 path 读导致段错误。 */
+    int dfd = open(".", O_RDONLY);
+    if (dfd < 0) {
+        printf("FAIL: open(.): %s\n", strerror(errno));
+        return 1;
+    }
+    char *dargv[] = {"test_fexecve", NULL};
+    char *denvp[] = {NULL};
+    int dr = fexecve(dfd, dargv, denvp);
+    if (dr != -1) {
+        printf("FAIL: fexecve(dir) returned %d, expected -1\n", dr);
+        close(dfd);
         return 1;
     }
     if (errno == 0) {
-        printf("fexecve returned -1 but errno is 0\n");
+        printf("FAIL: fexecve(dir) returned -1 but errno is 0\n");
+        close(dfd);
         return 1;
     }
-    printf("fexecve gracefully degraded: ret=%d errno=%d\n", r, errno);
-    return 0;
+    close(dfd);
+    printf("fexecve(dir) gracefully degraded: ret=%d errno=%d\n", dr, errno);
+
+    /* 用例 1 失败导致走到这里：整体失败。 */
+    return 1;
 }
