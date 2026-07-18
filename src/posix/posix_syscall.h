@@ -5,6 +5,7 @@
 
 #include <unordered_map>
 #include <array>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
@@ -12,6 +13,8 @@
 #include <unistd.h>
 #include <fcntl.h>   // AT_FDCWD（guest_abs_path/resolve_path 的 dirfd 默认值）
 
+// 信号队列扫描上限（handle_signals 单轮最多处理的信号数，防止极端情况下死循环）。
+// 原 MpscQueue 的固定容量；改 deque+锁后队列本身无界，此常量仅作单轮 drain 上限。
 #define BPF_SIGNAL_QUE_SIZE 1024
 
 // 会话（session）：setsid 创建，sid == leader->pid。
@@ -64,24 +67,39 @@ struct ThreadGroup {
     explicit ThreadGroup(uint64_t t) : tgid(t) {}
 };
 
-class MpscQueue {
-    struct slot {
-        std::atomic<uint64_t> seq;
-        int value = 0;
-    };
-    static constexpr size_t k_capacity = BPF_SIGNAL_QUE_SIZE;
-    static constexpr size_t k_mask = k_capacity - 1;
-    static_assert((k_capacity & (k_capacity - 1)) == 0, "k_capacity must be power of two");
-    std::array<slot, k_capacity> slots{};
-    std::atomic<uint64_t> head{0};
-    std::atomic<uint64_t> tail{0};
+// 信号事件：既作 queue_signal 的入参，也作 SignalQueue 的元素。携带 siginfo 投递所需的字段。
+//   sig     —— 信号号
+//   sender  —— 发送方 pid（0 = kernel/host，对齐 Linux si_pid 语义）。pid 在
+//              PosixSyscall 是 uint64_t，故此处用 uint64_t，免得调用方到处 cast。
+//   code    —— si_code：SI_USER（kill/raise）、SI_KERNEL（kernel/tty）、CLD_*（SIGCHLD）
+//   status  —— si_status：SIGCHLD 事件有效（CLD_EXITED=退出码、CLD_KILLED=信号号、
+//              CLD_STOPPED=停止信号号），其余场景为 0
+struct SigEvent {
+    int sig;
+    uint64_t sender;
+    int32_t code;
+    int32_t status;
+};
+
+// 信号队列：deque + 互斥锁。
+//
+// 容量上限 = BPF_SIGNAL_QUE_SIZE：push 满则丢弃（与原 MpscQueue 一致，
+// 防止信号风暴下 deque 无限增长 OOM）。实现见 signal_queue.cpp。
+class SignalQueue {
+    std::deque<SigEvent> q_;
+    std::mutex mtx_;
 public:
-    MpscQueue();
-    bool try_push(int value);
-    bool try_pop(int& value);
-    bool empty() const {
-        return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
-    }
+    // 入队。满（size >= BPF_SIGNAL_QUE_SIZE）则丢弃，返回 false。调用方据此决定
+    // 是否置 flag / wakeup（丢弃的信号不影响 VM_SIGNAL_PENDING 状态）。
+    bool push(SigEvent v);
+    // 出队。空则返回 false。
+    bool pop(SigEvent& v);
+    // 是否为空。供 waitpid/do_sigprocmask 等只需 peek 的调用方使用。
+    bool empty();
+    // 给 handle_signals 用：暴露锁让 drain + flag 维护原子化。
+    // 调用方必须持 mtx() 后再访问 raw()。
+    std::mutex& mtx() { return mtx_; }
+    std::deque<SigEvent>& raw() { return q_; }
 };
 
 #ifndef NSIG
@@ -121,7 +139,7 @@ class PosixSyscall: public SyscallHandler{
     // 仅在 handle_signals 投递端过滤；queue_signal 无条件入队，被阻塞的信号留在
     // pending_signals 里，解锁后 safepoint 重扫时自然投出（实时信号统一模型）。
     std::atomic<uint64_t> sigmask{0};
-    MpscQueue pending_signals;
+    SignalQueue pending_signals;
     // set_tid_address / CLONE_CHILD_CLEARTID 设置；线程退出时清零并 futex_wake。
     uint64_t tid_address_ = 0;
 
@@ -130,8 +148,8 @@ class PosixSyscall: public SyscallHandler{
     // 也不会打断阻塞中的系统调用（对齐 Linux：get_signal 不让 Ign/Cont 信号产生 EINTR）。
     // SIGKILL/SIGSTOP 调用方已特判，不会进入此函数。
     bool signal_ignorable(int sig);
-    // 把信号投给指定 vm 的内部接口
-    void queue_signal(vm* v, int sig);
+    // 把信号投给指定 vm 的内部接口。
+    void queue_signal(vm* v, const SigEvent& ev);
     // 停止整个线程组（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）：设 tg 级停止状态 + 组内每线程
     // VM_STOPPED + 给父进程投一次 SIGCHLD（去重）。stop 是进程级，整组一致
     void stop_process(int sig);
@@ -296,6 +314,7 @@ public:
     int64_t do_epoll_create1(vm* v);
     int64_t do_epoll_ctl(vm* v);
     int64_t do_epoll_pwait(vm* v);
+    int64_t do_signalfd4(vm* v);
 };
 
 #endif

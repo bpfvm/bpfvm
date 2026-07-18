@@ -1,15 +1,41 @@
 #include "posix_internal.h"
 
+#include <sys/signalfd.h>   // host 侧 signalfd_siginfo 布局（与 guest 一致：128 字节）
+
 void PosixSyscall::notify_parent_sigchld() {
-    // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm（leader），sys() downcast 后调其
-    // queue_signal(SIGCHLD)。父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
+    // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
+    // 父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
     // （测试，sys() 返 nullptr）、或正常 PosixSyscall。前两者降级 no-op。
     // ppid 进程级（在 tg）：从 tg->ppid 取本进程的父 pid。
     uint64_t parent_pid = tg->ppid.load();
     if(parent_pid == 0) return;  // pid 1 无父（init）
     auto parent_vm = find_task(parent_pid);
     if(!parent_vm) return;
-    if(auto ps = sys(parent_vm.get())) ps->queue_signal(parent_vm.get(), SIGCHLD);
+
+    // SIGCHLD 的 si_code/si_status 取决于子进程状态（对齐 Linux）：
+    //   stopped —— CLD_STOPPED，status = stop_sig
+    //   否则按 exit_code：<128 = CLD_EXITED + 退出码；>=128 = CLD_KILLED + 信号号
+    // （bpfvm 不区分 core dump，故无 CLD_DUMPED。）exit_code 的 -1 兜底（last 线程
+    // 在 posix_syscall.cpp fini 里 CAS 成 128+9）保证退出路径总有合法值。
+    int32_t code;
+    int32_t status;
+    if(tg->stopped.load(std::memory_order_acquire)) {
+        code = CLD_STOPPED;
+        status = tg->stop_sig.load(std::memory_order_acquire);
+    } else {
+        int ec = tg->exit_code.load(std::memory_order_acquire);
+        if(ec >= 128) {
+            code = CLD_KILLED;
+            status = ec - 128;   // 原始信号号
+        } else {
+            code = CLD_EXITED;
+            status = ec;         // 原始退出码
+        }
+    }
+    // sender = 本子进程的 pid（wait4 的 siginfo.si_pid 据此报告是谁退出/停止）。
+    if(auto ps = sys(parent_vm.get())) {
+        ps->queue_signal(parent_vm.get(), {SIGCHLD, pid, code, status});
+    }
 }
 
 void PosixSyscall::stop_process(int sig) {
@@ -76,19 +102,31 @@ bool PosixSyscall::signal_ignorable(int sig) {
     return !is_default_term(sig) && !is_default_stop(sig);
 }
 
-void PosixSyscall::queue_signal(vm* v, int sig) {
+void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
+    // 分类处理：不同信号走不同路径。SIGSTOP/SIGCONT/未阻塞 ignorable 自己 return
+    // （不打断 host syscall）；SIGKILL/普通信号/被阻塞 ignorable 走到末尾的
+    // pthread_kill(SIGUSR1) 把目标线程正阻塞的 host syscall 踢成 EINTR。
+    int sig = ev.sig;
     bool stop_dfl = is_default_stop(sig) &&
                     handler_is_default(ps->signal_actions[static_cast<size_t>(sig)].handler);
+    // 是否需要入队 pending_signals。SIGKILL 直接置 VM_KILLED 不入队；SIGSTOP/SIGCONT/
+    // 未阻塞 ignorable 自己 return；普通信号 + 被阻塞 ignorable 需要入队。
+    bool enqueue = true;
+
     if(sig == SIGKILL) {
+        // SIGKILL 不入队：直接置 VM_KILLED，VM 在下个 safepoint 退出。落到末尾的
+        // pthread_kill 把目标线程正阻塞的 host syscall（nanosleep/read/...）踢成
+        // EINTR，让它回 safepoint 看到 VM_KILLED 退出（exit_group_race #7 检测此机制）。
         flags(v).fetch_or(vm::VM_KILLED, std::memory_order_release);
         v->wakeup(false);
+        enqueue = false;
     } else if(sig == SIGSTOP || stop_dfl) {
         stop_process(sig);
-        return;              // STOP 不踢 host syscall
+        return;              // STOP 不踢 host syscall（stop_process 自己 wakeup）
     } else if(sig == SIGCONT) {
-        // 恢复整个线程组：清 tg 停止状态 + 组内每线程清 VM_STOPPED + wakeup(true) 让 safepoint
-        // 的 cond_wait 返回。stop_sig 不清（waitpid 已消费或不再查询；下次停止会覆盖）。
-        // 本次不投 SIGCHLD(CLD_CONTINUED) / 不报告 WIFCONTINUED（范围控制）。
+        // 恢复整个线程组：清 tg 停止状态 + 组内每线程清 VM_STOPPED + wakeup(false) 让
+        // safepoint 的 cond_wait 返回。stop_sig 不清（waitpid 已消费或不再查询；下次
+        // 停止会覆盖）。不投 SIGCHLD(CLD_CONTINUED) / 不报告 WIFCONTINUED（范围控制）。
         tg->stopped.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(tg->mtx);
@@ -103,17 +141,46 @@ void PosixSyscall::queue_signal(vm* v, int sig) {
         }
         return;
     } else if(signal_ignorable(sig)) {
-        return;
-    } else if(pending_signals.try_push(sig)) {
-        // Best-effort: drop if the queue is full to avoid blocking the VM thread.
-        flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
-        // 排队信号也要 wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1
-        // 无法可靠打断 pthread_cond_wait（glibc 内部重试 EINTR）
-        v->wakeup(false);
-    } else {
-        return; // 队列满：丢弃信号，不处理
+        uint64_t bit = (sig >= 1 && sig < NSIG) ? (1ULL << (sig - 1)) : 0;
+        bool blocked = bit && (sigmask.load(std::memory_order_relaxed) & bit);
+        if(!blocked) {
+            return;   // 未阻塞：ignorable 直接丢弃，不打断 syscall
+        }
+        // 被阻塞：保留 enqueue=true，落入下面的入队路径（供 signalfd 消费）
     }
-    if (tid != 0) {
+
+    if(enqueue) {
+        // push + 置 flag 在同一把锁内，与 handle_signals 的 clear 形成原子对应：
+        // 要么本线程的 fetch_or 在 handle_signals 的 fetch_and 之前（handle_signals
+        // 看到 non-empty 不清 flag），要么在之后（fetch_and 已完成，本线程置位）。
+        //
+        // 直接操作 raw() 而非调 push()：本块已持 mtx()，再调 push() 会重复加锁死锁
+        // （std::mutex 不可重入）。容量检查在此处内联，与 push() 的实现保持一致。
+        // push 满则丢弃（容量 BPF_SIGNAL_QUE_SIZE）：丢弃的信号不置 flag、不 wakeup，
+        // best-effort（对齐 Linux 信号队列满语义）。
+        bool pushed;
+        {
+            std::lock_guard<std::mutex> lk(pending_signals.mtx());
+            if(pending_signals.raw().size() >= BPF_SIGNAL_QUE_SIZE) {
+                pushed = false;
+            } else {
+                pending_signals.raw().push_back(ev);
+                pushed = true;
+                flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_relaxed);
+            }
+        }
+        if(!pushed) {
+            return;   // 队列满：丢弃信号，不处理
+        }
+        // wakeup 在队列锁外：锁序约定 pending_signals.mtx() → vm::wait_mutex，
+        // wakeup 内部拿 wait_mutex，持锁调用会反序。
+        // wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1 无法可靠打断
+        // pthread_cond_wait（glibc 内部重试 EINTR），靠 broadcast 唤醒。
+        v->wakeup(false);
+    }
+    // 收尾：踢 SIGUSR1 把目标线程正阻塞的 host syscall 踢成 EINTR，让它回 safepoint
+    // 处理（SIGKILL 看 VM_KILLED；普通/pending 信号 handle_signals 投递）。
+    if(tid != 0) {
         pthread_kill(tid, SIGUSR1);
     }
 }
@@ -123,54 +190,80 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     // 的信号暂存到 deferred（函数末尾回挂队列，保持 FIFO），找到第一个未阻塞的即投递。
     // 队列空 / 全部被阻塞 → 收尾：阻塞信号留在队里，VM_SIGNAL_PENDING 保留，待
     // sigprocmask 解锁后 safepoint 重扫时投出。
+    //
+    // signalfd 分流：被阻塞的信号若被某 signalfd 监听，则送进 pipe、不入 deferred
+    // （视为已消费）。对齐 Linux：signalfd 只消费"本来要走默认/handler 路径"的信号——
+    // 用户用 signalfd 时必须先 sigprocmask 阻塞目标信号，故分流点必在被阻塞分支。
+    // 未阻塞信号不送 signalfd（直接 handler/默认动作），与 Linux 一致。
     const uint64_t blocked = sigmask.load(std::memory_order_relaxed);
-    int sig = 0;
-    int deferred[BPF_SIGNAL_QUE_SIZE];
-    size_t deferred_count = 0;
-    // 扫描上限 = 队列容量，避免极端情况下死循环（理论上每轮最多 pop k_capacity 个）。
-    for(size_t i = 0; i < BPF_SIGNAL_QUE_SIZE; i++) {
-        int s;
-        if(!pending_signals.try_pop(s)) {
-            break;  // 队列空
-        }
-        uint64_t bit = (s >= 1 && s < NSIG) ? (1ULL << (s - 1)) : 0;
-        if(bit && (blocked & bit)) {
-            deferred[deferred_count++] = s;
-            continue;
-        }
-        sig = s;
-        break;
-    }
-    // 重新入队被阻塞的信号（保持入队先后顺序）。
-    for(size_t i = 0; i < deferred_count; i++) {
-        pending_signals.try_push(deferred[i]);
-    }
-    if(sig == 0) {
-        // 没找到可投信号。若队列仍非空（全被阻塞）→ 保留 VM_SIGNAL_PENDING 等解锁；
-        // 若队列空 → 清 VM_SIGNAL_PENDING，并 seq_cst fence 后复检关闭与并发
-        // queue_signal 的丢失窗口（push 发生在 clear 前→复检抓到；后→queue_signal 已置位）。
-        if(deferred_count > 0) {
-            return true;  // 队列里只剩阻塞信号
-        }
-        flags(v).fetch_and(~vm::VM_SIGNAL_PENDING, std::memory_order_seq_cst);
-        int recheck;
-        if(pending_signals.try_pop(recheck)) {
-            // 复检抓到一个 push：要么被阻塞（回挂、留 flag），要么可投（投它）。
-            uint64_t bit = (recheck >= 1 && recheck < NSIG) ? (1ULL << (recheck - 1)) : 0;
-            if(bit && (blocked & bit)) {
-                pending_signals.try_push(recheck);
-                return true;
+
+    SigEvent chosen{};          // 选中的待投递事件（sig==0 表示无）
+    uint64_t handler = 0;
+    int sig_action_flags = 0;
+    std::vector<SignalFd*> signalfds;
+    bool has_filled_signalfd = false;
+    std::vector<SigEvent> deferred;   // 锁内收集的阻塞信号，锁内原样回挂
+
+    {
+        std::lock_guard<std::mutex> lk(pending_signals.mtx());
+        // 扫描上限 = 队列容量，避免极端情况下死循环（理论上每轮最多处理这么多）。
+        for(size_t i = 0; i < BPF_SIGNAL_QUE_SIZE; i++) {
+            if(pending_signals.raw().empty()) {
+                break;  // 队列空
             }
-            sig = recheck;
-        } else {
-            return true;
+            SigEvent e = pending_signals.raw().front();
+            pending_signals.raw().pop_front();
+            uint64_t bit = (e.sig >= 1 && e.sig < NSIG) ? (1ULL << (e.sig - 1)) : 0;
+            if(bit && (blocked & bit)) {
+                // 被阻塞：先试 signalfd（仅当存在），命中即消费；否则暂存 deferred 回挂队列。
+                if(!has_filled_signalfd) {
+                    for(const auto& kv : ps->fds) {
+                        if(auto* sfd = dynamic_cast<SignalFd*>(kv.second.get())) {
+                            signalfds.push_back(sfd);
+                        }
+                    }
+                    has_filled_signalfd = true;
+                }
+                bool consumed = false;
+                for(SignalFd* sfd : signalfds) {
+                    // 第一个 mask 匹配的 signalfd 就投它一个（与 Linux 一致——信号在 task 队列里只一份，
+                    // 多个 signalfd 读同一队列，先到先得）。code/status/sender 透传给 signalfd_siginfo。
+                    if(sfd->deliver(e)) {
+                        consumed = true;
+                        break;
+                    }
+                }
+                if(consumed) {
+                    continue;
+                }
+                deferred.push_back(e);
+                continue;
+            }
+            chosen = e;
+            break;
+        }
+        // 重新入队被阻塞的信号（保持入队先后顺序）。
+        for(const auto& d : deferred) {
+            pending_signals.raw().push_back(d);
+        }
+        // flag 维护（锁内）：只有当队列空 且 本轮未投递信号时，才清 VM_SIGNAL_PENDING。
+        if(chosen.sig == 0 && deferred.empty() && pending_signals.raw().empty()) {
+            flags(v).fetch_and(~vm::VM_SIGNAL_PENDING, std::memory_order_relaxed);
+        }
+        // 预读 handler（锁内读 signal_actions，与 fork/clone 的 make_shared 拷贝路径隔离）
+        if(chosen.sig > 0 && chosen.sig < NSIG) {
+            const auto& act = ps->signal_actions[static_cast<size_t>(chosen.sig)];
+            handler = act.handler;
+            sig_action_flags = act.flags;
         }
     }
+    // 当前 handler 只传 sig（r1），未走 SA_SIGINFO，故 chosen.code/status/sender 未使用；
+    // 保留在 chosen 里供未来 SA_SIGINFO 投递填 siginfo.si_code/si_status/si_pid 用。
+    int sig = chosen.sig;
+    (void)chosen.sender; (void)chosen.code; (void)chosen.status;
     if(sig <= 0 || sig >= NSIG) {
         return true;
     }
-    const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
-    uint64_t handler = act.handler;
     if(options(v).verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
@@ -204,7 +297,7 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     // 同时带回 sa_flags：投递信号的 SA_RESTART 位用于 ERESTARTSYS 重启判定。
     info->sig = sig;
     info->handler = handler;
-    info->sa_flags = static_cast<uint64_t>(act.flags);
+    info->sa_flags = static_cast<uint64_t>(sig_action_flags);
     return true;
 }
 
@@ -267,7 +360,8 @@ int64_t PosixSyscall::do_kill(vm* v) {
     }
 
     for(auto& t : targets) {
-        if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
+        // kill/tgkill 来源：SI_USER（用户态发起），si_status=0。
+        if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, pid, SI_USER, 0});
     }
     return 0;
 }
@@ -285,7 +379,7 @@ int64_t PosixSyscall::do_tkill(vm* v) {
     if(sig == 0) {
         return 0;
     }
-    if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), sig);
+    if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0});
     return 0;
 }
 
@@ -307,7 +401,7 @@ int64_t PosixSyscall::do_tgkill(vm* v) {
     if(sig == 0) {
         return 0;
     }
-    target->queue_signal(target_vm.get(), sig);
+    target->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0});
     return 0;
 }
 
@@ -466,4 +560,106 @@ int64_t PosixSyscall::do_siglongjmp(vm* v) {
     }
 
     return (val == 0) ? 1 : val;
+}
+
+// 把 guest sigset_t 指针解析成 host uint64_t mask（仅低 8 字节有效），按 NSIG 截断。
+// 返回 false 表示指针翻译失败（调用方返回 -EFAULT）。
+static bool parse_guest_sigset(vm* v, uint64_t set_addr, uint64_t& out_mask) {
+    if(set_addr == 0) {
+        out_mask = 0;
+        return true;
+    }
+    // 与 do_sigprocmask 一致：读低 8 字节，按 NSIG 截断。
+    auto* set_ptr = static_cast<const uint64_t*>(v->mmu(set_addr, sizeof(uint64_t)));
+    if(set_ptr == nullptr) {
+        return false;
+    }
+    uint64_t bits = *set_ptr;
+    constexpr uint64_t valid = (NSIG < 64) ? ((1ULL << (NSIG - 1)) - 1) : ~0ULL;
+    out_mask = bits & valid;
+    return true;
+}
+
+int64_t PosixSyscall::do_signalfd4(vm* v) {
+    // ABI: r1=fd, r2=sigset*, r3=sigsetsize, r4=flags（musl signalfd() 透传）
+    int fd = arg_s32(v->r(1));
+    uint64_t set_addr = v->r(2);
+    // r3 = sigsetsize（musl 传 _NSIG/8=8）。本 host 固定按 8 字节解析，忽略 size 校验。
+    int flags = arg_s32(v->r(4));
+
+    // 仅允许 SFD_CLOEXEC (=O_CLOEXEC) 与 SFD_NONBLOCK (=O_NONBLOCK)。
+    if((flags & ~(SFD_CLOEXEC | SFD_NONBLOCK)) != 0) {
+        return -EINVAL;
+    }
+
+    uint64_t mask;
+    if(!parse_guest_sigset(v, set_addr, mask)) {
+        return -EFAULT;
+    }
+
+    if(fd < 0) {
+        // —— 创建新 signalfd ——
+        // pipe2 用 O_CLOEXEC（若请求）让两端的 host fd 都带 CLOEXEC；写端额外设
+        // O_NONBLOCK：信号风暴时 pipe 满 → EAGAIN → 静默丢，绝不阻塞 VM 线程。
+        int p[2];
+        int pipe_flags = (flags & SFD_CLOEXEC) ? O_CLOEXEC : 0;
+        if(pipe2(p, pipe_flags) < 0) {
+            return -errno;
+        }
+        // 写端设 O_NONBLOCK。读端保持阻塞（让 guest 的 read() 能阻塞，符合 signalfd 语义）；
+        // SFD_NONBLOCK 仅作用在 guest 视角的读端行为上 → 通过 O_NONBLOCK 体现。
+        int fcntl_flags = fcntl(p[1], F_GETFL);
+        if(fcntl_flags >= 0) {
+            fcntl(p[1], F_SETFL, fcntl_flags | O_NONBLOCK);
+        }
+        if(flags & SFD_NONBLOCK) {
+            int rf = fcntl(p[0], F_GETFL);
+            if(rf >= 0) {
+                fcntl(p[0], F_SETFL, rf | O_NONBLOCK);
+            }
+        }
+
+        int guest_fd = allocate_fd();
+        auto handle = std::make_shared<SignalFd>(p[0], p[1], mask);
+        if(flags & SFD_CLOEXEC) {
+            handle->cloexec = true;
+        }
+        ps->fds[guest_fd] = handle;
+        return guest_fd;
+    }
+
+    // —— 更新既有 signalfd 的 mask ——
+    // dynamic_cast 判定：非 SignalFd（普通文件/pipe/socket/ProcFile/ProcDir）→ Linux 返回 EINVAL。
+    auto it = ps->fds.find(fd);
+    if(it == ps->fds.end()) {
+        return -EBADF;
+    }
+    SignalFd* sfd = dynamic_cast<SignalFd*>(it->second.get());
+    if(sfd == nullptr) {
+        return -EINVAL;
+    }
+    sfd->mask.store(mask, std::memory_order_relaxed);
+    return fd;
+}
+
+bool SignalFd::deliver(const SigEvent& ev) {
+    // ev.sig 在 mask 内则构造 signalfd_siginfo 并写入 pipe。host 与 guest 的 signalfd_siginfo
+    // 布局一致（128 字节，定义见 root/include/sys/signalfd.h）。
+    int sig = ev.sig;
+    if(sig <= 0 || sig >= NSIG) {
+        return false;
+    }
+    uint64_t bit = 1ULL << (sig - 1);
+    if(!(mask.load(std::memory_order_relaxed) & bit)) {
+        return false;
+    }
+    signalfd_siginfo si{};
+    si.ssi_signo  = static_cast<uint32_t>(sig);
+    si.ssi_code   = ev.code;        // SI_USER/SI_KERNEL/CLD_*，对齐 Linux si_code
+    si.ssi_status = ev.status;      // SIGCHLD 有效：CLD_EXITED=退出码、CLD_KILLED=信号号、CLD_STOPPED=停止信号号；其余 0
+    si.ssi_pid    = static_cast<uint32_t>(ev.sender);   // 发送方 pid（0 = kernel/host，对齐 Linux si_pid 语义）
+    si.ssi_uid    = 0;
+    ssize_t n = ::write(write_fd, &si, sizeof(si));
+    (void)n;  // EAGAIN（pipe 满）/ EBADF（已关闭，理论不会）均静默忽略，与 Linux 一致。
+    return true;
 }

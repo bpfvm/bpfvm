@@ -34,10 +34,11 @@ std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<F
         if(is_read) {
             return -EIO;
         }
-        queue_signal(v, sig);  // 仍入队（语义上发生过，但被忽略），不影响本次 I/O
+        // tty 信号由内核发送：sender=0、code=SI_KERNEL。
+        queue_signal(v, {sig, 0, SI_KERNEL, 0});  // 仍入队（被忽略），不影响本次 I/O
         return std::nullopt;   // 放行真正 write
     }
-    queue_signal(v, sig);
+    queue_signal(v, {sig, 0, SI_KERNEL, 0});
     // SIG_DFL（停止作业，本次 I/O 不完成；已投递，handle_signals 会置 VM_STOPPED）或
     // 已 catch（handler 返回后返回 -EINTR，job-control 信号默认不复重啜）。
     return -EINTR;

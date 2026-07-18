@@ -134,6 +134,26 @@ std::shared_ptr<Fd> DevFd::clone() const {
     return std::make_shared<DevFd>(new_fd, path, tty_, master_token_);
 }
 
+std::shared_ptr<Fd> SignalFd::clone() const {
+    // fork 复制：为子新建独立 pipe（写端 O_NONBLOCK），mask 复制自父。子读端不能
+    // 指向父同一 pipe——否则父子读到对方 pending 的信号，破坏 Linux task-pending 语义。
+    // cloexec 不复制（由调用方按需设置，与 dup 语义一致）。
+    int p[2];
+    if(pipe2(p, 0) < 0) {
+        return nullptr;
+    }
+    // 写端设 O_NONBLOCK：信号风暴时 pipe 满 → EAGAIN → 静默丢，绝不阻塞 VM 线程。
+    int wf = fcntl(p[1], F_GETFL);
+    if(wf >= 0) fcntl(p[1], F_SETFL, wf | O_NONBLOCK);
+    // 父读端带 O_NONBLOCK（SFD_NONBLOCK 创建）→ 子读端也继承。
+    int rf = fcntl(fd_, F_GETFL);
+    if(rf >= 0 && (rf & O_NONBLOCK)) {
+        int nrf = fcntl(p[0], F_GETFL);
+        if(nrf >= 0) fcntl(p[0], F_SETFL, nrf | O_NONBLOCK);
+    }
+    return std::make_shared<SignalFd>(p[0], p[1], mask.load(std::memory_order_relaxed));
+}
+
 // =====================================================================
 // 静态工厂：do_openat 的 /dev/* 与 /proc/* 拦截分流到此。
 // 约定：命中（本类负责的路径）→ 返回构造好的 fd（cloexec 由 do_openat 统一设置）；

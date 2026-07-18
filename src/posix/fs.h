@@ -15,6 +15,10 @@
 
 class PosixSyscall;
 
+// 信号事件 POD（完整定义见 posix_syscall.h，下移避免循环 include）。
+// 此处前向声明让 SignalFd::deliver 的方法声明可用；实现在 signal.cpp（可见完整定义）。
+struct SigEvent;
+
 // guest tty 设备的 bpfvm 侧状态。
 // 本对象只持有 bpfvm 必须管的进程语义：
 //   fg_pgrp  —— 本设备当前前台进程组。tty 信号（SIGINT/SIGTSTP/...）发给 fg_pgrp 的所有成员。
@@ -133,6 +137,45 @@ struct DevFd: HostFd {
     // 失败返 nullptr，errno 已设。仅按 guest_abs 匹配，不看 dirfd（绝对路径特殊设备）。
     static std::shared_ptr<Fd> open(const std::string& guest_abs, int flags, mode_t mode,
                                     PosixSyscall* self);
+};
+
+// SignalFd —— signalfd 读端（pipe 模拟）。继承 HostFd：read/readv/poll/dup/fcntl 复用
+// host fd 现成逻辑（pipe 本就是 host fd）；其余操作（write/pwrite/writev/lseek/ftruncate/
+// fchmod/...）按 Linux signalfd 语义拦截返回错误，防止 guest 把数据写进内部 pipe 污染
+// 信号流。额外承载内部 pipe 写端 + 监听 mask。
+//   read_fd（= HostFd::fd_）—— 返给 guest 的读端，read/readv/poll 直通。
+//   write_fd                —— VM 内部持有的写端（O_NONBLOCK，pipe 满则丢，与 Linux 一致）。
+//   mask                    —— 监听信号集（bit (sig-1)）。
+// fork 经 clone() 复制：子读端不能指向父同一 pipe（否则父子读到对方 pending），故 clone()
+// 为子新建独立 pipe。task-wide 共享队列语义：handle_signals 里遍历 ps->fds 找 signalfd，
+// 命中第一个 mask 匹配的就投一个（多个 signalfd 读同一 pending 队列，先到先得）。
+struct SignalFd: HostFd {
+    int write_fd;          // 内部 pipe 写端（O_NONBLOCK）
+    // 监听信号集（bit (sig-1)）。atomic：deliver（handle_signals 路径，某线程 A 的
+    // safepoint）与 do_signalfd4 的 mask 更新（线程 B 调 signalfd() 重建 mask）可能
+    // 跨线程并发（CLONE_FILES 共享 fd 表 + CLONE_SIGHAND），pending_signals 锁是 per-vm
+    // 的不足以保护；用 atomic 保证读到的要么旧要么新 mask，两者都自洽。
+    std::atomic<uint64_t> mask;
+    SignalFd(int read_fd, int write_fd, uint64_t mask_)
+        : HostFd(read_fd), write_fd(write_fd), mask(mask_) {}
+    ~SignalFd() override { if(write_fd >= 0) close(write_fd); }
+    // 读端 fd_ 由 HostFd 析构关闭；写端在此关闭。
+
+    std::shared_ptr<Fd> clone() const override;   // fork：独立新 pipe
+
+    // —— 拦截对 signalfd 无意义的操作（对齐 Linux 行为，防止污染内部 pipe）——
+    // 实测 Linux：write/writev/ftruncate → EINVAL；pwrite/pread → ESPIPE；
+    // lseek 在 signalfd 上 rc=0（no-op），保留 HostFd 透传即可（无需 override）。
+    ssize_t write(const void* buf, size_t count) override { (void)buf; (void)count; return -EINVAL; }
+    ssize_t pwrite(const void* buf, size_t count, off_t off) override { (void)buf; (void)count; (void)off; return -ESPIPE; }
+    ssize_t writev(const struct iovec* iov, int iovcnt) override { (void)iov; (void)iovcnt; return -EINVAL; }
+    ssize_t pread(void* buf, size_t count, off_t off) override { (void)buf; (void)count; (void)off; return -ESPIPE; }
+    int ftruncate(off_t len) override { (void)len; return -EINVAL; }
+
+    // 投递：sig 在 mask 内则构造 signalfd_siginfo 写 pipe，返回 true（已消费）。
+    // pipe 满（EAGAIN）/已关闭（EBADF）静默忽略，与 Linux signalfd 溢出语义一致。
+    // ev 的 sender/code/status 透传给 ssi_pid/ssi_code/ssi_status。
+    bool deliver(const SigEvent& ev);
 };
 
 // =====================================================================

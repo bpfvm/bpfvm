@@ -10,8 +10,8 @@
 #   - ${CMAKE_SOURCE_DIR}/src   → "posix_syscall.h" / "insn.h" 等项目头
 #   - ${CMAKE_SOURCE_DIR}       → "include/bpf_call.h" 等 BPF 侧头
 add_library(posix_obj OBJECT
-    mpsc_queue.cpp
     posix_syscall.cpp
+    signal_queue.cpp
     memory.cpp
     file_io.cpp
     filesystem.cpp

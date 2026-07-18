@@ -20,7 +20,7 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
         for(auto& weak_vm : tg->threads) {
             auto tvm = weak_vm.lock();
             if(tvm && tvm.get() != v) {
-                if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), SIGKILL);
+                if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0});
             }
         }
     }

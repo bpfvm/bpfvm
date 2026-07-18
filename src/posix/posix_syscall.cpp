@@ -211,12 +211,13 @@ void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
 
     if(targets.empty()) {
         if(tty) return;  // tty 路径不 fallback
-        queue_signal(v, sig);  // 无 ctty fallback：投给当前 v（pid 1）
+        // 无 ctty fallback：投给当前 v（pid 1）。host/kernel 发起：sender=0、code=SI_KERNEL。
+        queue_signal(v, {sig, 0, SI_KERNEL, 0});
         return;
     }
     for(auto& t : targets) {
         // 目标是另一个 PosixSyscall：经 sys() downcast 后调内部 queue_signal。
-        if(auto s = sys(t.get())) s->queue_signal(t.get(), sig);
+        if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, 0, SI_KERNEL, 0});
     }
 }
 
@@ -394,6 +395,8 @@ int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
     case BPF_SYS_EPOLL_CREATE1:  return do_epoll_create1(v);
     case BPF_SYS_EPOLL_CTL:      return do_epoll_ctl(v);
     case BPF_SYS_EPOLL_PWAIT:    return do_epoll_pwait(v);
+    // —— signalfd ——
+    case BPF_SYS_SIGNALFD4:      return do_signalfd4(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG

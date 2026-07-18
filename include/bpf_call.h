@@ -98,6 +98,8 @@ enum bpf_syscall_id {
     BPF_SYS_EPOLL_CTL,      // epoll_ctl(epfd, op, fd, epoll_event*)
     BPF_SYS_EPOLL_PWAIT,    // epoll_pwait(epfd, ev, maxev, timeout_ms, sigset, sigsetsize)
                             //   — epoll_wait() 复用；第 6 参 sigsetsize 走 r0
+    // —— signalfd（信号 → fd 读取）——
+    BPF_SYS_SIGNALFD4,      // signalfd4(fd, sigset*, sigsetsize, flags) — signalfd() 复用
 };
 
 #define BPF_CALL_MMAP      BPF_CALL_ID(BPF_SYS_MMAP)
@@ -183,6 +185,8 @@ enum bpf_syscall_id {
 #define BPF_CALL_EPOLL_CREATE1 BPF_CALL_ID(BPF_SYS_EPOLL_CREATE1)
 #define BPF_CALL_EPOLL_CTL     BPF_CALL_ID(BPF_SYS_EPOLL_CTL)
 #define BPF_CALL_EPOLL_PWAIT   BPF_CALL_ID(BPF_SYS_EPOLL_PWAIT)
+// —— signalfd ——
+#define BPF_CALL_SIGNALFD4     BPF_CALL_ID(BPF_SYS_SIGNALFD4)
 // —— msg 系列 ——
 #define BPF_CALL_SENDMSG       BPF_CALL_ID(BPF_SYS_SENDMSG)
 #define BPF_CALL_RECVMSG       BPF_CALL_ID(BPF_SYS_RECVMSG)
