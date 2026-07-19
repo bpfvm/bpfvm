@@ -4,9 +4,21 @@
 #include <atomic>
 #include <pthread.h>
 #include <termios.h>
+#include <errno.h>      // EINTR（TEMP_FAILURE_RETRY 用）
 
 class vm;
 class SyscallHandler;
+
+// TEMP_FAILURE_RETRY：glibc 的 <unistd.h> 扩展（非 POSIX，非 UAPI），musl 不提供。
+// 仅 bpfvm 自身 pty 模块用（pump 线程的 EINTR 自动重试），不对外暴露给 guest，
+// 故放本模块头而非 include/。host glibc 已定义时 #ifndef 守护跳过。
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(expression) \
+    (__extension__({ long int __result; \
+       do __result = (long int)(expression); \
+       while(__result == -1L && errno == EINTR); \
+       __result; }))
+#endif
 
 // host 接入器 + 信号路由器。两类职责，统一由 pump 线程承载：
 //

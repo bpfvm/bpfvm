@@ -1,12 +1,6 @@
 #include "posix_internal.h"
 
-int PosixSyscall::allocate_fd(int min_fd) {
-    int fd = min_fd;
-    while(ps->fds.count(fd)) {
-        fd++;
-    }
-    return fd;
-}
+#include <asm/ioctl.h>
 
 int64_t PosixSyscall::do_umask(vm* v) {
     uint32_t new_mask = arg_u32(v->r(1));
@@ -21,19 +15,17 @@ int64_t PosixSyscall::do_dup(vm* v) {
         return -EBADF;
     }
 
-    auto it = ps->fds.find(old_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(old_fd);
+    if(!h) {
         return -EBADF;
     }
 
-    auto new_handle = it->second->clone();  // host dup host fd；GuestTty共享
+    auto new_handle = h->clone();  // host dup host fd；GuestTty共享
     if(!new_handle) {
         return -errno;
     }
 
-    int new_fd = allocate_fd();
-    ps->fds[new_fd] = new_handle;
-    return new_fd;
+    return ps->fds_emplace(new_handle);
 }
 
 int64_t PosixSyscall::do_dup3(vm* v) {
@@ -50,25 +42,28 @@ int64_t PosixSyscall::do_dup3(vm* v) {
         return -EINVAL;
     }
 
-    auto it = ps->fds.find(old_fd);
-    if(it == ps->fds.end()) {
+    auto old_h = ps->find_fd(old_fd);
+    if(!old_h) {
         return -EBADF;
     }
 
-    auto handle = it->second->clone();
+    auto handle = old_h->clone();
     if(!handle) {
         return -errno;
     }
     if(flags & O_CLOEXEC) {
         handle->cloexec = true;
     }
-    // 若 new_fd 已被占用：dup2/dup3 静默关闭旧 fd（Linux 语义）。旧 fd 若是最后一个 master
-    // 端，应触发 SIGHUP（drop_fd_handle 判断）。先 drop 再覆盖（覆盖的赋值会析构旧 shared_ptr）。
-    auto existing = ps->fds.find(new_fd);
-    if(existing != ps->fds.end()) {
-        drop_fd_handle(v, existing->second);
+    // 若 new_fd 已被占用：dup2/dup3 静默关闭旧 fd（Linux 语义）。旧 fd 若是最后一个
+    // master 端，drop_fd_handle 触发 SIGHUP。drop 在锁外（投 SIGHUP 不能在 fds_mutate
+    // 重试循环里）。
+    auto existing = ps->find_fd(new_fd);
+    if(existing) {
+        drop_fd_handle(v, existing);
     }
-    ps->fds[new_fd] = handle;
+    ps->fds_mutate([&](SharedState::FdMap& m){
+        m[new_fd] = handle;
+    });
     return new_fd;
 }
 
@@ -86,19 +81,25 @@ int64_t PosixSyscall::do_pipe2(vm* v) {
         return -errno;
     }
 
-    int guest_fd0 = allocate_fd();
     auto handle0 = std::make_shared<HostFd>(host_fds[0]);
     if (flags & O_CLOEXEC) {
         handle0->cloexec = true;
     }
-    ps->fds[guest_fd0] = handle0;
-
-    int guest_fd1 = allocate_fd(guest_fd0 + 1);
     auto handle1 = std::make_shared<HostFd>(host_fds[1]);
     if (flags & O_CLOEXEC) {
         handle1->cloexec = true;
     }
-    ps->fds[guest_fd1] = handle1;
+    // 两端在同一个 mutate 内分配，保证不抢同号。Linux 不要求两端连续，从 fd0+1 找
+    // 第二个空号尽量相邻。
+    int guest_fd0 = -1, guest_fd1 = -1;
+    ps->fds_mutate([&](SharedState::FdMap& m){
+        guest_fd0 = 0;
+        while(m.count(guest_fd0)) guest_fd0++;
+        guest_fd1 = guest_fd0 + 1;
+        while(m.count(guest_fd1)) guest_fd1++;
+        m[guest_fd0] = handle0;
+        m[guest_fd1] = handle1;
+    });
 
     pipefd[0] = guest_fd0;
     pipefd[1] = guest_fd1;
@@ -106,8 +107,8 @@ int64_t PosixSyscall::do_pipe2(vm* v) {
 }
 
 int64_t PosixSyscall::do_fcntl(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
     int cmd = arg_s32(v->r(2));
@@ -117,27 +118,26 @@ int64_t PosixSyscall::do_fcntl(vm* v) {
             return -EINVAL;
         }
 
-        auto new_handle = it->second->clone();
+        auto new_handle = h->clone();
         if(!new_handle) {
             return -errno;
         }
-
-        int new_fd = allocate_fd(min_fd);
         if (cmd == F_DUPFD_CLOEXEC) {
             new_handle->cloexec = true;
         }
-        ps->fds[new_fd] = new_handle;
-        return new_fd;
+        return ps->fds_emplace(new_handle, min_fd);
     }
     if (cmd == F_GETFD) {
-        return it->second->cloexec ? FD_CLOEXEC : 0;
+        return h->cloexec ? FD_CLOEXEC : 0;
     }
     if (cmd == F_SETFD) {
-        it->second->cloexec = (v->r(3) & FD_CLOEXEC) != 0;
+        // cloexec 是该 fd 号的属性，直接改 shared Fd 对象即可。并发 fcntl 与操作
+        // 之间有固有竞态（与 Linux 一致），后续读快照立即看到新值。
+        h->cloexec = (v->r(3) & FD_CLOEXEC) != 0;
         return 0;
     }
     // 虚拟 /proc fd（host_fd() < 0）：其余 fcntl cmd（F_GETFL/F_GETLK/...）无意义，返回 EINVAL。
-    int hfd = it->second->host_fd();
+    int hfd = h->host_fd();
     if(hfd < 0) {
         return -EINVAL;
     }
@@ -167,8 +167,8 @@ int64_t PosixSyscall::do_fcntl(vm* v) {
 }
 
 int64_t PosixSyscall::do_ioctl(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
     unsigned long request = v->r(2);
@@ -179,7 +179,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
     if (request == TIOCSCTTY) {
         // 绑定控制终端。语义：arg==1 强制（即使已被别的 session 占也夺），arg==0 仅在无人
         // 占用时绑定。前提：调用者须是 session leader（setsid 后），fd 是 pty 设备，否则错。
-        const auto tty = it->second->tty();
+        const auto tty = h->tty();
         if(!tty) {
             return -ENOTTY;
         }
@@ -211,7 +211,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         // 设置前台进程组（tcsetpgrp）。musl 的 tcsetpgrp 传指向 int 的指针（&pgrp），
         // 故 r(3) 是 guest 指针，需 mmu 取值。仅更新本 ctty 的 fg_pgrp，供 deliver_tty_signal
         // 选目标组。POSIX：fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || it->second->tty().get() != session->ctty.get()) {
+        if(!session || !session->ctty || h->tty().get() != session->ctty.get()) {
             return -ENOTTY;
         }
         const pid_t* in = (const pid_t*)v->mmu(v->r(3), sizeof(pid_t));
@@ -241,7 +241,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         return 0;
     } else if (request == TIOCGPGRP) {
         // 读取前台进程组（tcgetpgrp）。fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || it->second->tty().get() != session->ctty.get()) {
+        if(!session || !session->ctty || h->tty().get() != session->ctty.get()) {
             return -ENOTTY;
         }
         pid_t* out = (pid_t*)v->mmu_w(v->r(3), sizeof(pid_t));
@@ -252,7 +252,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         return 0;
     } else {
         // 虚拟 /proc fd（host_fd() < 0）：无 host fd，ioctl 无意义，返回 ENOTTY。
-        int hfd = it->second->host_fd();
+        int hfd = h->host_fd();
         if(hfd < 0) {
             return -ENOTTY;
         }
@@ -333,14 +333,14 @@ int64_t PosixSyscall::do_poll(vm* v) {
             hfds[i].fd = -1;          // 宿主 poll 跳过；guest revents 维持 0（POSIX：负 fd 条目）
             continue;
         }
-        auto it = ps->fds.find(gfd);
-        if(it == ps->fds.end()) {
+        auto fd_h = ps->find_fd(gfd);
+        if(!fd_h) {
             hfds[i].fd = -1;          // 让宿主 poll 忽略；POLLNVAL 由我们直接写回 guest
             gfds[i].revents = POLLNVAL;
             invalid_count++;
             continue;
         }
-        int hfd = it->second->host_fd();
+        int hfd = fd_h->host_fd();
         if(hfd < 0) {
             hfds[i].fd = -1;
             gfds[i].revents = gfds[i].events & (POLLIN | POLLOUT);

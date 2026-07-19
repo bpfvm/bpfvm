@@ -39,13 +39,14 @@ struct memmap {
     uint32_t flags = 0;
     // non-null: CoW page shared across VMs; DataDeleter owns the actual munmap call.
     std::shared_ptr<unsigned char> cow_data;
+    std::string path;
     memmap() = default;
     memmap(memmap&&) = default;
     ~memmap() = default;
     void set_data(unsigned char* p, size_t sz, bool own = true) {
         data = std::unique_ptr<unsigned char, DataDeleter>(p, DataDeleter{sz, own});
     }
-    static memmap static_map(void* addr, size_t size, uint64_t paddr);
+    static memmap static_map(void* addr, size_t size, uint64_t paddr, std::string path_ = "");
 };
 
 // 在 extra_dirs + 默认路径里找 name（dir + "/" + name）。

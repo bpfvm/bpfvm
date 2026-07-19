@@ -1,4 +1,5 @@
 #include "posix_internal.h"
+#include <sys/wait.h>    // WEXITED/WSTOPPED/WNOWAIT（waitid 选项标志）
 
 int64_t PosixSyscall::do_exit(vm* v) {
     int code = arg_s32(v->r(1));
@@ -42,7 +43,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
         return -EINVAL;   // AT_EMPTY_PATH 需要有效 dirfd，不能是 AT_FDCWD
     }
     // 常规路径：dirfd+path 解析 + 符号链接穿透 + chroot 前缀。
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
 
@@ -56,8 +57,8 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     }
     std::string guest_abs;
     if(flags & AT_EMPTY_PATH) {
-        auto fd = ps->fds[dirfd];
-        if(fd->path.empty()) {
+        auto fd = ps->find_fd(dirfd);
+        if(!fd || fd->path.empty()) {
             return -EBADF;
         }
         guest_abs = ResolvePath(this, guest_abs_path(fd->path))->follow();
@@ -112,15 +113,17 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     ps->signal_actions = new_actions;
     signal_depth(v) = 0;
 
-    std::unordered_map<int, std::shared_ptr<Fd>> new_fds;
-    for (const auto& entry : ps->fds) {
-        if (!entry.second->cloexec) {
-            new_fds.insert(entry);
+    // exec 关闭所有 cloexec fd：保留非 cloexec 的构造新快照，cloexec 的 drop（锁外）。
+    auto cur_snap = ps->fds_snap();
+    auto kept = std::make_shared<SharedState::FdMap>();
+    for(const auto& entry : *cur_snap) {
+        if(!entry.second->cloexec) {
+            kept->insert(entry);
         } else {
             drop_fd_handle(v, entry.second);
         }
     }
-    ps->fds.swap(new_fds);
+    ps->fds_replace(std::const_pointer_cast<const SharedState::FdMap>(kept));
     v->r(1) = fresh->r(1);
     v->r(10) = STACK_BASE + STACK_SIZE - 8;
     pc(v) = entry;
@@ -150,23 +153,30 @@ int64_t PosixSyscall::do_clone(vm* v) {
      * CLONE_THREAD: 整体共享 ps（musl 总是同时传 CLONE_FILES|SIGHAND|FS|THREAD）。
      * 非 CLONE_THREAD: 拷贝 ps（同 fork 语义）——dup 父 fd 成独立 host fd，
      *   否则子进程会丢掉所有打开的文件描述符。 */
-    std::unordered_map<int, std::shared_ptr<Fd>> child_fds;
+    std::shared_ptr<const SharedState::FdMap> child_fds_snap;
     if(!is_thread) {
-        for(const auto& entry : ps->fds) {
+        // 锁外逐个 host dup（::dup 是 syscall，不能在 fds_mutate 重试循环里），
+        // 构造子的 FdMap 后整表 store 进子的 ps。
+        auto parent_snap = ps->fds_snap();
+        auto mutable_child = std::make_shared<SharedState::FdMap>();
+        for(const auto& entry : *parent_snap) {
             // fork：host dup 得独立 host fd；GuestTty共享。
             auto new_handle = entry.second->clone();
             if(!new_handle) {
                 return -errno;
             }
             new_handle->cloexec = entry.second->cloexec;
-            child_fds[entry.first] = new_handle;
+            (*mutable_child)[entry.first] = new_handle;
         }
+        child_fds_snap = std::const_pointer_cast<const SharedState::FdMap>(mutable_child);
     }
     auto child_sys = std::make_shared<PosixSyscall>(pgrp, session);
     if(!is_thread) {
         // 整体拷贝而非逐字段罗列，避免新增 ps 字段时漏拷
         child_sys->ps = std::make_shared<SharedState>(*ps);
-        child_sys->ps->fds = std::move(child_fds);
+        // SharedState copy ctor 会让父子共享同一 fds 快照，子进程必须有独立 host fd，
+        // 故整表替换覆盖。
+        child_sys->ps->fds_replace(child_fds_snap);
         child_sys->tg->ppid.store(tg->tgid);
     } else {
         child_sys->ps = ps;
@@ -191,6 +201,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
             child_map.size  = map.size;
             child_map.paddr = map.paddr;
             child_map.flags = map.flags;
+            child_map.path = map.path;
 
             if(map.flags & PF_W) {
                 if(!map.cow_data && map.data.get_deleter().owned) {
@@ -281,6 +292,15 @@ int64_t PosixSyscall::do_clone(vm* v) {
         pthread_attr_destroy(&attr);
         return -rc;
     }
+    // 先登记 pid_map / tg->threads，再启动 host 线程。
+    {
+        std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
+        child_sys->tg->threads.push_back(child);
+    }
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map[child_sys->pid] = child;
+    }
     auto* holder = new std::shared_ptr<vm>(child);
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
         auto* child = static_cast<std::shared_ptr<vm>*>(arg);
@@ -292,15 +312,15 @@ int64_t PosixSyscall::do_clone(vm* v) {
     if(rc != 0) {
         delete holder;
         if(is_thread) tg->live_threads.fetch_sub(1);
+        {
+            std::lock_guard<std::mutex> lock(pid_map_mutex);
+            pid_map.erase(child_sys->pid);
+        }
+        {
+            std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
+            child_sys->tg->threads.pop_back();
+        }
         return -rc;
-    }
-    {
-        std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
-        child_sys->tg->threads.push_back(child);
-    }
-    {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map[child_sys->pid] = child;
     }
     return (int64_t)child_sys->pid;
 }

@@ -117,7 +117,6 @@ class PosixSyscall: public SyscallHandler{
     // CLONE_THREAD: 整体共享。fork: 整体拷贝（make_shared + 复制内容）。
     struct SharedState {
         std::string cwd;
-        std::unordered_map<int, std::shared_ptr<Fd>> fds;
         std::array<signal_action, NSIG> signal_actions{};
         // chroot 根目录（宿主绝对路径，无尾斜杠）。空 = 不 chroot。
         // 随 fork/clone 自动传播（与 cwd 同级）。ps->cwd 存 guest 视角路径，
@@ -128,6 +127,97 @@ class PosixSyscall: public SyscallHandler{
         std::string exe_path;
         // 文件创建掩码（进程级，fs_struct::umask）。openat/mkdir 等按 mode & ~umask 生效。
         uint32_t umask = 0022;
+
+        using FdMap = std::unordered_map<int, std::shared_ptr<Fd>>;
+        // fds 表采用 Copy-on-Write 不可变快照：写整表复制 + 换入，读者持有不可变快照，
+        // 阻塞调用（epoll_pwait/poll/read 等）任意久都不会和写冲突，避免"持锁调阻塞
+        // host syscall"的死锁。被 close 的 Fd 随旧快照延迟析构（host fd 延迟关闭），
+        // 对齐 Linux file 引用计数语义。
+        //
+        // 底层同步原语按标准库条件编译：
+        //   - libstdc++（host bpfvm）：std::atomic<std::shared_ptr<const FdMap>>（C++20
+        //     特化，lock-free COW + CAS 重试，读无锁）。
+        //   - libc++（BPF target / bpfvm.bpf）：该 C++20 特化至今未实现（llvm-project#99980）。
+#ifdef _LIBCPP_VERSION
+        mutable std::mutex fds_mutex;
+        FdMap fds;
+        // libc++ 分支： 锁+ std::unordered_map。读者持锁访问，写者持锁复制 + 替换。
+        std::shared_ptr<Fd> find_fd(int fd) const {
+            std::lock_guard<std::mutex> lock(fds_mutex);
+            auto it = fds.find(fd);
+            return  it == fds.end() ? nullptr : it->second;
+        }
+        std::shared_ptr<const FdMap> fds_snap() const {
+            std::lock_guard<std::mutex> lock(fds_mutex);
+            return std::make_shared<const FdMap>(fds);
+        }
+        template <class F>
+        void fds_mutate(F&& f) {
+            std::lock_guard<std::mutex> lock(fds_mutex);
+            f(fds);
+        }
+        void fds_replace(std::shared_ptr<const FdMap> new_snap) {
+            std::lock_guard<std::mutex> lock(fds_mutex);
+            fds = *new_snap;
+        }
+        int fds_emplace(std::shared_ptr<Fd> handle, int min_fd = 0) {
+            std::lock_guard<std::mutex> lock(fds_mutex);
+            int fd = min_fd;
+            while(fds.count(fd)) fd++;
+            fds[fd] = std::move(handle);
+            return fd;
+        }
+        SharedState() {}
+        SharedState(const SharedState& o)
+            : cwd(o.cwd), signal_actions(o.signal_actions), root(o.root),
+              exe_path(o.exe_path), umask(o.umask), fds_mutex(), fds(o.fds) {}
+#else
+        std::atomic<std::shared_ptr<const FdMap>> fds;
+        SharedState() : fds(std::make_shared<const FdMap>()) {}
+        // atomic 不可拷贝构造，手写 copy ctor：其它字段逐字段拷贝，fds 共享同一不可变快照。
+        SharedState(const SharedState& o)
+            : cwd(o.cwd), signal_actions(o.signal_actions), root(o.root),
+              exe_path(o.exe_path), umask(o.umask),
+              fds(o.fds.load(std::memory_order_acquire)) {}
+        SharedState& operator=(const SharedState&) = delete;
+
+        // 单 fd 查找：返回 shared_ptr<Fd>（找不到为 nullptr）。持有返回值期间该 Fd
+        // 存活，锁外调阻塞 host syscall 安全。
+        std::shared_ptr<Fd> find_fd(int fd) const {
+            auto snap = fds.load(std::memory_order_acquire);
+            auto it = snap->find(fd);
+            return it == snap->end() ? nullptr : it->second;
+        }
+        std::shared_ptr<const FdMap> fds_snap() const {
+            return fds.load(std::memory_order_acquire);
+        }
+        // COW 写：f 必须是纯表修改（不可阻塞 / 投信号 / 调 host syscall）。
+        template <class F>
+        void fds_mutate(F&& f) {
+            auto cur = fds.load(std::memory_order_acquire);
+            while(true) {
+                auto next = std::make_shared<FdMap>(*cur);
+                f(*next);
+                if(fds.compare_exchange_weak(
+                        cur, std::const_pointer_cast<const FdMap>(next),
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    break;
+                }
+            }
+        }
+        void fds_replace(std::shared_ptr<const FdMap> new_snap) {
+            fds.store(std::move(new_snap), std::memory_order_release);
+        }
+        int fds_emplace(std::shared_ptr<Fd> handle, int min_fd = 0) {
+            int fd = min_fd;
+            fds_mutate([&](FdMap& m){
+                fd = min_fd;
+                while(m.count(fd)) fd++;
+                m[fd] = std::move(handle);
+            });
+            return fd;
+        }
+#endif
     };
 
     static std::atomic<uint64_t> next_pid;
@@ -180,7 +270,7 @@ public:
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
     virtual bool handle_signals(vm* v, sig_info* info) override;
-    virtual int64_t syscall(vm* v, uint32_t call) override;
+    virtual int64_t (syscall)(vm* v, uint32_t call) override;
     virtual int id() override {
         return (int)pid;
     }

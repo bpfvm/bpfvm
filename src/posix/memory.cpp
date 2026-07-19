@@ -28,6 +28,7 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
             left.flags = fl;
             left.set_data(hbase, left.size, false);
             left.cow_data = cb;
+            left.path = m.path;
             ml.insert(it, std::move(left));
         }
         // 右段
@@ -38,6 +39,7 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
             right.flags = fl;
             right.set_data(hbase + (end - m.paddr), right.size, false);
             right.cow_data = cb;
+            right.path = m.path;
             ml.insert(it, std::move(right));
         }
         it = ml.erase(it);
@@ -77,13 +79,15 @@ int64_t PosixSyscall::do_mmap(vm* v) {
         return -EINVAL;   // MAP_FIXED 要求 addr 页对齐
     }
 
+    std::string path;
     int host_fd = -1;
     if (!(flags & MAP_ANONYMOUS)) {
-        auto it = ps->fds.find(fd);
-        if (it == ps->fds.end()) {
+        auto h = ps->find_fd(fd);
+        if(!h) {
             return -EBADF;
         }
-        host_fd = it->second->host_fd();
+        host_fd = h->host_fd();
+        path = h->path;
     }
 
     // host 内存始终独立分配（addr_hint 是 guest 空间地址，与 host 无关；host 端不
@@ -117,6 +121,7 @@ int64_t PosixSyscall::do_mmap(vm* v) {
     if(prot & PROT_EXEC) {
         mem.flags |= PF_X;
     }
+    mem.path = path;
     int64_t result;
     if (fixed) {
         mem.paddr = addr_hint;   // guest 空间固定地址

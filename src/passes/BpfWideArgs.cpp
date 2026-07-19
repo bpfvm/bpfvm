@@ -576,6 +576,61 @@ static bool needsLowering(Type *T, const DataLayout &DL) {
     return false;
 }
 
+// 把 callee 的聚合【值】参数（如 [2 x i64] shared_ptr）的 use 重写成通过【指针】参数访问。
+//
+// 背景：clang 对 by-value 非平凡聚合生成值类型参数（[2 x i64]），callee 体里先
+// `store %arg, ptr %local` 把值拷贝到可寻址内存，再 move/copy %local。若简单 load
+// 出值替换 %arg，move 作用于 load 副本，无法置空 caller 源对象 → 引用计数错乱
+// （见路径 B 整体注释及 eliminateByvalScalarTemporaries 的 #207686 注释）。
+//
+// 正确做法（模拟 x86 invisible-reference ABI）：让指针参数直接代表「值的存储位置」
+// （指向 caller 的源对象）。对每条 use：
+//   - `store T %arg, ptr %dst`（把值拷贝到本地 %dst）：消除该 store，后续对 %dst 的
+//     use 全部替换成 %newarg（%dst 成为指针参数的别名）。这样函数体里对 %dst 的
+//     move/copy/load 直接作用于 caller 源对象。
+//   - 其它 use（直接当值用）：在 use 前插 load T, ptr %newarg，替换 use。
+//
+// 典型 clang 生成模式只有第一种 use（非平凡聚合先拷贝到本地再操作），故走消除路径。
+static void rewriteValueParamUsesToPointer(Function &F, Instruction *InsertPt,
+                                           Argument *OldArg, Value *NewArg) {
+    Type *valTy = OldArg->getType();
+
+    // 收集所有 use（边遍历边改会失效迭代器）。
+    SmallVector<Use *, 8> uses;
+    for (Use &U : OldArg->uses())
+        uses.push_back(&U);
+
+    // 兜底 load（懒创建）：所有「直接值 use」共享同一个 load，避免多次读且保证
+    // InsertPt 早于所有 use。仅当存在非 store-to-local 的 use 时才创建。
+    Value *fallbackLoad = nullptr;
+    auto getFallbackLoad = [&]() -> Value * {
+        if (!fallbackLoad) {
+            IRBuilder<> B(InsertPt);
+            fallbackLoad = B.CreateLoad(valTy, NewArg, "__agg.ld." + OldArg->getName());
+        }
+        return fallbackLoad;
+    };
+
+    for (Use *U : uses) {
+        User *UR = U->getUser();
+        auto *SI = dyn_cast<StoreInst>(UR);
+        // 模式：store T %oldarg, ptr %dst —— %oldarg 是被存的值（operand 0）。
+        if (SI && SI->getValueOperand() == OldArg) {
+            Value *dst = SI->getPointerOperand();
+            // 消除拷贝：后续对 %dst 的 use 全部替换成 %newarg（指针参数别名）。
+            // %dst 通常是 alloca；它的所有 use（load/store/gep/传入 call 等）改成
+            // 操作 %newarg 指向的 caller 源对象。
+            dst->replaceAllUsesWith(NewArg);
+            SI->eraseFromParent();
+            continue;
+        }
+        // 其它 use（直接当值用，如再传给另一个 [2 x i64] 参数的 call）：替换成从指针
+        // load 出的值。值传递语义，但 move 不置空源 —— 此场景下源不会被 move，故无
+        // 计数问题。理论上 clang 对聚合值参数只生成 store-to-local 模式，此为兜底。
+        U->set(getFallbackLoad());
+    }
+}
+
 // 收集函数里"需要降级的值类型聚合参数"的下标（路径 B：非 byval、非 ptr 的聚合
 // 值类型）。已是 byval 的（路径 A，大聚合）不在此收集——它们只剥属性、不重建签名。
 static SmallVector<unsigned, 4> collectAggregateValueParams(Function &F, const DataLayout &DL) {
@@ -692,11 +747,7 @@ bool lowerAggregateParams(Module &M) {
         for (Argument &OldArg : F->args()) {
             Argument *NewArg = NewF->getArg(idx);
             if (aggSet.count(idx)) {
-                // 聚合参数：新参数是裸指针，load 出原聚合值
-                IRBuilder<> B(InsertPt);
-                Value *loaded = B.CreateLoad(OldArg.getType(), NewArg,
-                                              "__agg.ld." + OldArg.getName());
-                replacements.emplace_back(&OldArg, loaded);
+                rewriteValueParamUsesToPointer(*NewF, InsertPt, &OldArg, NewArg);
             } else {
                 replacements.emplace_back(&OldArg, NewArg);
             }
@@ -730,9 +781,15 @@ bool lowerAggregateParams(Module &M) {
         jobByOld[j.OldF] = &j;
 
     // 现在改写每个 call site：聚合实参是【值类型】（[2 x i64]/{...}/i128），不是 ptr。
-    // 必须 store 到一个临时 alloca，再把该 alloca 指针作为新实参传给 NewF。
-    // 不能用 memcpy：memcpy 的源要求 ptr，而聚合实参是 SSA 值。store 值到临时即可
-    // （C++ 按值语义：caller 拷贝一份给 callee）。不加 byval 属性——直接产裸 ptr 终态。
+    // callee 侧已把值参数改成裸 ptr（入口 load 出值或直接用指针，见 rewriteValueParamUsesToPointer）。
+    // caller 侧分两种情况传实参：
+    //   (a) 实参是 `load T, ptr %src`（clang 对非平凡 by-value 聚合的典型模式：caller
+    //       copy/move 构造一个临时 %src，再 load 出值传给 callee）。此时直接传 %src 指针，
+    //       让 callee 与 caller 共享同一存储 —— callee 内部的 move 构造作用于 %src，
+    //       置空源，caller 后续析构 %src 是 no-op，引用计数正确（模拟 x86 invisible-ref）。
+    //   (b) 实参是其它形式（平凡聚合直接构造的值，或另一 callee 的返回值）：在入口建
+    //       alloca、call 前 store 值、传 alloca 指针。平凡类型按位拷贝语义正确。
+    // 不加 byval 属性——直接产裸 ptr 终态。
     //
     // alloca 必须插在【caller 入口块】——BPF 后端要求所有 alloca 集中在入口块（static
     // alloca），非入口块的固定大小 alloca 会被拒绝（见 BpfVlaPass 的注释）。若 call
@@ -744,9 +801,15 @@ bool lowerAggregateParams(Module &M) {
         Function *Caller = CB->getFunction();
         // 先切 callee 到 NewF（NewF 签名里聚合参数已是裸 ptr）
         CB->setCalledFunction(NewF->getFunctionType(), NewF);
-        // 为每个聚合参数插入口块 alloca + call 前 store，实参换成指针
+        // 为每个聚合参数处理实参：load 源 → 传源指针；否则 alloca+store。
         for (unsigned i : j->agIdxs) {
             Value *arg = CB->getArgOperand(i);
+            if (auto *LI = dyn_cast<LoadInst>(arg)) {
+                // (a) 实参是 load：传源指针（caller 临时/源对象的地址）。
+                CB->setArgOperand(i, LI->getPointerOperand());
+                continue;
+            }
+            // (b) 实参是直接值：建 alloca 存值传指针。
             Type *aggTy = arg->getType();
             IRBuilder<> EntryB(&Caller->getEntryBlock(), Caller->getEntryBlock().getFirstInsertionPt());
             AllocaInst *tmp = EntryB.CreateAlloca(aggTy, nullptr, "__agg.arg");
@@ -773,32 +836,92 @@ bool lowerAggregateParams(Module &M) {
 }
 
 // ===========================================================================
-// by-value ≤8B 非平凡析构参数（std::unique_ptr 等）的 double-free 修复
+// by-value 非平凡析构参数（std::unique_ptr/std::shared_ptr 等）的 double-free 修复
 //
-// 背景：BPF 后端把 ≤8B 的非平凡析构 by-value 参数（典型 std::unique_ptr，8B）
-// 直接降级成 i64 寄存器传值，绕过 byval。但 clang 的 caller 仍按"非平凡析构
-// 对象"模型，在栈上构造一个备份临时 %tmp，把指针存进去，调用后析构它：
-//   store %src, %tmp            ; move-construct 备份临时
-//   %arg = ptrtoint (load %tmp) ; 取出指针 i64 化给 callee（或直接 ptrtoint %src）
-//   call @callee(i64 %arg)      ; callee 拿到指针，move 到自己成员
-//   call @~unique_ptr(%tmp)     ; ~备份：tmp 仍是该指针 → delete → double-free
-// %tmp 是多余备份——它的值已交给 callee（callee 拥有），析构它即 double-free
-// 那个已被 move 走的指针。
+// 背景（上游 LLVM issue #207686）：BPF 后端把能塞进 1~2 个寄存器（≤16B）的非
+// 平凡析构 by-value 参数直接降级成 i64 / [2 x i64] 按值传递（unique_ptr=8B→i64、
+// shared_ptr=16B→[2 x i64]），而不是按 Itanium C++ ABI 走 invisible-reference
+// (ptr 指向 caller 栈临时)。
 //
-// >8B 的非平凡析构 by-value 参数（string 24B、shared_ptr 16B）不走此路：它们
-// 走 byval/ptr，callee 共享 caller 临时、move 时置空，caller 析构 noop。本 bug
-// 只影响 ≤8B 被 i64 化的那类（唯一常见的是 unique_ptr）。
+// caller 侧的 IR 模式（lowerAggregateParams 已把 callee 签名改成 ptr 之后）：
+//   %tmp = alloca T                          ; 备份临时
+//   call T::T(ptr %tmp, ptr %src)            ; move-construct（mangling 含 C1/C2 + OS_）
+//   %v  = load T,  ptr %tmp                  ; 取出值
+//   store %v, ptr __agg_arg                  ; 转存到 lowerAggregateParams 插入的 alloca
+//   call @callee(ptr __agg_arg)              ; callee 拿 ptr，move 出去后置空它自己的 ptr
+//   call ~T(ptr %tmp)                        ; ★ 析构备份 %tmp——值仍是原指针→double-free
+// %tmp 是多余的"中转"备份：它的内容已交给 callee（callee 通过 __agg_arg 拥有），
+// 析构它就再次释放已被 callee move 走的资源。
 //
-// 修复：在 dtor 前插入 store null, %tmp，让析构对 null noop。load/保留不变
-// （load 在置空之前，仍读到原值）。
+// 修复：在 dtor 前插入 store zeroinitializer, %tmp，把 %tmp 清零让析构 noop。
+// 所有 load 都在 dtor 前（备份临时只在调用前被读），清零不破坏正确性。
 //
-// 识别 %tmp 是备份临时而非普通局部对象：clang 对普通局部 unique_ptr 通常内联
-// ~unique_ptr（不出现 call 形式），故【call @~unique_ptr(%tmp) 形式的析构】基
-// 本只出现在备份临时场景。再加 hasLoad（%tmp 被读出交给 callee）作为确认：备
-// 份临时的值必被 load 后交给 callee（经 ptrtoint 给 call，或 store 到内联
-// callee 的成员）；不会被 load 的纯临时不存在（clang 直接构造即析构无意义）。
-// 普通 sret 构造（call @f(ptr writable %tmp)）、lifetime、store 等 use 不影响。
+// 识别 %tmp 是"备份临时"而非普通局部对象（两条路径任一满足即处理）：
+//   路径 A：存在 call T::T(ptr %tmp, ptr %src) move-construct（mangling 含
+//           C1/C2 + OS_<num>_）——%tmp 是从另一个 T 对象 move 出来的备份。普通局部
+//           对象（call T::T(ptr %s, i64 a, i64 b)）不走从另一同类型对象 move 构造，
+//           这是可靠的区分。再加 benign-use 守卫（见 isBenignTmpUse）排除少数有
+//           move-ctor 但非备份的场景。覆盖 ≤16B（unique_ptr 8B + shared_ptr 16B）。
+//   路径 B：size ≤ 8 + hasLoad + dtor call——兜底 -O1 已把 move-construct inline 成
+//           store、无 call 形式可识别的场景（只覆盖 unique_ptr 8B；16B shared_ptr
+//           备份临时在 -O1 后被整体消除，不会进入此路径）。
 // ===========================================================================
+
+// 判断 call 是否是对 %tmp 的 move-construct：
+//   - mangling 以 _Z 开头，含 "C1"/"C2"（构造函数），且含 "OS" + 数字 + "_"（rvalue ref 参数）
+//   - 至少 2 个参数，参数 0 是 %tmp，参数 1 是 ptr 类型
+static bool isMoveConstructOf(CallInst *CI, AllocaInst *Tmp) {
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee)
+        return false;
+    if (CI->arg_size() < 2)
+        return false;
+    if (CI->getArgOperand(0) != Tmp)
+        return false;
+    if (!CI->getArgOperand(1)->getType()->isPointerTy())
+        return false;
+    StringRef cn = Callee->getName();
+    if (!cn.starts_with("_Z"))
+        return false;
+    if (!cn.contains("C1") && !cn.contains("C2"))
+        return false;
+    // rvalue ref 参数的 mangling：OS + <num> + _（如 OS2_、OS4_）
+    if (!cn.contains("OS"))
+        return false;
+    return true;
+}
+
+// 判断 use 是否"无害"——只读出值（load）、单纯写入（store）、地址 bitcast、或
+// lifetime intrinsic / 析构 / move-construct 本身。出现 GEP / atomic / 传入作为
+// 非 ctor 的参数（sret/普通参数）等则视为普通局部，跳过避免误伤。
+static bool isBenignTmpUse(Value *Tmp, User *U) {
+    if (isa<LoadInst>(U) || isa<StoreInst>(U) || isa<BitCastInst>(U))
+        return true;
+    if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+        // llvm.lifetime.start/end 是 ptr nocapture use
+        if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+            II->getIntrinsicID() == Intrinsic::lifetime_end)
+            return true;
+        return false;
+    }
+    if (auto *CI = dyn_cast<CallInst>(U)) {
+        // 允许析构本身 / move-construct / reset(nullptr)。它们都在上面专项判定里。
+        Function *Callee = CI->getCalledFunction();
+        if (!Callee)
+            return false;
+        StringRef cn = Callee->getName();
+        if (!cn.starts_with("_Z"))
+            return false;
+        if (cn.contains("D0") || cn.contains("D1") || cn.contains("D2"))
+            return true;          // 析构
+        if (cn.contains("C1") || cn.contains("C2"))
+            return true;          // 构造（含 move-construct）
+        if (cn.contains("5reset"))
+            return true;          // unique_ptr::reset(nullptr) inline 残留
+        return false;
+    }
+    return false;
+}
 
 bool eliminateByvalScalarTemporaries(Module &M) {
     bool changed = false;
@@ -841,7 +964,19 @@ bool eliminateByvalScalarTemporaries(Module &M) {
                        cn.contains("D2") || cn.contains("5reset"))))
                     continue;
 
-                // %tmp 必被 load（值读出交给 callee）——确认是备份临时。
+                // 两条识别路径（详见函数头注释）：
+                //   pathA：存在 call T::T(ptr %tmp, ptr %src) move-construct。
+                //   pathB：size ≤ 8（兜底 -O1 已 inline 掉 move-ctor 的场景）。
+                // 两条都要求 hasLoad（备份临时的值必被读出交给 callee）。
+                bool hasMoveCtor = false;
+                for (User *U : tmp->users()) {
+                    auto *CI = dyn_cast<CallInst>(U);
+                    if (CI && isMoveConstructOf(CI, tmp)) {
+                        hasMoveCtor = true;
+                        break;
+                    }
+                }
+
                 bool hasLoad = false;
                 for (User *U : tmp->users()) {
                     if (isa<LoadInst>(U)) {
@@ -852,16 +987,30 @@ bool eliminateByvalScalarTemporaries(Module &M) {
                 if (!hasLoad)
                     continue;
 
-                // 只处理 ≤8B 的备份临时。本 pass 的修复目标是被 BPF 后端 i64 化的
-                // by-value 非平凡析构参数（唯一常见的是 unique_ptr，{ptr}=8B）；
-                // >8B 的非平凡析构 by-value 参数（string 24B、shared_ptr 16B）走 byval/ptr
-                // 共享路径，不走此 i64 路径（见上方注释）。
-                // 不加这个约束会误伤普通局部对象：clang 对"call 形式析构 + alloca +
-                // 被 load 读字段"的普通局部（如 iostream 的 sentry(16B)、ostringstream
-                // (264B)、istringstream）同样匹配上面的判定，会被错误地插入
-                // store zeroinitializer 清零对象状态——析构读到全零对象崩溃。
                 const DataLayout &DL = M.getDataLayout();
-                if (DL.getTypeAllocSize(tmp->getAllocatedType()) > 8)
+                uint64_t allocSize = DL.getTypeAllocSize(tmp->getAllocatedType());
+                bool pathA = hasMoveCtor;
+                bool pathB = (allocSize <= 8);
+                if (!pathA && !pathB)
+                    continue;
+
+                // pathA 加 benign-use 守卫（避免误伤有 move-ctor 的普通局部对象）；
+                // pathB 不加（已在 STL 测试集上验证不误伤，sret 传入等 use 也允许）。
+                bool matched = false;
+                if (pathA) {
+                    bool benign = true;
+                    for (User *U : tmp->users()) {
+                        if (!isBenignTmpUse(tmp, U)) {
+                            benign = false;
+                            break;
+                        }
+                    }
+                    if (benign)
+                        matched = true;
+                }
+                if (!matched && pathB)
+                    matched = true;
+                if (!matched)
                     continue;
 
                 toErase.push_back({tmp, dtor});
@@ -1381,11 +1530,13 @@ public:
     }
 };
 
-// C. by-value ≤8B 非平凡析构参数（unique_ptr 等）double-free 修复。
-// 必须晚跑（OptimizerLastEP）：clang 的 move-construct 在 PipelineStartEP 时还是
-// 构造函数 call（@unique_ptr::unique_ptr(&&)），要等 -O1 把它 inline 成 store，
-// "备份临时"模式（store + dtor，从不 load）才浮现，eliminateByvalScalarTemporaries
-// 才能识别。与 BpfVlaPass 同处 OptimizerLastEP，无数据依赖。
+// C. by-value 非平凡析构参数（unique_ptr 8B / shared_ptr 16B 等）double-free 修复
+//    （上游 LLVM #207686）。两个 EP 都跑：
+//   - PipelineStartEP（紧跟 BpfWideArgsPass）：在 -O1 之前清零备份临时。若晚于此，
+//     -O1 会把备份临时与源对象 fold（误以为两者共享同一资源），把 caller 结尾的
+//     析构直接 fold 成对原 ctrl 的 atomicrmw -1（miscompile 形态）。
+//   - OptimizerLastEP：兜底 -O1 已把 move-construct inline 成 store、无 call 形式
+//     move-ctor 可识别的场景（unique_ptr 经此路径）。
 class BpfByvalTmpPass : public PassInfoMixin<BpfByvalTmpPass> {
 public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
@@ -1425,15 +1576,281 @@ public:
 //    load 配对时仍无法让 load 端原子，且 guard 的 store（__cxa_guard_release
 //    指向的 guard 字节写入）同样位于非原子的 slow path 之后。统一降级最简单一致。
 //
-// 范围：只处理 LoadInst/StoreInst 的 atomic 形式；不碰 AtomicRMW/AtomicCmpXchg
-// （后端能 select，且语义上 RMW 本就是 eBPF 原生支持的）。这些"漏网"的 plain
-// atomic load/store 多由 static guard、stdatomic 的 atomic_load/atomic_store 产生；
-// 真正需要多线程原子语义的代码应使用 atomic_fetch_*（RMW）或 cmpxchg。
+// 范围：
+//   D1: LoadInst/StoreInst 的 atomic 形式 → 降级为普通 load/store（见上）。
+//   D2: i8/i16 的 AtomicRMW/AtomicCmpXchg → 展开成对包含它的对齐 i32 槽的子字节 CAS
+//       循环（BPF 后端只支持 i32/i64 的 RMW/cmpxchg，窄类型会报 "unsupported atomic
+//       operation, please use 32/64 bit version"）。照搬 LLVM 官方 expandPartwordCmpXchg
+//       /expandPartwordAtomicRMW 算法（llvm/lib/CodeGen/AtomicExpandPass.cpp），展开后
+//       生成普通 i32 atomic，VM 的 do_atomic 原生支持（BPF_W），无需改 VM。
+//       解锁 atomic<bool>/char/short 等标准 C++ 写法。
+//   i32/i64 的 RMW/cmpxchg 不动（后端原生支持）。
 //
 // 时机：OptimizerLastEPCallback（晚跑，与 VLA/ByvalTmp 同列）。晚跑能让优化器
 // 先尝试消除可证明为单线程的 atomic（部分 guard 在 -O1 inline 后会被删），
 // 只改写真正漏到后端的。isRequired()=true 保证 -O0 也跑。
+// 顺序：D2 先于 D1——D2 展开会插入普通（非原子）load，不该被 D1 再降级。
 class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
+    // 子字节 CAS 的 mask/shift 计算结果（对应 LLVM PartwordMaskValues）。
+    struct PartwordMaskValues {
+        Type *WordType = nullptr;        // 展开后的宽类型（i32）
+        Value *AlignedAddr = nullptr;    // 对齐到 WordSize 的地址（addr & ~(WS-1)）
+        Align AlignedAddrAlignment;      // 对齐值（= WordSize）
+        Value *ShiftAmt = nullptr;       // 目标字节的位偏移（PtrLSB * 8）
+        Value *Mask = nullptr;           // 目标字节在宽槽里的位掩码
+        Value *Inv_Mask = nullptr;       // 反掩码（清目标字节用）
+    };
+
+    static constexpr unsigned MinWordSize = 4;  // BPF 原子最小宽度（i32）
+
+    // 窄原子子字节 CAS 的前提：对象位于一个可安全 4 字节读写的槽内（AlignedAddr 处
+    // 的 i32 load/store 不能越界破坏相邻对象）。对 _Atomic 全局/堆对象成立（标准要求
+    // 对齐）；但栈上窄 atomic（如局部 uint16_t）clang 只给 align=2 的 alloca，&s & ~3
+    // 会越过对象边界读到/写脏相邻栈数据。
+    // 修复：把窄 atomic 指针背后的 alloca 对齐提升到 MinWordSize。提升后编译器给它
+    // 分配 4 字节对齐的栈槽，&s & 3 == 0，shift=0，CAS 只在对象自身的 4 字节内（对象
+    // 因 alloca 变大而获得额外 padding，不越界）。对非 alloca（堆/全局/参数）不动——
+    // 它们的对齐由分配方保证，且 _Atomic 语义要求对象布局容纳原子访问。
+    static void widenUnderlyingAllocaAlign(Value *Addr) {
+        // 剥掉 bitcast / GEP（零偏移），找到底层 alloca。
+        Value *U = Addr->stripPointerCasts();
+        // 只处理「整个 alloca 的起始」（GEP 带偏移的不安全，无法靠提升对齐修复）。
+        if(auto *AI = dyn_cast<AllocaInst>(U)) {
+            if(AI->getAlign().value() < MinWordSize)
+                AI->setAlignment(Align(MinWordSize));
+        }
+    }
+
+    // 计算 addr/shift/mask（照搬 LLVM createMaskInstrs，简化：只处理整数小端）。
+    static PartwordMaskValues createMaskInstrs(IRBuilder<> &Builder, Instruction *I,
+                                                Type *ValueType, Value *Addr,
+                                                Align AddrAlign) {
+        PartwordMaskValues PMV;
+        const DataLayout &DL = I->getModule()->getDataLayout();
+        LLVMContext &Ctx = I->getContext();
+        unsigned ValueSize = DL.getTypeStoreSize(ValueType);  // i8→1, i16→2
+        PMV.WordType = Type::getInt32Ty(Ctx);
+        PMV.AlignedAddrAlignment = Align(MinWordSize);
+
+        PointerType *PtrTy = cast<PointerType>(Addr->getType());
+        IntegerType *IntTy = DL.getIndexType(Ctx, PtrTy->getAddressSpace());
+        Value *PtrLSB;
+        if(AddrAlign < MinWordSize) {
+            // 地址对齐不足：运行时对齐（ptrmask）+ 取低位算 shift。
+            PMV.AlignedAddr = Builder.CreateIntrinsic(
+                Intrinsic::ptrmask, {PtrTy, IntTy},
+                {Addr, ConstantInt::get(IntTy, ~(uint64_t)(MinWordSize - 1))}, nullptr,
+                "AlignedAddr");
+            Value *AddrInt = Builder.CreatePtrToInt(Addr, IntTy);
+            PtrLSB = Builder.CreateAnd(AddrInt, MinWordSize - 1, "PtrLSB");
+        } else {
+            // 已对齐：LSB 已知 0，shift=0。
+            PMV.AlignedAddr = Addr;
+            PtrLSB = ConstantInt::getNullValue(IntTy);
+        }
+        PMV.ShiftAmt = Builder.CreateTrunc(Builder.CreateShl(PtrLSB, 3), PMV.WordType,
+                                            "ShiftAmt");
+        PMV.Mask = Builder.CreateShl(
+            ConstantInt::get(PMV.WordType, (1 << (ValueSize * 8)) - 1), PMV.ShiftAmt,
+            "Mask");
+        PMV.Inv_Mask = Builder.CreateNot(PMV.Mask, "Inv_Mask");
+        return PMV;
+    }
+
+    // 从宽槽里提取目标窄值（lshr + trunc）。
+    static Value *extractMaskedValue(IRBuilder<> &Builder, Value *WideWord, Type *ValueType,
+                                      const PartwordMaskValues &PMV) {
+        Value *Shift = Builder.CreateLShr(WideWord, PMV.ShiftAmt, "shifted");
+        return Builder.CreateTrunc(Shift, ValueType, "extracted");
+    }
+
+    // D2a: i8/i16 cmpxchg → i32 子字节 CAS loop（照搬 expandPartwordCmpXchg）。
+    // IR 序列见 llvm/lib/CodeGen/AtomicExpandPass.cpp:1015 注释。
+    static bool expandPartwordCmpXchg(AtomicCmpXchgInst *CI) {
+        Value *Addr = CI->getPointerOperand();
+        widenUnderlyingAllocaAlign(Addr);  // 提升栈窄 atomic 的对齐，避免越界
+        Value *Cmp = CI->getCompareOperand();
+        Value *NewVal = CI->getNewValOperand();
+        Type *ValueType = Cmp->getType();
+
+        BasicBlock *BB = CI->getParent();
+        Function *F = BB->getParent();
+        IRBuilder<> Builder(CI);
+        BasicBlock *EndBB = BB->splitBasicBlock(CI->getIterator(), "partword.cmpxchg.end");
+        BasicBlock *FailureBB = BasicBlock::Create(CI->getContext(),
+                                                    "partword.cmpxchg.failure", F, EndBB);
+        BasicBlock *LoopBB = BasicBlock::Create(CI->getContext(),
+                                                 "partword.cmpxchg.loop", F, FailureBB);
+        std::prev(BB->end())->eraseFromParent();  // 去掉 split 加的错分支
+        Builder.SetInsertPoint(BB);
+
+        PartwordMaskValues PMV = createMaskInstrs(Builder, CI, ValueType, Addr, CI->getAlign());
+        Value *NewVal_Shifted = Builder.CreateShl(Builder.CreateZExt(NewVal, PMV.WordType),
+                                                   PMV.ShiftAmt);
+        Value *Cmp_Shifted = Builder.CreateShl(Builder.CreateZExt(Cmp, PMV.WordType),
+                                                PMV.ShiftAmt);
+        LoadInst *InitLoaded = Builder.CreateLoad(PMV.WordType, PMV.AlignedAddr);
+        InitLoaded->setVolatile(CI->isVolatile());
+        Value *InitLoaded_MaskOut = Builder.CreateAnd(InitLoaded, PMV.Inv_Mask);
+        Builder.CreateBr(LoopBB);
+
+        // loop:
+        Builder.SetInsertPoint(LoopBB);
+        PHINode *Loaded_MaskOut = Builder.CreatePHI(PMV.WordType, 2);
+        Loaded_MaskOut->addIncoming(InitLoaded_MaskOut, BB);
+        Value *FullWord_NewVal = Builder.CreateOr(Loaded_MaskOut, NewVal_Shifted);
+        Value *FullWord_Cmp = Builder.CreateOr(Loaded_MaskOut, Cmp_Shifted);
+        AtomicCmpXchgInst *NewCI = Builder.CreateAtomicCmpXchg(
+            PMV.AlignedAddr, FullWord_Cmp, FullWord_NewVal, PMV.AlignedAddrAlignment,
+            CI->getSuccessOrdering(), CI->getFailureOrdering(), CI->getSyncScopeID());
+        NewCI->setVolatile(CI->isVolatile());
+        NewCI->setWeak(CI->isWeak());
+        Value *OldVal = Builder.CreateExtractValue(NewCI, 0);
+        Value *Success = Builder.CreateExtractValue(NewCI, 1);
+        if(CI->isWeak())
+            Builder.CreateBr(EndBB);
+        else
+            Builder.CreateCondBr(Success, EndBB, FailureBB);
+
+        // failure: 周边位变了才重试，否则真实失败。
+        Builder.SetInsertPoint(FailureBB);
+        Value *OldVal_MaskOut = Builder.CreateAnd(OldVal, PMV.Inv_Mask);
+        Value *ShouldContinue = Builder.CreateICmpNE(Loaded_MaskOut, OldVal_MaskOut);
+        Builder.CreateCondBr(ShouldContinue, LoopBB, EndBB);
+        Loaded_MaskOut->addIncoming(OldVal_MaskOut, FailureBB);
+
+        // end: 提取旧值，重组 {窄值, i1} 返回。
+        Builder.SetInsertPoint(CI);
+        Value *FinalOldVal = extractMaskedValue(Builder, OldVal, ValueType, PMV);
+        Value *Res = PoisonValue::get(CI->getType());
+        Res = Builder.CreateInsertValue(Res, FinalOldVal, 0);
+        Res = Builder.CreateInsertValue(Res, Success, 1);
+        CI->replaceAllUsesWith(Res);
+        CI->eraseFromParent();
+        return true;
+    }
+
+    // 算 RMW 在【窄值原宽】下的 new value（Min/Max 等需原宽比较）。
+    static Value *buildRMWValue(AtomicRMWInst::BinOp Op, IRBuilder<> &B,
+                                 Value *Loaded, Value *Inc) {
+        switch(Op) {
+        case AtomicRMWInst::Xchg: return Inc;
+        case AtomicRMWInst::Add:  return B.CreateAdd(Loaded, Inc, "new");
+        case AtomicRMWInst::Sub:  return B.CreateSub(Loaded, Inc, "new");
+        case AtomicRMWInst::And:  return B.CreateAnd(Loaded, Inc, "new");
+        case AtomicRMWInst::Nand: return B.CreateNot(B.CreateAnd(Loaded, Inc), "new");
+        case AtomicRMWInst::Or:   return B.CreateOr(Loaded, Inc, "new");
+        case AtomicRMWInst::Xor:  return B.CreateXor(Loaded, Inc, "new");
+        case AtomicRMWInst::Max:  return B.CreateSelect(B.CreateICmpSGT(Loaded, Inc), Loaded, Inc, "new");
+        case AtomicRMWInst::Min:  return B.CreateSelect(B.CreateICmpSLE(Loaded, Inc), Loaded, Inc, "new");
+        case AtomicRMWInst::UMax: return B.CreateSelect(B.CreateICmpUGT(Loaded, Inc), Loaded, Inc, "new");
+        case AtomicRMWInst::UMin: return B.CreateSelect(B.CreateICmpULE(Loaded, Inc), Loaded, Inc, "new");
+        default: return nullptr;  // FP/UIncWrap/UDecWrap 不处理（窄场景无意义）
+        }
+    }
+
+    // D2b: i8/i16 atomicrmw → i32 子字节 CAS loop（照搬 expandPartwordAtomicRMW）。
+    // Or/Xor/And 直接 widen 成 i32 原子位运算（周边位为 0/1 不影响结果；And 需把
+    //   非目标字节置 1 避免清掉）。Add/Sub/Nand 在移位后的位上算再 mask 回目标字节。
+    //   Min/Max/UMin/UMax extract 出窄值原宽算再 insert 回宽槽。
+    static bool expandPartwordRMW(AtomicRMWInst *AI) {
+        AtomicRMWInst::BinOp Op = AI->getOperation();
+        Type *ValueType = AI->getType();
+        Value *Addr = AI->getPointerOperand();
+        widenUnderlyingAllocaAlign(Addr);  // 提升栈窄 atomic 的对齐，避免越界
+        AtomicOrdering MemOpOrder = AI->getOrdering();
+        SyncScope::ID SSID = AI->getSyncScopeID();
+        IRBuilder<> Builder(AI);
+
+        PartwordMaskValues PMV = createMaskInstrs(Builder, AI, ValueType, Addr, AI->getAlign());
+
+        // 分支 1: Or/Xor/And widen 成 i32 原子位运算（不需 CAS loop）。
+        if(Op == AtomicRMWInst::Or || Op == AtomicRMWInst::Xor || Op == AtomicRMWInst::And) {
+            Value *ValOperand_Shifted = Builder.CreateShl(
+                Builder.CreateZExt(AI->getValOperand(), PMV.WordType), PMV.ShiftAmt,
+                "ValOperand_Shifted");
+            Value *NewOperand = (Op == AtomicRMWInst::And)
+                                    ? Builder.CreateOr(ValOperand_Shifted, PMV.Inv_Mask, "AndOperand")
+                                    : ValOperand_Shifted;
+            AtomicRMWInst *NewAI = Builder.CreateAtomicRMW(Op, PMV.AlignedAddr, NewOperand,
+                                                            PMV.AlignedAddrAlignment, MemOpOrder, SSID);
+            Value *FinalOld = extractMaskedValue(Builder, NewAI, ValueType, PMV);
+            AI->replaceAllUsesWith(FinalOld);
+            AI->eraseFromParent();
+            return true;
+        }
+
+        // 分支 2/3: CAS loop（在移位后的位上算，或 extract 后原宽算）。
+        // 预计算移位后的 incr（Add/Sub/Nand/Xchg 用；Min/Max 等用原宽 Inc）。
+        Value *ValOperand_Shifted = nullptr;
+        if(Op == AtomicRMWInst::Xchg || Op == AtomicRMWInst::Add ||
+           Op == AtomicRMWInst::Sub || Op == AtomicRMWInst::Nand) {
+            ValOperand_Shifted = Builder.CreateShl(
+                Builder.CreateZExt(AI->getValOperand(), PMV.WordType), PMV.ShiftAmt,
+                "ValOperand_Shifted");
+        }
+
+        // PerformOp: 给定当前宽槽值 Loaded，算要 CAS 进去的 FullWord。
+        auto PerformOp = [&](IRBuilder<> &B, Value *Loaded) -> Value * {
+            switch(Op) {
+            case AtomicRMWInst::Xchg: {
+                Value *Loaded_MaskOut = B.CreateAnd(Loaded, PMV.Inv_Mask);
+                return B.CreateOr(Loaded_MaskOut, ValOperand_Shifted);
+            }
+            case AtomicRMWInst::Add:
+            case AtomicRMWInst::Sub:
+            case AtomicRMWInst::Nand: {
+                Value *NewVal = buildRMWValue(Op, B, Loaded, ValOperand_Shifted);
+                Value *NewVal_Masked = B.CreateAnd(NewVal, PMV.Mask);
+                Value *Loaded_MaskOut = B.CreateAnd(Loaded, PMV.Inv_Mask);
+                return B.CreateOr(Loaded_MaskOut, NewVal_Masked);
+            }
+            case AtomicRMWInst::Max: case AtomicRMWInst::Min:
+            case AtomicRMWInst::UMax: case AtomicRMWInst::UMin: {
+                Value *Loaded_Extract = extractMaskedValue(B, Loaded, ValueType, PMV);
+                Value *NewVal = buildRMWValue(Op, B, Loaded_Extract, AI->getValOperand());
+                if(!NewVal) return nullptr;
+                Value *ZExt = B.CreateZExt(NewVal, PMV.WordType, "extended");
+                Value *Shift = B.CreateShl(ZExt, PMV.ShiftAmt, "shifted", /*HasNUW*/ true);
+                Value *And = B.CreateAnd(Loaded, PMV.Inv_Mask, "unmasked");
+                return B.CreateOr(And, Shift, "inserted");
+            }
+            default:
+                return nullptr;
+            }
+        };
+
+        // 构造 CAS loop（照搬 insertRMWCmpXchgLoop）。
+        BasicBlock *BB = Builder.GetInsertBlock();
+        Function *F = BB->getParent();
+        BasicBlock *ExitBB = BB->splitBasicBlock(Builder.GetInsertPoint(), "atomicrmw.end");
+        BasicBlock *LoopBB = BasicBlock::Create(AI->getContext(), "atomicrmw.start", F, ExitBB);
+        std::prev(BB->end())->eraseFromParent();
+        Builder.SetInsertPoint(BB);
+        LoadInst *InitLoaded = Builder.CreateLoad(PMV.WordType, PMV.AlignedAddr);
+        Builder.CreateBr(LoopBB);
+
+        Builder.SetInsertPoint(LoopBB);
+        PHINode *Loaded = Builder.CreatePHI(PMV.WordType, 2, "loaded");
+        Loaded->addIncoming(InitLoaded, BB);
+        Value *NewVal = PerformOp(Builder, Loaded);
+        AtomicOrdering CmpOrder = (MemOpOrder == AtomicOrdering::Unordered)
+                                      ? AtomicOrdering::Monotonic : MemOpOrder;
+        AtomicCmpXchgInst *Pair = Builder.CreateAtomicCmpXchg(
+            PMV.AlignedAddr, Loaded, NewVal, PMV.AlignedAddrAlignment, CmpOrder,
+            AtomicCmpXchgInst::getStrongestFailureOrdering(CmpOrder), SSID);
+        Value *NewLoaded = Builder.CreateExtractValue(Pair, 0);
+        Value *Success = Builder.CreateExtractValue(Pair, 1);
+        Loaded->addIncoming(NewLoaded, LoopBB);
+        Builder.CreateCondBr(Success, ExitBB, LoopBB);
+
+        Builder.SetInsertPoint(ExitBB, ExitBB->begin());
+        Value *FinalOld = extractMaskedValue(Builder, NewLoaded, ValueType, PMV);
+        AI->replaceAllUsesWith(FinalOld);
+        AI->eraseFromParent();
+        return true;
+    }
+
 public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
         if(F.isDeclaration())
@@ -1442,6 +1859,8 @@ public:
         bool Changed = false;
         SmallVector<LoadInst *, 16> Loads;
         SmallVector<StoreInst *, 16> Stores;
+        SmallVector<AtomicCmpXchgInst *, 16> NarrowCmpXchgs;
+        SmallVector<AtomicRMWInst *, 16> NarrowRMWs;
         for(BasicBlock &BB : F) {
             for(Instruction &I : BB) {
                 if(auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -1450,11 +1869,30 @@ public:
                 } else if(auto *SI = dyn_cast<StoreInst>(&I)) {
                     if(SI->isAtomic())
                         Stores.push_back(SI);
+                } else if(auto *CmpX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+                    // 窄 cmpxchg（i8/i16）：BPF 后端只支持 i32/i64，需展开。
+                    if(CmpX->getCompareOperand()->getType()->getIntegerBitWidth() < 32)
+                        NarrowCmpXchgs.push_back(CmpX);
+                } else if(auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+                    // 窄 RMW：同上。跳过浮点（BPF 无窄浮点原子场景）。
+                    if(!RMW->isFloatingPointOperation() &&
+                       RMW->getType()->getIntegerBitWidth() < 32)
+                        NarrowRMWs.push_back(RMW);
                 }
             }
         }
 
-        // load atomic T, ptr <order>, align A  →  load T, ptr, align A
+        // D2 先展开窄原子（会插入普通 load，不该被 D1 再降级）。
+        for(AtomicCmpXchgInst *CmpX : NarrowCmpXchgs) {
+            expandPartwordCmpXchg(CmpX);
+            Changed = true;
+        }
+        for(AtomicRMWInst *RMW : NarrowRMWs) {
+            expandPartwordRMW(RMW);
+            Changed = true;
+        }
+
+        // D1: load atomic T, ptr <order>, align A  →  load T, ptr, align A
         // 直接构造普通 LoadInst（IRBuilder 的 CreateLoad 无带 Align 的重载），
         // 复制对齐/volatile/调试元数据，order 设为 NotAtomic，插在原指令前再替换。
         for(LoadInst *LI : Loads) {
@@ -1469,7 +1907,7 @@ public:
             Changed = true;
         }
 
-        // store atomic T v, ptr <order>, align A  →  store T v, ptr, align A
+        // D1: store atomic T v, ptr <order>, align A  →  store T v, ptr, align A
         for(StoreInst *SI : Stores) {
             StoreInst *New = new StoreInst(SI->getValueOperand(), SI->getPointerOperand(),
                                             SI->isVolatile(), SI->getAlign(),
@@ -1493,8 +1931,9 @@ public:
 //   - BpfWideArgsPass： PipelineStartEP（早，所有 -O 触发）—— 改签名/调用点。
 //   - BpfVlaPass：      OptimizerLastEP（晚）+ -O0 兜底的 PipelineStartEP ——
 //                       必须在 SROA/instcombine 之后，只处理漏网的动态 alloca。
-//   - BpfByvalTmpPass： OptimizerLastEP（晚）—— by-value 标量析构 double-free 修复
-//                       （只命中 ≤8B 备份临时，避开普通局部对象的析构）。
+//   - BpfByvalTmpPass： PipelineStartEP（早，紧跟 WideArgs）+ OptimizerLastEP（晚兜底）
+//                       —— by-value 非平凡析构参数 double-free 修复（≤16B；unique_ptr
+//                       8B / shared_ptr 16B），上游 #207686 的本仓库 workaround。
 //   - BpfAtomicLowerPass: OptimizerLastEP（晚）—— 把 plain atomic load/store 降级
 //                       为普通 load/store（解锁 iostream/static guard；见 pass 注释）。
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
@@ -1505,6 +1944,11 @@ llvmGetPassPluginInfo() {
         PB.registerPipelineStartEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel) {
                 MPM.addPass(BpfWideArgsPass());
+                // C. by-value 析构参数 double-free 修复（早跑一份，详见 BpfByvalTmpPass
+                // 注释）：必须在 -O1 之前清零备份临时，否则 -O1 会把它与源对象 fold，
+                // 把 caller 析构直接 fold 成对原 ctrl 的 atomicrmw -1（miscompile）。
+                // OptimizerLastEP 还有一份兜底（见下 addByvalTmpPass）。
+                MPM.addPass(BpfByvalTmpPass());
             });
 
         // B. BpfVlaPass：跑在优化器末尾

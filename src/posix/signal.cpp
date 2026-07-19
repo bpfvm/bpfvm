@@ -217,7 +217,7 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
             if(bit && (blocked & bit)) {
                 // 被阻塞：先试 signalfd（仅当存在），命中即消费；否则暂存 deferred 回挂队列。
                 if(!has_filled_signalfd) {
-                    for(const auto& kv : ps->fds) {
+                    for(const auto& kv : *ps->fds_snap()) {
                         if(auto* sfd = dynamic_cast<SignalFd*>(kv.second.get())) {
                             signalfds.push_back(sfd);
                         }
@@ -619,22 +619,26 @@ int64_t PosixSyscall::do_signalfd4(vm* v) {
             }
         }
 
-        int guest_fd = allocate_fd();
         auto handle = std::make_shared<SignalFd>(p[0], p[1], mask);
         if(flags & SFD_CLOEXEC) {
             handle->cloexec = true;
         }
-        ps->fds[guest_fd] = handle;
+        int guest_fd = -1;
+        ps->fds_mutate([&](SharedState::FdMap& m){
+            guest_fd = 0;
+            while(m.count(guest_fd)) guest_fd++;
+            m[guest_fd] = handle;
+        });
         return guest_fd;
     }
 
     // —— 更新既有 signalfd 的 mask ——
     // dynamic_cast 判定：非 SignalFd（普通文件/pipe/socket/ProcFile/ProcDir）→ Linux 返回 EINVAL。
-    auto it = ps->fds.find(fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(fd);
+    if(!h) {
         return -EBADF;
     }
-    SignalFd* sfd = dynamic_cast<SignalFd*>(it->second.get());
+    SignalFd* sfd = dynamic_cast<SignalFd*>(h.get());
     if(sfd == nullptr) {
         return -EINVAL;
     }

@@ -2,7 +2,7 @@
 #include "pty.h"
 
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
-std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map{};
+std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map;
 std::mutex PosixSyscall::pid_map_mutex;
 
 PosixSyscall::PosixSyscall() : pid(next_pid.fetch_add(1)) {
@@ -55,14 +55,18 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         tty->owner_ = session.get();
         tty->fg_pgrp.store(pgrp->pgid);
         session->ctty = tty;
-        ps->fds.emplace(0, std::make_shared<DevFd>(dup(slave_fd), "", tty));
-        ps->fds.emplace(1, std::make_shared<DevFd>(dup(slave_fd), "", tty));
-        ps->fds.emplace(2, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+        ps->fds_mutate([&](SharedState::FdMap& m){
+            m.emplace(0, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+            m.emplace(1, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+            m.emplace(2, std::make_shared<DevFd>(dup(slave_fd), "", tty));
+        });
         close(slave_fd);
     } else {
-        ps->fds.emplace(0, std::make_shared<HostFd>(dup(STDIN_FILENO)));
-        ps->fds.emplace(1, std::make_shared<HostFd>(dup(STDOUT_FILENO)));
-        ps->fds.emplace(2, std::make_shared<HostFd>(dup(STDERR_FILENO)));
+        ps->fds_mutate([&](SharedState::FdMap& m){
+            m.emplace(0, std::make_shared<HostFd>(dup(STDIN_FILENO)));
+            m.emplace(1, std::make_shared<HostFd>(dup(STDOUT_FILENO)));
+            m.emplace(2, std::make_shared<HostFd>(dup(STDERR_FILENO)));
+        });
     }
     if(!ps->root.empty()) {
         return;
@@ -151,11 +155,12 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
         }
     }
 
-    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表，对齐do_close
-    for(auto& kv : ps->fds) {
+    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表。
+    // drop 在锁外执行（投 SIGHUP 不能在 fds_mutate 重试循环里），再整表替换为空快照。
+    for(auto& kv : *ps->fds_snap()) {
         drop_fd_handle(v.get(), kv.second);
     }
-    ps->fds.clear();
+    ps->fds_replace(std::make_shared<const SharedState::FdMap>());
 }
 
 std::shared_ptr<PosixSyscall> PosixSyscall::sys(vm* v) {
@@ -303,7 +308,7 @@ int64_t PosixSyscall::do_alloca(vm* v) {
     return (int64_t)v->alloca(inc);
 }
 
-int64_t PosixSyscall::syscall(vm* v, uint32_t call) {
+int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
         sys_id = BPF_CALL_TO_ID(call);

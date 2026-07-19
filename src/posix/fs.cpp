@@ -22,7 +22,6 @@
 
 // ptmx 注册表：guest open("/dev/ptmx") 合成的 host pty，按 pts 编号(=TIOCGPTN 返回值)
 // 索引到 GuestTty。后续 open("/dev/pts/N") 用 N 查此表，复用同一 GuestTty。
-// 文件作用域：唯一使用者是本文件的 DevFd::open。
 static std::unordered_map<int, std::shared_ptr<GuestTty>> ptmx_registry;
 static std::mutex ptmx_registry_mutex;
 
@@ -55,7 +54,7 @@ ssize_t HostFd::pwrite(const void* buf, size_t count, off_t off) {
 }
 
 off_t HostFd::lseek(off_t off, int whence) {
-    off_t rc = lseek64(fd_, off, whence);
+    off_t rc = ::lseek(fd_, off, whence);
     if(rc == (off_t)-1) return -errno;
     return rc;
 }
@@ -190,18 +189,18 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
         }
         const auto& ctty = session->ctty;
         // 找一个已绑同一 ctty 的 guest fd 做 dup 源（PTY 模式下 fd 0/1/2 必是）。
-        int src_guest_fd = -1;
-        for(const auto& entry : self->ps->fds) {
+        std::shared_ptr<Fd> src;
+        for(const auto& entry : *self->ps->fds_snap()) {
             if(entry.second->tty().get() == ctty.get()) {
-                src_guest_fd = entry.first;
+                src = entry.second;
                 break;
             }
         }
-        if(src_guest_fd < 0) {
+        if(!src) {
             errno = ENXIO;
             return nullptr;
         }
-        int host_fd = dup(self->ps->fds[src_guest_fd]->host_fd());
+        int host_fd = dup(src->host_fd());
         if(host_fd < 0) return nullptr;   // errno 已由 dup 设
         return std::make_shared<DevFd>(host_fd, guest_abs, ctty);
     }

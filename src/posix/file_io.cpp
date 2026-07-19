@@ -46,7 +46,7 @@ std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<F
 
 int64_t PosixSyscall::do_openat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -60,17 +60,15 @@ int64_t PosixSyscall::do_openat(vm* v) {
     if(!handle) return -errno;
 
     if(flags & O_CLOEXEC) handle->cloexec = true;
-    int guest_fd = allocate_fd();
-    ps->fds.emplace(guest_fd, std::move(handle));
-    return guest_fd;
+    return ps->fds_emplace(std::move(handle));
 }
 
 int64_t PosixSyscall::do_read(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    if(auto r = tty_bg_check(v, it->second, /*is_read=*/true)) {
+    if(auto r = tty_bg_check(v, h, /*is_read=*/true)) {
         return *r;  // 后台读 ctty：tty_bg_check 已投 SIGTTIN 并定好结果（/proc fd 自动放行）
     }
     size_t count = arg_size(v->r(3));
@@ -78,7 +76,7 @@ int64_t PosixSyscall::do_read(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->read(buf, count);  // 虚分派：HostFd::read / ProcFile::read
+    ssize_t rc = h->read(buf, count);  // 虚分派：HostFd::read / ProcFile::read
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -86,11 +84,11 @@ int64_t PosixSyscall::do_read(vm* v) {
 }
 
 int64_t PosixSyscall::do_write(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    if(auto r = tty_bg_check(v, it->second, /*is_read=*/false)) {
+    if(auto r = tty_bg_check(v, h, /*is_read=*/false)) {
         return *r;  // 后台写 ctty：tty_bg_check 已投 SIGTTOU 并定好结果
     }
     size_t count = arg_size(v->r(3));
@@ -98,7 +96,7 @@ int64_t PosixSyscall::do_write(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->write(buf, count);  // HostFd::write / ProcFile/ProcDir::write(-EROFS)
+    ssize_t rc = h->write(buf, count);  // HostFd::write / ProcFile/ProcDir::write(-EROFS)
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -106,11 +104,11 @@ int64_t PosixSyscall::do_write(vm* v) {
 }
 
 int64_t PosixSyscall::do_lseek(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    return it->second->lseek((off_t)v->r(2), arg_s32(v->r(3)));
+    return h->lseek((off_t)v->r(2), arg_s32(v->r(3)));
 }
 
 int64_t PosixSyscall::do_truncate(vm* v) {
@@ -122,21 +120,27 @@ int64_t PosixSyscall::do_truncate(vm* v) {
 }
 
 int64_t PosixSyscall::do_ftruncate(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    return it->second->ftruncate(static_cast<off_t>(v->r(2)));
+    return h->ftruncate(static_cast<off_t>(v->r(2)));
 }
 
 int64_t PosixSyscall::do_close(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    int fd = arg_s32(v->r(1));
+    auto h = ps->find_fd(fd);
+    if(!h) {
         return -EBADF;
     }
-    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFile/ProcDir 的 on_close 为 no-op）
-    drop_fd_handle(v, it->second);
-    ps->fds.erase(it);
+    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFile/ProcDir 的 on_close 为 no-op）。
+    // drop 在锁外（投 SIGHUP 不能在 fds_mutate 重试循环里）。
+    // COW 下别的线程持有的旧快照仍能看到该 fd（host fd 延迟关闭，对齐 Linux file 引用计数语义）。
+    drop_fd_handle(v, h);
+    ps->fds_mutate([&](SharedState::FdMap& m){
+        m.erase(fd); // <- bug
+        //fprintf(stderr, "after erase: fd=%d\n", fd);
+    });
     return 0;
 }
 
@@ -164,11 +168,11 @@ static std::optional<std::vector<iovec>> translate_iovec(vm* v, uint64_t guest_a
 }
 
 int64_t PosixSyscall::do_readv(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    if(auto r = tty_bg_check(v, it->second, /*is_read=*/true)) {
+    if(auto r = tty_bg_check(v, h, /*is_read=*/true)) {
         return *r;  // 后台读 ctty：已投 SIGTTIN（/proc fd 自动放行）
     }
     int iovcnt = arg_s32(v->r(3));
@@ -182,7 +186,7 @@ int64_t PosixSyscall::do_readv(vm* v) {
     if(host_vec->empty()) {
         return 0;  // 全 0 长度段：无数据可读
     }
-    ssize_t rc = it->second->readv(host_vec->data(), (int)host_vec->size());
+    ssize_t rc = h->readv(host_vec->data(), (int)host_vec->size());
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -190,11 +194,11 @@ int64_t PosixSyscall::do_readv(vm* v) {
 }
 
 int64_t PosixSyscall::do_writev(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    if(auto r = tty_bg_check(v, it->second, /*is_read=*/false)) {
+    if(auto r = tty_bg_check(v, h, /*is_read=*/false)) {
         return *r;  // 后台写 ctty：tty_bg_check 已投 SIGTTOU 并定好结果
     }
     int iovcnt = arg_s32(v->r(3));
@@ -208,7 +212,7 @@ int64_t PosixSyscall::do_writev(vm* v) {
     if(host_vec->empty()) {
         return 0;  // 全 0 长度段：无数据可写
     }
-    ssize_t rc = it->second->writev(host_vec->data(), (int)host_vec->size());
+    ssize_t rc = h->writev(host_vec->data(), (int)host_vec->size());
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -216,8 +220,8 @@ int64_t PosixSyscall::do_writev(vm* v) {
 }
 
 int64_t PosixSyscall::do_pread(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
     size_t count = arg_size(v->r(3));
@@ -225,7 +229,7 @@ int64_t PosixSyscall::do_pread(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->pread(buf, count, (off_t)v->r(4));
+    ssize_t rc = h->pread(buf, count, (off_t)v->r(4));
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -233,8 +237,8 @@ int64_t PosixSyscall::do_pread(vm* v) {
 }
 
 int64_t PosixSyscall::do_pwrite(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
     size_t count = arg_size(v->r(3));
@@ -242,7 +246,7 @@ int64_t PosixSyscall::do_pwrite(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = it->second->pwrite(buf, count, (off_t)v->r(4));
+    ssize_t rc = h->pwrite(buf, count, (off_t)v->r(4));
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -250,8 +254,8 @@ int64_t PosixSyscall::do_pwrite(vm* v) {
 }
 
 int64_t PosixSyscall::do_getdents64(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
     size_t count = arg_size(v->r(3));
@@ -262,5 +266,5 @@ int64_t PosixSyscall::do_getdents64(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    return it->second->getdents64(buf, count);  // HostFd 透传 / ProcDir 填充虚拟条目
+    return h->getdents64(buf, count);  // HostFd 透传 / ProcDir 填充虚拟条目
 }

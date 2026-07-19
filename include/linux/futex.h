@@ -8,6 +8,8 @@
  *
  * 数值与内核 <linux/futex.h>、musl 内部头一致。注意：内核 UAPI 的私有标志名为
  * FUTEX_PRIVATE_FLAG(128)，这里沿用 musl/本项目的 FUTEX_PRIVATE 命名，二者不冲突。
+ * FUTEX2_PRIVATE 是新版 futex2 API 的同名常量（= FUTEX_PRIVATE_FLAG，内核 <linux/futex.h>
+ * 定义），本项目 do_futex 用它剥离 op 的私有标志。
  *
  * #ifndef 守护避免与系统 <linux/futex.h>（若被引入）或 musl 内部头重复定义冲突。
  */
@@ -22,6 +24,9 @@
 #endif
 #ifndef FUTEX_PRIVATE
 #define FUTEX_PRIVATE		128
+#endif
+#ifndef FUTEX2_PRIVATE
+#define FUTEX2_PRIVATE		FUTEX_PRIVATE
 #endif
 
 #endif

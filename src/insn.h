@@ -165,7 +165,7 @@ public:
     virtual ~SyscallHandler() = default;
     virtual void init(const std::shared_ptr<vm>& v) = 0;
     virtual void fini(const std::shared_ptr<vm>& v) = 0;
-    virtual int64_t syscall(vm* v, uint32_t call) = 0;
+    virtual int64_t (syscall)(vm* v, uint32_t call) = 0;
     // 宿主侧信号（物理终端 ^C / 终端挂断 / 外部 kill 给 bpfvm）转交 handler 路由。
     // handler 凭自己掌握的进程语义（session/ctty/前台组）决定投给谁：有控制终端走
     // 前台进程组，无 ctty 退化为投给该 vm 自身。默认实现 = 直接 queue 给该 vm。
@@ -253,7 +253,7 @@ private:
 
     // 处理 syscall 形式的 BPF call 指令（src_reg=0）。
     bool do_syscall(uint32_t call) {
-        int64_t ret = options.sys->syscall(this, call);
+        int64_t ret = (options.sys->syscall)(this, call);
         if(ret == SYSCALL_RESTART) {
             restart_syscall_pc_ = pc;
         } else {

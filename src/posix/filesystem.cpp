@@ -61,9 +61,8 @@ std::string PosixSyscall::guest_abs_path(const std::string& path, int dirfd) {
         // fd 无 path 时退化为相对 cwd。
         std::string base = ps->cwd.empty() ? std::string("/") : ps->cwd;
         if(dirfd != AT_FDCWD) {
-            auto it = ps->fds.find(dirfd);
-            if(it != ps->fds.end() && !it->second->path.empty()) {
-                base = it->second->path;
+            if(auto h = ps->find_fd(dirfd); h && !h->path.empty()) {
+                base = h->path;
             }
         }
         guest_abs = (std::filesystem::path(base) / input).lexically_normal().string();
@@ -77,7 +76,7 @@ std::string PosixSyscall::guest_abs_path(const std::string& path, int dirfd) {
 
 int64_t PosixSyscall::do_unlinkat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -90,7 +89,7 @@ int64_t PosixSyscall::do_unlinkat(vm* v) {
 
 int64_t PosixSyscall::do_mkdirat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -103,7 +102,7 @@ int64_t PosixSyscall::do_mkdirat(vm* v) {
 
 int64_t PosixSyscall::do_symlinkat(vm* v) {
     int dirfd = arg_s32(v->r(2));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string target;
@@ -118,10 +117,10 @@ int64_t PosixSyscall::do_linkat(vm* v) {
     int olddirfd = arg_s32(v->r(1));
     int newdirfd = arg_s32(v->r(3));
     int flags = arg_s32(v->r(5));
-    if(olddirfd != AT_FDCWD && ps->fds.find(olddirfd) == ps->fds.end()) {
+    if(olddirfd != AT_FDCWD && !ps->find_fd(olddirfd)) {
         return -EBADF;
     }
-    if(newdirfd != AT_FDCWD && ps->fds.find(newdirfd) == ps->fds.end()) {
+    if(newdirfd != AT_FDCWD && !ps->find_fd(newdirfd)) {
         return -EBADF;
     }
     std::string oldpath;
@@ -138,10 +137,10 @@ int64_t PosixSyscall::do_renameat2(vm* v) {
     int old_dirfd = arg_s32(v->r(1));
     int new_dirfd = arg_s32(v->r(3));
     unsigned int flags = arg_u32(v->r(5));
-    if(old_dirfd != AT_FDCWD && ps->fds.find(old_dirfd) == ps->fds.end()) {
+    if(old_dirfd != AT_FDCWD && !ps->find_fd(old_dirfd)) {
         return -EBADF;
     }
-    if(new_dirfd != AT_FDCWD && ps->fds.find(new_dirfd) == ps->fds.end()) {
+    if(new_dirfd != AT_FDCWD && !ps->find_fd(new_dirfd)) {
         return -EBADF;
     }
     std::string old_path;
@@ -156,7 +155,7 @@ int64_t PosixSyscall::do_renameat2(vm* v) {
 
 int64_t PosixSyscall::do_readlinkat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -175,22 +174,22 @@ int64_t PosixSyscall::do_readlinkat(vm* v) {
 
 int64_t PosixSyscall::do_fchdir(vm* v) {
     int fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(fd);
+    if(!h) {
         return -EBADF;
     }
     struct statx stx = {};
-    int rc = it->second->fstatx(&stx, STATX_TYPE, 0);
+    int rc = h->fstatx(&stx, STATX_TYPE, 0);
     if(rc < 0) {
         return rc;
     }
     if(!S_ISDIR(stx.stx_mode)) {
         return -ENOTDIR;
     }
-    if(it->second->path.empty()) {
+    if(h->path.empty()) {
         return -ENOENT;
     }
-    ps->cwd = it->second->path;
+    ps->cwd = h->path;
     return 0;
 }
 
@@ -214,7 +213,7 @@ int64_t PosixSyscall::do_getcwd(vm* v) {
 
 int64_t PosixSyscall::do_statx(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -237,14 +236,16 @@ int64_t PosixSyscall::do_statx(vm* v) {
     // AT_EMPTY_PATH（或 path 为空）+ 有效 dirfd：纯 fd 操作（fstat 语义）。
     // 经 Fd::fstatx 多态分发：HostFd 透传 host statx（socket fd 也正确返回 S_IFSOCK），
     if(dirfd != AT_FDCWD && (flags & AT_EMPTY_PATH)) {
-        return ps->fds[dirfd]->fstatx(out, mask, flags);
+        auto h = ps->find_fd(dirfd);
+        if(!h) return -EBADF;
+        return h->fstatx(out, mask, flags);
     }
     return ResolvePath(this, guest_abs_path(path, dirfd))->statx(out, mask, flags);
 }
 
 int64_t PosixSyscall::do_fchmodat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     std::string path;
@@ -258,7 +259,7 @@ int64_t PosixSyscall::do_fchmodat(vm* v) {
 
 int64_t PosixSyscall::do_utimensat(vm* v) {
     int dirfd = arg_s32(v->r(1));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
 
@@ -290,7 +291,9 @@ int64_t PosixSyscall::do_utimensat(vm* v) {
     // dirfd 顶部已校验有效；AT_FDCWD 时无 fd 可作用 → EFAULT（utimensat 语义）。
     if(!has_path) {
         if(dirfd == AT_FDCWD) return -EFAULT;
-        return ps->fds[dirfd]->futimens(times_ptr, flags);
+        auto h = ps->find_fd(dirfd);
+        if(!h) return -EBADF;
+        return h->futimens(times_ptr, flags);
     }
     return ResolvePath(this, guest_abs_path(path, dirfd))->utimens(times_ptr, flags);
 }
@@ -303,7 +306,7 @@ int64_t PosixSyscall::do_faccessat(vm* v) {
     }
     int mode = arg_s32(v->r(3));
     int flags = arg_s32(v->r(4));
-    if(dirfd != AT_FDCWD && ps->fds.find(dirfd) == ps->fds.end()) {
+    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
         return -EBADF;
     }
     return ResolvePath(this, guest_abs_path(path, dirfd))->access(mode, flags);

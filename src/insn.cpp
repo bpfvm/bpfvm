@@ -22,13 +22,11 @@ using JitCompilerImpl = JitCompiler<AArch64Emitter>;
 #else
 class StubJitCompiler : public JitCompilerBase {
 public:
-    JitFunction* compile(vm*, const bpf_insn*) override { return nullptr; }
+    JitFunction* compile(vm*, uint64_t) override { return nullptr; }
 };
 using JitCompilerImpl = StubJitCompiler;
 #endif
 
-#include <libelf.h>
-#include <gelf.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -615,6 +613,7 @@ bool vm::do_softfp(uint32_t call) {
         m.set_data(host, alloc_sz);
         m.size = alloc_sz;
         m.flags = PF_R | PF_W;
+        m.path = "<emutls>";
         uint64_t guest_addr = 0;
         {
             auto& ml = *maps;
@@ -853,7 +852,8 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
         std::cerr << "  Start: 0x" << std::hex << map.paddr
                   << " End: 0x" << (map.paddr + map.size)
                   << " Size: 0x" << map.size
-                  << " Flags: " << perm << std::dec << std::endl;
+                  << " Flags: " << perm << std::dec 
+                  << " Path: " << map.path << std::endl;
     }
 }
 
@@ -1492,6 +1492,7 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
         stack_memmap.size = STACK_SIZE;
         stack_memmap.paddr = STACK_BASE;
         stack_memmap.flags = PF_W;
+        stack_memmap.path = "<stack>";
         addmem(std::move(stack_memmap));
         stack_base = data;
     }

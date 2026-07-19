@@ -9,14 +9,12 @@ int64_t PosixSyscall::do_socket(vm* v) {
     if(host_fd < 0) {
         return -errno;
     }
-    int guest_fd = allocate_fd();
     auto handle = std::make_shared<HostFd>(host_fd);
     // cloexec 仅是 VM 的 fd 表属性，同步登记以便 execve 时关闭。
     if(type & SOCK_CLOEXEC) {
         handle->cloexec = true;
     }
-    ps->fds[guest_fd] = handle;
-    return guest_fd;
+    return ps->fds_emplace(handle);
 }
 
 int64_t PosixSyscall::do_socketpair(vm* v) {
@@ -33,19 +31,24 @@ int64_t PosixSyscall::do_socketpair(vm* v) {
         return -errno;
     }
 
-    int guest_fd0 = allocate_fd();
     auto handle0 = std::make_shared<HostFd>(host_fds[0]);
     if(type & SOCK_CLOEXEC) {
         handle0->cloexec = true;
     }
-    ps->fds[guest_fd0] = handle0;
-
-    int guest_fd1 = allocate_fd(guest_fd0 + 1);
     auto handle1 = std::make_shared<HostFd>(host_fds[1]);
     if(type & SOCK_CLOEXEC) {
         handle1->cloexec = true;
     }
-    ps->fds[guest_fd1] = handle1;
+    // 两端在同一 mutate 内分配，保证不抢同号。
+    int guest_fd0 = -1, guest_fd1 = -1;
+    ps->fds_mutate([&](SharedState::FdMap& m){
+        guest_fd0 = 0;
+        while(m.count(guest_fd0)) guest_fd0++;
+        guest_fd1 = guest_fd0 + 1;
+        while(m.count(guest_fd1)) guest_fd1++;
+        m[guest_fd0] = handle0;
+        m[guest_fd1] = handle1;
+    });
 
     sv[0] = guest_fd0;
     sv[1] = guest_fd1;
@@ -58,8 +61,8 @@ int64_t PosixSyscall::do_socketpair(vm* v) {
 
 int64_t PosixSyscall::do_bind(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     socklen_t addrlen = (socklen_t)arg_u32(v->r(3));
@@ -67,7 +70,7 @@ int64_t PosixSyscall::do_bind(vm* v) {
     if(addr == nullptr) {
         return -EFAULT;
     }
-    if(::bind(it->second->host_fd(), addr, addrlen) < 0) {
+    if(::bind(h->host_fd(), addr, addrlen) < 0) {
         return -errno;
     }
     return 0;
@@ -75,12 +78,12 @@ int64_t PosixSyscall::do_bind(vm* v) {
 
 int64_t PosixSyscall::do_listen(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     int backlog = arg_s32(v->r(2));
-    if(::listen(it->second->host_fd(), backlog) < 0) {
+    if(::listen(h->host_fd(), backlog) < 0) {
         return -errno;
     }
     return 0;
@@ -88,8 +91,8 @@ int64_t PosixSyscall::do_listen(vm* v) {
 
 int64_t PosixSyscall::do_connect(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     socklen_t addrlen = (socklen_t)arg_u32(v->r(3));
@@ -97,7 +100,7 @@ int64_t PosixSyscall::do_connect(vm* v) {
     if(addr == nullptr) {
         return -EFAULT;
     }
-    if(::connect(it->second->host_fd(), addr, addrlen) < 0) {
+    if(::connect(h->host_fd(), addr, addrlen) < 0) {
         // EINPROGRESS（非阻塞 socket，连接建立中）按 errno 透传；
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -106,12 +109,12 @@ int64_t PosixSyscall::do_connect(vm* v) {
 
 int64_t PosixSyscall::do_shutdown(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     int how = arg_s32(v->r(2));
-    if(::shutdown(it->second->host_fd(), how) < 0) {
+    if(::shutdown(h->host_fd(), how) < 0) {
         return -errno;
     }
     return 0;
@@ -123,8 +126,8 @@ int64_t PosixSyscall::do_shutdown(vm* v) {
 
 int64_t PosixSyscall::do_accept4(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     uint64_t addr_arg = v->r(2);
@@ -147,19 +150,17 @@ int64_t PosixSyscall::do_accept4(vm* v) {
         }
     }
 
-    int new_host = ::accept4(it->second->host_fd(), addr, addrlen, flags);
+    int new_host = ::accept4(h->host_fd(), addr, addrlen, flags);
     if(new_host < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
     // addrlen 已被 host 写回（实际对端地址长度），host 直接写进了 guest 内存。
 
-    int new_guest = allocate_fd();
     auto handle = std::make_shared<HostFd>(new_host);
     if(flags & SOCK_CLOEXEC) {
         handle->cloexec = true;
     }
-    ps->fds[new_guest] = handle;
-    return new_guest;
+    return ps->fds_emplace(handle);
 }
 
 // ===========================================================================
@@ -168,8 +169,8 @@ int64_t PosixSyscall::do_accept4(vm* v) {
 
 int64_t PosixSyscall::do_sendto(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     size_t len = arg_size(v->r(3));
@@ -189,7 +190,7 @@ int64_t PosixSyscall::do_sendto(vm* v) {
         }
     }
 
-    ssize_t rc = ::sendto(it->second->host_fd(), buf, len, flags, addr, addrlen);
+    ssize_t rc = ::sendto(h->host_fd(), buf, len, flags, addr, addrlen);
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -198,8 +199,8 @@ int64_t PosixSyscall::do_sendto(vm* v) {
 
 int64_t PosixSyscall::do_recvfrom(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     size_t len = arg_size(v->r(3));
@@ -225,7 +226,7 @@ int64_t PosixSyscall::do_recvfrom(vm* v) {
         }
     }
 
-    ssize_t rc = ::recvfrom(it->second->host_fd(), buf, len, flags, addr, addrlen);
+    ssize_t rc = ::recvfrom(h->host_fd(), buf, len, flags, addr, addrlen);
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -245,7 +246,7 @@ int64_t PosixSyscall::do_recvfrom(vm* v) {
 // SCM_RIGHTS（fd 传递）：
 // VM 只在边界翻译 fd 编号——cmsg 里 guest 塞的是 guest fd，host 内核认 host fd：
 //   sendmsg: guest cmsg 的 SCM_RIGHTS fd → 查 fd 表得 host fd → 写进 cmsg → host 内核
-//   recvmsg: host 内核在本进程安装 host fd → VM allocate_fd 登记进接收方 guest fd 表
+//   recvmsg: host 内核在本进程安装 host fd → VM 分配 guest fd 登记进接收方 fd 表
 //            → 得 guest fd → 写回 guest cmsg
 //
 // FIXME: 目前只翻译 SCM_RIGHTS 的 fd，其余 cmsg 类型原样透传（如 SCM_TIMESTAMP 的
@@ -307,8 +308,8 @@ static bool translate_msghdr(vm* v, const struct msghdr* gmsg, struct msghdr* hm
 
 int64_t PosixSyscall::do_sendmsg(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     const struct msghdr* gmsg = static_cast<const struct msghdr*>(
@@ -339,16 +340,16 @@ int64_t PosixSyscall::do_sendmsg(vm* v) {
             int* fds = reinterpret_cast<int*>(CMSG_DATA(cmsg));
             int nfds = static_cast<int>((cmsg->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int));
             for(int i = 0; i < nfds; ++i) {
-                auto fdit = ps->fds.find(fds[i]);
-                if(fdit == ps->fds.end()) {
+                auto fd_h = ps->find_fd(fds[i]);
+                if(!fd_h) {
                     return -EBADF;
                 }
-                fds[i] = fdit->second->host_fd();   // guest fd → host fd
+                fds[i] = fd_h->host_fd();   // guest fd → host fd
             }
         }
     }
 
-    ssize_t rc = ::sendmsg(it->second->host_fd(), &hmsg, arg_s32(v->r(3)));
+    ssize_t rc = ::sendmsg(h->host_fd(), &hmsg, arg_s32(v->r(3)));
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -357,8 +358,8 @@ int64_t PosixSyscall::do_sendmsg(vm* v) {
 
 int64_t PosixSyscall::do_recvmsg(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     struct msghdr* gmsg = static_cast<struct msghdr*>(
@@ -374,7 +375,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
         return err;
     }
 
-    ssize_t rc = ::recvmsg(it->second->host_fd(), &hmsg, arg_s32(v->r(3)));
+    ssize_t rc = ::recvmsg(h->host_fd(), &hmsg, arg_s32(v->r(3)));
     if(rc < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;
     }
@@ -382,7 +383,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
     gmsg->msg_flags = hmsg.msg_flags;
     gmsg->msg_namelen = hmsg.msg_namelen;
     gmsg->msg_controllen = hmsg.msg_controllen;
-    // SCM_RIGHTS: host fd → guest fd（host 内核已在本进程安装 host fd，登记进接收方 fd 表）
+    // SCM_RIGHTS: host fd → guest fd（host 内核已在本进程安装 host fd，登记进接收方 fd 表）。
     for(struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hmsg); cmsg; cmsg = CMSG_NXTHDR(&hmsg, cmsg)) {
         if(cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
             continue;
@@ -391,8 +392,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
         int nfds = static_cast<int>((cmsg->cmsg_len - sizeof(struct cmsghdr)) / sizeof(int));
         for(int i = 0; i < nfds; ++i) {
             int host_fd = fds[i];
-            int new_guest = allocate_fd();
-            ps->fds[new_guest] = std::make_shared<HostFd>(host_fd);
+            int new_guest = ps->fds_emplace(std::make_shared<HostFd>(host_fd));
             fds[i] = new_guest;   // host fd → guest fd，写回 guest 的 cmsg 缓冲区
         }
     }
@@ -405,8 +405,8 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
 
 int64_t PosixSyscall::do_setsockopt(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     int level   = arg_s32(v->r(2));
@@ -416,7 +416,7 @@ int64_t PosixSyscall::do_setsockopt(vm* v) {
     if(optval == nullptr && optlen > 0) {
         return -EFAULT;
     }
-    if(::setsockopt(it->second->host_fd(), level, optname, optval, optlen) < 0) {
+    if(::setsockopt(h->host_fd(), level, optname, optval, optlen) < 0) {
         return -errno;
     }
     return 0;
@@ -424,8 +424,8 @@ int64_t PosixSyscall::do_setsockopt(vm* v) {
 
 int64_t PosixSyscall::do_getsockopt(vm* v) {
     int guest_fd = arg_s32(v->r(1));
-    auto it = ps->fds.find(guest_fd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(guest_fd);
+    if(!h) {
         return -EBADF;
     }
     int level   = arg_s32(v->r(2));
@@ -443,7 +443,7 @@ int64_t PosixSyscall::do_getsockopt(vm* v) {
             return -EFAULT;
         }
     }
-    if(::getsockopt(it->second->host_fd(), level, optname, optval, optlen) < 0) {
+    if(::getsockopt(h->host_fd(), level, optname, optval, optlen) < 0) {
         return -errno;
     }
     // optlen 已被 host 写回（实际选项值长度）。
@@ -478,19 +478,19 @@ static inline int64_t do_sockname_common(vm* v, int host_fd,
 }
 
 int64_t PosixSyscall::do_getsockname(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    return do_sockname_common(v, it->second->host_fd(), ::getsockname);
+    return do_sockname_common(v, h->host_fd(), ::getsockname);
 }
 
 int64_t PosixSyscall::do_getpeername(vm* v) {
-    auto it = ps->fds.find(arg_s32(v->r(1)));
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
         return -EBADF;
     }
-    return do_sockname_common(v, it->second->host_fd(), ::getpeername);
+    return do_sockname_common(v, h->host_fd(), ::getpeername);
 }
 
 // ===========================================================================
@@ -512,26 +512,24 @@ int64_t PosixSyscall::do_epoll_create1(vm* v) {
     if(host_fd < 0) {
         return -errno;
     }
-    int guest_fd = allocate_fd();
     auto handle = std::make_shared<HostFd>(host_fd);
     // EPOLL_CLOEXEC == O_CLOEXEC；host 已处理，VM 登记 cloexec 属性。
     if(flags & EPOLL_CLOEXEC) {
         handle->cloexec = true;
     }
-    ps->fds[guest_fd] = handle;
-    return guest_fd;
+    return ps->fds_emplace(handle);
 }
 
 int64_t PosixSyscall::do_epoll_ctl(vm* v) {
     int epfd = arg_s32(v->r(1));
-    auto it_ep = ps->fds.find(epfd);
-    if(it_ep == ps->fds.end()) {
+    auto ep_h = ps->find_fd(epfd);
+    if(!ep_h) {
         return -EBADF;
     }
     int op = arg_s32(v->r(2));
     int target_guest = arg_s32(v->r(3));
-    auto it_tg = ps->fds.find(target_guest);
-    if(op != EPOLL_CTL_DEL && it_tg == ps->fds.end()) {
+    auto tg_h = ps->find_fd(target_guest);
+    if(op != EPOLL_CTL_DEL && !tg_h) {
         return -EBADF;
     }
 
@@ -547,8 +545,8 @@ int64_t PosixSyscall::do_epoll_ctl(vm* v) {
     // 但都是 8B opaque union、布局一致。按 u64 整体搬运，不解析 data 语义。
     hev.data.u64 = gev->data.u64;
 
-    int target_host = (it_tg == ps->fds.end()) ? -1 : it_tg->second->host_fd();
-    if(::epoll_ctl(it_ep->second->host_fd(), op, target_host,
+    int target_host = tg_h ? tg_h->host_fd() : -1;
+    if(::epoll_ctl(ep_h->host_fd(), op, target_host,
                    reinterpret_cast<struct epoll_event*>(&hev)) < 0) {
         return -errno;
     }
@@ -557,8 +555,8 @@ int64_t PosixSyscall::do_epoll_ctl(vm* v) {
 
 int64_t PosixSyscall::do_epoll_pwait(vm* v) {
     int epfd = arg_s32(v->r(1));
-    auto it = ps->fds.find(epfd);
-    if(it == ps->fds.end()) {
+    auto h = ps->find_fd(epfd);
+    if(!h) {
         return -EBADF;
     }
     int maxev = arg_s32(v->r(3));
@@ -578,7 +576,9 @@ int64_t PosixSyscall::do_epoll_pwait(vm* v) {
     }
 
     std::vector<epoll_event> hev(maxev);
-    int n = ::epoll_pwait(it->second->host_fd(), reinterpret_cast<struct epoll_event*>(hev.data()),
+    // h 是 find_fd 拷贝出的 shared_ptr<Fd>，::epoll_pwait 阻塞期间持有者不释放，
+    // 与并发 dup/open/close 不冲突（fds COW 快照语义）。
+    int n = ::epoll_pwait(h->host_fd(), reinterpret_cast<struct epoll_event*>(hev.data()),
                           maxev, timeout, sigs);
     if(n < 0) {
         return (errno == EINTR) ? SYSCALL_RESTART : -errno;

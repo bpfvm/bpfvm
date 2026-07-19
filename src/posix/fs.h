@@ -9,6 +9,7 @@
 #include <vector>
 #include <utility>
 #include <atomic>
+#include <unistd.h>     // close（HostFd 析构用）
 #include <sys/types.h>   // off_t / ssize_t / mode_t
 #include <sys/stat.h>    // struct statx
 #include <sys/uio.h>     // struct iovec

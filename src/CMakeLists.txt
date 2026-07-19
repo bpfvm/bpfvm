@@ -2,20 +2,31 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# POSIX syscall 实现：单独成目录，自带 CMakeLists（见 posix/CMakeLists.txt）。
-# 这里把它的对象库并入 bpfvm_lib，最终产物仍是单个 libbpfvm_lib.a。
-add_subdirectory(posix)
-
-add_library(bpfvm_lib STATIC
+# VM 核心 + JIT 源（本目录维护）。add_library 直接用相对路径；
+# 再用 list(TRANSFORM PREPEND) 加上本目录相对项目根的相对前缀，CACHE INTERNAL 导出到
+# 全局作用域，供顶层转发给 nesting 子项目。
+set(_lib_sources
     insn.cpp
     elf_loader.cpp
     pty.cpp
-    $<TARGET_OBJECTS:posix_obj>
     jit/jit_compiler.cpp
     jit/x86_emitter.cpp
     jit/aarch64_emitter.cpp
 )
+
+add_subdirectory(posix)
+
+add_library(bpfvm_lib STATIC
+    ${_lib_sources}
+    $<TARGET_OBJECTS:posix_obj>
+)
 target_include_directories(bpfvm_lib PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+
+# 导出给顶层/nesting：路径相对 ${CMAKE_SOURCE_DIR}（CACHE INTERNAL 全局可见）。
+file(RELATIVE_PATH _dir_prefix "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+list(TRANSFORM _lib_sources PREPEND "${_dir_prefix}/" OUTPUT_VARIABLE _lib_exported)
+set(BPFVM_LIB_SOURCES   "${_lib_exported}"          CACHE INTERNAL "VM lib sources for nesting")
+set(BPFVM_MAIN_SOURCE   "src/main.cpp"              CACHE INTERNAL "VM main source for nesting")
 
 # ---------------------------------------------------------------------------
 # BpfWideArgs：BPF 突破 5 参数限制 + 返回结构体的 LLVM pass 插件
@@ -106,7 +117,7 @@ message(STATUS "BpfLibcallLower: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfLi
 
 
 add_executable(bpfvm main.cpp)
-target_link_libraries(bpfvm bpfvm_lib ${LIBELF_LIBRARIES})
+target_link_libraries(bpfvm bpfvm_lib)
 
 # bpfvm-ld 只需离线链接逻辑，独立编译，不依赖 VM 运行时（bpfvm_lib）
 add_executable(bpfvm-ld ld_main.cpp elf_linker.cpp elf_loader.cpp)
@@ -114,4 +125,4 @@ target_include_directories(bpfvm-ld PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(bpfvm-ld ${LIBELF_LIBRARIES})
 
 add_executable(bpfvm_test insn_test.cpp)
-target_link_libraries(bpfvm_test bpfvm_lib ${LIBELF_LIBRARIES})
+target_link_libraries(bpfvm_test bpfvm_lib)
