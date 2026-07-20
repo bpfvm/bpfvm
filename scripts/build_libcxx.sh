@@ -25,20 +25,10 @@ set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "${ROOT_DIR}"
 
-# 探测 libc++ 头目录（/usr/lib/llvm-NN/include/c++/v1）。
-# clang resource dir 是 /usr/lib/llvm-NN/lib/clang/NN/include，向上三级即 llvm-NN 根，
-# 再拼 include/c++/v1。这是 Debian/Ubuntu 标准布局，比 find 可靠（find 会先命中
-# wasm32-wasi 的 vector，其 ABI namespace 是 __2，与用户代码 __1 不匹配）。
-CLANG_RESOURCE=$(clang++ -print-resource-dir 2>/dev/null)
-LIBCXX_INC=$(cd "$CLANG_RESOURCE/../../.." 2>/dev/null && pwd)/include/c++/v1
+# 探测 libc++ 头目录：让 clang 自己给（-print-file-name=include/c++/v1 直接返回
+LIBCXX_INC=$(clang++ -print-file-name=include/c++/v1 2>/dev/null)
 if ! [ -f "$LIBCXX_INC/vector" ]; then
-    # 回退：扫描 /usr/lib/llvm-* （取最新版本）
-    for p in $(ls -d /usr/lib/llvm-*/include/c++/v1 2>/dev/null | sort -Vr); do
-        if [ -f "$p/vector" ]; then LIBCXX_INC="$p"; break; fi
-    done
-fi
-if ! [ -f "$LIBCXX_INC/vector" ]; then
-    echo "libc++ headers not found (looked in clang resource dir + /usr/lib/llvm-*)" >&2
+    echo "libc++ headers not found: clang -print-file-name=include/c++/v1 -> '$LIBCXX_INC'" >&2
     exit 1
 fi
 echo "==> libc++ headers: $LIBCXX_INC"
@@ -65,16 +55,21 @@ done
 #   typeinfo.cpp → ~type_info 交给 libc++abi stdlib_typeinfo.cpp。
 STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-builtin -fno-math-errno \
     -mllvm -bpf-stack-size=16384 \
-    -nostdinc -nostdinc++ \
+    -nostdinc \
     -D_GNU_SOURCE \
-    -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC \
+    -D_LIBCPP_HAS_THREAD_API_PTHREAD \
+    -D_LIBCPP_HAS_MUSL_LIBC \
     -D_LIBCPP_HAS_NO_INT128 \
-    -D_LIBCPP_HARDENING_MODE_DEFAULT=0 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
-    -D_LIBCPP_BUILDING_LIBRARY -DLIBCXX_BUILDING_LIBCXXABI \
+    -D_LIBCPP_HARDENING_MODE_DEFAULT=0 \
+    -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
+    -D_LIBCPP_BUILDING_LIBRARY \
+    -DLIBCXX_BUILDING_LIBCXXABI \
     -isystem $LIBCXX_INC \
-    -isystem root/include/ -isystem include \
+    -isystem root/include/ \
+    -isystem include \
     -I $LIBCXX_SRC \
-    -fpass-plugin=${PASS_LIBCALLLOWER} -fpass-plugin=${PASS_WIDEARGS} \
+    -fpass-plugin=${PASS_LIBCALLLOWER} \
+    -fpass-plugin=${PASS_WIDEARGS} \
     -fpass-plugin=${PASS_SOFTFP}"
 
 OBJS=""
@@ -110,9 +105,6 @@ if [ -d "$LIBCXX_SRC" ]; then
     #   __int128 乘除法（__multi3/__divti3/__muloti4），而 file_clock::rep 默认是
     #   __int128_t。定义该宏让 rep 退化为 long long；int128_builtins.cpp 整体被 #if 包裹，
     #   定义后变空 TU（不产 __muloti4 符号，也无冲突）。
-    # 已知降级：copy_file（依赖 sendfile，VM 未实现→返回错误）与 space()（依赖 statfs，
-    #   VM 未实现→capacity/free/available 置 (uintmax_t)-1）。其余 API 全可用。
-    # .o 命名加 fs_ 前缀避免与同名文件冲突。
     for src in "$LIBCXX_SRC"/filesystem/*.cpp; do
         b=$(basename "$src")
         clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/fs_${b%.cpp}.o"
@@ -156,13 +148,6 @@ if [ -n "$LIBCXXABI_SRC" ]; then
     #                                 无引用，纳入是死代码。
     #   cxa_personality.cpp        — 含 throw，-fno-exceptions 下编不过；异常人格函数，不需要。
     #   cxa_thread_atexit.cpp      — 用 __thread 原生 TLS，BPF 不支持，编不过。
-    # 其余全部纳入（private_typeinfo/stdlib_*/cxa_noexception/cxa_virtual/cxa_handlers/
-    #   cxa_default_handlers/fallback_malloc/cxa_vector/cxa_demangle/cxa_aux_runtime/abort_message/
-    #   cxa_guard/stdlib_new_delete）。
-    #   - cxa_guard.cpp：static 局部守卫，GlobalMutex 实现（pthread_mutex+cond，不走原子 CAS）。
-    #     裸 syscall(SYS_futex,int*,...) 经 bits/syscall.h 的 C++ 指针重载处理 int*→long 类型转换。
-    #   - stdlib_new_delete.cpp：20 个 operator new/delete 弱符号变体（含 nothrow/对齐版）。
-    #     bpfvm-ld 的 __start_/__stop_ section 边界符号合成支持 __is_function_overridden 机制。
     ABI_EXCLUDE="cxa_exception.cpp cxa_exception_storage.cpp cxa_personality.cpp cxa_thread_atexit.cpp"
     n=0
     for src in "$LIBCXXABI_SRC"/*.cpp; do

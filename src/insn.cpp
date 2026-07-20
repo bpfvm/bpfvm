@@ -215,8 +215,8 @@ std::shared_ptr<vm> vm::create() {
     return std::make_shared<vm>(Token{});
 }
 
-ElfLoadInfo vm::load_elf(const char* elf_file_path) {
-    return ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); });
+ElfLoadInfo vm::load_elf(const char* elf_file_path, const std::map<std::string, std::string>& envp) {
+    return ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); }, envp);
 }
 
 /*
@@ -1465,6 +1465,7 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         printf("entry: 0x%lx\n", options->entry);
     }
 
+    // setup_stack 接收 map（key→value），内部拼成 "KEY=VALUE" 写入栈。
     if(!setup_stack(options->argv, options->envp, info)) {
         return 0;
     }
@@ -1478,7 +1479,8 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
     return run();
 }
 
-bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
+bool vm::setup_stack(const std::vector<std::string>& argv,
+                     const std::map<std::string, std::string>& envp,
                      const ElfLoadInfo& info) {
     unsigned char* stack_base = (unsigned char*)mmu(STACK_BASE);
     if(stack_base == nullptr) {
@@ -1510,8 +1512,9 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     for(const auto& arg : argv) {
         strings_bytes += arg.size() + 1;
     }
-    for(const auto& env : envp) {
-        strings_bytes += env.size() + 1;
+    // 每个 env 项在栈上写作 "KEY=VALUE\0"：key + '=' + val + '\0'。
+    for(const auto& [k, val] : envp) {
+        strings_bytes += k.size() + 1 + val.size() + 1;
     }
 
     // 附加 auxv 载荷字符串：
@@ -1574,11 +1577,12 @@ bool vm::setup_stack(const std::vector<std::string>& argv, const std::vector<std
     header[1 + argv.size()] = 0;
 
     size_t env_base = 1 + (argv.size() + 1);
-    for(size_t i = 0; i < envp.size(); i++) {
-        size_t len = envp[i].size() + 1;
-        memcpy(stack_base + cursor, envp[i].c_str(), len);
-        header[env_base + i] = STACK_BASE + cursor;
-        cursor += len;
+    size_t env_idx = 0;
+    for(const auto& [k, val] : envp) {
+        int n = sprintf(reinterpret_cast<char*>(stack_base + cursor), "%s=%s", k.c_str(), val.c_str());
+        header[env_base + env_idx] = STACK_BASE + cursor;
+        cursor += n + 1;  // +1 for '\0'（sprintf 返回不含 '\0'）
+        env_idx++;
     }
     header[env_base + envp.size()] = 0;
 

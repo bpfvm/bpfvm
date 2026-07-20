@@ -189,6 +189,11 @@ int main(int argc, char** argv) {
         opt.inputs.push_back(a);
     }
 
+    if (const char* lp = getenv("LD_LIBRARY_PATH")) {
+        auto dirs = lib_search_dirs_from_envp({{"LD_LIBRARY_PATH", lp}});
+        opt.lib_dirs.insert(opt.lib_dirs.end(), dirs.begin(), dirs.end());
+    }
+
     if (opt.inputs.empty()) {
         std::cerr << basename(argv[0]) << ": missing input file\n";
         usage(argv[0]);

@@ -63,13 +63,8 @@ static std::string guest_view(const std::string& host_path) {
 
 static std::vector<std::string> default_lib_search_dirs() {
     std::vector<std::string> dirs;
-    if (const char* env = getenv("LD_LIBRARY_PATH")) {
-        std::stringstream ss(env);
-        std::string d;
-        while (std::getline(ss, d, ':')) {
-            if (!d.empty()) dirs.push_back(d);
-        }
-    }
+    // 不再读宿主 getenv("LD_LIBRARY_PATH")：库搜索路径由调用方经 envp 显式传入
+    // （VM 运行时用 guest envp，ld_main 自己读 host getenv 后并入 opt.lib_dirs）。
     dirs.push_back("lib");
     dirs.push_back(".");
     // chroot 模式：在 rootfs 内补搜标准 lib 目录（优先于宿主，因 interp 在 rootfs 内）。
@@ -77,6 +72,20 @@ static std::vector<std::string> default_lib_search_dirs() {
         dirs.insert(dirs.begin(), g_loader_root + "/lib");
         dirs.insert(dirs.begin(), g_loader_root + "/lib64");
         dirs.insert(dirs.begin(), g_loader_root);
+    }
+    return dirs;
+}
+
+// 从 envp（key→value）解析 LD_LIBRARY_PATH，按 ':' 拆成目录列表。
+// elf_loader 不再读宿主 getenv；VM 运行时把 guest 的 envp 传入，由本函数提取库搜索路径。
+std::vector<std::string> lib_search_dirs_from_envp(const std::map<std::string, std::string>& envp) {
+    std::vector<std::string> dirs;
+    auto it = envp.find("LD_LIBRARY_PATH");
+    if (it == envp.end()) return dirs;
+    std::stringstream ss(it->second);
+    std::string d;
+    while (std::getline(ss, d, ':')) {
+        if (!d.empty()) dirs.push_back(d);
     }
     return dirs;
 }
@@ -264,12 +273,14 @@ bool map_segment(const Seg& s, const ElfFile& ef, memmap& m_out) {
 // ElfFile/Seg/layout_module/map_segment 等辅助结构与静态路径共用。
 ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
                            std::function<void(memmap&&)>& add,
-                           std::vector<std::pair<int, int>>& opened) {
+                           std::vector<std::pair<int, int>>& opened,
+                           const std::map<std::string, std::string>& envp) {
     // 定位 ldso 文件：PT_INTERP 路径（如 /lib/ld-bpf.so）→ 在库搜索路径找。
+    // 搜索路径由 guest envp 里的 LD_LIBRARY_PATH 决定（POSIX 语义）。
     std::string interp_name = interp_path;
     size_t slash = interp_name.find_last_of('/');
     if (slash != std::string::npos) interp_name = interp_name.substr(slash + 1);
-    std::string ldso_path = find_library({}, interp_name);
+    std::string ldso_path = find_library(lib_search_dirs_from_envp(envp), interp_name);
     if (ldso_path.empty()) {
         std::cerr << "[load_elf] ldso not found: " << interp_path
                   << " (searched LD_LIBRARY_PATH + default dirs for " << interp_name << ")\n";
@@ -339,7 +350,8 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
     return ElfLoadInfo{entry, phdr_addr, main_ef.ehdr.e_phentsize, main_ef.ehdr.e_phnum, ldso_base, app_entry};
 }
 
-ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
+ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add,
+                     const std::map<std::string, std::string>& envp) {
     // 加载 ET_EXEC（静态，固定地址）或 ET_DYN（PIE 主程序 / .so，运行时分配地址）。
     // 运行时处理 .rela.dyn（数据/lddw 重定位）和 .rela.plt（GOT 槽）。
     int main_fd = open(path, O_RDONLY);
@@ -376,7 +388,7 @@ ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add) {
                 interp.resize(n);
                 if (!interp.empty() && interp.back() == '\0') interp.pop_back();
                 ElfFile main_ef_obj{path, ehdr, main_fd};
-                return load_elf_ldso(main_ef_obj, interp.c_str(), add, opened);
+                return load_elf_ldso(main_ef_obj, interp.c_str(), add, opened, envp);
             }
         }
     }

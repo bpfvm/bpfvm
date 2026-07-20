@@ -41,8 +41,20 @@ int main(void) {
         return 1;
     }
     char *argv[] = {"test_fexecve", NULL};
-    /* 哨兵 env 让 re-exec 后的新映像能识别自己已被 fexecve 过。 */
-    char *envp[] = {SENTINEL, NULL};
+    /* envp 必须包含哨兵 SENTINEL（re-exec 识别用）+ 父进程 LD_LIBRARY_PATH
+     * （动态变体 re-exec 需要 ldso/libc.so）。execve 用 envp 整体替换环境，不继承
+     * 父 environ，故 LD_LIBRARY_PATH 必须显式带上。用动态构造避免数组字面量里出现
+     * "中间的 NULL"（envp 数组里的 NULL 会提前终止，吞掉后面的项）。*/
+    char ldpath_var[280];
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    char *envp[4];
+    int en = 0;
+    if (lp && *lp) {
+        snprintf(ldpath_var, sizeof(ldpath_var), "LD_LIBRARY_PATH=%s", lp);
+        envp[en++] = ldpath_var;
+    }
+    envp[en++] = SENTINEL;
+    envp[en] = NULL;
     int r = fexecve(fd, argv, envp);
     /* 走到这里说明 fexecve 失败（成功则映像已被替换，不会返回）。 */
     printf("FAIL: fexecve(self exe) returned %d, expected not to return: %s\n",

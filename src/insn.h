@@ -7,6 +7,7 @@
 #include "elf_loader.h"
 
 #include <list>
+#include <map>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -187,7 +188,7 @@ struct vmOptions {
     // 的栈帧上限对齐。frame[0] 低 32 位存的总长度 = stack_limit + alloca_len。
     uint64_t stack_limit = 16 * 1024;
     std::vector<std::string> argv;
-    std::vector<std::string> envp;
+    std::map<std::string, std::string> envp;
     std::shared_ptr<SyscallHandler> sys;
     // host 接入器 + 信号路由器，始终非空。PTY 模式开真 pty（fd 0/1/2 接 slave）；
     // 非 PTY 模式退化为仅信号路由。pump 线程读 signalfd 后调 sys->host_signal。
@@ -291,7 +292,8 @@ public:
     // Slow path: linear scan maps + fill TLB (no TLB lookup).  Called by JIT on miss.
     void* mmu_slow(uint64_t addr, size_t size);
     void* mmu_w_slow(uint64_t addr, size_t size);
-    bool setup_stack(const std::vector<std::string>& argv, const std::vector<std::string>& envp,
+    bool setup_stack(const std::vector<std::string>& argv,
+                     const std::map<std::string, std::string>& envp,
                      const ElfLoadInfo& info);
     bool push_frame(uint64_t return_addr, bool is_signal = false);
     // 调用 handle_signals 决策并通过 push_frame 投递信号 handler（压信号帧、r(1)=sig、pc=handler）。
@@ -306,7 +308,7 @@ public:
     // clear_blocked=true：清 VM_BLOCKED，wait_for 返回 0（正常唤醒，如 futex_wake / IO 完成）。
     // clear_blocked=false：保留 VM_BLOCKED，仅 broadcast 让 waiter 重判信号 flag 而返回 -EINTR
     void wakeup(bool clear_blocked);
-    ElfLoadInfo load_elf(const char* elf_file_path);
+    ElfLoadInfo load_elf(const char* elf_file_path, const std::map<std::string, std::string>& envp);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();

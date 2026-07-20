@@ -30,7 +30,19 @@ int main(int argc, char** argv) {
     snprintf(target, sizeof(target), "test/test_cloexec_child.%s", variant);
 
     char *const new_argv[] = { target, fd1_str, fd2_str, NULL };
-    char *const new_envp[] = { NULL };
+    /* envp 透传父进程 LD_LIBRARY_PATH（动态变体的 child 需要它定位 ldso/libc.so）。
+     * execve 用 envp 整体替换环境，不继承父 environ，故必须显式带上——与真实 shell
+     * 行为一致（bash/dash 会把自己 environ 里的 LD_LIBRARY_PATH 透传给子进程）。
+     * 动态构造避免数组字面量里出现"中间的 NULL"（见 test_fexecve.c 同名注释）。*/
+    char ldpath_var[280];
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    char *new_envp[3];
+    int en = 0;
+    if (lp && *lp) {
+        snprintf(ldpath_var, sizeof(ldpath_var), "LD_LIBRARY_PATH=%s", lp);
+        new_envp[en++] = ldpath_var;
+    }
+    new_envp[en] = NULL;
 
     printf("Parent: fd_cloexec=%d, fd_keep=%d. Executing child %s...\n",
            fd_cloexec, fd_keep, target);

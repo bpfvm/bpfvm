@@ -19,10 +19,27 @@ static struct option long_options[] = {
     {"insn-limit", required_argument, nullptr, 'l'},
     {"stack-size", required_argument, nullptr, 'S'},
     {"root", required_argument, nullptr, 'R'},
+    {"env", required_argument, nullptr, 'e'},
     {"pty", no_argument, nullptr, 't'},
     {"no-pty", no_argument, nullptr, 'T'},
     {nullptr, 0, nullptr, 0}
 };
+
+static void print_usage(const char* prog) {
+    std::cerr
+        << "Usage: " << prog << " [options] <elf-file> [args...]\n"
+        << "\n"
+        << "Options:\n"
+        << "  -v, --verbose               verbose output\n"
+        << "  -b, --breakpoint <addr>     break at guest pc (hex 0x.. or decimal)\n"
+        << "  -s, --step                  single-step (interpreter)\n"
+        << "  -l, --insn-limit <N>        max instructions before exit 255 (0 = unlimited)\n"
+        << "  -S, --stack-size <N>        per-frame stack bytes (default 16384)\n"
+        << "  -R, --root <dir>            chroot into <dir>; guest paths resolved under it\n"
+        << "  -e, --env <KEY=VALUE>       inject env var for guest (repeatable; overrides default)\n"
+        << "  -t, --pty                   force PTY mode for stdio\n"
+        << "  -T, --no-pty                disable PTY mode (raw stdio passthrough)\n";
+}
 
 int main(int argc, char** argv) {
     std::shared_ptr<vmOptions> options = std::make_shared<vmOptions>();
@@ -37,8 +54,12 @@ int main(int argc, char** argv) {
     enum class PtyMode { Auto, On, Off };
     PtyMode pty_mode = PtyMode::Auto;
 
+    // -e KEY=VALUE 收集：命令行显式注入的环境变量，覆盖 HOME/PATH 等默认（命令行优先）。
+    // 存 {key, value}（已拆出 VALUE，不含 '='），合并阶段用 key 做覆盖匹配。
+    std::map<std::string, std::string> extra_envp;
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "vb:sl:S:R:tT", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vb:sl:S:R:e:tT", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options->verbose = true;
@@ -58,6 +79,18 @@ int main(int argc, char** argv) {
         case 'R':
             options->root = optarg;
             break;
+        case 'e': {
+            std::string e(optarg);
+            auto eq = e.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                std::cerr << "Invalid -e argument: '" << optarg
+                          << "' (expected KEY=VALUE)" << std::endl;
+                print_usage(basename(argv[0]));
+                return 1;
+            }
+            extra_envp.emplace(e.substr(0, eq), e.substr(eq + 1));
+            break;
+        }
         case 't':
             pty_mode = PtyMode::On;
             break;
@@ -65,13 +98,13 @@ int main(int argc, char** argv) {
             pty_mode = PtyMode::Off;
             break;
         default:
-            std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-R root_dir|--root root_dir] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+            print_usage(basename(argv[0]));
             return 1;
         }
     }
 
     if (optind >= argc) {
-        std::cerr << "Usage: " << basename(argv[0]) << " [-v] [-b breakpoint_address] [-s] [-l insn_limit] [-S stack_size] [-R root_dir|--root root_dir] [-t|--pty|-T|--no-pty] <elf-file>" << std::endl;
+        print_usage(basename(argv[0]));
         return 1;
     }
 
@@ -100,7 +133,9 @@ int main(int argc, char** argv) {
     options->pty->setup(use_pty);
 
     auto vm = vm::create();
-    ElfLoadInfo load_info = vm->load_elf(elf_file_path);
+    // load_elf 从 envp 解析 LD_LIBRARY_PATH 做库搜索；extra_envp 是 map（key→value），
+    // load_elf 直接消费，无需展平。
+    ElfLoadInfo load_info = vm->load_elf(elf_file_path, extra_envp);
     if(load_info.entry == 0) {
         return 1;
     }
@@ -144,25 +179,18 @@ int main(int argc, char** argv) {
                   : std::string(argv[optind]);
     // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
     if(!options->root.empty()) {
-        options->envp.emplace_back("HOME=/");
+        options->envp["HOME"] = "/";
         // argv[optind] 是 guest 视角路径，dirname 得其所在 guest 目录（如 /bin）。
-        options->envp.emplace_back(std::string("PATH=") + dirname((char*)argv[optind]));
+        options->envp["PATH"] = dirname((char*)argv[optind]);
     } else {
         char* cwd = getcwd(nullptr, 0);
-        options->envp.emplace_back(std::string("HOME=") + cwd);
+        options->envp["HOME"] = cwd;
         free(cwd);
         const char* dir = dirname((char*)elf_file_path);
-        options->envp.emplace_back(std::string("PATH=") + dir);
+        options->envp["PATH"] = dir;
     }
-    // 透传 LD_LIBRARY_PATH 给 guest：bpfvm 自身（elf_loader）和 guest ldso 都用它搜库，
-    if (const char* lp = getenv("LD_LIBRARY_PATH")) {
-        options->envp.emplace_back(std::string("LD_LIBRARY_PATH=") + lp);
-    }
-    // 透传 BPF_ 开头的宿主环境变量（如 BPF_TEST_VARIANT），
-    extern char **environ;
-    for (char **e = environ; *e; e++) {
-        std::string s(*e);
-        if (s.rfind("BPF_", 0) == 0) options->envp.emplace_back(s);
+    for (const auto& [k, val] : extra_envp) {
+        options->envp[k] = val;
     }
     umask(0);
     std::cout<<(int)vm->run(options.get(), load_info)<<std::endl;

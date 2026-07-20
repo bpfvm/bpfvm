@@ -13,7 +13,22 @@ int main(void) {
 
     printf("fork+execve launcher: before fork (target=%s)\n", target);
     char *const argv[] = { "test.out", "arg1", "arg2", NULL };
-    char *const envp[] = { "FOO=bar", "HELLO=world", NULL };
+    /* envp 模拟 shell 行为：透传父进程的 LD_LIBRARY_PATH（动态变体的 helper
+       需要它定位 ldso/libc.so），再加两个测试用变量验证 envp 整体替换语义。
+       注意 execve 用 envp 整体替换环境，不会继承父 environ，故必须显式带上。
+       动态构造避免数组字面量里出现"中间的 NULL"（envp 数组里的 NULL 会提前终止，
+       吞掉后面的项——静态变体下父进程无 LD_LIBRARY_PATH 即触发）。*/
+    char ldpath_var[280];
+    const char *lp = getenv("LD_LIBRARY_PATH");
+    char *envp[5];
+    int en = 0;
+    if (lp && *lp) {
+        snprintf(ldpath_var, sizeof(ldpath_var), "LD_LIBRARY_PATH=%s", lp);
+        envp[en++] = ldpath_var;
+    }
+    envp[en++] = "FOO=bar";
+    envp[en++] = "HELLO=world";
+    envp[en] = NULL;
     int pid = fork();
     if(pid == 0) {
         printf("child: before execve\n");

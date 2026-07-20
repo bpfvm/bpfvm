@@ -29,7 +29,7 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
 # #include_next <stddef.h> 要求 libc++ 的 stddef.h 先被找到，再串联到 musl。
 # 不加 -g：规避 clang BPF 后端 EmitExternalFunctionDeclaration 崩溃。
 set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
-    -nostdinc -nostdinc++ -fno-builtin -fno-math-errno -fno-exceptions -frtti \
+    -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti \
     -std=c++23 -D_GNU_SOURCE \
     -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC -D_LIBCPP_HAS_NO_INT128 \
     -D_LIBCPP_HARDENING_MODE_DEFAULT=0 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \

@@ -238,24 +238,45 @@ int main(void) {
 
     /* —— 用例 9：SIGCHLD 的 ssi_code / ssi_status ——
      * 阻塞 SIGCHLD + signalfd 监听。fork 两个子：一个 _exit(42) 正常退出，
-     * 一个被 SIGKILL 杀。父【不 wait4】，直接从 signalfd 读 SIGCHLD，验证：
+     * 一个被 SIGKILL 杀。父从 signalfd 读 SIGCHLD，验证：
      *   CLD_EXITED + ssi_status == 42（正常退出码）
      *   CLD_KILLED + ssi_status == 9 （SIGKILL 信号号）
      * 对齐 Linux siginfo 语义。注意 ssi_status 是【原始值】，不是 wait4 的 (code<<8|sig)。
      *
-     * 【不能用 wait4 同步】Linux 内核里 wait4 和 signalfd 争抢消费同一个 SIGCHLD：
-     * wait4 先拿到则 signalfd 拿不到。故本测试让 signalfd 独占消费（不 wait4），
-     * 读完后再用 waitpid(WNOHANG) 非阻塞回收僵尸（此时子必已退出，不会阻塞）。*/
+     * 【串行化 fork/read/reap】SIGCHLD 是标准信号会合并：若两个子都在父第一次 read
+     * 前退出（负载下父被调度延迟即触发），两次 exit 只 pending 一个 SIGCHLD，
+     * 第二次 read 会永久阻塞→卡死；且 A/B 谁先退出不确定，固定顺序假设也会偶发失败。
+     * 故一次只 outstanding 一个子：fork A → read A 的 SIGCHLD → waitpid 回收 A →
+     * 再 fork B → read B 的 SIGCHLD → 回收 B。任一时刻只有一个未回收子，SIGCHLD 不
+     * 合并、顺序确定。read 在前、waitpid 在后只回收已 zombie 的子（SIGCHLD 已被
+     * signalfd 消费，waitpid 不与 signalfd 争抢）。*/
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) return fail("case9 block", "sigprocmask");
     int sfd_chld = signalfd(-1, &mask, 0);
     if (sfd_chld < 0) return fail("case9 create", "signalfd");
 
+    struct signalfd_siginfo s9;
+
     /* 子 A：正常退出，退出码 42 */
     pid_t ca = fork();
     if (ca < 0) return fail("case9 forkA", "fork");
     if (ca == 0) _exit(42);
+    n = read(sfd_chld, &s9, sizeof(s9));
+    if (n != sizeof(s9) || s9.ssi_signo != SIGCHLD || s9.ssi_code != CLD_EXITED || s9.ssi_status != 42) {
+        fprintf(stderr, "FAIL case9 readA: n=%zd signo=%u code=%d status=%d "
+                        "(want CLD_EXITED/42)\n", n, s9.ssi_signo, s9.ssi_code, s9.ssi_status);
+        return 1;
+    }
+    if (s9.ssi_pid != (uint32_t)ca) {
+        fprintf(stderr, "FAIL case9 readA: ssi_pid=%u expected=%d\n", s9.ssi_pid, ca);
+        return 1;
+    }
+    /* A 已 zombie（read 拿到 CLD_EXITED 即证明），阻塞 waitpid 立即回收，不与 signalfd 争抢。*/
+    int sa;
+    if (waitpid(ca, &sa, 0) != ca || !WIFEXITED(sa) || WEXITSTATUS(sa) != 42) {
+        return fail("case9 reapA", "waitpid");
+    }
 
     /* 子 B：被 SIGKILL 杀 */
     pid_t cb = fork();
@@ -264,36 +285,19 @@ int main(void) {
         raise(SIGKILL);
         _exit(99);   /* 不会到达 */
     }
-
-    /* 两次 SIGCHLD 由 signalfd 独占消费（不 wait4）。队列 FIFO：先 CLD_EXITED 后 CLD_KILLED。*/
-    struct signalfd_siginfo s9;
-    n = read(sfd_chld, &s9, sizeof(s9));
-    if (n != sizeof(s9) || s9.ssi_signo != SIGCHLD || s9.ssi_code != CLD_EXITED || s9.ssi_status != 42) {
-        fprintf(stderr, "FAIL case9 read1: n=%zd signo=%u code=%d status=%d "
-                        "(want CLD_EXITED/42)\n", n, s9.ssi_signo, s9.ssi_code, s9.ssi_status);
-        return 1;
-    }
-    if (s9.ssi_pid != (uint32_t)ca) {
-        fprintf(stderr, "FAIL case9 read1: ssi_pid=%u expected=%d\n", s9.ssi_pid, ca);
-        return 1;
-    }
     n = read(sfd_chld, &s9, sizeof(s9));
     if (n != sizeof(s9) || s9.ssi_signo != SIGCHLD || s9.ssi_code != CLD_KILLED || s9.ssi_status != SIGKILL) {
-        fprintf(stderr, "FAIL case9 read2: n=%zd signo=%u code=%d status=%d "
+        fprintf(stderr, "FAIL case9 readB: n=%zd signo=%u code=%d status=%d "
                         "(want CLD_KILLED/9)\n", n, s9.ssi_signo, s9.ssi_code, s9.ssi_status);
         return 1;
     }
     if (s9.ssi_pid != (uint32_t)cb) {
-        fprintf(stderr, "FAIL case9 read2: ssi_pid=%u expected=%d\n", s9.ssi_pid, cb);
+        fprintf(stderr, "FAIL case9 readB: ssi_pid=%u expected=%d\n", s9.ssi_pid, cb);
         return 1;
     }
-    /* 读完后回收僵尸（WNOHANG：子必已退出，不阻塞）*/
-    int sa, sb;
-    if (waitpid(ca, &sa, WNOHANG) != ca || !WIFEXITED(sa) || WEXITSTATUS(sa) != 42) {
-        return fail("case9 reapA", "waitpid WNOHANG");
-    }
-    if (waitpid(cb, &sb, WNOHANG) != cb || !WIFSIGNALED(sb) || WTERMSIG(sb) != SIGKILL) {
-        return fail("case9 reapB", "waitpid WNOHANG");
+    int sb;
+    if (waitpid(cb, &sb, 0) != cb || !WIFSIGNALED(sb) || WTERMSIG(sb) != SIGKILL) {
+        return fail("case9 reapB", "waitpid");
     }
     close(sfd_chld);
 

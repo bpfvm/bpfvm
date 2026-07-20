@@ -409,7 +409,9 @@ static std::string gen_pid_environ(uint64_t pid) {
     if(!task_vm) return {};
     const auto& envp = PosixSyscall::options_of(task_vm.get()).envp;
     std::string out;
-    for(const auto& e : envp) { out += e; out += '\0'; }
+    for(const auto& [k, val] : envp) {
+        out += k; out += '='; out += val; out += '\0';
+    }
     return out;
 }
 

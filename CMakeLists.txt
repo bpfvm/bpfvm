@@ -55,27 +55,15 @@ if(BPFVM_BUILD_BPF)
         set(_bpf_reason "clang not in PATH")
     endif()
 
-    # libc++ 头 + clang resource include（与 scripts/build_libcxx.sh 同逻辑：
-    # clang resource dir 上溯三级 + include/c++/v1；找不到再扫 /usr/lib/llvm-*）。
+    # libc++ 头 + clang resource include（与 scripts/build_libcxx.sh 同逻辑）。
     if(_bpf_on)
         execute_process(COMMAND ${BPFVM_CLANGXX_BIN} -print-resource-dir
                         OUTPUT_VARIABLE _bpf_clang_res OUTPUT_STRIP_TRAILING_WHITESPACE)
-        get_filename_component(_bpf_llvm_root "${_bpf_clang_res}/../../.." ABSOLUTE)
-        set(_bpf_libcxx_inc "${_bpf_llvm_root}/include/c++/v1")
-        if(NOT EXISTS "${_bpf_libcxx_inc}/vector")
-            file(GLOB _bpf_cand LIST_DIRECTORIES true "/usr/lib/llvm-*/include/c++/v1")
-            list(SORT _bpf_cand)
-            list(REVERSE _bpf_cand)
-            foreach(_p IN LISTS _bpf_cand)
-                if(EXISTS "${_p}/vector")
-                    set(_bpf_libcxx_inc "${_p}")
-                    break()
-                endif()
-            endforeach()
-            if(NOT EXISTS "${_bpf_libcxx_inc}/vector")
-                set(_bpf_on OFF)
-                set(_bpf_reason "libc++ headers (include/c++/v1) not found")
-            endif()
+        execute_process(COMMAND ${BPFVM_CLANGXX_BIN} -print-file-name=include/c++/v1
+                        OUTPUT_VARIABLE _bpf_libcxx_inc OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT IS_ABSOLUTE "${_bpf_libcxx_inc}" OR NOT EXISTS "${_bpf_libcxx_inc}/vector")
+            set(_bpf_on OFF)
+            set(_bpf_reason "libc++ headers not found; clang -print-file-name=include/c++/v1 -> '${_bpf_libcxx_inc}'")
         endif()
     endif()
 
@@ -149,13 +137,27 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
 
-    # 每个用例一个 ctest 条目，内部串行跑 4 变体（静态/动态 × JIT 开/关）。
+    # bpfvm-on-bpfvm 嵌套变体：host bpfvm 跑 build/bpfvm.bpf，内层 bpfvm 再跑测试程序。
+    # 默认开启；bpfvm.bpf 没构建/依赖缺失时脚本运行期优雅跳过嵌套变体，不影响普通变体。
+    # 注意：bpfvm.bpf 交叉编译到 BPF 目标，src/insn.cpp 的 JIT 编译器按宿主编译目标
+    # 架构在编译期选择，BPF 目标既非 __x86_64__ 也非 __aarch64__ → StubJitCompiler
+    # （compile() 恒返回 nullptr），故内层 bpfvm 是纯解释器，JIT_ENABLE 对它无效，
+    # 嵌套变体只按程序类型（static/dynamic）区分，无 jit/interp 之分。
+    option(BPFVM_TEST_NESTED "Run bpfvm-on-bpfvm nested variants in ctest" ON)
+    if(BPFVM_TEST_NESTED AND BPFVM_BUILD_BPF AND _bpf_on)
+        set(BPFVM_BPF_PATH "${CMAKE_BINARY_DIR}/bpfvm.bpf")
+    endif()
+
+    # 每个用例一个 ctest 条目，内部串行跑多变体（静态/动态 × JIT 开/关 + host + 嵌套）。
     # 不同用例之间由 ctest -j 并发；同用例变体串行，不冲突文件。
     # ROOT 参数非空时走 chroot 模式（建临时 rootfs + --root 启动 + marker 落位校验）。
     function(add_bpf_program_test name)
         set(extra_args)
         if(name IN_LIST BPF_ROOT_TESTS)
             list(APPEND extra_args -DROOT=1)
+        endif()
+        if(DEFINED BPFVM_BPF_PATH)
+            list(APPEND extra_args -DBPFVM_BPF=${BPFVM_BPF_PATH})
         endif()
         add_test(NAME ${name}
             COMMAND ${CMAKE_COMMAND}

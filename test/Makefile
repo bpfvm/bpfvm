@@ -83,7 +83,6 @@ CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-
 # 与 CC_FLAGS 共用 BPF target/CPU/栈大小/pass 插件，C++ 特有部分：
 # - -std=c++23：libc++ 内部需要 C++20+；升到 c++23 解锁 <expected> 等 C++23 头。
 #   c++23 是 c++20 的超集，现有测试无回归；libcxx.a 跨版本混编无碍（mangling 不依赖语言版本）。
-# - -nostdinc++：不用系统默认 C++ 头路径，改用下方显式 -isystem 指向的 libc++ 头。
 # - libc++ 头（$LIBCXX_INC）必须在 musl 之前：cstddef 的 #include_next <stddef.h>
 #   要求 libc++ 的 stddef.h 先被找到，再 #include_next 串联到 musl 的。
 # - 绕过宏（_LIBCPP_HAS_THREAD_API_PTHREAD 等）：BPF target 无平台宏（__linux__ 等），
@@ -92,10 +91,13 @@ CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-
 # - -fno-exceptions -frtti：异常禁用（BPF 无异常 runtime，throw/try 编译期被拒）；
 #   RTTI 启用——libcxx.a 含 libc++abi 的 typeinfo 子集（__dynamic_cast/__cxa_bad_typeid 等），
 #   typeid/dynamic_cast 可用。
-# 探测 libc++ 头目录：优先 c++/v1（普通 ABI __1），排除 wasm32-wasi（ABI __2 不匹配）。
-LIBCXX_INC := $(patsubst %/vector,%,$(shell find /usr/lib/llvm-* -name vector -path '*/c++/v1/*' ! -path '*wasm*' 2>/dev/null | head -1))
+# 探测 libc++ 头目录：让 clang 自己给（-print-file-name=include/c++/v1 返回 clang 内部
+# 解析的路径，不假设布局，也不含 wasm32-wasi 的 ABI __2 头）。找不到返回参数本身，
+# 用 wildcard 校验 vector 后置空，-isystem 即跳过。
+LIBCXX_INC := $(shell clang++ -print-file-name=include/c++/v1 2>/dev/null)
+LIBCXX_INC := $(if $(wildcard $(LIBCXX_INC)/vector),$(LIBCXX_INC),)
 CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
-             -mllvm -bpf-stack-size=16384 -nostdinc -nostdinc++ \
+             -mllvm -bpf-stack-size=16384 -nostdinc \
              -fno-builtin -fno-math-errno -fno-exceptions -frtti \
              -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC \
              -D_LIBCPP_HAS_NO_INT128 \

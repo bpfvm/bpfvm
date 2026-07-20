@@ -55,6 +55,14 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     if(!read_c_string_array(v, v->r(4), envp_strings, 1024, 4096)) {
         return -EFAULT;
     }
+    // envp_strings 是从 guest 读出的 "KEY=VALUE" 列表（read_c_string_array 的输出）
+    std::map<std::string, std::string> envp_map;
+    for(const auto& e : envp_strings) {
+        auto eq = e.find('=');
+        if(eq != std::string::npos) {
+            envp_map[e.substr(0, eq)] = e.substr(eq + 1);
+        }
+    }
     std::string guest_abs;
     if(flags & AT_EMPTY_PATH) {
         auto fd = ps->find_fd(dirfd);
@@ -77,14 +85,14 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     auto fresh = vm::create();
     options(fresh.get()).stack_limit = options(v).stack_limit;
     options(fresh.get()).raw_stack   = options(v).raw_stack;
-    ElfLoadInfo load_info = fresh->load_elf(host_path.c_str());
+    ElfLoadInfo load_info = fresh->load_elf(host_path.c_str(), envp_map);
     if(load_info.entry == 0) {
         // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
         return load_info.err ? -load_info.err : -ENOEXEC;
     }
     const uint64_t entry = load_info.entry;
     // setup_stack 直接接收 load_info，用它合成 auxv
-    if(!fresh->setup_stack(argv_strings, envp_strings, load_info)) {
+    if(!fresh->setup_stack(argv_strings, envp_map, load_info)) {
         return -E2BIG;
     }
     if(!fresh->mmu(entry)) {
@@ -92,7 +100,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     }
     options(v).entry = entry;
     options(v).argv = std::move(argv_strings);
-    options(v).envp = std::move(envp_strings);
+    options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
     comm_ = make_comm(guest_abs);
     {
