@@ -1607,6 +1607,7 @@ void test_atomic64_xor_fetch() {
 
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
+    setenv("BPF_TEST_NO_CLEAN_MMAP", "1", 1);
 
     // PosixSyscall 契约：跨线程/跨 vm 投递信号（fork 子退出给父投 SIGCHLD、queue_signal
     // 唤醒阻塞线程等）会用 pthread_kill(tid, SIGUSR1) 打断目标线程。SIGUSR1 默认动作是

@@ -105,7 +105,7 @@ static void* pump_thread_fn(void* raw) {
                     if(w < 0) break;
                     off += w;
                 }
-            } else if(fd == master_fd && (events[i].events & EPOLLIN)) {
+            } else if(fd == master_fd && (events[i].events & (EPOLLIN | EPOLLRDHUP))) {
                 // 仅 PTY 模式注册了 master_fd。
                 ssize_t r = TEMP_FAILURE_RETRY(read(master_fd, buf, sizeof(buf)));
                 if(r <= 0) { goto done; }

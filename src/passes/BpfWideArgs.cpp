@@ -617,6 +617,27 @@ static void rewriteValueParamUsesToPointer(Function &F, Instruction *InsertPt,
         // 模式：store T %oldarg, ptr %dst —— %oldarg 是被存的值（operand 0）。
         if (SI && SI->getValueOperand() == OldArg) {
             Value *dst = SI->getPointerOperand();
+            // clang 对 `return __iter`（by-value 聚合参数的返回）生成：
+            //   %tmp = alloca T
+            //   store %arg, ptr %tmp.field0   ; %dst = gep(%tmp, 0, 0)
+            //   call T::T(sret, %tmp)          ; move from %tmp（alloca base，非 %dst）
+            // 简单 RAUW %dst（gep）不影响 %tmp，move 从未初始化 %tmp 读出垃圾
+            // （directory_iterator::begin/end 这类 free function return by-value
+            // 聚合即触发，range-for begin() 拿到空迭代器，循环体不执行）。
+            // 当 %dst 是 gep(alloca, ...) 且字节 offset 0、且 gep 取整个 alloca
+            // （大小相等 = alloca 是单字段聚合、store 即整体赋值），改 RAUW alloca base。
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(dst)) {
+                Value *base = GEP->getPointerOperand()->stripPointerCasts();
+                if (auto *AI = dyn_cast<AllocaInst>(base)) {
+                    const DataLayout &DL = F.getParent()->getDataLayout();
+                    APInt off(DL.getIndexSizeInBits(GEP->getPointerAddressSpace()), 0);
+                    if (GEP->accumulateConstantOffset(DL, off) && off.isZero() &&
+                        DL.getTypeAllocSize(AI->getAllocatedType()) ==
+                            DL.getTypeAllocSize(GEP->getResultElementType())) {
+                        dst = AI;
+                    }
+                }
+            }
             // 消除拷贝：后续对 %dst 的 use 全部替换成 %newarg（指针参数别名）。
             // %dst 通常是 alloca；它的所有 use（load/store/gep/传入 call 等）改成
             // 操作 %newarg 指向的 caller 源对象。

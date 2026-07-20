@@ -25,12 +25,12 @@ static struct option long_options[] = {
 };
 
 int main(int argc, char** argv) {
-    vmOptions options;
-    options.verbose = false; // 默认值
-    options.breakpoint = 0;   // 默认值
-    options.step_run = false; // 默认值
-    options.raw_stack = false; // 默认值
-    options.sys = std::make_shared<PosixSyscall>();
+    std::shared_ptr<vmOptions> options = std::make_shared<vmOptions>();
+    options->verbose = false; // 默认值
+    options->breakpoint = 0;   // 默认值
+    options->step_run = false; // 默认值
+    options->raw_stack = false; // 默认值
+    options->sys = std::make_shared<PosixSyscall>();
 
     // PTY 三态：默认 auto（stdin 是 tty 则开，贴近真实终端行为；管道/CI 下关，保持既有
     // 测试行为）；-t/--pty 强制开；-T/--no-pty 强制关（即便在真 tty 里也走纯透传 stdio）。
@@ -41,22 +41,22 @@ int main(int argc, char** argv) {
     while ((opt = getopt_long(argc, argv, "vb:sl:S:R:tT", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
-            options.verbose = true;
+            options->verbose = true;
             break;
         case 'b':
-            options.breakpoint = std::stoul(optarg, nullptr, 0);
+            options->breakpoint = std::stoul(optarg, nullptr, 0);
             break;
         case 's':
-            options.step_run = true;
+            options->step_run = true;
             break;
         case 'l':
-            options.insn_limit = std::stoull(optarg, nullptr, 0);
+            options->insn_limit = std::stoull(optarg, nullptr, 0);
             break;
         case 'S':
-            options.stack_limit = std::stoull(optarg, nullptr, 0);
+            options->stack_limit = std::stoull(optarg, nullptr, 0);
             break;
         case 'R':
-            options.root = optarg;
+            options->root = optarg;
             break;
         case 't':
             pty_mode = PtyMode::On;
@@ -76,14 +76,14 @@ int main(int argc, char** argv) {
     }
 
     // 创建 syscall handler；指定了 --root 则进入 chroot（cwd 重置为 /）。
-    if(!options.root.empty()) {
-        set_loader_root(options.root);
+    if(!options->root.empty()) {
+        set_loader_root(options->root);
     }
     // ELF 路径解析：chroot 模式下 argv[optind] 是 guest 视角路径（如 /bin/dash），
     // 需拼上 root 前缀再解析为宿主路径；非 chroot 模式直接按宿主路径解析。
     const char* elf_file_path;
-    if(!options.root.empty()) {
-        auto elf_resolved_storage = std::filesystem::path(options.root + argv[optind]);
+    if(!options->root.empty()) {
+        auto elf_resolved_storage = std::filesystem::path(options->root + argv[optind]);
         elf_file_path = realpath(elf_resolved_storage.lexically_normal().c_str(), nullptr);
     } else {
         elf_file_path = realpath(argv[optind], nullptr);
@@ -96,9 +96,8 @@ int main(int argc, char** argv) {
     // 两种模式都起 pump 线程读 signalfd 做 host 信号路由（见下 block）。
     bool use_pty = (pty_mode == PtyMode::On) ||
                    (pty_mode == PtyMode::Auto && isatty(STDIN_FILENO));
-    auto pty = std::make_shared<Pty>();
-    pty->setup(use_pty);
-    options.pty = pty;
+    options->pty = std::make_shared<Pty>();
+    options->pty->setup(use_pty);
 
     auto vm = vm::create();
     ElfLoadInfo load_info = vm->load_elf(elf_file_path);
@@ -130,43 +129,46 @@ int main(int argc, char** argv) {
     sigprocmask(SIG_BLOCK, &block_mask, nullptr);
 
     // PTY 模式做字节转发 + 信号路由；非 PTY 模式仅信号路由。
-    options.pty->start_pump(options.sys.get(), vm.get());
-    options.entry = load_info.entry;
-    options.argv.reserve(argc - optind);
+    options->pty->start_pump(options->sys.get(), vm.get());
+    options->entry = load_info.entry;
+    options->argv.reserve(argc - optind);
     for(int i = optind; i < argc; i++) {
-        options.argv.emplace_back(argv[i]);
+        options->argv.emplace_back(argv[i]);
     }
     // /proc 用的 exe 路径：经 vmOptions 传给 handler（PosixSyscall::init 消费）。
     // main 不感知具体 handler 实现，只填 options.exe；comm 由 PosixSyscall 自己派生。
     // elf_file_path 是 realpath(argv[optind])（宿主绝对路径）。guest 视角的 exe 应是
     // guest 能看到的路径：chroot 模式用 argv[optind]（如 /bin/dash），否则用 realpath。
-    options.exe = options.root.empty()
+    options->exe = options->root.empty()
                   ? (elf_file_path ? std::string(elf_file_path) : std::string(argv[optind]))
                   : std::string(argv[optind]);
     // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
-    if(!options.root.empty()) {
-        options.envp.emplace_back("HOME=/");
+    if(!options->root.empty()) {
+        options->envp.emplace_back("HOME=/");
         // argv[optind] 是 guest 视角路径，dirname 得其所在 guest 目录（如 /bin）。
-        options.envp.emplace_back(std::string("PATH=") + dirname((char*)argv[optind]));
+        options->envp.emplace_back(std::string("PATH=") + dirname((char*)argv[optind]));
     } else {
         char* cwd = getcwd(nullptr, 0);
-        options.envp.emplace_back(std::string("HOME=") + cwd);
+        options->envp.emplace_back(std::string("HOME=") + cwd);
         free(cwd);
         const char* dir = dirname((char*)elf_file_path);
-        options.envp.emplace_back(std::string("PATH=") + dir);
+        options->envp.emplace_back(std::string("PATH=") + dir);
     }
     // 透传 LD_LIBRARY_PATH 给 guest：bpfvm 自身（elf_loader）和 guest ldso 都用它搜库，
     if (const char* lp = getenv("LD_LIBRARY_PATH")) {
-        options.envp.emplace_back(std::string("LD_LIBRARY_PATH=") + lp);
+        options->envp.emplace_back(std::string("LD_LIBRARY_PATH=") + lp);
     }
     // 透传 BPF_ 开头的宿主环境变量（如 BPF_TEST_VARIANT），
     extern char **environ;
     for (char **e = environ; *e; e++) {
         std::string s(*e);
-        if (s.rfind("BPF_", 0) == 0) options.envp.emplace_back(s);
+        if (s.rfind("BPF_", 0) == 0) options->envp.emplace_back(s);
     }
     umask(0);
-    std::cout<<(int)vm->run(&options, load_info)<<std::endl;
+    std::cout<<(int)vm->run(options.get(), load_info)<<std::endl;
     free((void*)elf_file_path);
-    return vm->r(0);
+    auto ret = vm->r(0);
+    vm.reset();
+    options.reset();
+    _Exit(ret);
 }

@@ -111,14 +111,11 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     // 本线程的信号上下文复位（与 last / pid_map 无关）。
     signal_depth(v.get()) = 0;
 
-    // pid 1（init）不参与线程组清理，提前返回。
-    if(pid == 1) {
-        return;
+    if(!getenv("BPF_TEST_NO_CLEAN_MMAP")) {
+        // 释放本线程的地址空间引用：僵尸不再持地址空间。
+        // 必须在 clear-child-tid（用 mmu_w 访问 maps）之后；本 vm 此后不再访存。
+        maps_ptr(v.get()) = std::make_shared<std::list<memmap>>();
     }
-
-    // 释放本线程的地址空间引用：僵尸不再持地址空间。
-    // 必须在 clear-child-tid（用 mmu_w 访问 maps）之后；本 vm 此后不再访存。
-    maps_ptr(v.get()) = std::make_shared<std::list<memmap>>();
 
     // 非 leader 线程：从 pid_map 移除（不可 waitpid）。leader 留给 waitpid 回收。
     if(pid != tg->tgid) {
@@ -127,6 +124,20 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     }
 
     if(!last) {
+        return;
+    }
+
+    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表。
+    // drop 在锁外执行（投 SIGHUP 不能在 fds_mutate 重试循环里），再整表替换为空快照。
+    for(auto& kv : *ps->fds_snap()) {
+        drop_fd_handle(v.get(), kv.second);
+    }
+    ps->fds_replace(std::make_shared<const SharedState::FdMap>());
+
+    if(pid == 1) {
+        //1号进程直接清理，没人wait它
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map.erase(pid);
         return;
     }
 
@@ -155,12 +166,6 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
         }
     }
 
-    // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表。
-    // drop 在锁外执行（投 SIGHUP 不能在 fds_mutate 重试循环里），再整表替换为空快照。
-    for(auto& kv : *ps->fds_snap()) {
-        drop_fd_handle(v.get(), kv.second);
-    }
-    ps->fds_replace(std::make_shared<const SharedState::FdMap>());
 }
 
 std::shared_ptr<PosixSyscall> PosixSyscall::sys(vm* v) {
