@@ -10,10 +10,11 @@
 //     SIG_DFL     → 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
 //     已 catch    → handler 返回后被中断的系统调用返回 -1/EINTR
 // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
-// ProcFile/ProcDir::tty() 返回 nullptr，第一行短路 → 对虚拟 /proc fd 永远放行（无后台门控）。
+// 非 DevFd（HostFd/SignalFd/ProcFile/ProcDir）第一行短路 → 对它们永远放行（无后台门控）。
 std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read) {
-    const auto tty = fd->tty();
-    if(!tty || !session || session->ctty.get() != tty.get()) return std::nullopt;
+    auto dfd = std::dynamic_pointer_cast<DevFd>(fd).get();
+    GuestTty* tty = dfd ? dfd->guest_tty().get() : nullptr;
+    if(!tty || !session || session->ctty.get() != tty) return std::nullopt;
     uint64_t fg = tty->fg_pgrp.load(std::memory_order_acquire);
     if(fg == 0 || pgrp->pgid == fg) return std::nullopt;  // 前台组：放行
     // 后台组写 ctty：TOSTOP 未置位时不产生信号，I/O 照常进行（POSIX 默认）。
@@ -134,12 +135,11 @@ int64_t PosixSyscall::do_close(vm* v) {
         return -EBADF;
     }
     // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFile/ProcDir 的 on_close 为 no-op）。
-    // drop 在锁外（投 SIGHUP 不能在 fds_mutate 重试循环里）。
+    // on_close 在锁外（投 SIGHUP 不能在 fds_mutate 重试循环里）。
     // COW 下别的线程持有的旧快照仍能看到该 fd（host fd 延迟关闭，对齐 Linux file 引用计数语义）。
-    drop_fd_handle(v, h);
+    h->on_close(this, v);
     ps->fds_mutate([&](SharedState::FdMap& m){
-        m.erase(fd); // <- bug
-        //fprintf(stderr, "after erase: fd=%d\n", fd);
+        m.erase(fd);
     });
     return 0;
 }

@@ -246,15 +246,6 @@ class PosixSyscall: public SyscallHandler{
     // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
     // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
     void notify_parent_sigchld();
-    // 向控制终端的前台进程组（tty->fg_pgrp）投递 tty 信号。tty==nullptr 时退化为按
-    // 调用者 session 选目标组。host_signal（宿主→guest 路由）与 do_close 的 pty master
-    // 关闭发 SIGHUP（对齐 Linux tty_vhangup 语义）共用此路径。
-    void deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig);
-    // 销毁一个 Fd 前的 master SIGHUP 处理：若是 pty master 端且是最后一个引用
-    // （master_token().use_count()==1），向 ctty 前台组投 SIGHUP。所有 fd 销毁路径
-    // （do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
-    // ProcFile/ProcDir::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
-    void drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h);
 
 public:
     const uint64_t pid;          // task id（== tid）。gettid 返回此值。
@@ -313,6 +304,12 @@ public:
     // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
     // 仅当 fd 是本 session ctty 且调用者非前台组时触发。
     std::optional<int64_t> tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read);
+
+    // 向控制终端的前台进程组（tty->fg_pgrp）投递 tty 信号。tty==nullptr 时退化为按
+    // 调用者 session 选目标组。host_signal（宿主→guest 路由）与 do_close 的 pty master
+    // 关闭发 SIGHUP（对齐 Linux tty_vhangup 语义）共用此路径。
+    void deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig);
+
 
     // —— SyscallHandler protected 静态访问器的公开转发：procfs 自由函数要读 vm* 的
     //    options/maps/flags（protected），非成员够不到，经此转发。——

@@ -128,9 +128,9 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     }
 
     // 清理进程级资源。maps 已在上方 per-thread 释放（exit_mm 语义），此处清 fd 表。
-    // drop 在锁外执行（投 SIGHUP 不能在 fds_mutate 重试循环里），再整表替换为空快照。
+    // on_close 在锁外执行（投 SIGHUP 不能在 fds_mutate 重试循环里），再整表替换为空快照。
     for(auto& kv : *ps->fds_snap()) {
-        drop_fd_handle(v.get(), kv.second);
+        kv.second->on_close(this, v.get());
     }
     ps->fds_replace(std::make_shared<const SharedState::FdMap>());
 
@@ -228,17 +228,6 @@ void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
     for(auto& t : targets) {
         // 目标是另一个 PosixSyscall：经 sys() downcast 后调内部 queue_signal。
         if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, 0, SI_KERNEL, 0});
-    }
-}
-
-void PosixSyscall::drop_fd_handle(vm* v, const std::shared_ptr<Fd>& h) {
-    // 所有 fd 销毁路径（do_close、dup3 覆盖、execve cloexec 丢弃、fini 退出）统一调此函数。
-    // pty master fd（master_token() 非空）且是最后一个引用（use_count()==1，即只剩 h 持有，
-    // erase 析构后归零）时，向 ctty 前台组投 SIGHUP（对齐 Linux pty_close → tty_vhangup）。
-    // ProcFile/ProcDir::master_token() 返回 nullptr，条件短路（虚拟 /proc fd 无 pty 语义）。
-    auto mt = h->master_token();
-    if(mt && mt.use_count() == 1) {
-        deliver_to_ctty_fg(v, h->tty().get(), SIGHUP);
     }
 }
 

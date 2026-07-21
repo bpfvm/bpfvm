@@ -133,6 +133,17 @@ std::shared_ptr<Fd> DevFd::clone() const {
     return std::make_shared<DevFd>(new_fd, path, tty_, master_token_);
 }
 
+void DevFd::on_close(PosixSyscall* self, vm* v) {
+    // pty master fd（master_token_ 非空）且是最后一个引用（use_count()==1，即调用方
+    // 的 shared_ptr<Fd> h 持有的就是这最后一份，on_close 返回后调用方把 h 从 fd 表
+    // erase，析构后 master_token_ 归零）时，向 ctty 前台组投 SIGHUP
+    // （对齐 Linux pty_close → tty_vhangup）。slave fd（master_token_ 为空）和
+    // /dev/tty 合成端、PTY 初始 stdio 都不发 SIGHUP（slave 关不发 SIGHUP）。
+    if(master_token_ && master_token_.use_count() == 1) {
+        self->deliver_to_ctty_fg(v, tty_.get(), SIGHUP);
+    }
+}
+
 std::shared_ptr<Fd> SignalFd::clone() const {
     // fork 复制：为子新建独立 pipe（写端 O_NONBLOCK），mask 复制自父。子读端不能
     // 指向父同一 pipe——否则父子读到对方 pending 的信号，破坏 Linux task-pending 语义。
@@ -188,10 +199,11 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
             return nullptr;
         }
         const auto& ctty = session->ctty;
-        // 找一个已绑同一 ctty 的 guest fd 做 dup 源（PTY 模式下 fd 0/1/2 必是）。
+        // 找一个已绑同一 ctty 的 guest DevFd 做 dup 源（PTY 模式下 fd 0/1/2 必是）。
         std::shared_ptr<Fd> src;
         for(const auto& entry : *self->ps->fds_snap()) {
-            if(entry.second->tty().get() == ctty.get()) {
+            auto dfd = std::dynamic_pointer_cast<DevFd>(entry.second).get();
+            if(dfd && dfd->guest_tty().get() == ctty.get()) {
                 src = entry.second;
                 break;
             }

@@ -15,6 +15,7 @@
 #include <sys/uio.h>     // struct iovec
 
 class PosixSyscall;
+class vm;
 
 // 信号事件 POD（完整定义见 posix_syscall.h，下移避免循环 include）。
 // 此处前向声明让 SignalFd::deliver 的方法声明可用；实现在 signal.cpp（可见完整定义）。
@@ -32,7 +33,7 @@ struct GuestTty {
 };
 
 // pty master 端的共享 token。DevFd(pty master) 持有它的 shared_ptr，use_count 即 master fd
-// 引用数（对应内核 master tty_struct::count）。归零（drop_fd_handle 里 use_count()==1 判断，
+// 引用数（对应内核 master tty_struct::count）。归零（DevFd::on_close 里 use_count()==1 判断，
 // erase 析构后归零）触发 SIGHUP。slave fd 不持有 PtySide——slave 关闭不发 SIGHUP，故无需计数。
 struct PtySide {};
 
@@ -45,6 +46,10 @@ struct PtySide {};
 // 虚方法约定：接收已翻译的 host 指针（不碰 vm/mmu），返回 ssize_t：
 //   >=0 成功字节数（read/write 等），0 = EOF，<0 = 负 errno（如 -EINVAL/-EROFS/-EINTR）。
 // EINTR 由各实现返回 -EINTR，syscall 层统一转 SYSCALL_RESTART。
+//
+// pty/tty 语义不暴露在基类（不是所有 fd 都是 pty 端）：SIGHUP-on-close 经
+// on_close() 多态下沉到 DevFd；身份比对（TIOCSCTTY/TIOCSPGRP/TIOCGPGRP/tty_bg_check）
+// 由调用方 dynamic_pointer_cast<DevFd> 拿到子类后用 guest_tty() 取。
 // =====================================================================
 struct Fd {
     bool cloexec = false;       // FD_CLOEXEC（F_GETFD/F_SETFD 用，两类 fd 公共）
@@ -73,11 +78,13 @@ struct Fd {
     // 自然失败（EBADF），行为与重构前一致。
     virtual int host_fd() const { return -1; }
 
-    // —— pty/tty 专用（仅 HostFd 持有；ProcFile/ProcDir 返回空）——
-    // tty_bg_check / TIOCSCTTY/TIOCSPGRP/TIOCGPGRP / drop SIGHUP 通过这些取 GuestTty。
-    // ProcFile/ProcDir::tty() 返回 nullptr 使 tty_bg_check 第一行短路，无需在调用方判类型。
-    virtual std::shared_ptr<GuestTty> tty() const { return nullptr; }
-    virtual std::shared_ptr<PtySide> master_token() const { return nullptr; }
+    // 销毁前副作用（所有 fd 关闭路径在 erase 前统一调）。默认 no-op。
+    // DevFd override：pty master 末次关闭时向 ctty 前台组投 SIGHUP
+    // （对齐 Linux pty_close → tty_vhangup）。其余子类（HostFd/SignalFd/ProcFile/ProcDir）
+    // 用默认 no-op。
+    // 约束：不得在持有 fds 锁（fds_mutate 重试循环）时调用——SIGHUP 投递会重入 fd 表。
+    // 调用方须先 find_fd 拿到 shared_ptr 快照、退出锁、再调本方法，最后才 erase。
+    virtual void on_close(PosixSyscall* /*self*/, vm* /*v*/) {}
 };
 
 // HostFd —— host fd 直通（普通文件/pipe/socket）。
@@ -103,8 +110,6 @@ struct HostFd: Fd {
 
     std::shared_ptr<Fd> clone() const override;
     int host_fd() const override { return fd_; }
-    // tty()/master_token()/isatty() 不重写：回落 Fd 基类默认（nullptr/nullptr/false），
-    // 使 tty_bg_check、drop_fd_handle、ioctl TIOC* 等在普通 host fd 上自然短路。
     // host 透传工厂：openat(AT_FDCWD, host_path)。host_path 已含 chroot 前缀；guest_abs 存进
     // Fd::path（供 fchdir/readlinkat 用）。失败返 nullptr，errno 已设（host syscall 失败自带）。
     static std::shared_ptr<HostFd> open(const std::string& host_path, int flags, mode_t mode,
@@ -113,8 +118,9 @@ struct HostFd: Fd {
 
 // DevFd —— 设备 fd（pty master/slave、/dev/tty、PTY 模式初始 stdio）。
 // 继承 HostFd：I/O 与 host fd 访问完全复用（设备端就是一个 host fd，读写直通 host libc），
-// 仅额外承载 tty/pty 语义——tty_bg_check 的 job-control 门控、drop_fd_handle 的 SIGHUP 计数、
-// ioctl TIOCSCTTY/TIOCSPGRP/TIOCGPGRP 的 tty 身份比对都经 tty()/master_token() 多态取到。
+// 仅额外承载 tty/pty 语义——fd 销毁时的 SIGHUP 投递经 on_close() 多态、
+// ioctl TIOCSCTTY/TIOCSPGRP/TIOCGPGRP 与 tty_bg_check 的 tty 身份比对经 guest_tty()
+// （调用方 dynamic_pointer_cast<DevFd> 后取）。
 //
 // master/slave 区分靠 master_token_ 有无（沿用 PtySide 计数模型，无 enum）：
 //   - pty master（/dev/ptmx）：构造时传 make_shared<PtySide>()，use_count()==1 时关闭触发 SIGHUP。
@@ -127,8 +133,11 @@ struct DevFd: HostFd {
           std::shared_ptr<PtySide> m = {})
         : HostFd(fd, std::move(path_)), tty_(std::move(t)), master_token_(std::move(m)) {}
     std::shared_ptr<Fd> clone() const override;        // 返回 DevFd，保留 tty_/master_token_
-    std::shared_ptr<GuestTty> tty() const override { return tty_; }
-    std::shared_ptr<PtySide> master_token() const override { return master_token_; }
+    // fd 销毁前副作用：master 末次关闭发 SIGHUP（所有 fd 关闭路径在 erase 前统一调）。
+    void on_close(PosixSyscall* self, vm* v) override;
+    // 身份访问器：返回 tty_ 的 shared_ptr（供 do_ioctl/tty_bg_check/DevFd::open 找 ctty fd
+    // 比对；TIOCSCTTY 的 session->ctty 绑定也用此 shared_ptr 直接赋值）。
+    const std::shared_ptr<GuestTty>& guest_tty() const { return tty_; }
     // /dev/* 严格拦截（不 fallback 到 host openat）：仅调用方已知是 /dev/* 路径时才调本函数。
     //   /dev/tty、/dev/ptmx、/dev/pts/N —— 合成 DevFd（pty 设备）。
     //   /dev/null、/dev/zero、/dev/urandom、/dev/random、/dev/full —— 委托 HostFd::open 开宿主

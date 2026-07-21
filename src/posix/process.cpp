@@ -121,14 +121,14 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     ps->signal_actions = new_actions;
     signal_depth(v) = 0;
 
-    // exec 关闭所有 cloexec fd：保留非 cloexec 的构造新快照，cloexec 的 drop（锁外）。
+    // exec 关闭所有 cloexec fd：保留非 cloexec 的构造新快照，cloexec 的 on_close（锁外）。
     auto cur_snap = ps->fds_snap();
     auto kept = std::make_shared<SharedState::FdMap>();
     for(const auto& entry : *cur_snap) {
         if(!entry.second->cloexec) {
             kept->insert(entry);
         } else {
-            drop_fd_handle(v, entry.second);
+            entry.second->on_close(this, v);
         }
     }
     ps->fds_replace(std::const_pointer_cast<const SharedState::FdMap>(kept));

@@ -55,11 +55,11 @@ int64_t PosixSyscall::do_dup3(vm* v) {
         handle->cloexec = true;
     }
     // 若 new_fd 已被占用：dup2/dup3 静默关闭旧 fd（Linux 语义）。旧 fd 若是最后一个
-    // master 端，drop_fd_handle 触发 SIGHUP。drop 在锁外（投 SIGHUP 不能在 fds_mutate
+    // master 端，on_close 触发 SIGHUP。on_close 在锁外（投 SIGHUP 不能在 fds_mutate
     // 重试循环里）。
     auto existing = ps->find_fd(new_fd);
     if(existing) {
-        drop_fd_handle(v, existing);
+        existing->on_close(this, v);
     }
     ps->fds_mutate([&](SharedState::FdMap& m){
         m[new_fd] = handle;
@@ -173,13 +173,17 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
     }
     unsigned long request = v->r(2);
 
+    // tty 身份（pty 设备才有；普通 host fd / 虚拟 /proc fd 此处为 nullptr）。
+    // TIOCSCTTY/TIOCSPGRP/TIOCGPGRP 三个分支据此判 ctty 身份，nullptr 即 ENOTTY 短路。
+    auto dfd = std::dynamic_pointer_cast<DevFd>(h).get();
+    GuestTty* tty = dfd ? dfd->guest_tty().get() : nullptr;
+
     // 终端属性 (TCGETS/TCSETS/...)、winsize (TIOCGWINSZ/TIOCSWINSZ)、ptmx 锁/编号
     // (TIOCSPTLCK/TIOCGPTN) 等透传 host 内核（host ioctl 直通，由 host n_tty 处理）。
     // 只有 job-control 类（TIOCSCTTY/TIOCSPGRP/TIOCGPGRP）是 guest 进程语义，bpfvm 自己管。
     if (request == TIOCSCTTY) {
         // 绑定控制终端。语义：arg==1 强制（即使已被别的 session 占也夺），arg==0 仅在无人
         // 占用时绑定。前提：调用者须是 session leader（setsid 后），fd 是 pty 设备，否则错。
-        const auto tty = h->tty();
         if(!tty) {
             return -ENOTTY;
         }
@@ -188,7 +192,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         }
         int force = arg_s32(v->r(3));
         // 本会话已绑同一 tty：幂等成功。
-        if(session->ctty.get() == tty.get()) {
+        if(session->ctty.get() == tty) {
             return 0;
         }
         // tty 已被别的 session 占用？持 pid_map_mutex 保护 owner_ 读写（防抢夺竞态）。
@@ -202,7 +206,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
                 tty->owner_->ctty.reset();
             }
             // 绑定：session->ctty 指向 GuestTty，owner_ 反指 session，前台组初始化为自身。
-            session->ctty = tty;
+            session->ctty = dfd->guest_tty();
             tty->owner_ = session.get();
         }
         tty->fg_pgrp.store(pgrp->pgid, std::memory_order_release);
@@ -211,7 +215,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         // 设置前台进程组（tcsetpgrp）。musl 的 tcsetpgrp 传指向 int 的指针（&pgrp），
         // 故 r(3) 是 guest 指针，需 mmu 取值。仅更新本 ctty 的 fg_pgrp，供 deliver_tty_signal
         // 选目标组。POSIX：fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || h->tty().get() != session->ctty.get()) {
+        if(!session || !session->ctty || tty != session->ctty.get()) {
             return -ENOTTY;
         }
         const pid_t* in = (const pid_t*)v->mmu(v->r(3), sizeof(pid_t));
@@ -241,7 +245,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         return 0;
     } else if (request == TIOCGPGRP) {
         // 读取前台进程组（tcgetpgrp）。fd 必须是本会话 ctty，否则 ENOTTY。
-        if(!session || !session->ctty || h->tty().get() != session->ctty.get()) {
+        if(!session || !session->ctty || tty != session->ctty.get()) {
             return -ENOTTY;
         }
         pid_t* out = (pid_t*)v->mmu_w(v->r(3), sizeof(pid_t));
