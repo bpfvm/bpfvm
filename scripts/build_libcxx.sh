@@ -60,7 +60,6 @@ STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-b
     -D_LIBCPP_HAS_THREAD_API_PTHREAD \
     -D_LIBCPP_HAS_MUSL_LIBC \
     -D_LIBCPP_HAS_NO_INT128 \
-    -D_LIBCPP_HARDENING_MODE_DEFAULT=0 \
     -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
     -D_LIBCPP_BUILDING_LIBRARY \
     -DLIBCXX_BUILDING_LIBCXXABI \
@@ -76,9 +75,6 @@ OBJS=""
 if [ -d "$LIBCXX_SRC" ]; then
     echo "==> libc++ sources detected: $LIBCXX_SRC"
     # 编译 $LIBCXX_SRC 下全部 .cpp，仅排除少数在 BPF 上编不过或有冲突的：
-    #   barrier.cpp       — 用 1 字节 AtomicCmpSwap（BPF 后端只支持 32/64 位原子，
-    #                       "unsupported atomic operation, please use 32/64 bit version"），
-    #                       eBPF ISA 限制，编不过。
     #   charconv.cpp      — 浮点 to_chars 调 ryu/d2s.cpp 等（__multi3 int128 乘法，BPF
     #                       后端拒绝）；charconv.cpp 本身可编但浮点路径链接期缺 ryu 符号，
     #                       排除避免库带未定义引用。整数 to_chars 是 header-only，不受影响。
@@ -86,10 +82,10 @@ if [ -d "$LIBCXX_SRC" ]; then
     #                       （二选一取 libc++abi 版的 stdlib_new_delete.cpp）。
     # memory_resource.cpp 靠 stdlib_new_delete 的对齐版 operator new/delete
     #   （St11align_val_t）满足 pmr 引用。expected.cpp 在 c++23 下
-    #   #if _LIBCPP_STD_VER >= 23 门控的声明可见（STL_CXX_FLAGS 已是 c++23）。
+    # #if _LIBCPP_STD_VER >= 23 门控的声明可见（STL_CXX_FLAGS 已是 c++23）。
     # 其余全部纳入（algorithm/string/vector/regex/iostream/thread/memory_resource/expected/
     #   atomic/chrono/random/strstream/...）。fstream.cpp 编译为 0 符号（模板实例化被 #if 包），无副作用。
-    EXCLUDE="barrier.cpp charconv.cpp new.cpp"
+    EXCLUDE="charconv.cpp new.cpp"
     n=0
     for src in "$LIBCXX_SRC"/*.cpp; do
         b=$(basename "$src")

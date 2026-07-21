@@ -251,7 +251,7 @@ The BPF VM supports a **C++ language subset**: programs compiled with `clang++ -
 - Namespaces, `constexpr`, function overloading, references, `auto`, lambdas (with capture).
 - `operator new` / `operator delete` backed by musl `malloc`/`free` (define them in the `.cpp`; mangles to `_Znwm`/`_ZdlPv`, resolves without a C++ runtime library).
 
-**STL via libc++** (`libcxx.a`/`libcxx.so`, built by `scripts/build_libcxx.sh`): the standard library works, including RTTI (`typeid`/`dynamic_cast`) and `<thread>`/`<mutex>`/`<future>` (libc++ pthread backend over musl pthread).
+**STL via libc++** (`libcxx.a`/`libcxx.so`, built by `scripts/build_libcxx.sh`): the standard library works, including RTTI (`typeid`/`dynamic_cast`) and `<thread>`/`<mutex>`/`<future>`/`<barrier>` (libc++ pthread backend over musl pthread).
 
 **Verified compile-time limitations** (clang 19, `-target bpf -fno-exceptions -frtti`):
 - `throw` / `try`: `error: cannot use 'throw'/'try' with exceptions disabled`. RTTI **is** enabled, so `dynamic_cast` and `typeid` work (see `test/test_stl_rtti.cpp`); only reference-`dynamic_cast` failure (`bad_cast`) is unavailable because it requires exceptions.
@@ -310,7 +310,7 @@ On the host, `__mythread` expands to real `thread_local`, so the same source ser
 1. ✅ Language subset (this section).
 2. ✅ Emulated TLS via `address_space(256)` (this subsection; `test/test_cpp_tls.cpp`).
 3. ✅ Global ctors/dtors via `.init_array`/`.fini_array` (this subsection; `test/test_cpp_ctor.cpp`).
-4. ✅ STL via libc++ + `libcxx.a`/`libcxx.so` (the `test/test_stl_*.cpp` suite). The standard library works (containers, algorithms, `<iostream>`, `<regex>`, `<thread>`/`<mutex>`/`<future>`, `<filesystem>`, RTTI). Mechanism: `lowerAggregateParams` (by-value aggregate params → ptr) + `BpfAtomicLowerPass` (lower plain atomic load/store — eBPF ISA has only RMW atomics; unlocks static guards in locale/iostream) + `BpfByvalTmpPass` (≤16B by-value unique_ptr/shared_ptr double-free fix; LLVM bug workaround, see §5) + `BpfLibcallLower` (memcpy/memmove/memset/trap + floor/ceil/trunc/round → musl calls) + libc++ pthread backend over musl pthread + `uncaught_exceptions` stub override.
+4. ✅ STL via libc++ + `libcxx.a`/`libcxx.so`. The standard library works (containers, algorithms, io, filesystem, thread, regex, RTTI). Mechanism: `lowerAggregateParams` (by-value aggregate params → ptr) + `BpfAtomicLowerPass` (lower plain atomic load/store — eBPF ISA has only RMW atomics; unlocks static guards in locale/iostream) + `BpfByvalTmpPass` (≤16B by-value unique_ptr/shared_ptr double-free fix; LLVM bug workaround, see §5) + `BpfLibcallLower` (memcpy/memmove/memset/trap + floor/ceil/trunc/round → musl calls) + libc++ pthread backend over musl pthread + `uncaught_exceptions` stub override.
 
 #### Global ctors/dtors via `.init_array`/`.fini_array`
 

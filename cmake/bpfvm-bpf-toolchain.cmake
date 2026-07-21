@@ -15,25 +15,25 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_C_COMPILER   ${BPFVM_CLANG})
 set(CMAKE_CXX_COMPILER ${BPFVM_CLANGXX})
 
-# C flags（照搬 scripts/build_bpfvm_bpf.sh / test/Makefile 的 C 部分）。
+# C flags（照搬 test/Makefile 的 C 部分）。
 set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
-    -nostdinc -fno-builtin -fno-math-errno -D_GNU_SOURCE -D__BPF__=1 \
+    -nostdinc -fno-builtin -fno-math-errno -D_GNU_SOURCE \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
     -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include \
     -isystem ${BPFVM_ROOT}/include -isystem ${BPFVM_CLANG_RES_INC}"
     CACHE STRING "BPF C flags" FORCE)
 
-# C++ flags（C 部分 + libc++ 头 + 绕过宏，照搬 build_bpfvm_bpf.sh 第 43-55 行）。
 # 关键：libc++ 头(BPFVM_LIBCXX_INC)必须在 musl(root/include)前——cstddef 的
 # #include_next <stddef.h> 要求 libc++ 的 stddef.h 先被找到，再串联到 musl。
 # 不加 -g：规避 clang BPF 后端 EmitExternalFunctionDeclaration 崩溃。
 set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
-    -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti \
-    -std=c++23 -D_GNU_SOURCE \
-    -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC -D_LIBCPP_HAS_NO_INT128 \
-    -D_LIBCPP_HARDENING_MODE_DEFAULT=0 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
-    -D__BPF__=1 \
+    -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
+    -D_GNU_SOURCE \
+    -D_LIBCPP_HAS_THREAD_API_PTHREAD \
+    -D_LIBCPP_HAS_MUSL_LIBC \
+    -D_LIBCPP_HAS_NO_INT128 \
+    -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
     -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include \
