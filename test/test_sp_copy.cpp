@@ -1,8 +1,7 @@
 // shared_ptr 按值 copy 传参的引用计数回归测试。
 //
 // 守护 lowerAggregateParams 路径 B 对非平凡拷贝构造聚合（shared_ptr 16B =
-// {ptr,ptr}）的 invisible-reference 改写（见 AGENTS.md「By-value struct
-// parameters」/「Small aggregates ... Non-trivially copyable」）。改写前的缺陷：
+// {ptr,ptr}）的 invisible-reference 改写（见 README.md 函数调用约定突破一节）。改写前的缺陷：
 // clang 对 by-value 非平凡聚合生成 [2 x i64] 值参数，pass 在 caller 侧只做按位
 // store 到临时 alloca、callee 侧 load 出值——move 构造作用于 load 副本，无法
 // 置空 caller 的源临时，caller 析构源时多减一次引用计数 → 计数比实际少 1 →

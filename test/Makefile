@@ -32,7 +32,7 @@ LIBC_BPFSO := ../root/lib/libc.so
 # 路径用 wildcard 探测，存在则注入（缺失时跳过，不报错——便于在 pass 未构建的环境复用）。
 # BpfWideArgs：突破 BPF 5 参数限制 + 返回结构体支持 + lowerAggregateParams
 #   （按值传聚合参数：路径 A 剥大聚合 byval 属性、路径 B 小聚合成值降级成 ptr）+
-#   stripSret + 变参（详见 AGENTS.md「BpfWideArgs pass」）。C 和 C++ 都可能用到。
+#   stripSret + 变参（详见 README.md「函数调用约定突破」）。C 和 C++ 都可能用到。
 WIDEARGS := $(wildcard ../build/libBpfWideArgs.so)
 # BpfSoftFp：浮点运算（fadd/fmul/fcmp/...）在 IR 层替换成 BPF_FP_* call（src_reg=2，
 #   FP 专用通道），绕过 BPF 后端对浮点的拒绝；VM 侧 do_softfp 用宿主硬件浮点执行。

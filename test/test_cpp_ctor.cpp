@@ -1,6 +1,6 @@
 // 全局构造/析构框架测试：验证 .init_array/.fini_array 在 bpfvm 上正确工作。
 //
-// 机制（见 AGENTS.md "Global ctors/dtors" 与 src/elf_linker.cpp 的 init_array 处理）：
+// 机制（见 README.md 的全局构造/析构说明与 src/elf_linker.cpp 的 init_array 处理）：
 //   - clang 把带非平凡 ctor 的全局对象的构造函数指针放进 .init_array（SHT_INIT_ARRAY），
 //     析构经 __cxa_atexit 登记（由 musl 在 exit 时倒序调用）。
 //   - bpfvm-ld 收集 .init_array section（保证段内连续）、合成 __init_array_start/end

@@ -2,7 +2,7 @@
 
 `bpfvm` 是一个基于 C++20 实现的 BPF (eBPF) 虚拟机，旨在在用户态加载并运行 BPF ELF 二进制文件。
 
-与内核中的 BPF 运行时不同，本项目致力于提供一个类似 POSIX 的运行环境，通过集成 [PDCLib](https://uclibc.org/pdclib/) (Public Domain C Library) 和模拟常见的系统调用 (syscalls)，使得标准的 C 语言程序（如 `dash` shell 和 `busybox` 工具集）能够通过交叉编译运行在此虚拟机上。
+与内核中的 BPF 运行时不同，本项目致力于提供一个类似 POSIX 的运行环境，通过集成 [musl](https://musl.libc.org/) libc，并模拟常见的系统调用 (syscalls)，使得标准的 C/C++ 程序（如 `dash` shell 和 `busybox` 工具集）能够通过交叉编译运行在此虚拟机上。
 
 ## 核心特性
 
@@ -11,7 +11,7 @@
 *   **指令集支持**: 实现核心 eBPF 指令集解释执行。
 *   **浮点支持**: 通过 `BpfSoftFp` LLVM pass 提供 `float`/`double` 支持（算术、类型转换、比较）。
 *   **系统调用模拟**: 通过可插拔的 `SyscallHandler` 接口实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
-*   **标准库支持**: 深度集成了 `PDCLib`，为 BPF 程序提供标准 C 库支持 (stdio, stdlib, string 等)。
+*   **标准库支持**: 深度集成了 musl（默认）作为 C 库，并提供 libc++ 支持 C++ STL。
 *   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用。
 *   **内存安全**: 提供内存越界检查机制。
 *   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `busybox` (coreutils) 等复杂程序。
@@ -50,7 +50,15 @@ sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，�
 ```
 *默认安装前缀是项目根目录的 `root/`，所有构建脚本/Makefile 统一引用 `-Iroot/include`、`-Lroot/lib`。*
 
-> PDCLib 是可选的替代 C 库（默认不构建）。如需改用 PDCLib，详见 `AGENTS.md` 的 "Default C Library (musl) & Optional PDCLib" 一节，将其头文件与库装入 `root/`。
+### 构建 Demo Rootfs (dash + busybox)
+
+一键构建 `dash` 和 `busybox`，并将 C/C++ 运行时（musl、libcxx）与可执行文件统一安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
+
+```bash
+./scripts/build_root.sh   # = 构建 musl → root/{include,lib}；合成 libc.so/libcxx.so；构建 dash/busybox → root/bin
+# 运行 dash（示例）
+./build/bpfvm root/bin/dash
+```
 
 ## 运行与测试
 
@@ -68,16 +76,6 @@ VM 自身的指令集单元测试：
 
 ```bash
 ./build/bpfvm_test
-```
-
-### 构建 Demo Rootfs (dash + busybox)
-
-一键构建 `dash` 和 `busybox`，并将 C/C++ 运行时（musl、libcxx）与可执行文件统一安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
-
-```bash
-./scripts/build_root.sh   # = 构建 musl → root/{include,lib}；合成 libc.so/libcxx.so；构建 dash/busybox → root/bin
-# 运行 dash（示例）
-./build/bpfvm root/bin/dash
 ```
 
 ### 运行集成测试
@@ -105,32 +103,23 @@ make -C test
 │   │   ├── x86_emitter.h/cpp     # x86_64 JIT 代码发射
 │   │   └── aarch64_emitter.h/cpp # AArch64 JIT 代码发射
 │   ├── passes/               # LLVM pass 插件（编译为 build/lib*.so，由 clang -fpass-plugin= 加载）
-│   │   ├── BpfWideArgs.cpp   #   突破 5 参数限制 + 返回结构体 + 变参函数
-│   │   └── BpfSoftFp.cpp     #   把浮点 IR 改写为软浮点 call（启用 float/double）
+│   │   ├── BpfWideArgs.cpp   #   突破 5 参数限制 + 返回结构体 + 变参函数 + by-value 聚合参数
+│   │   ├── BpfSoftFp.cpp     #   把浮点 IR 改写为软浮点 call（启用 float/double）
+│   │   ├── BpfEmutls.cpp     #   emutls（address_space(256) → 每线程存储）
+│   │   └── BpfLibcallLower.cpp #  memcpy/memmove/memset/trap + floor/ceil/... → musl 调用
 │   └── insn_test.cpp         # 指令集单元测试
 ├── include/              # BPF Guest 程序使用的头文件（syscall ID、POSIX 类型、浮点 call 编号）
 ├── cmake/                # CMake 辅助脚本（CTest 集成等）
-├── pdclib/               # PDCLib 标准 C 库 (子模块)
+├── musl/                 # musl 标准 C 库 (默认，含 BPF 移植)
 ├── dash/                 # dash shell (子模块)
 ├── busybox/              # busybox
-├── sbase/                # sbase coreutils
 ├── test/                 # BPF 集成测试用例
 └── root/                 # Demo rootfs 输出目录
 ```
 
 VM 架构采用可插拔的 `SyscallHandler` 接口，将指令执行 (`insn.cpp`) 与系统调用处理 (`posix_syscall.cpp`) 解耦。`PosixSyscall` 提供完整的 POSIX 系统调用模拟，`EmptySyscall` 则作为测试用的空实现。
 
-## 架构限制与开发指南
-
-由于 BPF 架构的特殊性，为本虚拟机开发 C 程序时需注意以下限制：
-
-1.  **浮点运算**: BPF 硬件本身无浮点单元。本项目通过 `BpfSoftFp` LLVM pass 插件（编译时自动注入）提供 `float`/`double` 支持，可直接使用，无需手动改写。
-2.  **参数与返回值限制**: 原生 BPF 调用约定最多 **5 个参数**，且无法返回结构体。本项目自带 `BpfWideArgs` LLVM pass 插件，编译时自动解决这两个限制。
-3.  **变长参数 (Varargs)**: BPF 后端拒绝任何变参函数。`BpfWideArgs` pass 同样自动解决，可直接使用 `...` 函数及 `va_start`/`va_arg`。
-
-> 三类限制的细节与历史实现方案见 [`AGENTS.md`](AGENTS.md) 的 "BPF Architecture Constraints & Developer Guide" 一节。
-
-## 工具链
+## 工具链 / bpfvm-ld
 
 本项目自带 BPF 链接器 `bpfvm-ld`（`src/ld_main.cpp`），完全替代 `binutils-bpf` `bpf-ld`。
 
@@ -151,6 +140,242 @@ bpfvm foo.linked    # 或 foo.dyn
 
 `bpfvm-ld` 兼容 clang/gcc 风格命令行（接受 `-target`、`-Wl,...`、`-isystem` 等），可作为 autoconf 项目的 `CCLD`。
 
+### 三种链接模式
+
+三种模式共享同一个 `Linker` 核心，与标准 `ld` 默认行为对齐：
+
+- **静态** (`-static`)：把 `.o` + 归档合并成自包含的 ET_EXEC（固定地址）。例：`bpfvm-ld -static foo.o -l:libc.a -o foo.linked`。
+- **共享库** (`-shared` / `--shared`)：从归档构建 `.so`，导出其 GLOBAL 符号表，PIE（`p_vaddr=0`，可加载到任意地址）。例：`bpfvm-ld --shared --soname libc.so libc.a -o libc.so`。
+- **动态可执行**（默认）：构建引用 `.so` 依赖（`DT_NEEDED`）的 PIE ET_DYN。跨模块函数调用走 PLT/GOT；跨模块数据引用记录在 `.rela.dyn`。运行时 `bpfvm` 分配加载地址并应用重定位。例：`bpfvm-ld foo.o -l libc.so -o foo.linked`。
+
+三种模式都输出**三个权限分离的 `PT_LOAD` 段**（W^X），由 `layout_segments`（`src/elf_linker.cpp`）按 section flags 分类：
+- `text`（`SHF_EXECINSTR`）→ `PF_R|PF_X`（只读 + 可执行）
+- `rodata`（只读数据）→ `PF_R`
+- `data` + `.bss`（`SHF_WRITE`）→ `PF_R|PF_W`；`.bss` 是 `SHT_NOBITS`，故 `p_memsz > p_filesz`，加载时零填充
+
+段在 guest 地址空间内页对齐且互不重叠。
+
+入口符号默认 `_start`（标准 `ld` 行为）；用 `-e <name>` / `--entry <name>` 覆盖。
+
+### 调试信息 (DWARF)
+
+默认 `bpfvm-ld` 在输出中保留 DWARF 调试段（`.debug_info`、`.debug_line`、`.debug_str`、`.debug_abbrev`、`.debug_addr`、`.debug_frame`、...）作为 **non-ALLOC `SHT_PROGBITS`** 段，与标准 `ld` 行为一致。用 `-g` 编译（`test/Makefile`、`scripts/build_root.sh`、`scripts/build_busybox.sh` 已默认开启），链接后的二进制即带源码级调试信息：
+
+```bash
+bpfvm-ld -static foo.o -l:libc.a -o foo.linked     # .debug_* 保留（默认）
+bpf-objdump -S foo.linked                           # 反汇编与 C 源码交错
+llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
+```
+
+- **仅静态模式**：调试段保留目前只在 `-static`（固定地址）启用。PIE 模式（`-shared`、默认动态）跳过调试输出，因为 `.debug_addr` 按绝对地址引用 `.text`，而该地址要到运行时 VM 选定加载基址后才确定（未来阶段可输出位置无关调试信息）。
+- **Strip**：`--strip-debug` (`-S`) 仅丢弃 `.debug_*`；`-s` / `--strip-all` 同时丢弃 `.debug_*` 和 `.symtab`/`.strtab`（与标准 `ld` 语义一致）。`-g` 及其变体（`-g2`、`-gdwarf-4`、...）作为 no-op 接受（调试默认已开）。
+- **重定位**：`.rel.debug_*` 重定位在链接期应用，**不**输出到产物（更干净；消费者看到的是预解析值）。处理两类地址引用：debug→debug 引用解析为段内偏移；debug→loadable 引用解析为最终 guest 地址。
+- **符号表**：三种模式现在都输出静态 `.symtab`/`.strtab`，同时包含 GLOBAL 符号和 `STB_LOCAL` FUNC/OBJECT 符号（使 `objdump -d` 能标注本地函数边界）。`sh_info` 按 ELF 约定指向第一个 GLOBAL。PIE 模式下运行时符号解析仍用 `.dynsym`。
+- `.BTF`/`.BTF.ext`（BPF 内核元数据）和 `.llvm_addrsig` 仍被丢弃（VM 用不到）。
+
+## 架构设计与实现
+
+由于 BPF 架构的特殊性，为本虚拟机开发 C/C++ 程序时存在若干硬限制。本仓库通过一组 LLVM pass 在编译期透明解除，**写 guest 代码时按标准 C/C++ 直接用即可**。下面给出完整的三层实现机制（约束 → 方案 → pass / 链接器 / VM 执行）。
+
+### 浮点数支持
+
+**约束**：BPF 架构**没有硬件浮点单元或寄存器**。BPF LLVM 后端（`BPFISelLowering.cpp`）在 ISel 阶段拒绝任何浮点操作，报错如 `"A call to built-in function '__adddf3' is not supported"`——且该拒绝发生在后端把它 lower 成库调用**之前**，所以仅仅提供 `__adddf3` 实现并不够。
+
+**方案：一批以 BPF `call` 编码的浮点「虚拟指令」**
+
+核心思想是**通过 BPF `call` 机制模拟一批浮点指令**，然后在流水线的每一处都把它当作单条指令处理。具体地，每个浮点操作被赋予一个稳定的数字 ID——`include/bpf_call.h` 中的 `BPF_CALL_FP_*` 族（如 `BPF_CALL_FP_ADD_D`、`BPF_CALL_FP_D2SI`、`BPF_CALL_FP_CMP_D`）——在 BPF 程序中最终变成一条 `call <imm>`，且 **`src_reg=2`（专用浮点通道）**。这刻意把浮点与系统调用（`src_reg=0`）分开：解释器和 JIT 把 `src_reg=2` 直接派发到浮点路径（`do_softfp` / `emit_call_softfp`），完全不碰 syscall handler。每条浮点指令自包含：从 `r1`/`r2` 读操作数（位模式），用宿主硬件 FP 计算结果，把位模式写回 `r0`。运行时没有函数调用、没有栈帧、操作数与结果之间没有 VM 状态穿梭——它就是一条恰好用 `call` 操作码承载的指令。
+
+这跨三层实现（无 guest 侧胶水）：
+
+1. **`BpfSoftFp` LLVM pass**（`src/passes/BpfSoftFp.cpp`，自动编进 `build/libBpfSoftFp.so`，由 `test/Makefile` 自动注入）——*IR* 阶段：把每条浮点 IR 指令（`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`、fp↔int 转换、`fpext`/`fptrunc`、以及 `fmuladd`/`fma`/`sqrt` 内联函数）改写为对 `extern __ksym` 函数 `__bpf_fp_<ID>`（段 `.ksyms`）的调用，其中 `<ID>` 是十进制 `BPF_CALL_FP_*` 值。后端把它当作普通的未解析外部调用 lower：参数按 BPF 调用约定落到 `r1`/`r2`/...、结果落到 `r0`（这是关键的稳定性属性——它用的是后端原生调用 lowering，而非 InlineAsm 那种 `"r"`/`"=r"` 约束无法钉住物理寄存器的把戏）。`fcmp` 展开成**两**次调用（`CMP` + `UNORD`），从而精确重建每个 IEEE-754 谓词。
+
+2. **`bpfvm-ld` 链接器**——*字节码改写*阶段：clang 把它们发成 `call -1`（`src_reg=1` 占位）+ 指向 `__bpf_fp_<ID>` 的 `R_BPF_64_32` 重定位。链接器识别 `__bpf_fp_` 符号名，从名字解析 `<ID>`（无查表——ID 就在名字里），把指令改写为 `src_reg=2` + `imm=<ID>`。同时对这些名字抑制 "undefined symbol"（VM 在运行时解释它们），并跳过它们的 PLT/GOT 合成（它们不是真正的跨模块调用）。
+
+3. **执行**——两条路径都解析同一个 `BPF_CALL_FP_*` ID（来自 `imm`），用宿主硬件 FP 执行（操作数为 `i64` 位模式，结果写 `r0`）：
+   - **解释器**：`insn.cpp` 的 `do_softfp`——经 `src_reg=2` 派发分支直达，也是 JIT 的兜底。
+   - **JIT**：`emit_call_softfp()` 识别 ID 并内联发射宿主原生 FP 代码。因为 JIT 把全部 11 个 BPF 寄存器常驻在物理寄存器中，r1/r2/r0 已就位（x86：R9/R10/R8；AArch64：X10/X11/X9）——无需 flush、无需 VM 退出，该操作只是指令流里又一条指令。各 arch 的细节与 bring-up 期间踩过的编码坑都注释在每个 `emit_call_softfp` 现场。这一层唯一要紧的架构差异：**AArch64 有原生 `FCVTZU`/`UCVTF`，每条 `BPF_CALL_FP_*` 都能原生处理；而 x86 缺少无符号 fp↔int 转换（需 AVX-512），故 x86 上无符号转换类 ID 回退到 `do_softfp`**（经 `emit_call_softfp_slow` → `helper_do_softfp`，一个与 syscall 路径解耦的专用 FP 兜底 helper）。
+
+**ABI 细节**：浮点值以 IEEE-754 位模式存于 64 位 BPF 寄存器/栈槽——无精度损失。`printf("%f", x)` 之类的变参通过现有的 `BpfWideArgs` pass 工作（`va_list` 槽为 8 字节）。`printf %f` 格式化由默认 musl libc 提供（musl 的 printf 原生处理 `%f`/`%e`/`%g`）
+
+**仍需注意**：
+*   `long double` == `double`（64-bit）在本目标上；使用 128-bit `long double` 精度的代码应改为 `double`。
+*   **数学函数：在 musl libm 与 VM 虚拟指令之间划分，分界线 = musl 函数体能否撑过 `instcombine`。** `floor`/`ceil`/`trunc`/`round`（+ `sin`/`cos`/`exp`/`log`/`pow`/...）来自 musl 的 `src/math/*.c`（通用纯 C；BPF 无 arch 专化）；`BpfLibcallLower` pass 把它们的*内联函数*形式（`@llvm.floor`、...）lower 成普通库调用（`call @floor`/`floorf`），并放行库调用形式让 libc 解析。`sqrt`/`fabs`/`copysign` 保留为 VM 虚拟指令（`BPF_FP_SQRT_*`/`FABS_*`/`COPYSIGN_*`）：`sqrt` 因为 JIT 发单条原生硬件指令（`sqrtsd`/`fsqrt`）；`fabs`/`copysign` 因为它们的 musl 函数体是单条按位 `and`/`or`，`-O1` instcombine 会把它*折叠回*同名内联函数（`@llvm.fabs`），所以 lower 成 `call @fabs` 会无限递归（`fabs` 调自己）——保留为 VM 指令绕开递归，无需在 pass 里写专门的按位逻辑。这三者（`sqrt`/`fabs`/`copysign`）在两个 `emit_call_softfp` 发射器里都有原生 JIT 用例（x86：xmm 上的 `sqrtsd`/`andps`/`orps`；AArch64：sqrt/fabs 用 `FSQRT`/`FABS`，copysign 用 GPR `and`/`or` 位掩码——它没有单条原生 FP 指令），故永不回退到解释器。它们的内联函数与库调用形式都被 `BpfSoftFp` 拦截并改写为对应 `BPF_FP_*`。VM 虚拟指令集因此保持：无 libc 对应物的 ISA 原语（算术/比较/转换）+ `sqrt` + `fabs`/`copysign` + emutls。
+
+### 函数调用约定突破
+
+**约束（原生 BPF ABI）**：原生 BPF 调用约定有三条严格限制：
+1.  **参数个数**：函数参数不能超过 **5 个**（`"stack arguments are not supported"`）。
+2.  **结构体返回**：函数**不能返回结构体**——后端拒绝 `sret` 属性（`"aggregate returns are not supported"`）。
+3.  **变参函数**：后端在 ISel 阶段拒绝任何变参函数（`isVarArg = true`）（`"variadic functions are not supported"`，`BPFISelLowering.cpp`）。这也覆盖了使用 `va_arg`/`va_copy` 内联函数的非变参函数（如 `vfprintf`，它取 `va_list` 参数）。
+
+**方案：BpfWideArgs pass**
+本项目提供一个 LLVM pass 插件（`src/passes/BpfWideArgs.cpp`），在编译期透明解除**全部三条**限制，使你能写**标准 C**——任意参数个数、结构体返回、`...` 变参函数。它在 LLVM 开发头存在时自动编进 `build/libBpfWideArgs.so`，并由 `bpf-toolchain.cmake` / `test/Makefile` 自动注入。
+
+**工作原理**（见 `src/passes/BpfWideArgs.cpp`）——四种变换独立且可组合（如返回结构体的 6 参函数也支持）：
+*   **>5 个参数**：pass 把第 5 个参数起打包成 `__bpf_pack_<func>` 结构体，经 `r5` 中的指针传递。调用者在栈上分配该结构体（可重入/递归安全）；被调用者在入口加载额外参数。于是寄存器 `r1`–`r4` 持有前四个标量参数，`r5` 是 pack 指针。
+*   **结构体返回**：LLVM 已把 `struct` 返回 lower 成 `sret` 指针约定（`void f(ptr sret, ...)`）；pass 只是剥离 BPF 后端拒绝的 `sret` 属性。语义不变。
+*   **按值结构体参数**：clang 以两种方式 lower C++ 按值聚合参数，`lowerAggregateParams` 把两者都归一化为普通 `ptr`（各 1 个寄存器）：
+    *   **大聚合（≥3 字，如 `std::string` 24B）**：clang 已发出 `ptr byval(%T) align N`——调用者把参数 memcpy 进栈临时并传其指针，被调用者把它当普通指针用（`getelementptr`/`load`）。BPF 后端拒绝 `byval` 属性（"pass by value not supported"），故 pass 从每个函数签名和调用点剥离 `byval`（覆盖直接/间接调用和外部 callee）。无类型/函数体改动——参数本就是指针。
+    *   **小聚合（≤2 字，如 `std::pair`=`{i64,i64}`、`__bit_iterator`=`[2 x i64]`、`i128`）**：clang 直接用聚合**值类型**作参数类型（无 `byval`）。BPF 后端把它按元素/字段展开成多个寄存器，于是 `f(__bit_iterator, __bit_iterator, value, proj)` = 2+2+1+1 = 6 寄存器 > 5 寄存器限制 → "too many arguments"。pass 把签名重建为普通 `ptr`，搬移函数体，并改写函数体对值参数的使用及每个调用点的实参。按聚合是否平凡可拷贝分两种子情况：
+        *   **平凡可拷贝**（标量的 `std::pair`、`i128`、...）：被调用者入口插入 `load T, ptr %arg`，调用点把值存入一个入口块新 alloca 并传其指针。按位拷贝正确。
+        *   **非平凡可拷贝**（如 `std::shared_ptr` = `{ptr,ptr}` 16B，任何有用户自定义拷贝/移动构造或析构的）：clang 生成 `[2 x i64]` 值参数和形如 `store [2 x i64] %arg, ptr %local; ... move/copy %local ...` 的函数体。按位 `load`/`store` 会破坏移动语义——`move %local` 置空的是 `%local`（那份 load 拷贝），而非调用者的源对象，于是调用者拷贝构造的临时仍被析构、引用计数多减一次（静默：引用计数最终少一，调用者的 `shared_ptr` 悬空，下次 fork/访问 UAF；由 `test/test_sp_copy.cpp` 和 `bpfvm-on-bpfvm` 的 `test_waitid` 崩溃复现，其中 `do_clone` 的 `make_shared<PosixSyscall>(pgrp, session)` 少计了 `pgrp`）。修复镜像 x86 的 invisible-reference ABI：`rewriteValueParamUsesToPointer` 擦除 `store %arg, ptr %local`，把 `%local` RAUW 成指针参数，使函数体直接操作调用者的源对象；调用点在实参为 `load T, ptr %src`（clang 模式：调用者拷贝/移动构造一个临时 `%src` 再 load）时，传 `%src` 本身，使被调用者的移动置空调用者的临时、其析构变成 no-op。非 load 实参（罕见；如另一个调用的返回值）回退到平凡可拷贝的 alloca+store 路径。
+    两种情况下语义都不变（按值 = 调用者交给被调用者一份独立拷贝）；每调用点的拷贝被保留（优化器无法证明被调用者不会写向这个现在无归属的指针，故保守保留它）。这解锁了 `f(std::string)` / `f(std::vector)` / `f(std::pair)` / 任意按值聚合——此前被拒绝。
+*   **变参函数**——使用 clang 原生的 `VoidPtrBuiltinVaList`，`va_list` 是指向第一个 vararg 的单个 `void*`：
+    *   **被调用者改写**：`R f(T0..Tn, ...)` → `R f(T0..Tn, ptr __va_base)`。`__va_base` 指向一块调用者分配的、持有 vararg 的内存区。函数原型（声明）同样改写。
+    *   **调用者改写**：每个调用点在入口栈上分配 `__bpf_vapack_<func>` 结构体（packed，每槽按 `allocSize(T)` 定大小），把变参实参存入，并把其地址作为 `__va_base` 传入。
+    *   **内联函数 lowering**（应用于*所有*函数，不只是变参的）：
+        *   `va_start(ap)` → `store __va_base, ap`
+        *   `va_arg(ap, T)` → `load T, ptr ap; ap += allocSize(T)`
+        *   `va_copy(d, s)` → `*d = *s`（拷贝指针值）
+        *   `va_end(ap)` → no-op
+
+#### 历史 / 可选替代方案
+
+> 以下内容是 `BpfWideArgs` pass 出现**之前**采用的技术，或 pass 关闭时（直接瞄准原生 BPF ABI）的备选方案。它们**不影响**现代 guest 程序的编写（pass 默认开启），保留作参考——想直接理解当前用法可跳过本节，直接看下一节 [C++ 支持](#c-支持)。
+
+主要手法有二：强制内联、手搓 pseudo-`va_list`。
+
+##### 强制内联（pass 关闭时的可选兜底）
+通过内联函数绕过参数数/结构体返回限制，使调用约定不被触发：
+
+```c
+#define BPF_INLINE __attribute__((always_inline)) inline
+
+// 例：>5 参数的函数
+BPF_INLINE void complex_logic(int a, int b, int c, int d, int e, int f) {
+    // 实现被内联，避开 5 寄存器限制
+}
+```
+##### 手搓 pseudo-`va_list`
+变参可完全在头文件里用一个调用者在每个调用点手工组装的 pseudo-`va_list` 模拟。pass 已取代该技术；本节保留作参考。
+
+*   **把 `va_list` 定义为结构体**：
+    ```c
+    typedef struct {
+        int pos;
+        unsigned long long* data;
+    } _va_list;
+    ```
+    `pos` 是运行索引，`data` 指向一个调用者分配的、持有 vararg 的 `uint64_t[]` 数组。
+*   **参数计数**：数组长度与逐槽填充循环由一个预处理器参数计数器（`___bpf_narg`）驱动，使调用者无需手写计数。这是经典的占位符偏移技巧——一个前导哑参数，然后一个倒序编号列表，N 落在正确的槽上：
+    ```c
+    #define ___bpf_nth(_, _1, _2, _3, _4, _5, _6, _7, _8, _9, _a, _b, _c, N, ...) N
+    #define ___bpf_narg(...) \
+        ___bpf_nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+    // ___bpf_narg(a, b)        → 2
+    // ___bpf_narg(a, b, c, d)  → 4
+    ```
+    `___bpf_apply(fn, N)` 随后选择匹配的重载，故 `___bpf_fill(arr, a, b, c)` 展开为 `___bpf_fill3(arr, 0, a, b, c)`（每个 arity 都有一个 `___bpf_fillN` 重载，至 12）。同一计数器也定 size 数组本身：`unsigned long long data[___bpf_narg(args)]`。
+*   **在调用点构建 list**：helper 宏分配一个局部 `uint64_t[]`（由 `___bpf_narg` 定 size），通过 `___bpf_fill` 逐槽逐参填充，并初始化结构体指向它。手动展开形如：
+    ```c
+    uint64_t ap_data[2] = { (uint64_t)(uintptr_t)"world", 42 };
+    _va_list ap = { .pos = 0, .data = ap_data };
+    ```
+*   **访问宏**遍历数组：
+    *   `_va_arg(ap, type)` → `{ ap.pos++; (type)ap.data[ap.pos-1]; }`
+    *   `_va_copy(dest, src)` → `dest = src`（结构体拷贝，故两者共享数组）
+    *   `_va_end(ap)` → no-op
+    *   `_va_start` 被故意禁用（BPF 没有可 start 的 `...` 函数）。
+*   **使用模式**：声明取真正 `va_list` 的*后端*函数，并在每个调用点构建 pseudo-`va_list` 的语句表达式宏中包装它：
+    ```c
+    int my_vprintf(const char *format, va_list ap);   // 后端，取 va_list
+
+    #define my_printf(fmt, ...) ({ \
+        /* 构建 ap：局部 uint64_t[] + init _va_list */ \
+        my_vprintf(fmt, ap); \
+    })
+    ```
+
+### C++ 支持
+
+BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -frtti` 编译的程序，通过 `extern "C"` 使用 musl 的 C 运行时，并用 **libc++**（`libcxx.a`/`libcxx.so`）作为 C++ 标准库。由 `test/test_cpp_lang.cpp` 端到端验证（5 个 ctest 变体：static/dynamic × JIT/interp + host）；STL 覆盖由 `test/test_stl_*.cpp` 套件保证。
+
+**无 C++ 运行时即可工作**（裸语言子集）：
+- 模板、类/结构体、构造/析构、单继承、虚函数（vtable 分派）。
+- 命名空间、`constexpr`、函数重载、引用、`auto`、lambda（带捕获）。
+- `operator new` / `operator delete` 由 musl `malloc`/`free` 支撑（在 `.cpp` 里定义它们；mangle 为 `_Znwm`/`_ZdlPv`，无需 C++ 运行时库即可解析）。
+
+**经 libc++ 的 STL**（`libcxx.a`/`libcxx.so`，由 `scripts/build_libcxx.sh` 构建）：标准库可用，含 RTTI（`typeid`/`dynamic_cast`）和 `<thread>`/`<mutex>`/`<future>`/`<barrier>`（musl pthread 之上的 libc++ pthread 后端）。
+
+**已验证的编译期限制**（clang 19，`-target bpf -fno-exceptions -frtti`）：
+- `throw` / `try`：`error: cannot use 'throw'/'try' with exceptions disabled`。RTTI已启用，故 `dynamic_cast` 和 `typeid` 可用（见 `test/test_stl_rtti.cpp`）；仅引用 `dynamic_cast` 失败（`bad_cast`）不可用，因为它需要异常。
+
+**为本目标写 C++ 时要遵守的硬约束**：
+- **无异常**：`throw`/`try` 编译期被拒（未移植 `__cxa_throw`/`__cxa_personality`/libunwind）。RTTI 已启用；`typeid`/`dynamic_cast` 可用。
+- **`thread_local` 经 `address_space(256)`**（见下文「模拟 TLS (emutls)」）：C++ `thread_local` 关键字被 clang Sema 对 BPF 目标拒绝（无法用 `-femulated-tls` 绕过）；改用 `__mythread` 宏。
+- **不能 `&thread_local_var`**：取 emutls 变量地址是编译错误（地址空间不同）；直接访问变量。
+
+**全局构造/析构**：经 `bpfvm-ld` 的 `.init_array`/`.fini_array` 框架支持（见 `src/elf_linker.cpp` 与下文「全局构造/析构」）。有非平凡构造/析构的全局对象可用：构造在 `main` 之前运行（定义序），析构在 `exit` 时运行（逆序，经 `_GLOBAL__sub_I_*` 中注册的 `__cxa_atexit`）。由 `test/test_cpp_ctor.cpp` 验证。
+
+**构建集成**（见 `test/Makefile`）：
+- `test/test_cpp_*.cpp` 自动发现；`CXX_FLAGS` 镜像 C 的 `CC_FLAGS`（相同的 target/CPU/stack-size/isystem/pass-plugin 标志）加上 `-std=c++23 -nostdinc++ -fno-exceptions -frtti` 和 libc++ 绕过宏（`-D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC -D_LIBCPP_HAS_NO_INT128 ...`）。C++ pass 插件（`libBpfWideArgs.so`/`libBpfSoftFp.so`/`libBpfLibcallLower.so`/`libBpfEmutls.so`）随 C 的一起注入。
+- C++ 测试链接 `libcxx.a`（静态 `.out`）或 `libcxx.so`（动态 `.linked`），两者均由 `scripts/build_root.sh` 的 `build_libcxx` 产出（`scripts/build_libcxx.sh` → `libcxx.a`；`bpfvm-ld -shared` → `libcxx.so`，`DT_NEEDED libc.so`）。C 测试保持无任何 libcxx 依赖。
+- C++ 测试经 `cmake/RunBpfProgram.cmake` 运行与 C 测试相同的 5 个 ctest 变体。
+- musl `libc.a` **不**提供 C++ ABI 符号（仅 C 式 `__cxa_atexit`/`__cxa_finalize`）；C++ 运行时——`operator new`/`delete`、libc++abi typeinfo vtable + `__dynamic_cast` + `__cxa_*`，以及 libc++ 库本身——来自 `libcxx.a`/`libcxx.so`。
+
+#### 模拟 TLS (emutls)
+
+每线程存储通过「宏 + LLVM pass + VM 运行时」支持，复用浮点虚拟指令通道（`src_reg=2`）。
+
+**用法**：
+```cpp
+#ifdef __BPF__
+#define __mythread __attribute__((address_space(256)))
+#else
+#define __mythread thread_local   // host 基线
+#endif
+
+__mythread int counter = 0;          // 零初始化
+__mythread int init_val = 42;        // 非零初始化（首次访问时模板拷贝）
+__mythread int arr[4] = {1,2,3,4};   // 数组（支持 GEP 访问）
+struct Point { int x; int y; };
+__mythread Point pt = {1, 2};        // 结构体（支持字段访问）
+```
+在 host 上，`__mythread` 展开为真正的 `thread_local`，故同一源码在 `host` ctest 变体里充作基线。
+
+**机制**（镜像 `BpfSoftFp` 架构；见 `src/passes/BpfEmutls.cpp`）：
+1. clang 发出 `addrspace(256)` 全局 + `load/store/GEP ... ptr addrspace(256)`——这完全绕过 Sema 的 `thread_local` 拒绝（BPF.h：`TLSSupported=false`）和 BPF 后端的 `GlobalTLSAddress` ISel 崩溃。
+2. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行）把每个对 `addrspace(256)` 全局的访问改写为：
+   - 一个控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value }`（零初始化时 init 模板指针为 null，否则指向拷贝出的 `@__emutls_t.<name>` 模板）；
+   - 一个调用 `__bpf_fp_<EMUTLS_ID>(i64 ctrl_ptr)` 返回每线程地址（调用发为 `extern __ksym`，段 `.ksyms`）。
+3. 链接器无需改动：`__bpf_fp_<ID>` 已被 `is_fp_ksym` 识别，后者把调用改写为 `src_reg=2` + `imm=<ID>`。`BPF_FP_EMUTLS_GET_ADDR` 即该 ID（在 `include/bpf_call.h`，附于 `bpf_fp_op`）。
+4. `vm::do_softfp` 派发 `BPF_FP_EMUTLS_GET_ADDR`（`src/insn.cpp`）：从 `r1` 读控制块，在 `vm::emutls_slots_` 中懒分配一个每线程槽（每个槽是一份新 `mmap`，作为 `memmap` 注册进 guest 地址空间），首次访问时拷贝 init 模板，并在 `r0` 返回 guest 地址。每个 VM（= 每个线程）有自己的 `emutls_slots_`，故隔离是自动的——无需 `pthread_key`。
+5. JIT：`emit_call_softfp` 对 `BPF_FP_EMUTLS_GET_ADDR` 返回 false，回退到 `emit_call_softfp_slow` → `helper_do_softfp` → `do_softfp`。无需改 JIT 发射器。
+
+**限制**：
+- 仅平凡可析构类型（尚无 `thread_local` 析构的 `__cxa_thread_atexit`）。
+- `&var` 是编译错误（地址空间不匹配）；直接访问变量。
+- 每个 TLS 变量当前分配一整页 4 KiB（尚无 slab/arena）。
+- TLS 变量必须定义并使用于单个翻译单元内；不支持跨 TU 的 `extern __mythread`（控制块 `__emutls_v.<name>` 用内部链接）。
+
+**fork 语义**：经 `fork()` 创建的子进程（不带 `CLONE_VM` 的 clone）继承父进程当前 TLS 值（父进程的 `emutls_slots_` 被拷贝；每个槽的 guest 页 CoW 共享，故任一方写入触发 CoW 并分叉）。线程（`pthread_create`、带 `CLONE_VM` 的 clone）各获独立槽（无继承——标准 `thread_local` 语义）。
+
+#### 全局构造/析构
+
+有非平凡构造/析构的全局对象经链接器合成符号支持，复用 musl 既有的 `__libc_start_init` / `__libc_exit_fini` 循环
+
+**机制**（见 `src/elf_linker.cpp`）：
+1. clang 发出 `.init_array`（SHT_INIT_ARRAY）持有函数指针（`_GLOBAL__sub_I_*`），每个构造一个全局对象并通过 `__cxa_atexit(dtor, obj, __dso_handle)` 注册其析构。
+2. `bpfvm-ld` 把 `.init_array`/`.fini_array` 段收集进 SEG_DATA（在段内保持连续），并合成四个边界符号：`__init_array_start/end`、`__fini_array_start/end`（存于 `synthetic_globals_`，作为 `SHN_ABS` 同时发到 `.symtab` 和 `.dynsym`）。它还合成 `__dso_handle`。
+3. 静态模式：`.init_array` 中的函数指针在链接期打补丁（R_BPF_64_ABS64）。PIE 模式：留作 `.rela.dyn` 条目，由 loader 在运行时解析（`_GLOBAL__sub_I_*` 是主程序中的已定义符号，收集进 `exports_`）。
+4. musl 的 `__libc_start_main` → `__libc_start_init` 遍历 `[__init_array_start, __init_array_end)` 调用每个 ctor；`exit` → `__libc_exit_fini` 逆序遍历 `[__fini_array_start, __fini_array_end)`，加上 `__cxa_atexit` 链。
+
+**顺序**：ctor 在一个 TU 内按定义序运行；dtor 逆序运行（LIFO），与 `__cxa_atexit` 注册的 dtor 交错。跨 TU 顺序遵循链接顺序（标准 `ld` 语义，无保证）。
+
+## 标准库与移植
+
+### musl 移植（`musl/`）
+
+本项目附带 musl 1.2.6 的移植，作为 BPF 目标的**默认** C 库。用 `sh musl/build.sh`（默认前缀 `$TOP/root`）构建——产出 `root/lib/libc.a`（内含 `crt1.o`/`crti.o`/`crtn.o`，故含 `_start`）+ 独立的 `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`，以及 `root/include/` 中的头文件，故 `-Iroot/include` 与 `-Lroot/lib` 解析到 musl 的头文件和 `libc.a`。`test/Makefile` 和 `scripts/build_root.sh` 直接基于此 musl 构建（静态 `.out` + 动态 `.linked`）。
+
+#### musl 构建（`musl/build.sh`）
+- **`--disable-shared`**：musl 的 `.so` 由 `bpfvm-ld -shared` 从 `libc.a` 合成（在 `scripts/build_root.sh` 的 `build_libc_bpfso` 中），而非由 musl 自己的构建产出。
+- **`-mllvm -bpf-stack-size=16384`**：musl 的 `crypt_blowfish`（`BF_crypt`）有 ~8.5KB 局部结构；默认 4096 会溢出。
+- **跳过 rcrt1.o / crti.o / crtn.o / Scrt1.o**：`make install` 编译 `rcrt1.o`（静态 PIE 自启动，依赖 `dlstart` 动态链接器逻辑——BPF 不支持；`_start_c` 签名不匹配 + `GETFUNCSYM` 无前向声明）并失败。脚本经 per-target `make obj/crt/crt1.o` **只构建 `crt1.o`**。其它 crt 对象在 BPF 上不必要：`crti.o`/`crtn.o` 编译成空 `.o`（BPF 无 `.init_array`/`.fini_array` 框架），且 `Scrt1.o` 在 BPF 上与 `crt1.o` 相同（clang 对地址引用总发重定位，故 `-fPIC` 不改变输出）。头文件手工拷到 `root/include/`（先 generic/bits，再 bpf/bits，使 BPF 专化覆盖胜出）。
+- **crt1 合并进 libc.a**：BPF 的 `_start` 在 `crt1.o` 中（纯 C，`arch/bpf/crt_arch.h`）。脚本运行 `ar rcs lib/libc.a lib/crt1.o` 使 `libc.a` 自带 `_start`，链接器只需传 `libc.a`/`libc.so`，无需单独 crt 文件或排序。`crt1.o` 同时覆盖静态和 PIE/.so 模式（BPF `-fPIC` 不改变 crt1 输出）。
+- **ldso 对象（`dlstart.lo`/`dynlink.lo`）单独构建；与 libc 合并进单二进制**：标准 musl 把 ldso 代码（`ldso/dlstart.c`、`ldso/dynlink.c`）放进 `libc.so` 而非 `libc.a`（静态链接的程序不需要动态链接器）。由于 BPF 的 `libc.so` 由 `bpfvm-ld -shared` 从 `libc.a` 合成（非 musl 自己的构建），这些对象本会丢失。脚本经 `make obj/ldso/dlstart.lo obj/ldso/dynlink.lo` 构建它们，并随 `libc.a` 一起安装到 `root/lib/`。
+- **`libc.so` == `ld-bpf.so`（单二进制，镜像上游 musl `libc.so` == `ld.so`）**：ldso 必须在任何其它库被重定位之前工作，故它依赖的 libc（`malloc`/`memcpy`/TLS 设置/`__libc_start_main`/...）必须链接进它——它不能从单独的 `libc.so` 导入这些。`scripts/build_root.sh` 的 `build_libc_bpfso` 因此从 `libc.a + dlstart.lo + dynlink.lo` 构建**一个**二进制，`--soname libc.so`，入口 `_dlstart`（`-e _dlstart`），输出到 `root/lib/ld-bpf.so`，`root/lib/libc.so` 是指向它的相对符号链接。这不是浪费的重复：运行时 `load_library("libc.so")` 命中 musl ldso 的 `is_self` 短路（`ldso.name` 在 `__dls2` 中硬编码为 `"libc.so"`，且 `"libc"` 在保留名表中），故程序的 `DT_NEEDED libc.so` 复用已映射的 ldso 而非打开文件——磁盘上单独的 `libc.so` 会是死重。单文件服务三条路径：链接时（`-l:libc.so` 读其 dynsym + `DT_SONAME=libc.so`）、`DT_NEEDED libc.so`（→ `is_self`）、以及 `PT_INTERP=/lib/ld-bpf.so`（VM loader 解析 `ld-bpf.so`，入口 = `load_base + e_entry` → `_dlstart`）。ldso 自做 stage-1 自重定位（`dlstart.c` 的 `_dlstart_c`）；VM loader 只 mmap 段 + 设置 auxv。
+- **安装布局**：`root/{include,lib}` 是与 libcxx 和 rootfs 共享的统一安装树；`root/lib` 持有 `libc.a`（含 crt1 合并）、`crt1.o`，以及 ldso 对象 `dlstart.lo`/`dynlink.lo`。
 
 ## 许可证
 

@@ -1,6 +1,6 @@
 // emutls spike：验证 address_space(256) 标记的 TLS 变量在 bpfvm 上正确工作。
 //
-// 机制（见 AGENTS.md "emutls via address_space(256)" 与 src/passes/BpfEmutls.cpp）：
+// 机制（见 README.md 的 emutls 章节与 src/passes/BpfEmutls.cpp）：
 //   - `__mythread` 宏：BPF 上展开成 `__attribute__((address_space(256)))`，绕过
 //     clang 对 thread_local 的拒绝；host 上展开成真正的 thread_local 作对照。
 //   - BpfEmutls pass 把对 addrspace(256) 全局的访问改写成 `__bpf_fp_<EMUTLS_ID>`
