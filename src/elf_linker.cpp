@@ -94,6 +94,13 @@ struct DebugSec {
     Elf64_Xword addralign = 1;   // sh_addralign（输出时保留对齐）
     std::vector<uint8_t> data;   // 原始字节（写出时复制进 SecBuf 并按需 patch 重定位）
     size_t extra_idx = SIZE_MAX; // 写出时在 extras[] 里的位置
+    // 本 obj 的该段在合并后的同名输出段中的字节起始偏移（collect_debug_sections 填）。
+    // 多 .o 链接时同名 .debug_* 段按输入顺序拼接成一个输出段；contrib_off 标出本 .o
+    // 贡献区的起点。debug→debug 重定位（debug_abbrev_offset / DW_AT_str_offsets_base /
+    // DW_AT_addr_base / DW_AT_stmt_list 等）必须用 contrib_off + sym.value 定位本 .o 的
+    // contribution，否则跨 .o 的 CU 全部错位（gdb 报 "Could not find abbrev" /
+    // "DW_FORM_addrx outside .debug_addr"）。
+    size_t contrib_off = 0;
 };
 
 // 加载后的 .o
@@ -1275,11 +1282,14 @@ private:
         const auto& def_sym = objects_[def_obj_idx].symbols[def_sym_idx];
         if (def_sym.sec_idx == SIZE_MAX || def_sym.sec_idx >= objects_[def_obj_idx].sections.size())
             return 0;
-        // 符号指向 debug 段：值 = 段内偏移（sym.value）。STT_SECTION 符号 value=0，
-        // addend 在调用处加上，得到段内最终偏移。
+        // 符号指向 debug 段：值 = 本 .o 贡献区起点（contrib_off）+ 段内偏移（sym.value）。
+        // 同名 debug 段已合并成单个输出段，每 .o 占一个贡献区；不加 contrib_off 会让所有
+        // .o 的 base 属性都指向段头（CU header 的 debug_abbrev_offset、DW_AT_addr_base 等），
+        // 导致 gdb 报 "Could not find abbrev" / "DW_FORM_addrx outside .debug_addr"。
         auto lit = objects_[def_obj_idx].dbg_sec_local_idx.find(def_sym.sec_idx);
         if (lit != objects_[def_obj_idx].dbg_sec_local_idx.end()) {
-            return def_sym.value;
+            const auto& dsec = objects_[def_obj_idx].debug_secs[lit->second];
+            return dsec.contrib_off + def_sym.value;
         }
         // 否则指向 loadable 段：用 guest 地址（STATIC_EXE 下即最终地址）
         const auto& sec = objects_[def_obj_idx].sections[def_sym.sec_idx];
@@ -1398,9 +1408,12 @@ private:
         // 2. 构建 extras（按 mode_ 条件追加）
         std::vector<SecBuf> extras;
         // 2a. DWARF 调试段（最先 push：在 extras 区前部，便于 shstrtab 自动注册名字）。
-        //     仅 STATIC_EXE 启用——PIE 模式下 .debug_addr 等引用的地址在运行时由 VM 选基址
-        //     加载，链接期填死会错（留阶段二）。
-        const bool emit_debug = (keep_debug_ && mode_ == Mode::STATIC_EXE);
+        //     .debug_addr/.debug_ranges 等含运行时地址的重定位走 debug→loadable 分支，
+        //     返回 guest_addr。STATIC_EXE 下 guest_addr 即最终地址；PIE 模式下 guest_addr
+        //     是文件内偏移（基址 0），运行时由 VM 加载基址后，GDB 经 qOffsets/RSP 获得真实
+        //     地址——但 GDB 对 PIE remote target 默认按文件内偏移匹配，二者需一致，故 PIE
+        //     下 .debug_addr 填文件内偏移可用（VM 加载基址与 GDB 推断一致即可）。
+        const bool emit_debug = (keep_debug_ && mode_ != Mode::SHARED_LIB);
         if (emit_debug) {
             collect_debug_sections(extras);
         }
@@ -1445,18 +1458,44 @@ private:
 
     // 收集所有 obj 的 DWARF 调试段为 non-ALLOC SecBuf，推入 extras；同时回填各
     // DebugSec::extra_idx 以便后续 patch 按索引找到对应缓冲。
+    // 收集 debug 段到 extras：同名段按 objects_ 输入顺序拼接成单个输出段（对齐标准
+    // 链接器做法——DWARF v5 设计假设）。每个 .o 的同名段在合并段里占一个"贡献区"
+    // （contribution），起点记到 ds.contrib_off；DWARF 重定位用它定位本 .o 的 contribution。
+    // 对齐：每个贡献区按该段的 sh_addralign 填充，保证 contribution header 不错位。
     void collect_debug_sections(std::vector<SecBuf>& extras) {
+        // name -> (extras 里的 SecBuf 下标, 合并段当前累计字节)
+        std::unordered_map<std::string, std::pair<size_t, size_t>> merged;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t di = 0; di < objects_[oi].debug_secs.size(); di++) {
                 auto& ds = objects_[oi].debug_secs[di];
-                SecBuf sb;
-                sb.name = ds.name;
-                sb.type = SHT_PROGBITS;
-                sb.flags = 0;       // 非 ALLOC：write_shdrs 留 sh_addr=0（non-loadable）
-                sb.addralign = ds.addralign;
-                sb.data = ds.data;  // 复制一份，原始 data 留作多次链接/校验
-                ds.extra_idx = extras.size();
-                extras.push_back(std::move(sb));
+                auto align = ds.addralign ? ds.addralign : 1;
+                auto it = merged.find(ds.name);
+                if (it == merged.end()) {
+                    // 首次出现该段名：新建一个 SecBuf，contrib_off = 0
+                    SecBuf sb;
+                    sb.name = ds.name;
+                    sb.type = SHT_PROGBITS;
+                    sb.flags = 0;       // 非 ALLOC：write_shdrs 留 sh_addr=0
+                    sb.addralign = align;
+                    sb.data = ds.data;  // 首份贡献区，从 0 开始
+                    ds.extra_idx = extras.size();
+                    ds.contrib_off = 0;
+                    merged[ds.name] = {extras.size(), sb.data.size()};
+                    extras.push_back(std::move(sb));
+                } else {
+                    auto& [idx, acc] = it->second;
+                    auto& out = extras[idx];
+                    // 对齐填充到 align 的倍数
+                    if (align > 1 && (acc % align) != 0) {
+                        size_t pad = align - (acc % align);
+                        out.data.insert(out.data.end(), pad, 0);
+                        acc += pad;
+                    }
+                    ds.extra_idx = idx;
+                    ds.contrib_off = acc;          // 本 .o 贡献区起点
+                    out.data.insert(out.data.end(), ds.data.begin(), ds.data.end());
+                    acc += ds.data.size();
+                }
             }
         }
     }
@@ -1476,8 +1515,10 @@ private:
                 const auto& ds = obj.debug_secs[lit->second];
                 if (ds.extra_idx >= extras.size()) continue;
                 auto& out = extras[ds.extra_idx];
+                // 合并段里本 .o 贡献区从 contrib_off 起，patch 点要落在贡献区内。
+                size_t patch_off = ds.contrib_off + r.offset;
                 // 越界校验（针对实际要 patch 的输出副本）
-                if (r.offset + reloc_write_len(r.type) > out.data.size()) {
+                if (patch_off + reloc_write_len(r.type) > out.data.size()) {
                     std::cerr << "[elf_linker] debug reloc out of bounds in " << obj.source
                               << ": offset=" << r.offset << " type=" << r.type
                               << " sec=" << ds.name << " size=" << out.data.size() << "\n";
@@ -1486,7 +1527,7 @@ private:
                 auto resolved = resolve_debug_value(oi, r.sym_idx);
                 if (!resolved) continue;
                 uint64_t S = *resolved;
-                uint8_t* patch = out.data.data() + r.offset;
+                uint8_t* patch = out.data.data() + patch_off;
                 switch (r.type) {
                 case 3: {  // R_BPF_64_ABS32
                     uint32_t V = (uint32_t)(S + (uint64_t)r.addend);

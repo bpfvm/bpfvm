@@ -347,7 +347,7 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
         if (ph.p_type == PT_PHDR) phdr_addr = load_base[0] + ph.p_vaddr;
     }
 
-    return ElfLoadInfo{entry, phdr_addr, main_ef.ehdr.e_phentsize, main_ef.ehdr.e_phnum, ldso_base, app_entry};
+    return ElfLoadInfo{entry, phdr_addr, main_ef.ehdr.e_phentsize, main_ef.ehdr.e_phnum, ldso_base, app_entry, load_base[0]};
 }
 
 ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add,
@@ -435,5 +435,5 @@ ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add,
         }
     }
 
-    return ElfLoadInfo{entry, phdr_addr, ehdr.e_phentsize, ehdr.e_phnum};
+    return ElfLoadInfo{entry, phdr_addr, ehdr.e_phentsize, ehdr.e_phnum, 0, entry, load_base[0]};
 }

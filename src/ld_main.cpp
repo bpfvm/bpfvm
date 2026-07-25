@@ -179,9 +179,7 @@ int main(int argc, char** argv) {
 
         // 剩下的是位置参数：.o/.a/.so 都直接作为链接输入（可多个）；只有 -l/-l: 才走库搜索。
         // （标准 ld 语义：位置参数=直接链接，-l=搜索库。gcc 经 bpf-gcc 链接时传多个 .o/.a。）
-        if (a.size() > 2 && (a.substr(a.size() - 2) == ".c" ||
-                              a.substr(a.size() - 3) == ".cc" ||
-                              a.substr(a.size() - 4) == ".cpp")) {
+        if (a.ends_with(".c") || a.ends_with(".cc") || a.ends_with(".cpp")) {
             std::cerr << basename(argv[0]) << ": source file '" << a
                       << "' - bpfvm-ld only links, use clang to compile first\n";
             return 1;

@@ -83,6 +83,10 @@ struct ElfLoadInfo {
                              // _dlstart（VM 从那里开始执行动态链接流程），而 AT_ENTRY 必须是
                              // 主程序入口——ldso 的 CRTJMP(aux[AT_ENTRY]) 跳到它移交控制权。
                              // 两者不同；0 表示回退用 entry（保持旧行为）。
+    uint64_t app_load_base = 0;  // 主程序 PIE 加载基址（load_base[0]）。静态/ET_EXEC 为 0；
+                                 // PIE（ET_DYN）下 = 运行时基址偏移，文件内地址 + 此值 = 运行时
+                                 // 地址。GDB server 的 qOffsets 用它让 GDB 把符号/DWARF 文件内
+                                 // 地址重定位到运行时地址（否则 PIE 断点命中不了）。
     int err = 0;           // 加载失败 errno（ENOENT/EACCES/ENOEXEC...）；成功时为 0。
 };
 
