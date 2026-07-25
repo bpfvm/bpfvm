@@ -52,7 +52,7 @@ void PosixSyscall::stop_process(int sig) {
             if(!tvm) {
                 continue;
             }
-            flags(tvm.get()).fetch_or(vm::VM_STOPPED, std::memory_order_release);
+            tvm->set_flags(vm::VM_STOPPED);
             tvm->wakeup(false);
         }
     }
@@ -117,7 +117,7 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
         // SIGKILL 不入队：直接置 VM_KILLED，VM 在下个 safepoint 退出。落到末尾的
         // pthread_kill 把目标线程正阻塞的 host syscall（nanosleep/read/...）踢成
         // EINTR，让它回 safepoint 看到 VM_KILLED 退出（exit_group_race #7 检测此机制）。
-        flags(v).fetch_or(vm::VM_KILLED, std::memory_order_release);
+        v->set_flags(vm::VM_KILLED);
         v->wakeup(false);
         enqueue = false;
     } else if(sig == SIGSTOP || stop_dfl) {
@@ -135,7 +135,7 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
                 if(!tvm) {
                     continue;
                 }
-                flags(tvm.get()).fetch_and(~vm::VM_STOPPED, std::memory_order_release);
+                tvm->clear_flags(vm::VM_STOPPED);
                 tvm->wakeup(false);  // 唤醒 safepoint 的停止 cond_wait；
             }
         }
@@ -166,7 +166,7 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
             } else {
                 pending_signals.raw().push_back(ev);
                 pushed = true;
-                flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_relaxed);
+                v->set_flags(vm::VM_SIGNAL_PENDING);
             }
         }
         if(!pushed) {
@@ -248,7 +248,7 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
         }
         // flag 维护（锁内）：只有当队列空 且 本轮未投递信号时，才清 VM_SIGNAL_PENDING。
         if(chosen.sig == 0 && deferred.empty() && pending_signals.raw().empty()) {
-            flags(v).fetch_and(~vm::VM_SIGNAL_PENDING, std::memory_order_relaxed);
+            v->clear_flags(vm::VM_SIGNAL_PENDING);
         }
         // 预读 handler（锁内读 signal_actions，与 fork/clone 的 make_shared 拷贝路径隔离）
         if(chosen.sig > 0 && chosen.sig < NSIG) {
@@ -267,7 +267,7 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     if(options(v).verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] signal %d handler=0x%lx return=0x%lx\n",
-               id(), sig, static_cast<unsigned long>(handler), pc(v));
+               id(), sig, static_cast<unsigned long>(handler), v->pc());
     }
     if(handler_is_ignored(handler)) {
         return true;
@@ -496,7 +496,7 @@ int64_t PosixSyscall::do_sigprocmask(vm* v) {
         // handle_signals 走空队列时已被清，这里补设 + 唤醒，让本 syscall 返回后 safepoint
         // 重扫投出。queue_signal 入队时已无条件置 flag，故这里只在 mask 变化时兜底。
         if(!pending_signals.empty()) {
-            flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
+            v->set_flags(vm::VM_SIGNAL_PENDING);
             v->wakeup(false);
         }
     }
@@ -516,7 +516,7 @@ int64_t PosixSyscall::do_sigsetjmp(vm* v) {
     env[2] = v->r(8);
     env[3] = v->r(9);
     env[4] = v->r(10);
-    env[5] = pc(v);
+    env[5] = v->pc();
     env[6] = signal_depth(v);
     env[7] = 0;
     env[8] = savemask ? 1 : 0;    // __fl
@@ -543,7 +543,7 @@ int64_t PosixSyscall::do_siglongjmp(vm* v) {
     if (env[7]) v->r(1) = env[7];
     uint64_t saved_pc = env[5];
     signal_depth(v) = static_cast<size_t>(env[6]);
-    pc(v) = saved_pc;
+    v->pc() = saved_pc;
     // pc points to syscall instruction.
     // loop increments pc.
     // next instruction is executed.
@@ -554,7 +554,7 @@ int64_t PosixSyscall::do_siglongjmp(vm* v) {
     if (env[8]) {
         sigmask.store(env[9], std::memory_order_release);
         if (!pending_signals.empty()) {
-            flags(v).fetch_or(vm::VM_SIGNAL_PENDING, std::memory_order_release);
+            v->set_flags(vm::VM_SIGNAL_PENDING);
             v->wakeup(false);
         }
     }

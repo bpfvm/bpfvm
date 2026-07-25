@@ -181,6 +181,14 @@ void PosixSyscall::host_signal(vm* v, int sig) {
     //
     // 有 ctty：tty 信号发给"控制终端的前台进程组所有成员"。
     // 无 ctty（非 PTY 模式 / setsid 前）：前台组即本进程所在 pgrp。
+    if(sig == 0) {
+        // sig=0 特殊处理：只踢出 host syscall / wait_for，不入队、不置 VM_SIGNAL_PENDING。
+        v->wakeup(false);
+        if(auto Sys = sys(v)) {
+            pthread_kill(Sys->tid, SIGUSR1);
+        }
+        return;
+    }
     deliver_to_ctty_fg(v, session ? session->ctty.get() : nullptr, sig);
 }
 

@@ -6,7 +6,7 @@ int64_t PosixSyscall::do_exit(vm* v) {
     // CAS(-1 -> code)：首个正常退出者赢，后续不覆盖。致命信号默认动作走 do_exit_group，不经过此函数。
     int expected = -1;
     tg->exit_code.compare_exchange_strong(expected, code, std::memory_order_acq_rel);
-    flags(v).fetch_or(vm::VM_EXITED, std::memory_order_release);  // fini 减 live_threads + clear-child-tid
+    v->set_flags(vm::VM_EXITED);  // fini 减 live_threads + clear-child-tid
     return code;
 }
 
@@ -25,7 +25,7 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
             }
         }
     }
-    flags(v).fetch_or(vm::VM_EXITED, std::memory_order_release);  // 调用线程退出 → fini
+    v->set_flags(vm::VM_EXITED);  // 调用线程退出 → fini
     return code;
 }
 
@@ -134,9 +134,9 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     ps->fds_replace(std::const_pointer_cast<const SharedState::FdMap>(kept));
     v->r(1) = fresh->r(1);
     v->r(10) = STACK_BASE + STACK_SIZE - 8;
-    pc(v) = entry;
+    v->pc() = entry;
     v->push_frame(0);
-    pc(v) -= sizeof(bpf_insn);
+    v->pc() -= sizeof(bpf_insn);
     return 0;
 }
 
@@ -260,7 +260,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
             *sent = frame_flags_make(false, 0);
         }
     }
-    pc(child.get()) = pc(v) + sizeof(bpf_insn);
+    child->pc() = v->pc() + sizeof(bpf_insn);
 
     /* CLONE_SETTLS：新线程用调用者提供的 tls。
      * 否则（非 CLONE_THREAD，如 fork / 裸 clone 新进程）继承父 tp：子进程是父
@@ -463,8 +463,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
             }
             // 调用者自身被 VM_KILL 或收到信号 -> 标记为可重启。
             // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
-            if(!pending_signals.empty() ||
-               (flags(v).load(std::memory_order_acquire) & (vm::VM_KILLED | vm::VM_STOPPED))) {
+            if(!pending_signals.empty() || (v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED))) {
                 return SYSCALL_RESTART;
             }
         }

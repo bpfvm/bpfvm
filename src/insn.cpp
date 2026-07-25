@@ -329,7 +329,7 @@ bool vm::deliver_signal() {
         // step 随后取指即重执行。Linux 内核在 arch_do_signal_or_restart 中对
         // ERESTARTSYS* 的处理同此（无信号投递时一律 restart）。
         if(restart_syscall_pc_ != 0) {
-            pc = restart_syscall_pc_;
+            pc_ = restart_syscall_pc_;
             restart_syscall_pc_ = 0;
         }
         return true;
@@ -341,7 +341,7 @@ bool vm::deliver_signal() {
     // 按 SA_RESTART 决定：置 SA_RESTART → 返回 syscall 指令（重启）；否则返回 syscall
     // 的下一条指令，并填 r(0) = -EINTR（语义同 Linux：未带 SA_RESTART 的信号打断
     // 可重启 syscall 后向用户态返回 -EINTR）。
-    uint64_t ret_addr = pc;
+    uint64_t ret_addr = pc_;
     if(restart_syscall_pc_ != 0) {
         if(info.sa_flags & SA_RESTART) {
             ret_addr = restart_syscall_pc_;
@@ -355,7 +355,7 @@ bool vm::deliver_signal() {
         return false;
     }
     r(1) = static_cast<uint64_t>(info.sig);
-    pc = info.handler;
+    pc_ = info.handler;
     return true;
 }
 
@@ -641,56 +641,56 @@ bool vm::jmp(const bpf_insn* cur) {
     uint64_t src = (cur->code & 0x08) == BPF_X ? r(cur->src_reg) : cur->imm;
     switch (cur->code & 0xf0) {
     case BPF_JA:
-        pc += (int64_t)cur->off * sizeof(bpf_insn);
+        pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         break;
     case BPF_JEQ:
         if (r(cur->dst_reg) == src) { 
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGT:
         if (r(cur->dst_reg) > src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGE:
         if (r(cur->dst_reg) >= src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSET:
         if (r(cur->dst_reg) & src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JNE:
         if (r(cur->dst_reg) != src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGT:
         if ((int64_t)r(cur->dst_reg) > (int64_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGE:
         if ((int64_t)r(cur->dst_reg) >= (int64_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_CALL:
         if((cur->code & 0x08) == BPF_X) {
-            if(!push_frame(pc + sizeof(bpf_insn))) {
+            if(!push_frame(pc_ + sizeof(bpf_insn))) {
                 return false;
             }
-            pc = r(cur->dst_reg) - sizeof(bpf_insn);
+            pc_ = r(cur->dst_reg) - sizeof(bpf_insn);
         }else if(cur->src_reg == 0) {
             return do_syscall(cur->imm);
         }else if(cur->src_reg == 1) {
-            if(!push_frame(pc + sizeof(bpf_insn))) {
+            if(!push_frame(pc_ + sizeof(bpf_insn))) {
                 return false;
             }
-            pc += (int64_t)cur->imm * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->imm * sizeof(bpf_insn);
         }else if(cur->src_reg == 2) {
             return do_softfp(cur->imm);
         }
@@ -702,27 +702,27 @@ bool vm::jmp(const bpf_insn* cur) {
             //到栈底了
             return false;
         }
-        pc = ret - sizeof(bpf_insn);  // run() 循环的 pc+=sizeof(bpf_insn) 会落到 ret
+        pc_ = ret - sizeof(bpf_insn);  // run() 循环的 pc+=sizeof(bpf_insn) 会落到 ret
         break;
     }
     case BPF_JLT:
         if (r(cur->dst_reg) < src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JLE:
         if (r(cur->dst_reg) <= src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLT:
         if ((int64_t)r(cur->dst_reg) < (int64_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLE:
         if ((int64_t)r(cur->dst_reg) <= (int64_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     }
@@ -734,41 +734,41 @@ bool vm::jmp32(const bpf_insn* cur) {
     auto dst = (uint32_t)r(cur->dst_reg);
     switch (cur->code & 0xf0) {
     case BPF_JA:
-        pc += (int64_t)cur->imm * sizeof(bpf_insn);
+        pc_ += (int64_t)cur->imm * sizeof(bpf_insn);
         break;
     case BPF_JEQ:
         if (dst == src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGT:
         if (dst > src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JGE:
         if (dst >= src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSET:
         if (dst & src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JNE:
         if (dst != src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGT:
         if ((int32_t)dst > (int32_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSGE:
         if ((int32_t)dst >= (int32_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_CALL:
@@ -776,22 +776,22 @@ bool vm::jmp32(const bpf_insn* cur) {
         return false;
     case BPF_JLT:
         if (dst < src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JLE:
         if (dst <= src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLT:
         if ((int32_t)dst < (int32_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     case BPF_JSLE:
         if ((int32_t)dst <= (int32_t)src) {
-            pc += (int64_t)cur->off * sizeof(bpf_insn);
+            pc_ += (int64_t)cur->off * sizeof(bpf_insn);
         }
         break;
     }
@@ -800,7 +800,7 @@ bool vm::jmp32(const bpf_insn* cur) {
 
 
 void vm::log_mem_violation(const char* type, uint64_t addr) {
-    std::cerr << "Memory access violation at PC 0x" << std::hex << pc
+    std::cerr << "Memory access violation at PC 0x" << std::hex << pc_
               << ": invalid " << type << " at address 0x" << addr << std::dec << std::endl;
 
     // 寄存器转储
@@ -816,7 +816,7 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     // 信号帧: flags+alloca_len[0] r0..r9[1..10] old_r10[11] ret_addr[12]
     std::cerr << "Call stack:" << std::hex;
     uint64_t cur_sp = r(10);
-    uint64_t cur_pc = pc;
+    uint64_t cur_pc = pc_;
     int depth = 0;
     constexpr int MAX_FRAMES = 64;
     while (cur_sp != 0 && depth < MAX_FRAMES) {
@@ -918,12 +918,12 @@ bool vm::ld(const bpf_insn* cur) {
         return false;
     }
     // lddw 是宽指令（占 2 个 bpf_insn 槽），第二个槽也必须在合法映射内
-    if(!mmu(pc + 2 * sizeof(bpf_insn))) {
-        log_mem_violation("lddw second slot", pc + 2 * sizeof(bpf_insn));
+    if(!mmu(pc_ + 2 * sizeof(bpf_insn))) {
+        log_mem_violation("lddw second slot", pc_ + 2 * sizeof(bpf_insn));
         return false;
     }
     r(cur->dst_reg) = (uint64_t)(cur+1)->imm << 32 | (uint32_t)cur->imm;
-    pc += sizeof(bpf_insn);  // 跳过第二槽；run() 循环再 +=sizeof(bpf_insn)，共两槽
+    pc_ += sizeof(bpf_insn);  // 跳过第二槽；run() 循环再 +=sizeof(bpf_insn)，共两槽
     return true;
 }
 
@@ -1260,10 +1260,10 @@ bool vm::safepoint() {
 bool vm::step() {
     // JIT hot path: keep executing compiled functions in a tight loop
     for(;;) {
-        auto* func = jit_->compile(this, pc);
+        auto* func = jit_->compile(this, pc_);
         if(!func) break;
         jit_->stats.jit_func_runs++;
-        uint64_t pc_before = pc;
+        uint64_t pc_before = pc_;
         ((void(*)(vm*))func->code)(this);
         // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
         // (safepoint, syscall, pc changed, etc.)
@@ -1274,7 +1274,7 @@ bool vm::step() {
         // safepoint 已处理信号/stop 等可恢复事件且未请求退出。若期间 pc 被改
         // (longjmp、信号处理、BPF CALL/EXIT 等)，则继续 JIT 循环；否则说明 JIT
         // 在无 flag 的情况下中止（如内存违例），落到解释器单步以报告错误。
-        if(pc != pc_before) {
+        if(pc_ != pc_before) {
             continue;
         }
         break;
@@ -1287,7 +1287,7 @@ bool vm::step() {
         flags.fetch_or(VM_BUDGET_EXCEEDED, std::memory_order_release);
         std::cerr << "Instruction budget exceeded (" << cnt
                   << " >= " << options.insn_limit << ") at PC 0x"
-                  << std::hex << pc << std::dec << std::endl;
+                  << std::hex << pc_ << std::dec << std::endl;
         return false;
     }
     // Safepoint check: flags 非零即需要处理
@@ -1295,22 +1295,28 @@ bool vm::step() {
     if(f && !safepoint()) {
         return false;
     }
-    const bpf_insn* cur = (const bpf_insn*)mmu(pc);
+    const bpf_insn* cur = (const bpf_insn*)mmu(pc_);
     if(!cur) {
-        log_mem_violation("exec", pc);
+        log_mem_violation("exec", pc_);
         return false;
     }
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] ", options.sys->id());
-        dump(pc, cur);
+        dump(pc_, cur);
     }
-    if(options.step_run || (options.breakpoint && options.breakpoint == pc)) {
-#if defined(__x86_64__) || defined(__i386__)
-        asm volatile("int3");
-#elif defined(__aarch64__)
-        asm volatile("brk #0");
-#endif
+    if(flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) {
+        // GDB server 调试停止点：取指后执行前。
+        //   VM_DEBUG_STOP：GDB 单步（'s'）或异步暂停请求 → 在当前 pc 停下。
+        //   命中断点集合：在断点 pc 停下。
+        // 两者都置 VM_STOPPED 后由 safepoint() 在 wait_cv 阻塞，等待 GDB continue 唤醒。
+        if((flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) ||
+           (!breakpoints_.empty() &&  has_breakpoint(pc_)))
+        {
+            clear_flags(VM_DEBUG_STOP);
+            set_flags(VM_STOPPED);
+            if(!safepoint()) return false;
+        }
     }
     bool ok = false;
     switch(cur->code & 0x07) {
@@ -1445,7 +1451,7 @@ uint64_t vm::run() {
     if(!jit_) jit_ = std::make_unique<JitCompilerImpl>();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
-        pc += sizeof(bpf_insn);
+        pc_ += sizeof(bpf_insn);
     }
     if(options.sys) options.sys->fini(shared_from_this());
     dump_stats();
@@ -1470,8 +1476,8 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         return 0;
     }
     flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
-    pc = options->entry;
-    if(!mmu(pc)) {
+    pc_ = options->entry;
+    if(!mmu(pc_)) {
         std::cerr << "[run] pc is null after mmu(entry)\n";
         return 0;
     }

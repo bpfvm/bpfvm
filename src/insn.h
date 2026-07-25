@@ -18,6 +18,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <sys/mman.h>
 
@@ -157,9 +158,7 @@ protected:
     static auto& maps_ptr(vm* v);
     static auto& maps_mutex(vm* v);
     static auto& options(vm* v);
-    static auto& flags(vm* v);
     static auto& signal_depth(vm* v);
-    static auto& pc(vm* v);
     static auto& tp(vm* v);
     static auto& emutls_slots(vm* v);
 public:
@@ -179,8 +178,6 @@ public:
 struct vmOptions {
     uint64_t entry = 0;
     bool verbose = false;
-    uint64_t breakpoint = 0;
-    bool step_run = false;
     bool raw_stack = false;
     uint64_t insn_limit = 0;  // 0 = 无限制
     // 每个函数栈帧为编译器分配的局部变量预留的区大小（默认 16KiB，对齐
@@ -218,7 +215,7 @@ class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
-    uint64_t pc;
+    uint64_t pc_;
     uint64_t reg[11];
     std::shared_ptr<std::list<memmap>> maps = std::make_shared<std::list<memmap>>();
     std::shared_ptr<std::mutex> maps_mutex = std::make_shared<std::mutex>();
@@ -242,6 +239,11 @@ private:
     // 信号时据此 + SA_RESTART 决定重启（PC 回该地址）或转 -EINTR，随后清零。
     uint64_t restart_syscall_pc_ = 0;
 
+    // GDB server 的软断点地址集合（guest pc 字节地址）。每 vm 一份；解释器 step()
+    // 取指后命中即置 VM_STOPPED 在 safepoint 阻塞，等待 GDB continue。
+    std::unordered_set<uint64_t> breakpoints_;
+    std::mutex bp_mutex_;
+
     bool ld(const bpf_insn* cur);
     bool ldx(const bpf_insn* cur);
     bool st(const bpf_insn* cur);
@@ -256,7 +258,7 @@ private:
     bool do_syscall(uint32_t call) {
         int64_t ret = (options.sys->syscall)(this, call);
         if(ret == SYSCALL_RESTART) {
-            restart_syscall_pc_ = pc;
+            restart_syscall_pc_ = pc_;
         } else {
             r(0) = (uint64_t)ret;
         }
@@ -282,6 +284,8 @@ public:
     static constexpr uint32_t VM_SIGNAL_PENDING = 0x8;
     static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
     static constexpr uint32_t VM_BLOCKED = 0x20; //内部暂停，在wait_for等待
+    static constexpr uint32_t VM_DEBUG_ATTACHED = 0x40;   //GDB 已 attach：JIT 跳过、解释器每步查断点
+    static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 请求停下（单步/异步暂停）
 
     vm(Token);
     ~vm();
@@ -316,6 +320,33 @@ public:
     uint64_t& r(int n) {
         return reg[n];
     }
+    uint64_t& pc() {
+        return pc_;
+    }
+    std::shared_ptr<SyscallHandler> sys() {
+        return options.sys;
+    }
+
+    uint32_t get_flags() const { return flags.load(std::memory_order_acquire); }
+    void clear_flags(uint32_t mask) { flags.fetch_and(~mask, std::memory_order_release); }
+    void set_flags(uint32_t mask) { flags.fetch_or(mask, std::memory_order_release); }
+    // GDB 软断点管理（线程安全）。
+    void add_breakpoint(uint64_t addr) {
+        std::lock_guard<std::mutex> lock(bp_mutex_);
+        breakpoints_.insert(addr);
+    }
+    void remove_breakpoint(uint64_t addr) {
+        std::lock_guard<std::mutex> lock(bp_mutex_);
+        breakpoints_.erase(addr);
+    }
+    void clear_breakpoints() {
+        std::lock_guard<std::mutex> lock(bp_mutex_);
+        breakpoints_.clear();
+    }
+    bool has_breakpoint(uint64_t addr) {
+        std::lock_guard<std::mutex> lock(bp_mutex_);
+        return breakpoints_.count(addr) != 0;
+    }
 
     uint64_t run();
     uint64_t run(const vmOptions* options, const ElfLoadInfo& info = ElfLoadInfo{});
@@ -326,10 +357,8 @@ inline auto& SyscallHandler::maps(vm* v) { return *v->maps; }
 inline auto& SyscallHandler::maps_ptr(vm* v) { return v->maps; }
 inline auto& SyscallHandler::maps_mutex(vm* v) { return v->maps_mutex; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
-inline auto& SyscallHandler::flags(vm* v) { return v->flags; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
 inline auto& SyscallHandler::tp(vm* v) { return v->tp_; }
 inline auto& SyscallHandler::emutls_slots(vm* v) { return v->emutls_slots_; }
-inline auto& SyscallHandler::pc(vm* v) { return v->pc; }
 
 #endif //INSN_H

@@ -24,7 +24,7 @@
 template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_reg_            = offsetof(vm, reg);
 template<typename EmitterT>
-const size_t JitCompiler<EmitterT>::off_pc_             = offsetof(vm, pc);
+const size_t JitCompiler<EmitterT>::off_pc_             = offsetof(vm, pc_);
 template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_flags_          = offsetof(vm, flags);
 template<typename EmitterT>
@@ -55,11 +55,11 @@ JitCompiler<EmitterT>::~JitCompiler() {
 
 template<typename EmitterT>
 int JitCompiler<EmitterT>::helper_safepoint(vm* v) {
-    uint64_t saved_pc = v->pc;
+    uint64_t saved_pc = v->pc_;
     if (!v->safepoint()) {
         return 1;
     }
-    if (v->pc != saved_pc) {
+    if (v->pc_ != saved_pc) {
         return 1;
     }
     return 0;
@@ -77,14 +77,14 @@ uint64_t JitCompiler<EmitterT>::helper_pop_frame(vm* v) {
 
 template<typename EmitterT>
 bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
-    uint64_t saved_pc = v->pc;
+    uint64_t saved_pc = v->pc_;
     // do_syscall 内部已检测 VM_EXITED|VM_KILLED 并据此返回 false，无需在此补设 flag。
     if (!v->do_syscall(call_id)) {
-        if (v->pc == saved_pc) v->pc += sizeof(bpf_insn);
+        if (v->pc_ == saved_pc) v->pc_ += sizeof(bpf_insn);
         return false;
     }
-    if (v->pc != saved_pc) {
-        v->pc += sizeof(bpf_insn);
+    if (v->pc_ != saved_pc) {
+        v->pc_ += sizeof(bpf_insn);
         return false;
     }
     // ERESTARTSYS：可重启 syscall 被信号打断。pc 保持 = saved_pc（syscall 指令）,不推进
@@ -96,7 +96,7 @@ bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
     // 其余 flag（退出/被杀/停止/待决信号）一律推进 pc 越过 syscall 指令并退出 JIT：
     uint32_t f = v->flags.load(std::memory_order_acquire);
     if (f & (vm::VM_EXITED | vm::VM_KILLED | vm::VM_STOPPED | vm::VM_SIGNAL_PENDING)) {
-        v->pc += sizeof(bpf_insn);
+        v->pc_ += sizeof(bpf_insn);
         return false;
     }
     return true;
@@ -119,7 +119,7 @@ void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
         return;
     }
-    v->pc = target;
+    v->pc_ = target;
 }
 
 template<typename EmitterT>
@@ -133,7 +133,7 @@ void JitCompiler<EmitterT>::helper_call_bpf(vm* v, uint64_t ret_gpa, uint64_t ca
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
         return;
     }
-    v->pc = callee_gpa;
+    v->pc_ = callee_gpa;
 }
 
 template<typename EmitterT>
@@ -143,7 +143,7 @@ int JitCompiler<EmitterT>::helper_return_to_caller(vm* v, uint64_t ret_gpa) {
         v->flags.fetch_or(vm::VM_KILLED, std::memory_order_release);
         return -1;
     }
-    v->pc = ret_gpa;
+    v->pc_ = ret_gpa;
     return 0;
 }
 
@@ -439,6 +439,8 @@ void* JitCompiler<EmitterT>::finalize_code(EmitterT& e) {
 template<typename EmitterT>
 JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     if (!enabled_) return nullptr;
+    // GDB attach 期间（VM_DEBUG_ATTACHED）：跳过 JIT，强制走解释器——解释器每步检查断点/单步，
+    if (v->get_flags() & vm::VM_DEBUG_ATTACHED) return nullptr;
     auto it = functions_.find(gpa);
     if (it != functions_.end()) return &it->second;
     if (failed_.count(gpa)) {

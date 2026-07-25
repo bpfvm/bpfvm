@@ -338,7 +338,7 @@ static std::string gen_mounts() {
 // =====================================================================
 static char proc_state(vm* task) {
     if(!task) return 'R';
-    uint32_t f = PosixSyscall::flags_of(task);
+    uint32_t f = task->get_flags();
     if(f & vm::VM_EXITED) return 'Z';
     if(f & vm::VM_STOPPED) return 'T';
     if(f & vm::VM_BLOCKED) return 'S';

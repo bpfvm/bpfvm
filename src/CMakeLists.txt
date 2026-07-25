@@ -9,6 +9,7 @@ set(_lib_sources
     insn.cpp
     elf_loader.cpp
     pty.cpp
+    gdb_server.cpp
     jit/jit_compiler.cpp
     jit/x86_emitter.cpp
     jit/aarch64_emitter.cpp
@@ -21,6 +22,8 @@ add_library(bpfvm_lib STATIC
     $<TARGET_OBJECTS:posix_obj>
 )
 target_include_directories(bpfvm_lib PUBLIC ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+find_package(Threads REQUIRED)
+target_link_libraries(bpfvm_lib PUBLIC Threads::Threads)
 
 # 导出给顶层/nesting：路径相对 ${CMAKE_SOURCE_DIR}（CACHE INTERNAL 全局可见）。
 file(RELATIVE_PATH _dir_prefix "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")

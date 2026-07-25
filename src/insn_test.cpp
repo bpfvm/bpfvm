@@ -20,8 +20,6 @@ void print_test_result(const std::string& test_name, bool success) {
 struct vmOptions option = {
     .entry = 0x1000,
     .verbose = true,
-    .breakpoint = 0,
-    .step_run = false,
     .raw_stack = true,
     .argv = {},
     .envp = {},
@@ -33,8 +31,6 @@ struct vmOptions option = {
 struct vmOptions posix_option = {
     .entry = 0x1000,
     .verbose = true,
-    .breakpoint = 0,
-    .step_run = false,
     .raw_stack = true,
     .argv = {},
     .envp = {},

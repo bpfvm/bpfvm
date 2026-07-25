@@ -1,5 +1,6 @@
 #include "insn.h"
 #include "pty.h"
+#include "gdb_server.h"
 #include "posix/posix_syscall.h"
 
 #include <iostream>
@@ -14,14 +15,13 @@
 
 static struct option long_options[] = {
     {"verbose", no_argument, nullptr, 'v'},
-    {"breakpoint", required_argument, nullptr, 'b'},
-    {"step", no_argument, nullptr, 's'},
     {"insn-limit", required_argument, nullptr, 'l'},
     {"stack-size", required_argument, nullptr, 'S'},
     {"root", required_argument, nullptr, 'R'},
     {"env", required_argument, nullptr, 'e'},
     {"pty", no_argument, nullptr, 't'},
     {"no-pty", no_argument, nullptr, 'T'},
+    {"gdb", required_argument, nullptr, 'g'},
     {nullptr, 0, nullptr, 0}
 };
 
@@ -31,21 +31,18 @@ static void print_usage(const char* prog) {
         << "\n"
         << "Options:\n"
         << "  -v, --verbose               verbose output\n"
-        << "  -b, --breakpoint <addr>     break at guest pc (hex 0x.. or decimal)\n"
-        << "  -s, --step                  single-step (interpreter)\n"
         << "  -l, --insn-limit <N>        max instructions before exit 255 (0 = unlimited)\n"
         << "  -S, --stack-size <N>        per-frame stack bytes (default 16384)\n"
         << "  -R, --root <dir>            chroot into <dir>; guest paths resolved under it\n"
         << "  -e, --env <KEY=VALUE>       inject env var for guest (repeatable; overrides default)\n"
         << "  -t, --pty                   force PTY mode for stdio\n"
-        << "  -T, --no-pty                disable PTY mode (raw stdio passthrough)\n";
+        << "  -T, --no-pty                disable PTY mode (raw stdio passthrough)\n"
+        << "  -g, --gdb <port>            start GDB RSP server on <port> (disables JIT)\n";
 }
 
 int main(int argc, char** argv) {
     std::shared_ptr<vmOptions> options = std::make_shared<vmOptions>();
     options->verbose = false; // 默认值
-    options->breakpoint = 0;   // 默认值
-    options->step_run = false; // 默认值
     options->raw_stack = false; // 默认值
     options->sys = std::make_shared<PosixSyscall>();
 
@@ -58,17 +55,14 @@ int main(int argc, char** argv) {
     // 存 {key, value}（已拆出 VALUE，不含 '='），合并阶段用 key 做覆盖匹配。
     std::map<std::string, std::string> extra_envp;
 
+    // --gdb <port>：启用 GDB RSP server。>0 表示启用，0 表示禁用。
+    uint16_t gdb_port = 0;
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "vb:sl:S:R:e:tT", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vl:S:R:e:tTg:", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options->verbose = true;
-            break;
-        case 'b':
-            options->breakpoint = std::stoul(optarg, nullptr, 0);
-            break;
-        case 's':
-            options->step_run = true;
             break;
         case 'l':
             options->insn_limit = std::stoull(optarg, nullptr, 0);
@@ -97,6 +91,16 @@ int main(int argc, char** argv) {
         case 'T':
             pty_mode = PtyMode::Off;
             break;
+        case 'g': {
+            int p = std::stoi(optarg);
+            if(p <= 0 || p > 65535) {
+                std::cerr << "Invalid --gdb port: " << optarg << std::endl;
+                print_usage(basename(argv[0]));
+                return 1;
+            }
+            gdb_port = (uint16_t)p;
+            break;
+        }
         default:
             print_usage(basename(argv[0]));
             return 1;
@@ -193,7 +197,25 @@ int main(int argc, char** argv) {
         options->envp[k] = val;
     }
     umask(0);
+
+    // --gdb：启动 GDB RSP server（独立线程，listen <gdb_port>，阻塞等 GDB 连接）。server 对象
+    // 生命周期覆盖 run()；持 shared_ptr<vm> 保证 vm 在 server 线程访问期间存活。
+    // JIT 的禁用由 per-vm 的 VM_DEBUG_ATTACHED flag 控制（GdbServer attach 时设置，detach 时清除），
+    // 不再用全局 setenv——detach 后 JIT 可恢复，且不影响同进程其他 vm。
+    std::unique_ptr<GdbServer> gdb_server;
+    if(gdb_port != 0) {
+        gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info);
+        gdb_server->start();
+    }
     std::cout<<(int)vm->run(options.get(), load_info)<<std::endl;
+    // _Exit 不跑析构，必须按依赖顺序手动释放，否则 PTY 模式下 termios 不恢复（终端留
+    // 在 raw 模式）。顺序：先停 GDB server（join 线程）→ 释放 gdb_server（它持 shared_ptr<vm>，
+    // 不先释放会让下面的 vm.reset 不析构）→ vm.reset（vm 析构释放其 options.pty 引用）
+    // → options.reset（pty 引用计数归 0，~Pty 恢复 termios）。
+    if(gdb_server) {
+        gdb_server->stop();
+        gdb_server.reset();
+    }
     free((void*)elf_file_path);
     auto ret = vm->r(0);
     vm.reset();

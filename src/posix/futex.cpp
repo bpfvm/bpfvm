@@ -80,7 +80,7 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
         if(*p != val) return -EAGAIN;
         auto it = g_futex_table.try_emplace(std::make_pair(tg, addr)).first;
         it->second.waiters.push_back(v);
-        flags(v).fetch_or(vm::VM_BLOCKED, std::memory_order_release);
+        v->set_flags(vm::VM_BLOCKED);
     }
 
     int rc = v->wait_for(timeout);
@@ -90,7 +90,7 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
     {
         std::lock_guard<std::mutex> flk(g_futex_mutex);
         futex_detach(tg, addr, v);
-        flags(v).fetch_and(~vm::VM_BLOCKED, std::memory_order_release);
+        v->clear_flags(vm::VM_BLOCKED);
     }
     // 对齐 Linux 内核 FUTEX_WAIT 的 ERESTARTSYS 语义。超时（-ETIMEDOUT）/唤醒（0）原样返回。
     if(rc == -EINTR) {

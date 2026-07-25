@@ -316,7 +316,6 @@ public:
     static auto& options_of(vm* v) { return options(v); }
     static auto& maps_of(vm* v) { return maps(v); }
     static auto& maps_mutex_of(vm* v) { return maps_mutex(v); }
-    static auto& flags_of(vm* v) { return flags(v); }
 
     int64_t do_clock_gettime(vm* v);
     int64_t do_mmap(vm* v);
