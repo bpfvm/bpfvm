@@ -4,7 +4,6 @@
 #include "posix/posix_syscall.h"
 
 #include <iostream>
-#include <filesystem>
 
 #include <libgen.h>
 #include <getopt.h>
@@ -40,7 +39,7 @@ static void print_usage(const char* prog) {
         << "  -g, --gdb <port>            start GDB RSP server on <port> (disables JIT)\n";
 }
 
-int main(int argc, char** argv) {
+int real_main(int argc, char** argv) {
     std::shared_ptr<vmOptions> options = std::make_shared<vmOptions>();
     options->verbose = false; // 默认值
     options->raw_stack = false; // 默认值
@@ -116,18 +115,17 @@ int main(int argc, char** argv) {
     if(!options->root.empty()) {
         set_loader_root(options->root);
     }
-    // ELF 路径解析：chroot 模式下 argv[optind] 是 guest 视角路径（如 /bin/dash），
-    // 需拼上 root 前缀再解析为宿主路径；非 chroot 模式直接按宿主路径解析。
-    const char* elf_file_path;
-    if(!options->root.empty()) {
-        auto elf_resolved_storage = std::filesystem::path(options->root + argv[optind]);
-        elf_file_path = realpath(elf_resolved_storage.lexically_normal().c_str(), nullptr);
-    } else {
-        elf_file_path = realpath(argv[optind], nullptr);
-    }
-    if(elf_file_path == nullptr) {
-        std::cerr << "Failed to resolve path: " << argv[optind] << std::endl;
-        return 1;
+    // ELF 路径解析：chroot 模式下 argv[optind] 是 guest 视角路径（如 /bin/dash），需拼上
+    // root 前缀得到宿主路径；非 chroot 模式 root 为空，拼接退化为 argv[optind] 本身。
+    std::string elf_path;
+    {
+        char* resolved = realpath((options->root + argv[optind]).c_str(), nullptr);
+        if(resolved == nullptr) {
+            std::cerr << "Failed to resolve path: " << argv[optind] << std::endl;
+            return 1;
+        }
+        elf_path = resolved;
+        free(resolved);
     }
     // Pty 总是建：PTY 模式开真 pty（fd 0/1/2 接 slave）；非 PTY 模式退化为仅信号路由。
     // 两种模式都起 pump 线程读 signalfd 做 host 信号路由（见下 block）。
@@ -139,7 +137,7 @@ int main(int argc, char** argv) {
     auto vm = vm::create();
     // load_elf 从 envp 解析 LD_LIBRARY_PATH 做库搜索；extra_envp 是 map（key→value），
     // load_elf 直接消费，无需展平。
-    ElfLoadInfo load_info = vm->load_elf(elf_file_path, extra_envp);
+    ElfLoadInfo load_info = vm->load_elf(elf_path.c_str(), extra_envp);
     if(load_info.entry == 0) {
         return 1;
     }
@@ -176,11 +174,9 @@ int main(int argc, char** argv) {
     }
     // /proc 用的 exe 路径：经 vmOptions 传给 handler（PosixSyscall::init 消费）。
     // main 不感知具体 handler 实现，只填 options.exe；comm 由 PosixSyscall 自己派生。
-    // elf_file_path 是 realpath(argv[optind])（宿主绝对路径）。guest 视角的 exe 应是
+    // elf_path 是 realpath(argv[optind])（宿主绝对路径）。guest 视角的 exe 应是
     // guest 能看到的路径：chroot 模式用 argv[optind]（如 /bin/dash），否则用 realpath。
-    options->exe = options->root.empty()
-                  ? (elf_file_path ? std::string(elf_file_path) : std::string(argv[optind]))
-                  : std::string(argv[optind]);
+    options->exe = options->root.empty() ? elf_path : std::string(argv[optind]);
     // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
     if(!options->root.empty()) {
         options->envp["HOME"] = "/";
@@ -190,8 +186,8 @@ int main(int argc, char** argv) {
         char* cwd = getcwd(nullptr, 0);
         options->envp["HOME"] = cwd;
         free(cwd);
-        const char* dir = dirname((char*)elf_file_path);
-        options->envp["PATH"] = dir;
+        // dirname 原地改写入参产出目录名；elf_path 在此后不再使用，原地破坏安全。
+        options->envp["PATH"] = dirname(elf_path.data());
     }
     for (const auto& [k, val] : extra_envp) {
         options->envp[k] = val;
@@ -207,18 +203,12 @@ int main(int argc, char** argv) {
         gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info);
         gdb_server->start();
     }
-    std::cout<<(int)vm->run(options.get(), load_info)<<std::endl;
-    // _Exit 不跑析构，必须按依赖顺序手动释放，否则 PTY 模式下 termios 不恢复（终端留
-    // 在 raw 模式）。顺序：先停 GDB server（join 线程）→ 释放 gdb_server（它持 shared_ptr<vm>，
-    // 不先释放会让下面的 vm.reset 不析构）→ vm.reset（vm 析构释放其 options.pty 引用）
-    // → options.reset（pty 引用计数归 0，~Pty 恢复 termios）。
-    if(gdb_server) {
-        gdb_server->stop();
-        gdb_server.reset();
-    }
-    free((void*)elf_file_path);
-    auto ret = vm->r(0);
-    vm.reset();
-    options.reset();
-    _Exit(ret);
+    std::cerr<<(int)vm->run(options.get(), load_info)<<std::endl;
+    return vm->r(0);
+}
+
+int main(int argc, char** argv) {
+    // 不跑析构：real_main 返回值即可代表程序退出码，main 直接 _Exit，跳过全局对象/静态
+    // 析构，与旧实现行为一致。real_main 内部栈对象正常析构（PTY termios 恢复等已处理）。
+    _Exit(real_main(argc, argv));
 }
