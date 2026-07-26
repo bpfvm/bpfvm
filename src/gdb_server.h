@@ -38,6 +38,7 @@
 
 #include "insn.h"
 #include "elf_loader.h"
+#include "include/bpf_call.h"  // BPF_CALL_TO_ID（syscall 钩子算 sysno）
 
 #include <atomic>
 #include <memory>
@@ -84,6 +85,24 @@ private:
     // wait_any_stopped 在 GDB 线程读。
     std::mutex fork_events_mutex_;
     std::unordered_map<uint64_t, uint64_t> fork_events_;  // parent_pid → child_pid
+
+    // catch syscall 配置（会话级，GDB 用 QCatchSyscalls 设置）。enabled=false=不 catch；
+    // enabled=true 且 sysnos 空=catch 全部 syscall；enabled=true 且 sysnos 非空=仅 catch 列表。
+    // 由 syscall 回调闭包（make_syscall_cb）在 vm 线程读、QCatchSyscalls 在 GDB 线程写，
+    // 故用 AtomicSharedPtr 整体原子替换（COW/RCU 风格）：写端构造新 const 实例 store，
+    // 读端 load 拿到不可变快照——不会读到半新半旧的组合。
+    struct SyscallCatchCfg {
+        bool enabled = false;
+        std::shared_ptr<const std::unordered_set<uint32_t>> sysnos =
+            std::make_shared<const std::unordered_set<uint32_t>>();  // 空=catch全部
+    };
+    AtomicSharedPtr<const SyscallCatchCfg> syscall_catch_{
+        std::make_shared<const SyscallCatchCfg>()};
+    // 待上报的 syscall 停止事件：syscall 钩子回调（vm 线程）命中时写入 (pid → (sysno,is_entry))，
+    // wait_any_stopped（GDB 线程）命中该 vm 时取出发 T05syscall_entry/return:<hex>; 回复并 erase。
+    // mutex 保护：回调与 wait_any_stopped 跨线程读写。
+    std::mutex syscall_events_mutex_;
+    std::unordered_map<uint64_t, std::pair<uint32_t, bool>> pending_syscall_events_;
 
     // 本 server 跟踪的 vm 表（pid → shared_ptr<vm>）。GdbServer 自维护，不依赖 syscall 层
     // pid_map——pid_map 条目会被 guest 父进程 waitpid 回收而消失，但被 trace 的 vm 退出后
@@ -180,6 +199,17 @@ private:
     // fork_child 非 0 时改发 fork 事件：T<sig>fork:<child_ptid>;thread:<tid>;
     // （GDB 据此应用 follow-fork-mode / detach-on-fork）。
     void send_stop_reply(vm* v, int sig, uint64_t fork_child = 0);
+    // 构造 syscall 停止回复并发送：T05syscall_entry/return:<hex-sysno>;thread:<tid>;。
+    // sysno 为 BPF_CALL_TO_ID(call)（bpf 枚举值，小写变长十六进制）。
+    void send_syscall_stop_reply(vm* v, uint32_t sysno, bool is_entry);
+    // 查 pending_syscall_events_ 是否有该 pid 的待上报 syscall 事件；有则发 syscall 停止
+    // 回复并 erase（一次性），返回 true（已发）。无则返回 false（调用方发普通断点/fork回复）。
+    bool try_send_syscall_stop(vm* v);
+
+    // 构建 syscall 钩子回调（entry/return）：命中 catch 配置则记事件 + debug_park 阻塞。
+    std::function<bool(vm*, uint32_t)> make_syscall_cb(bool is_entry);
+    // 构建完整 DebugHooks（create + syscall entry/return）并应用到所有 attached vm。
+    void install_debug_hooks();
 
     // vCont 处理：解析 vCont[;action[:tid]]... 多 action，按 per-tid 分派。
     // 返回空串（已自行 send_packet，self_replied_=true）。

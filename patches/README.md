@@ -31,6 +31,26 @@ fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
    `dwarf2_append_unwinders (gdbarch)` *before* the stub, so frames with CFI
    use the DWARF unwinder and frames without fall through to the stub.
 
+3. **`catch syscall` rejected with "not supported on this architecture yet".**
+   GDB gates the feature on `gdbarch_get_syscall_number_p()` in
+   `catch_syscall_command` (break-catch-syscall.c); bpf-tdep never set the
+   hook, so the feature was refused before the remote stub was ever queried —
+   even though bpfvm's stub already advertises `QCatchSyscalls+` and reports
+   `syscall_entry`/`syscall_return` stop reasons carrying the syscall number.
+   The patch adds `bpf_get_syscall_number` and registers it. On the remote
+   path GDB takes the syscall number from the stop reply, not from this hook,
+   so the returned value (r1) is only a placeholder that satisfies the
+   feature gate. A side fix sets
+   `set_gdbarch_xml_syscall_file(gdbarch, "bpf-linux.xml")` (a nonexistent
+   file): with a NULL xml file + the now-enabled syscall catch, GDB's
+   `xml_fetch_content_from_file` opens the datadir as a file, `ftell` returns
+   a bogus length, and it aborts with `std::length_error: cannot create
+   std::vector larger than max_size`. A real-looking name makes `gdb_fopen`
+   fail cleanly (file not found), and catch syscall works with numbers only
+   (BPF uses its own `bpf_syscall_id` enum, not Linux numbers, so no upstream
+   XML applies anyway). Bpfvm's sysno in `catch syscall N` is
+   `BPF_CALL_TO_ID(call)` (e.g. `BPF_SYS_clock_gettime` = 38).
+
 **Applies to**: upstream GDB 16.3 (and HEAD as of 2026-07-25, commit 1fba9bb3 —
 the bug has never been fixed). Applies cleanly via `patch -p1` from the gdb
 source root.

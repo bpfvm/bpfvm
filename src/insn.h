@@ -287,6 +287,29 @@ private:
     AtomicSharedPtr<const std::unordered_set<uint64_t>> ptr_;
 };
 
+// 所有调试回调的不可变集合，整体原子替换（同 AtomicBpSet）。把 create（vm 派生
+// 通知，原 create_cb_）与 syscall entry/return 钩子打包，是为了让一次 GDB 会话
+// 配置的回调原子生效，读端不会读到半新半旧的组合。
+struct DebugHooks {
+    // vm 派生（fork / CLONE_THREAD）通知：父 vm 在 do_clone 内同步调用。
+    std::function<void(vm* parent, vm* child, bool is_thread)> create;
+    // syscall entry/return 钩子：do_syscall 在执行真 syscall 的前/后同步调用。
+    // 回调在 vm 线程内执行——回调阻塞即 vm 阻塞，回调返回即 vm 继续。由 GdbServer
+    // 注册：命中 catch 则经 debug_park 把请求位转已停位（VM_STOPPED）阻塞 + 记待上报
+    // 事件，由 GDB 线程 wait_any_stopped 发停止回复（all-stop 协调要求）。
+    std::function<bool(vm* v, uint32_t call)> syscall_entry;
+    std::function<bool(vm* v, uint32_t call)> syscall_return;
+};
+class AtomicDebugHooks {
+public:
+    using value_type = std::shared_ptr<const DebugHooks>;
+    AtomicDebugHooks() : ptr_(std::make_shared<const DebugHooks>()) {}
+    value_type load() const { return ptr_.load(); }
+    void store(value_type desired) { ptr_.store(std::move(desired)); }
+private:
+    AtomicSharedPtr<const DebugHooks> ptr_;
+};
+
 class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
@@ -316,15 +339,14 @@ private:
     uint64_t restart_syscall_pc_ = 0;
 
     // GDB server 的软断点地址集合（guest pc 字节地址）。每 vm 一份；解释器 step()
-    // 取指后命中即置 VM_STOPPED 在 safepoint 阻塞，等待 GDB continue。
+    // 取指后命中即经 debug_park 阻塞（请求位 VM_DEBUG_STOP → 已停位 VM_STOPPED），
+    // 等待 GDB continue。
     // AtomicBpSet：不可变快照 + 原子整体替换（COW/RCU 风格），永远非空（初值为空集）。
     AtomicBpSet breakpoints_;
 
-    // vm 派生（fork / CLONE_THREAD 线程创建）通知回调：父 vm 在 do_clone 内同步调用。
-    // 参数：parent=本 vm（this）、child=新建 vm、is_thread=是否 CLONE_THREAD。
-    // 不持锁：do_clone 是单线程内（父 vm 线程）的同步点；注册/清空只在 GdbServer
-    // start/stop 发生（会话边界），不存在与 notify_create 的并发。
-    std::function<void(vm* parent, vm* child, bool is_thread)> create_cb_;
+    // 调试回调集合（create / syscall entry / syscall return）。原子整体替换，
+    // 见 AtomicDebugHooks。fork/clone 时子继承父的快照（与 breakpoints 一致）。
+    AtomicDebugHooks debug_hooks_;
 
     bool ld(const bpf_insn* cur);
     bool ldx(const bpf_insn* cur);
@@ -338,14 +360,23 @@ private:
 
     // 处理 syscall 形式的 BPF call 指令（src_reg=0）。
     bool do_syscall(uint32_t call) {
+        if((flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) && debug_hooks_.load()) {
+            debug_hooks_.load()->syscall_entry(this, call) ? debug_park() : void();
+        }
         int64_t ret = (options.sys->syscall)(this, call);
+        if(flags.load(std::memory_order_acquire) & (VM_EXITED | VM_KILLED)) {
+            return false;
+        }
         if(ret == SYSCALL_RESTART) {
             restart_syscall_pc_ = pc_;
+            return true;
         } else {
             r(0) = (uint64_t)ret;
         }
-        if(flags.load(std::memory_order_acquire) & (VM_EXITED | VM_KILLED)) {
-            return false;
+        // return 钩子仅在 syscall 真正执行后报（重启/退出不报，符合 ptrace 语义）。
+        if((flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) && debug_hooks_.load()) {
+            // 每次获取最新的hooker
+            debug_hooks_.load()->syscall_return(this, call) ? debug_park() : void();
         }
         return true;
     }
@@ -357,6 +388,7 @@ private:
     template<typename T> friend class JitCompiler;
     void log_mem_violation(const char* type, uint64_t addr);
     bool safepoint();
+    void debug_park();
     struct Token { explicit Token() = default; };
     uint64_t pop_frame();
 public:
@@ -423,15 +455,20 @@ public:
         breakpoints_.store(std::move(bps));
     }
 
-    // vm 派生通知回调（GdbServer::start 注册、stop 清空）
-    void set_create_callback(std::function<void(vm*, vm*, bool)> cb) { create_cb_ = std::move(cb); }
-    // do_clone 在父 vm 线程上调用：create_cb_ 非空则同步执行（父=this）。
+    // vm 派生通知回调（GdbServer::start 注册、stop 清空）。整体替换 debug_hooks_。
+    void set_debug_hooks(std::shared_ptr<const DebugHooks> hooks) {
+        debug_hooks_.store(std::move(hooks));
+    }
+    // do_clone 在父 vm 线程上调用：hooks->create 非空则同步执行（父=this）。
     void notify_create(vm* child, bool is_thread) {
-        if(!create_cb_) {
+        auto hooks = debug_hooks_.load();
+        if(!hooks->create) {
+            // 仍把 hooks 继承给子（即使 create 回调为空，syscall 等其它钩子也要继承）
+            child->debug_hooks_.store(hooks);
             return;
         }
-        child->create_cb_ = create_cb_;  // 子继承父的回调（多层 fork/线程树都能通知到本 server）
-        create_cb_(this, child, is_thread);
+        child->debug_hooks_.store(hooks);  // 子继承父的回调（多层 fork/线程树都能通知到本 server）
+        hooks->create(this, child, is_thread);
     }
 
     uint64_t run();
