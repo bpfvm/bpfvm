@@ -12,6 +12,9 @@
 #include <sys/stat.h>
 
 
+// --stop 标志：getopt_long 匹配到 --stop 时通过 flag 字段自动置 1，无需 switch case。
+static int gdb_stop_flag = 0;
+
 static struct option long_options[] = {
     {"verbose", no_argument, nullptr, 'v'},
     {"insn-limit", required_argument, nullptr, 'l'},
@@ -21,6 +24,7 @@ static struct option long_options[] = {
     {"pty", no_argument, nullptr, 't'},
     {"no-pty", no_argument, nullptr, 'T'},
     {"gdb", required_argument, nullptr, 'g'},
+    {"stop", no_argument, &gdb_stop_flag, 1},
     {nullptr, 0, nullptr, 0}
 };
 
@@ -36,7 +40,9 @@ static void print_usage(const char* prog) {
         << "  -e, --env <KEY=VALUE>       inject env var for guest (repeatable; overrides default)\n"
         << "  -t, --pty                   force PTY mode for stdio\n"
         << "  -T, --no-pty                disable PTY mode (raw stdio passthrough)\n"
-        << "  -g, --gdb <port>            start GDB RSP server on <port> (disables JIT)\n";
+        << "  -g, --gdb <port>            start GDB RSP server on <port>\n"
+        << "                              (VM runs at full speed; GDB attaches on connect)\n"
+        << "      --stop                  with --gdb: freeze VM at start until GDB connects\n";
 }
 
 int real_main(int argc, char** argv) {
@@ -100,6 +106,9 @@ int real_main(int argc, char** argv) {
             gdb_port = (uint16_t)p;
             break;
         }
+        case 0:
+            // flag 字段置位的选项（如 --stop）：getopt_long 直接写变量、返回 0，无需处理。
+            break;
         default:
             print_usage(basename(argv[0]));
             return 1;
@@ -107,6 +116,13 @@ int real_main(int argc, char** argv) {
     }
 
     if (optind >= argc) {
+        print_usage(basename(argv[0]));
+        return 1;
+    }
+
+    // --stop 仅与 --gdb 搭配才有意义。
+    if(gdb_stop_flag && gdb_port == 0) {
+        std::cerr << "--stop requires --gdb <port>" << std::endl;
         print_usage(basename(argv[0]));
         return 1;
     }
@@ -198,9 +214,11 @@ int real_main(int argc, char** argv) {
     // 生命周期覆盖 run()；持 shared_ptr<vm> 保证 vm 在 server 线程访问期间存活。
     // JIT 的禁用由 per-vm 的 VM_DEBUG_ATTACHED flag 控制（GdbServer attach 时设置，detach 时清除），
     // 不再用全局 setenv——detach 后 JIT 可恢复，且不影响同进程其他 vm。
+    // gdb_stop_flag（--stop）：run() 前就 attach + 冻结主 vm，等 GDB 连上后 continue 才放行
+    // （对齐 QEMU -S）；默认（不带 --stop）让主 vm 全速 JIT 跑，GDB 连上才 attach 停在当前 pc。
     std::unique_ptr<GdbServer> gdb_server;
     if(gdb_port != 0) {
-        gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info);
+        gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info, gdb_stop_flag != 0);
         gdb_server->start();
     }
     std::cerr<<(int)vm->run(options.get(), load_info)<<std::endl;

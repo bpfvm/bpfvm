@@ -184,7 +184,9 @@ void PosixSyscall::host_signal(vm* v, int sig) {
     if(sig == 0) {
         // sig=0 特殊处理：只踢出 host syscall / wait_for，不入队、不置 VM_SIGNAL_PENDING。
         v->wakeup(false);
-        if(auto Sys = sys(v)) {
+        auto Sys = sys(v);
+        if(Sys && Sys->tid != 0) {
+            // tid==0 表示子线程尚未跑到 init(), 此时它不可能阻塞在任何 syscall 里
             pthread_kill(Sys->tid, SIGUSR1);
         }
         return;

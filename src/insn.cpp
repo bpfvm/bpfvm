@@ -1310,8 +1310,7 @@ bool vm::step() {
         //   VM_DEBUG_STOP：GDB 单步（'s'）或异步暂停请求 → 在当前 pc 停下。
         //   命中断点集合：在断点 pc 停下。
         // 两者都置 VM_STOPPED 后由 safepoint() 在 wait_cv 阻塞，等待 GDB continue 唤醒。
-        if((flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) ||
-           (!breakpoints_.empty() &&  has_breakpoint(pc_)))
+        if((flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) || has_breakpoint(pc_))
         {
             clear_flags(VM_DEBUG_STOP);
             set_flags(VM_STOPPED);

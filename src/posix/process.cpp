@@ -309,6 +309,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
         pid_map[child_sys->pid] = child;
     }
+    v->notify_create(child.get(), is_thread);
     auto* holder = new std::shared_ptr<vm>(child);
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
         auto* child = static_cast<std::shared_ptr<vm>*>(arg);
@@ -461,9 +462,11 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
                 child = candidate;
                 break;
             }
-            // 调用者自身被 VM_KILL 或收到信号 -> 标记为可重启。
+            // 调用者自身被 VM_KILL / 收到信号 / GDB 请求停下 -> 标记为可重启。
             // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
-            if(!pending_signals.empty() || (v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED))) {
+            // VM_DEBUG_STOP：GDB Ctrl-C/单步经 stop_all_vms 置位，要求本 vm 回解释器停下。
+            if(!pending_signals.empty() ||
+               (v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_DEBUG_STOP))) {
                 return SYSCALL_RESTART;
             }
         }

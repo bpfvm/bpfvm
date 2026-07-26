@@ -14,8 +14,10 @@
 #include <string.h>
 #include <assert.h>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <string>
 #include <unordered_set>
@@ -211,6 +213,80 @@ struct TlbEntry {
 constexpr size_t TLB_SIZE = 16;
 static_assert((TLB_SIZE & (TLB_SIZE - 1)) == 0, "TLB_SIZE must be power of 2");
 
+// 本仓库的 BPF-on-BPF 自举 target（cmake/bpfvm-bpf-toolchain.cmake）用 libc++ LLVM 19，
+// 其 std::atomic<shared_ptr<T>> 至今未实现（__cpp_lib_atomic_shared_ptr 未定义、实例化即报
+// "no member named 'atomic'"，llvm-project#99980）。insn.h 被两个 target 共享，故按
+// __cpp_lib_atomic_shared_ptr 条件编译：有则用成员 atomic，否则回退到 std::atomic_load/store/
+// compare_exchange_*_explicit 自由函数（libc++ 支持）。
+//
+// compare_exchange 失败会把 expected 更新为当前值（与 std::atomic 语义一致），便于 COW 重试循环。
+template <class T>
+class AtomicSharedPtr {
+public:
+    using value_type = std::shared_ptr<T>;
+
+    // 默认构造持空 shared_ptr；可显式传入初值（如 make_shared<T>()）。
+    AtomicSharedPtr() : AtomicSharedPtr(value_type{}) {}
+    explicit AtomicSharedPtr(value_type init) {
+#if defined(__cpp_lib_atomic_shared_ptr)
+        atomic_.emplace(std::move(init));
+#else
+        ptr_ = std::move(init);
+#endif
+    }
+    // std::atomic 不可拷贝，故本类也不可拷贝；需要拷贝处（如 SharedState copy ctor）
+    // 用 AtomicSharedPtr(src.load()) 显式构造一个独立的新原子对象。
+    AtomicSharedPtr(const AtomicSharedPtr&) = delete;
+    AtomicSharedPtr& operator=(const AtomicSharedPtr&) = delete;
+
+    value_type load() const {
+#if defined(__cpp_lib_atomic_shared_ptr)
+        return atomic_->load(std::memory_order_acquire);
+#else
+        return std::atomic_load_explicit(&ptr_, std::memory_order_acquire);
+#endif
+    }
+    void store(value_type desired) {
+#if defined(__cpp_lib_atomic_shared_ptr)
+        atomic_->store(std::move(desired), std::memory_order_release);
+#else
+        std::atomic_store_explicit(&ptr_, std::move(desired), std::memory_order_release);
+#endif
+    }
+    // COW CAS：成功返回 true 并替换为 desired；失败返回 false 并把 expected 更新为当前值。
+    bool compare_exchange(value_type& expected, value_type desired) {
+#if defined(__cpp_lib_atomic_shared_ptr)
+        return atomic_->compare_exchange_weak(expected, std::move(desired),
+                                              std::memory_order_acq_rel, std::memory_order_acquire);
+#else
+        return std::atomic_compare_exchange_weak_explicit(&ptr_, &expected, std::move(desired),
+                                                          std::memory_order_acq_rel, std::memory_order_acquire);
+#endif
+    }
+private:
+#if defined(__cpp_lib_atomic_shared_ptr)
+    // optional 绕开 std::atomic 不可拷贝构造的限制，让 copy/赋值被 delete 的同时
+    // 仍能用 AtomicSharedPtr(value_type) 在 ctor body 内 emplace 构造成员。
+    std::optional<std::atomic<value_type>> atomic_;
+#else
+    mutable value_type ptr_;
+#endif
+};
+
+// 原子装载的不可变断点集：AtomicSharedPtr<const unordered_set<uint64_t>> 的薄封装。
+// 读端（解释器热路径）load 取快照后无锁查找；写端（vm::set_breakpoints）整体 store 替换。
+// 永远非空（初值为空集）。compare_exchange 供 set_breakpoints 的「读-改-写」并发安全路径，
+// 当前 set_breakpoints 是单一写者直接 store（调用方外部已构造好新快照），但保留 CAS 备用。
+class AtomicBpSet {
+public:
+    using value_type = std::shared_ptr<const std::unordered_set<uint64_t>>;
+    AtomicBpSet() : ptr_(std::make_shared<const std::unordered_set<uint64_t>>()) {}
+    value_type load() const { return ptr_.load(); }
+    void store(value_type desired) { ptr_.store(std::move(desired)); }
+private:
+    AtomicSharedPtr<const std::unordered_set<uint64_t>> ptr_;
+};
+
 class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
@@ -241,8 +317,14 @@ private:
 
     // GDB server 的软断点地址集合（guest pc 字节地址）。每 vm 一份；解释器 step()
     // 取指后命中即置 VM_STOPPED 在 safepoint 阻塞，等待 GDB continue。
-    std::unordered_set<uint64_t> breakpoints_;
-    std::mutex bp_mutex_;
+    // AtomicBpSet：不可变快照 + 原子整体替换（COW/RCU 风格），永远非空（初值为空集）。
+    AtomicBpSet breakpoints_;
+
+    // vm 派生（fork / CLONE_THREAD 线程创建）通知回调：父 vm 在 do_clone 内同步调用。
+    // 参数：parent=本 vm（this）、child=新建 vm、is_thread=是否 CLONE_THREAD。
+    // 不持锁：do_clone 是单线程内（父 vm 线程）的同步点；注册/清空只在 GdbServer
+    // start/stop 发生（会话边界），不存在与 notify_create 的并发。
+    std::function<void(vm* parent, vm* child, bool is_thread)> create_cb_;
 
     bool ld(const bpf_insn* cur);
     bool ldx(const bpf_insn* cur);
@@ -330,22 +412,26 @@ public:
     uint32_t get_flags() const { return flags.load(std::memory_order_acquire); }
     void clear_flags(uint32_t mask) { flags.fetch_and(~mask, std::memory_order_release); }
     void set_flags(uint32_t mask) { flags.fetch_or(mask, std::memory_order_release); }
-    // GDB 软断点管理（线程安全）。
-    void add_breakpoint(uint64_t addr) {
-        std::lock_guard<std::mutex> lock(bp_mutex_);
-        breakpoints_.insert(addr);
+
+    bool has_breakpoint(uint64_t addr) const {
+        return breakpoints_.load()->count(addr) != 0;
     }
-    void remove_breakpoint(uint64_t addr) {
-        std::lock_guard<std::mutex> lock(bp_mutex_);
-        breakpoints_.erase(addr);
+    std::shared_ptr<const std::unordered_set<uint64_t>> get_breakpoints() const {
+        return breakpoints_.load();
     }
-    void clear_breakpoints() {
-        std::lock_guard<std::mutex> lock(bp_mutex_);
-        breakpoints_.clear();
+    void set_breakpoints(std::shared_ptr<const std::unordered_set<uint64_t>> bps) {
+        breakpoints_.store(std::move(bps));
     }
-    bool has_breakpoint(uint64_t addr) {
-        std::lock_guard<std::mutex> lock(bp_mutex_);
-        return breakpoints_.count(addr) != 0;
+
+    // vm 派生通知回调（GdbServer::start 注册、stop 清空）
+    void set_create_callback(std::function<void(vm*, vm*, bool)> cb) { create_cb_ = std::move(cb); }
+    // do_clone 在父 vm 线程上调用：create_cb_ 非空则同步执行（父=this）。
+    void notify_create(vm* child, bool is_thread) {
+        if(!create_cb_) {
+            return;
+        }
+        child->create_cb_ = create_cb_;  // 子继承父的回调（多层 fork/线程树都能通知到本 server）
+        create_cb_(this, child, is_thread);
     }
 
     uint64_t run();
