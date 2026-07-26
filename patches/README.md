@@ -6,18 +6,30 @@ fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
 
 ## gdb-bpf-ptr-bit.patch
 
-**Fixes**: GDB's BPF target crashes with an internal assertion
-`raw_read: Assertion 'dst.size () == m_descr->sizeof_register[regnum]' failed`
-the first time the register cache is touched after a `backtrace` (e.g.
-`bt` then `info registers`).
+**Fixes**: Two defects in GDB's BPF target (`gdb/bpf-tdep.c`):
 
-**Root cause**: `gdb/bpf-tdep.c`'s `bpf_gdbarch_init` never calls
-`set_gdbarch_ptr_bit` / `set_gdbarch_long_bit` / `set_gdbarch_int_bit`
-(every other target does). With `ptr_bit` defaulting to 32,
-`bpf_register_type` returns `builtin_data_ptr` / `builtin_func_ptr` (4 bytes)
-for r10/pc, but frame unwinders read SP/PC with an 8-byte buffer → size
-mismatch → assertion. BPF is a 64-bit ISA (r0..r10 are all 64-bit), so these
-settings are simply missing.
+1. **Register-cache assertion after `backtrace`.** GDB crashes with
+   `raw_read: Assertion 'dst.size () == m_descr->sizeof_register[regnum]' failed`
+   the first time the register cache is touched after a `backtrace` (e.g.
+   `bt` then `info registers`).
+
+   **Root cause**: `bpf_gdbarch_init` never calls `set_gdbarch_ptr_bit` /
+   `set_gdbarch_long_bit` / `set_gdbarch_int_bit` (every other target does).
+   With `ptr_bit` defaulting to 32, `bpf_register_type` returns
+   `builtin_data_ptr` / `builtin_func_ptr` (4 bytes) for r10/pc, but frame
+   unwinders read SP/PC with an 8-byte buffer → size mismatch → assertion.
+   BPF is a 64-bit ISA (r0..r10 are all 64-bit), so these settings are simply
+   missing.
+
+2. **`bt` only shows frame #0** (no stack walk). **Root cause**: BPF's
+   `bpf_frame_unwind` is a stub — `bpf_frame_this_id` is empty (defaults the
+   frame to "outermost"), and `bpf_frame_unwind_stop_reason` returns
+   `UNWIND_OUTERMOST`. `bpf_gdbarch_init` only registers this stub; it never
+   calls `dwarf2_append_unwinders`, so the DWARF CFI unwinder (which reads
+   `.debug_frame` synthesized by `bpfvm-ld`) is never consulted and backtrace
+   never walks past the current frame. The patch adds
+   `dwarf2_append_unwinders (gdbarch)` *before* the stub, so frames with CFI
+   use the DWARF unwinder and frames without fall through to the stub.
 
 **Applies to**: upstream GDB 16.3 (and HEAD as of 2026-07-25, commit 1fba9bb3 —
 the bug has never been fixed). Applies cleanly via `patch -p1` from the gdb

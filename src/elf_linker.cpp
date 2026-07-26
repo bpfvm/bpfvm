@@ -29,6 +29,7 @@
 #include <optional>
 #include <cstring>
 #include <cctype>
+#include <functional>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1416,6 +1417,9 @@ private:
         const bool emit_debug = (keep_debug_ && mode_ != Mode::SHARED_LIB);
         if (emit_debug) {
             collect_debug_sections(extras);
+            // 合成 .debug_frame（clang BPF 不生成 CFI；GDB bt 靠它回溯栈）。
+            // 在 collect_debug_sections 之后：它已跳过输入的空 .debug_frame，这里补合成版。
+            synthesize_debug_frame(extras);
         }
         // 2b. 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
         //     -s/--strip-all 时跳过（对齐标准 ld；运行时符号解析仍走 .dynsym）。
@@ -1468,6 +1472,9 @@ private:
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t di = 0; di < objects_[oi].debug_secs.size(); di++) {
                 auto& ds = objects_[oi].debug_secs[di];
+                // 跳过 clang 输出的空 .debug_frame（CIE 只有 DW_CFA_nop、FDE 无 CFI 指令），
+                // 改由 synthesize_debug_frame 按本 VM 的帧布局合成正确的 CFI。
+                if(ds.name == ".debug_frame") continue;
                 auto align = ds.addralign ? ds.addralign : 1;
                 auto it = merged.find(ds.name);
                 if (it == merged.end()) {
@@ -1498,6 +1505,154 @@ private:
                 }
             }
         }
+    }
+
+    // 合成 .debug_frame：clang 的 BPF backend 不输出 CFI（CIE 仅 DW_CFA_nop，FDE 空），
+    // GDB 的 bt 无法回溯。这里按本 VM 的帧布局合成正确的 DWARF CFI。
+    //
+    // 帧布局（push_frame，insn.cpp:267-319）：每个函数的帧由 caller 的 call 指令压入，
+    // callee 的 r10 全程指向帧头（BPF ABI，frame pointer 只读）。普通帧 64 字节：
+    //   [r10+0]=flags+len, [+8/16/24/32]=caller r6/r7/r8/r9, [+40]=caller r10, [+48]=RA
+    //
+    // CFI 规则用 DWARF expression 而非静态偏移，关键在 [+40] 槽：
+    //   CFA = *(r10 + 40)   —— push_frame 瞬间记下的 caller r10，GDB 把它当上一帧的
+    //                          frame base 继续回溯。
+    //   RA  = *(r10 + 48)   —— 帧头返回地址槽。
+    //
+    // RA 列号 11 是 DWARF 逻辑列（DWARF 允许 return_address_reg ≥ num_regs），不是 BPF
+    // 物理寄存器（BPF 只有 r0..r10）。GDB 的 dwarf2_frame_cache 会特殊处理该列。
+    //
+    // _start 的帧 RA 槽=0（push_frame(0)），FDE 用 DW_CFA_undefined 覆盖 RA 规则，
+    // 让 GDB 在此干净停止回溯（否则会按默认规则读到 0，显示 "0x0 in ??"）。
+    void synthesize_debug_frame(std::vector<SecBuf>& extras) {
+        std::vector<uint8_t> d;  // .debug_frame 数据
+        auto push_u8  = [&](uint8_t v){ d.push_back(v); };
+        auto push_u32 = [&](uint32_t v){ for(int i=0;i<4;i++) d.push_back(v >> (i*8)); };  // 小端
+        auto push_u64 = [&](uint64_t v){ for(int i=0;i<8;i++) d.push_back(v >> (i*8)); };
+        auto push_uleb = [&](uint64_t v){
+            do { uint8_t b = v & 0x7F; v >>= 7; if(v) b |= 0x80; d.push_back(b); } while(v);
+        };
+        auto push_sleb = [&](int64_t v){
+            bool more = true;
+            while(more) {
+                uint8_t b = v & 0x7F; v >>= 7;
+                if((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40))) more = false;
+                else b |= 0x80;
+                d.push_back(b);
+            }
+        };
+        // 在当前 d 末尾预留 4 字节 length 占位，返回其偏移；record 结束后回填 length。
+        auto reserve_length = [&]() -> size_t {
+            size_t off = d.size();
+            d.insert(d.end(), 4, 0);
+            return off;
+        };
+        auto patch_length = [&](size_t off){
+            uint32_t len = (uint32_t)(d.size() - off - 4);
+            for(int i = 0; i < 4; i++) d[off + i] = (len >> (i*8)) & 0xFF;
+        };
+        // 写一条带 ULEB128 长度前缀的 DWARF location expression。
+        // expression 字节由 lambda 直接 push 到 d；本辅助负责在表达式内容前回填长度。
+        auto push_expr = [&](const std::function<void()>& emit_body) {
+            size_t start = d.size();
+            emit_body();  // 写 expression 内容（不含长度前缀）
+            size_t len = d.size() - start;
+            std::vector<uint8_t> uleb;
+            do { uint8_t b = len & 0x7F; len >>= 7; if(len) b |= 0x80; uleb.push_back(b); } while(len);
+            d.insert(d.begin() + start, uleb.begin(), uleb.end());
+        };
+
+        // ── CIE（第一条记录，FDE 的 CIE_pointer = 0）──
+        size_t cie_len_off = reserve_length();
+        push_u32(0xFFFFFFFF);   // CIE_id（.debug_frame 用 0xFFFFFFFF 标识 CIE）
+        push_u8(4);             // version（DWARF 4：address_size/segment_size 字段、return_address_reg ULEB）
+        push_u8(0);             // augmentation（空）
+        push_u8(8);             // address_size
+        push_u8(0);             // segment_size
+        push_uleb(1);           // code_alignment_factor（PC 偏移按字节；expression 不用它）
+        push_sleb(8);           // data_alignment_factor（保持 8；expression 不用它）
+        push_uleb(11);          // return_address_register（r0..r10=列0..10，RA=列11；见函数头注释）
+
+        // initial_instructions：用 expression 定义默认展开规则，对所有 PC 生效（r10 全程不变）。
+        // CFA = *(r10 + 40)：读帧头 [+40] 槽 = caller 的 r10（push_frame 瞬间记下，与 alloca 无关）。
+        //   expression = DW_OP_breg10(40), DW_OP_deref
+        push_u8(0x0f);          // DW_CFA_def_cfa_expression
+        push_expr([&]{
+            push_u8(0x7a);      // DW_OP_breg10
+            push_sleb(40);      // +40
+            push_u8(0x06);      // DW_OP_deref
+        });
+        // RA 的值存在帧头 [+48] 槽。
+        //   注意 DW_CFA_expression 的语义（见 GDB dwarf2/frame.c:1159 SAVED_EXP 分支）：
+        //   expression 计算的是"返回地址存放的地址"，GDB 会自动去该地址读值。
+        //   因此 expression 只需算出 r10+48，不带 DW_OP_deref（否则会二次解引用）。
+        //   这与上面 CFA 的 def_cfa_expression 不同——后者 expression 结果直接是 CFA 值，
+        //   故需要 DW_OP_deref。
+        push_u8(0x10);          // DW_CFA_expression
+        push_uleb(11);          // RA 列
+        push_expr([&]{
+            push_u8(0x7a);      // DW_OP_breg10
+            push_sleb(48);      // +48（返回地址存放的地址；GDB 自动从此处读值）
+        });
+        patch_length(cie_len_off);
+
+        // ── 枚举所有函数 [addr,size)，按地址去重，每个写一个 FDE ──
+        std::set<std::pair<uint64_t,uint64_t>> seen;  // (addr, size)
+        auto emit_fde = [&](uint64_t addr, uint64_t size, bool is_entry) {
+            if(size == 0) return;
+            if(!seen.insert({addr, size}).second) return;  // 去重（同名 local + global）
+            size_t len_off = reserve_length();
+            push_u32(0);           // CIE_pointer = 0（CIE 在 .debug_frame 起始）
+            // 注：FDE 没有 address_size/segment_size 字段（那是 CIE v4 才有的）；
+            // initial_location/address_range 的大小由 CIE 的 addr_size 决定（这里 8 字节）。
+            push_u64(addr);        // initial_location
+            push_u64(size);        // address_range
+            if(is_entry) {
+                // _start：RA 不可恢复，GDB 在此干净停止回溯。
+                push_u8(0x07);     // DW_CFA_undefined
+                push_uleb(11);     // RA 列
+            }
+            // 否则 FDE 指令序列为空——CIE 的 initial_instructions 已覆盖所有 PC。
+            patch_length(len_off);
+        };
+
+        // 本地 STT_FUNC（仿 build_static_symtab 的枚举）
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            const auto& obj = objects_[oi];
+            for (size_t si = 1; si < obj.symbols.size(); si++) {
+                const auto& sym = obj.symbols[si];
+                if (sym.binding != STB_LOCAL) continue;
+                if (!sym.defined) continue;
+                if (sym.type != STT_FUNC) continue;
+                emit_fde(sec_guest_addr_of(obj, sym.sec_idx) + sym.value, sym.size, false);
+            }
+        }
+        // 全局 STT_FUNC
+        for (const auto& kv : globals_) {
+            const auto& obj = objects_[kv.second.obj_idx];
+            const auto& sym = obj.symbols[kv.second.sym_idx];
+            if (!sym.defined || sym.type != STT_FUNC) continue;
+            uint64_t addr = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
+            emit_fde(addr, sym.size, addr == entry_);
+        }
+
+        // _start 可能未在符号表里（如来自 .so 的 PLT stub 入口）——若上面没覆盖到，
+        // 单独补一个终止 FDE（用 entry_ 起始、保守小范围，确保 GDB 在入口处能停）。
+        if (entry_ != 0) {
+            bool covered = false;
+            for (const auto& r : seen) {
+                if (entry_ >= r.first && entry_ < r.first + r.second) { covered = true; break; }
+            }
+            if (!covered) emit_fde(entry_, 8, true);  // 8 字节 = 一条 BPF 指令，足以让 RA=undefined 生效
+        }
+
+        SecBuf sb;
+        sb.name = ".debug_frame";
+        sb.type = SHT_PROGBITS;
+        sb.flags = 0;
+        sb.addralign = 8;
+        sb.data = std::move(d);
+        extras.push_back(std::move(sb));
     }
 
     // 应用 DWARF 段的重定位（.rel.debug_*）。两类：
