@@ -189,7 +189,6 @@ int64_t PosixSyscall::do_clone(vm* v) {
     } else {
         child_sys->ps = ps;
         child_sys->tg = tg;
-        tg->live_threads.fetch_add(1);
     }
     // comm 是 per-thread：fork/CLONE_THREAD 都继承 creator 的 comm。
     child_sys->comm_ = comm_;
@@ -288,7 +287,13 @@ int64_t PosixSyscall::do_clone(vm* v) {
         child_sys->tid_address_ = ctid;
     }
 
-    /* 启动 host 线程 */
+    /* 启动 host 线程：先给 child 置 VM_STOPPED，让 worker 进入 run() 后立即在首个
+     * safepoint 阻塞（不执行任何访存/syscall），父线程随后再登记 pid_map / tg->threads
+     * 并放行。
+     * 子线程进 run() → init()(pid!=1 直接 return) → step() JIT 冷 pc 返回 nullptr →
+     * flags 检查命中 VM_STOPPED → safepoint 在 wait_cv 阻塞 */
+    child->set_flags(vm::VM_STOPPED);
+
     pthread_attr_t attr;
     pthread_t worker;
     int rc = pthread_attr_init(&attr);
@@ -300,16 +305,6 @@ int64_t PosixSyscall::do_clone(vm* v) {
         pthread_attr_destroy(&attr);
         return -rc;
     }
-    // 先登记 pid_map / tg->threads，再启动 host 线程。
-    {
-        std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
-        child_sys->tg->threads.push_back(child);
-    }
-    {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map[child_sys->pid] = child;
-    }
-    v->notify_create(child.get(), is_thread);
     auto* holder = new std::shared_ptr<vm>(child);
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
         auto* child = static_cast<std::shared_ptr<vm>*>(arg);
@@ -320,17 +315,26 @@ int64_t PosixSyscall::do_clone(vm* v) {
     pthread_attr_destroy(&attr);
     if(rc != 0) {
         delete holder;
-        if(is_thread) tg->live_threads.fetch_sub(1);
-        {
-            std::lock_guard<std::mutex> lock(pid_map_mutex);
-            pid_map.erase(child_sys->pid);
-        }
-        {
-            std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
-            child_sys->tg->threads.pop_back();
-        }
         return -rc;
     }
+
+    // worker 已启动并在 safepoint 阻塞，安全登记。live_threads 在此 +1（失败路径已排除）。
+    if(is_thread) {
+        tg->live_threads.fetch_add(1);
+    }
+    {
+        std::lock_guard<std::mutex> lock(child_sys->tg->mtx);
+        child_sys->tg->threads.push_back(child);
+    }
+    {
+        std::lock_guard<std::mutex> lock(pid_map_mutex);
+        pid_map[child_sys->pid] = child;
+    }
+    v->notify_create(child.get(), is_thread);
+
+    // 放行子线程：清 VM_STOPPED + wakeup(false)（同 SIGCONT 组合，signal.cpp）。
+    child->clear_flags(vm::VM_STOPPED);
+    child->wakeup(false);
     return (int64_t)child_sys->pid;
 }
 
