@@ -35,6 +35,12 @@
 // （非 VM_DEBUG_ATTACHED）的停止/退出绝不上报给 GDB（否则 GDB 对已移除 inferior 取状态会
 // internal-error）。
 //
+// ── exec 跟踪 ──
+// 协商 exec-events+ 后，execveat 替换地址空间后该 vm 停下并上报 T05exec:<hex-host-path>，
+// GDB 据此重载符号、重插断点（新程序地址空间与旧断点无关，旧断点位置已失效）。路径用宿主视角
+// 绝对路径（v->image().exe，load_elf 设置）——GDB 在宿主机跑、用它 open 文件读符号，chroot 模式
+// 下宿主路径与 guest 视角路径不同。复用 syscall_return 钩子检测（execveat 成功即 r(0)==0 时），
+//
 // ── all-stop ──
 // 任一 vm 命中断点/单步/异常停下后，stop_all_vms 对其余运行中 vm mark_stepping + host_signal，
 // 各 vm 在下个 step() 钩子消费即停；continue/vCont 时按 action 放行。
@@ -44,7 +50,6 @@
 #define GDB_SERVER_H
 
 #include "insn.h"
-#include "elf_loader.h"
 #include "include/bpf_call.h"  // BPF_CALL_TO_ID（syscall 钩子算 sysno）
 
 #include <atomic>
@@ -60,7 +65,7 @@ public:
     // main_vm：最初加载的 guest 程序 vm；port：监听端口。
     // stop_at_start：true=run() 前冻结主 vm 等连接（--stop，对齐 QEMU -S）；
     //                false=默认，全速运行、GDB 连上才 attach。
-    GdbServer(std::shared_ptr<vm> main_vm, uint16_t port, const ElfLoadInfo& info,
+    GdbServer(std::shared_ptr<vm> main_vm, uint16_t port,
               bool stop_at_start = false);
     ~GdbServer();
 
@@ -72,7 +77,6 @@ private:
     std::shared_ptr<vm> main_vm;        // 主 vm（根进程）。构造后不可变、恒非空；持 shared_ptr 保证 vm 在 server 期间存活
     std::shared_ptr<vm> current_vm;     // 当前选中的焦点 vm（RSP H 包设置；g/G/p/m/c/s 等操作目标）。
     uint16_t port_;
-    ElfLoadInfo info_;
     int listen_fd_ = -1;
     int client_fd_ = -1;
     std::thread thread_;
@@ -81,6 +85,7 @@ private:
     bool no_ack_ = false;                // QStartNoAckMode 后不再发/收 +-
     bool multiprocess_ = false;          // GDB 在 qSupported 里广告了 multiprocess+
     bool report_fork_events_ = false;    // GDB 在 qSupported 里广告了 fork-events+/vfork-events+
+    bool report_exec_events_ = false;    // GDB 在 qSupported 里广告了 exec-events+
     bool exit_notified_ = false;         // 已向 GDB 发过 W 包（避免重复）
     bool stop_at_start_ = false;         // --stop：run() 前冻结主 vm 等连接
     // handle_packet 内部标记：c/s/k/vCont 等已自行 send_packet，调用方据此跳过统一发送。
@@ -105,6 +110,7 @@ private:
     struct TaskEntry {
         std::shared_ptr<vm> vmp;                                // 该 task 的 vm 引用
         std::unordered_set<uint64_t> breakpoints;               // per-vm 软断点集（见文件头 per-pspace 说明）
+        std::string exec_path;                                  // 待上报 exec 事件（空=无）
         bool stepping = false;                                  // GDB 临时停止请求位（一次性，见文件头）
         vm* fork_child = nullptr;                               // 待上报 fork 事件（子 vm*，nullptr=无）
         std::pair<uint32_t, bool> syscall_event = {0, false};   // 待上报 syscall 事件（{0,false}=无）
@@ -179,10 +185,10 @@ private:
     void send_exit_reply(vm* v);   // W 包（退出，只发一次）
     // T<sig> + thread:<tid>；fork_child 非 null 时改发 fork 事件（T<sig>fork:<child>;thread:<tid>;）。
     void send_stop_reply(vm* v, int sig, vm* fork_child = nullptr);
-    // T05syscall_entry/return:<hex-sysno>;thread:<tid>;（sysno=BPF_CALL_TO_ID(call)）。
-    void send_syscall_stop_reply(vm* v, uint32_t sysno, bool is_entry);
     // 命中 vm 的 syscall_event 字段有待上报事件则发回复并清字段，返回 true。
     bool try_send_syscall_stop(vm* v);
+    // 命中 vm 的 exec_path 字段有待上报事件则发 T05exec:<hex-path>;thread:<tid>; 并清字段，返回 true。
+    bool try_send_exec_stop(vm* v);
 
     // vCont 处理：解析 vCont[;action[:tid]]... 多 action，按 per-tid 分派。
     // 返回空串（已自行 send_packet，self_replied_=true）。

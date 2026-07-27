@@ -79,14 +79,14 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         free((void*)rp);
         ps->cwd = "/";
     }
-    // /proc 进程标识：main.cpp 经 options.exe 传入 guest 视角 exe 路径；comm 从 exe 派生
-    // （basename + 截断，与 do_execveat 共用 make_comm）。只有 pid 1 走到这里；fork 子进程
-    // 经 ps 整体拷贝（exe_path）+ comm_ 拷贝继承。
-    auto& opt = options(v.get());
-    if(!opt.exe.empty()) {
-        ps->exe_path = opt.exe;
-        comm_ = make_comm(opt.exe);
+    // /proc 进程标识：从 argv[0] 用 guest_abs_path 算 guest 视角 exe 绝对路径
+    // 只有 pid 1 走到这里；fork 子进程经 ps 整体拷贝（exe_path）+ comm_ 拷贝继承。
+    if(ps->root.empty() || ps->root == "/") {
+        ps->exe_path = v->image().exe;
+    } else {
+        ps->exe_path = ( "/" / std::filesystem::relative(v->image().exe, ps->root)).string();
     }
+    comm_ = make_comm(ps->exe_path);
 }
 
 void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
@@ -107,6 +107,10 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
 
     // 线程组生命周期：减 live_threads，判定是否本组最后一个退出的线程。
     bool last = (tg->live_threads.fetch_sub(1, std::memory_order_acq_rel) == 1);
+    // 唤醒在 tg->cv 上等待的线程（do_execveat 杀同组其它线程后等 live_threads 收敛；
+    // waitpid 的子进程退出通知走下方 last 分支的 notify_all）。fetch_sub 与 notify 分离
+    // 是必要的：exec 执行者轮询 live_threads，这里减完后 notify 让它立即重判。
+    tg->cv.notify_all();
 
     // 本线程的信号上下文复位（与 last / pid_map 无关）。
     signal_depth(v.get()) = 0;

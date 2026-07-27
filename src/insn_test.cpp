@@ -18,25 +18,21 @@ void print_test_result(const std::string& test_name, bool success) {
 }
 
 struct vmOptions option = {
-    .entry = 0x1000,
     .verbose = true,
     .raw_stack = true,
     .argv = {},
     .envp = {},
     .sys = std::make_shared<EmptySyscall>(),
     .root = {},
-    .exe = {},
 };
 
 struct vmOptions posix_option = {
-    .entry = 0x1000,
     .verbose = true,
     .raw_stack = true,
     .argv = {},
     .envp = {},
     .sys = std::make_shared<PosixSyscall>(),
     .root = {},
-    .exe = {},
 };
 
 // Helper function to load BPF program code into the VM's memory
@@ -67,6 +63,11 @@ bool load_program_to_vm(std::shared_ptr<vm> ebpf_vm, const bpf_insn* instruction
     prog_mem.set_data(prog_data, sysconf(_SC_PAGESIZE));  // DataDeleter 用整页大小做 munmap
     prog_mem.flags = PF_R | PF_X | PF_W; // PF_W for free() by memmap destructor, PF_R | PF_X for execution
     ebpf_vm->addmem(std::move(prog_mem));
+    // 测试不经 load_elf，程序加载地址即入口。仅首次加载（entry 未设）时记入口；
+    // 多段加载（如主程序+helper）不覆盖入口——入口恒为主程序（首次）加载地址。
+    if(ebpf_vm->image().entry == 0) {
+        ebpf_vm->image().entry = paddr;
+    }
     return true;
 }
 

@@ -98,11 +98,31 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     if(!fresh->mmu(entry)) {
         return -ENOEXEC;
     }
-    options(v).entry = entry;
+    // exec 替换整个进程映像：按 POSIX/Linux 语义，同进程其它线程必须终止，只剩调用 exec
+    // 的线程。bpfvm 必须在 swap 地址空间前同步等待它们退出——否则其他线程共享 maps_ptr，
+    // swap + fresh 析构 munmap 旧页后它们仍在旧页上执行（use-after-unmap ）。
+    {
+        std::lock_guard<std::mutex> lock(tg->mtx);
+        for(auto& weak_vm : tg->threads) {
+            auto tvm = weak_vm.lock();
+            if(!tvm || tvm.get() == v) {
+                continue;
+            }
+            if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0});
+        }
+    }
+    // 等待同组其它线程退出（live_threads 降到 1）。带超时兜底防 spurious/死锁。
+    {
+        std::unique_lock<std::mutex> lk(tg->mtx);
+        tg->cv.wait_for(lk, std::chrono::seconds(5), [&]{
+            return tg->live_threads.load(std::memory_order_acquire) <= 1;
+        });
+    }
     options(v).argv = std::move(argv_strings);
     options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
     comm_ = make_comm(guest_abs);
+    v->image() = fresh->image();
     {
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
         maps(v).swap(maps(fresh.get()));
@@ -152,6 +172,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
 
     auto child = vm::create();
     options(child.get()) = options(v);
+    child->image() = v->image();
     /* CLONE_THREAD 是新线程，不在任何信号处理上下文 → signal_depth=0。
      * 非 CLONE_THREAD（如 fork / 裸 clone 新进程）继承父 signal_depth，
      * 与 fork 语义一致（fork 复制整个执行状态）。 */

@@ -183,16 +183,10 @@ int real_main(int argc, char** argv) {
 
     // PTY 模式做字节转发 + 信号路由；非 PTY 模式仅信号路由。
     options->pty->start_pump(options->sys.get(), vm.get());
-    options->entry = load_info.entry;
     options->argv.reserve(argc - optind);
     for(int i = optind; i < argc; i++) {
         options->argv.emplace_back(argv[i]);
     }
-    // /proc 用的 exe 路径：经 vmOptions 传给 handler（PosixSyscall::init 消费）。
-    // main 不感知具体 handler 实现，只填 options.exe；comm 由 PosixSyscall 自己派生。
-    // elf_path 是 realpath(argv[optind])（宿主绝对路径）。guest 视角的 exe 应是
-    // guest 能看到的路径：chroot 模式用 argv[optind]（如 /bin/dash），否则用 realpath。
-    options->exe = options->root.empty() ? elf_path : std::string(argv[optind]);
     // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
     if(!options->root.empty()) {
         options->envp["HOME"] = "/";
@@ -218,7 +212,7 @@ int real_main(int argc, char** argv) {
     // （对齐 QEMU -S）；默认（不带 --stop）让主 vm 全速 JIT 跑，GDB 连上才 attach 停在当前 pc。
     std::unique_ptr<GdbServer> gdb_server;
     if(gdb_port != 0) {
-        gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info, gdb_stop_flag != 0);
+        gdb_server = std::make_unique<GdbServer>(vm, gdb_port, gdb_stop_flag != 0);
         gdb_server->start();
     }
     return vm->run(options.get(), load_info);

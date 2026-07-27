@@ -177,8 +177,17 @@ public:
     virtual int id() = 0;
 };
 
-struct vmOptions {
+// 当前加载的 ELF 程序镜像信息
+//   entry：程序入口
+//   load_base：主程序 PIE 加载基址。静态/ET_EXEC 为 0；
+//   exe：host 视角绝对路径（= load_elf 的入参）。
+struct vmImage {
     uint64_t entry = 0;
+    uint64_t load_base = 0;
+    std::string exe;
+};
+
+struct vmOptions {
     bool verbose = false;
     bool raw_stack = false;
     uint64_t insn_limit = 0;  // 0 = 无限制
@@ -195,12 +204,6 @@ struct vmOptions {
     // chroot 根目录（宿主绝对路径）。非空时 guest 文件系统被限制在此目录下
     // （--root）。空 = 不 chroot，维持现有行为。
     std::string root;
-    // /proc 用的进程标识（main.cpp 初次加载时填，PosixSyscall::init 消费）。
-    // exe：guest 视角 exe 路径（/proc/self/exe 目标）——由 main.cpp 计算（chroot 模式用
-    // argv[0] 的 guest 视角，否则用 realpath），因为 chroot/非 chroot 的区别只有 main 知道。
-    // comm 不传：PosixSyscall 自己从 exe 派生（basename + 截断，Linux TASK_COMM_LEN-1）。
-    // 非 PosixSyscall 的 handler 忽略此字段。
-    std::string exe;
 };
 
 struct TlbEntry {
@@ -302,6 +305,7 @@ class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
+    struct vmImage vmImage;
     uint64_t pc_;
     uint64_t reg[11];
     std::shared_ptr<std::list<memmap>> maps = std::make_shared<std::list<memmap>>();
@@ -319,7 +323,7 @@ private:
     // 存的是 guest 地址（do_mmap 返回值），guest 后续 load/store 经 mmu 命中。
     std::vector<uint64_t> emutls_slots_;
 
-    std::unique_ptr<JitCompilerBase> jit_;
+    std::unique_ptr<JitCompilerBase> jit;
 
     // ERESTARTSYS：可重启 syscall 被信号打断后，syscall() 返回 SYSCALL_RESTART，
     // do_syscall 在此记录该 syscall 指令地址。0 = 无待决重启。deliver_signal 投递
@@ -423,6 +427,9 @@ public:
     }
     std::shared_ptr<SyscallHandler> sys() {
         return options.sys;
+    }
+    struct vmImage& image() {
+        return vmImage;
     }
 
     uint32_t get_flags() const { return flags.load(std::memory_order_acquire); }

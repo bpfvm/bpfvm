@@ -216,7 +216,12 @@ std::shared_ptr<vm> vm::create() {
 }
 
 ElfLoadInfo vm::load_elf(const char* elf_file_path, const std::map<std::string, std::string>& envp) {
-    return ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); }, envp);
+    auto info = ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); }, envp);
+    // 记录当前加载的镜像信息（entry/load_base/exe）。elf_file_path 是 host 视角路径
+    if(info.entry != 0) {
+        vmImage = {info.entry, info.app_load_base, elf_file_path};
+    }
+    return info;
 }
 
 /*
@@ -1275,9 +1280,9 @@ void vm::debug_park() {
 bool vm::step() {
     // JIT hot path: keep executing compiled functions in a tight loop
     for(;;) {
-        auto* func = jit_->compile(this, pc_);
+        auto* func = jit->compile(this, pc_);
         if(!func) break;
-        jit_->stats.jit_func_runs++;
+        jit->stats.jit_func_runs++;
         uint64_t pc_before = pc_;
         ((void(*)(vm*))func->code)(this);
         // JIT 函数返回后，检查是真正的 VM 退出还是可恢复的中断
@@ -1370,7 +1375,7 @@ void vm::flush_tlb() {
 }
 
 void vm::clear_jit_cache() {
-    if(jit_) jit_->clear();
+    if(jit) jit->clear();
 }
 
 void* vm::mmu(uint64_t addr, size_t size) {
@@ -1446,7 +1451,7 @@ void vm::dump_stats() const {
     if (!getenv("BPF_DEBUG")) return;
     fprintf(stderr, "[BPF] 执行指令数: %" PRIu64 "\n", insn_count);
     fprintf(stderr, "[BPF] 解释器执行指令数: %" PRIu64 "\n", interp_insns);
-    auto& s = jit_->stats;
+    auto& s = jit->stats;
     if (s.jit_compiles) {
         fprintf(stderr, "[BPF] JIT编译函数数: %" PRIu64 "\n", s.jit_compiles);
         fprintf(stderr, "[BPF] JIT编译指令数: %" PRIu64 "\n", s.jit_compiled_insns);
@@ -1458,7 +1463,7 @@ void vm::dump_stats() const {
 }
 
 uint64_t vm::run() {
-    if(!jit_) jit_ = std::make_unique<JitCompilerImpl>();
+    if(!jit) jit = std::make_unique<JitCompilerImpl>();
     if(options.sys) options.sys->init(shared_from_this());
     while(step()) {
         pc_ += sizeof(bpf_insn);
@@ -1478,7 +1483,7 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
     insn_count = 0;
     interp_insns = 0;
     if(options->verbose) {
-        printf("entry: 0x%lx\n", options->entry);
+        printf("entry: 0x%lx\n", (unsigned long)vmImage.entry);
     }
 
     // setup_stack 接收 map（key→value），内部拼成 "KEY=VALUE" 写入栈。
@@ -1486,7 +1491,7 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         return 0;
     }
     flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
-    pc_ = options->entry;
+    pc_ = vmImage.entry;
     if(!mmu(pc_)) {
         std::cerr << "[run] pc is null after mmu(entry)\n";
         return 0;
