@@ -273,32 +273,20 @@ private:
 #endif
 };
 
-// 原子装载的不可变断点集：AtomicSharedPtr<const unordered_set<uint64_t>> 的薄封装。
-// 读端（解释器热路径）load 取快照后无锁查找；写端（vm::set_breakpoints）整体 store 替换。
-// 永远非空（初值为空集）。compare_exchange 供 set_breakpoints 的「读-改-写」并发安全路径，
-// 当前 set_breakpoints 是单一写者直接 store（调用方外部已构造好新快照），但保留 CAS 备用。
-class AtomicBpSet {
-public:
-    using value_type = std::shared_ptr<const std::unordered_set<uint64_t>>;
-    AtomicBpSet() : ptr_(std::make_shared<const std::unordered_set<uint64_t>>()) {}
-    value_type load() const { return ptr_.load(); }
-    void store(value_type desired) { ptr_.store(std::move(desired)); }
-private:
-    AtomicSharedPtr<const std::unordered_set<uint64_t>> ptr_;
-};
-
-// 所有调试回调的不可变集合，整体原子替换（同 AtomicBpSet）。把 create（vm 派生
-// 通知，原 create_cb_）与 syscall entry/return 钩子打包，是为了让一次 GDB 会话
-// 配置的回调原子生效，读端不会读到半新半旧的组合。
+// 所有调试回调的不可变集合，整体原子替换（见 AtomicDebugHooks），让一次 GDB 会话配置的
+// 回调原子生效，读端不会读到半新半旧的组合。
 struct DebugHooks {
     // vm 派生（fork / CLONE_THREAD）通知：父 vm 在 do_clone 内同步调用。
     std::function<void(vm* parent, vm* child, bool is_thread)> create;
-    // syscall entry/return 钩子：do_syscall 在执行真 syscall 的前/后同步调用。
-    // 回调在 vm 线程内执行——回调阻塞即 vm 阻塞，回调返回即 vm 继续。由 GdbServer
-    // 注册：命中 catch 则经 debug_park 把请求位转已停位（VM_STOPPED）阻塞 + 记待上报
-    // 事件，由 GDB 线程 wait_any_stopped 发停止回复（all-stop 协调要求）。
+    // syscall entry/return 钩子：do_syscall 在执行真 syscall 的前/后同步调用。回调在 vm 线程
+    // 内执行——回调阻塞即 vm 阻塞，返回即 vm 继续。命中 catch 则 debug_park 阻塞 + 记待上报
+    // 事件，由 GDB 线程发停止回复（all-stop 协调要求）。
     std::function<bool(vm* v, uint32_t call)> syscall_entry;
     std::function<bool(vm* v, uint32_t call)> syscall_return;
+    // 取指后执行前的停止点检查（软断点）。返回 true 表示命中，调用方据此 debug_park。由 GdbServer
+    // 注册：闭包查 gdbserver 自维护的 per-vm 断点集与 stepping 字段（模型与 syscall 钩子查
+    // syscall_catch_ 一致）。停止语义详见 gdb_server.h 文件头。
+    std::function<bool(vm* v)> breakpoint;
 };
 class AtomicDebugHooks {
 public:
@@ -338,14 +326,7 @@ private:
     // 信号时据此 + SA_RESTART 决定重启（PC 回该地址）或转 -EINTR，随后清零。
     uint64_t restart_syscall_pc_ = 0;
 
-    // GDB server 的软断点地址集合（guest pc 字节地址）。每 vm 一份；解释器 step()
-    // 取指后命中即经 debug_park 阻塞（请求位 VM_DEBUG_STOP → 已停位 VM_STOPPED），
-    // 等待 GDB continue。
-    // AtomicBpSet：不可变快照 + 原子整体替换（COW/RCU 风格），永远非空（初值为空集）。
-    AtomicBpSet breakpoints_;
-
-    // 调试回调集合（create / syscall entry / syscall return）。原子整体替换，
-    // 见 AtomicDebugHooks。fork/clone 时子继承父的快照（与 breakpoints 一致）。
+    // 调试回调集合（见 DebugHooks）。原子整体替换，fork/clone 时子继承父的快照。
     AtomicDebugHooks debug_hooks_;
 
     bool ld(const bpf_insn* cur);
@@ -364,14 +345,17 @@ private:
             debug_hooks_.load()->syscall_entry(this, call) ? debug_park() : void();
         }
         int64_t ret = (options.sys->syscall)(this, call);
-        if(flags.load(std::memory_order_acquire) & (VM_EXITED | VM_KILLED)) {
-            return false;
-        }
         if(ret == SYSCALL_RESTART) {
+            // 重启：不写 r(0)（保留调用前的值，由重投递的 syscall 重新设置），记 pc 供重启。
             restart_syscall_pc_ = pc_;
             return true;
-        } else {
-            r(0) = (uint64_t)ret;
+        }
+        // 先把返回值写回 r(0)——含 exit/exit_group 的退出码（这俩 syscall 返回 code 并置
+        // VM_EXITED）。必须在 VM_EXITED 检查之前，否则 exit 时 r(0) 残留调用前的值（多为 guest
+        // 指针），run() 返回错误退出码。SYSCALL_RESTART 上面已提前 return，不会把 -512 写进 r(0)。
+        r(0) = (uint64_t)ret;
+        if(flags.load(std::memory_order_acquire) & (VM_EXITED | VM_KILLED)) {
+            return false;
         }
         // return 钩子仅在 syscall 真正执行后报（重启/退出不报，符合 ptrace 语义）。
         if((flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) && debug_hooks_.load()) {
@@ -398,8 +382,8 @@ public:
     static constexpr uint32_t VM_SIGNAL_PENDING = 0x8;
     static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
     static constexpr uint32_t VM_BLOCKED = 0x20; //内部暂停，在wait_for等待
-    static constexpr uint32_t VM_DEBUG_ATTACHED = 0x40;   //GDB 已 attach：JIT 跳过、解释器每步查断点
-    static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 请求停下（单步/异步暂停）
+    static constexpr uint32_t VM_DEBUG_ATTACHED = 0x40;   //GDB 已 attach：JIT 跳过、解释器每步经 breakpoint 钩子判定
+    static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 停止阻塞位：debug_park 设、continue 清；与 POSIX 的 VM_STOPPED 独立
 
     vm(Token);
     ~vm();
@@ -444,16 +428,6 @@ public:
     uint32_t get_flags() const { return flags.load(std::memory_order_acquire); }
     void clear_flags(uint32_t mask) { flags.fetch_and(~mask, std::memory_order_release); }
     void set_flags(uint32_t mask) { flags.fetch_or(mask, std::memory_order_release); }
-
-    bool has_breakpoint(uint64_t addr) const {
-        return breakpoints_.load()->count(addr) != 0;
-    }
-    std::shared_ptr<const std::unordered_set<uint64_t>> get_breakpoints() const {
-        return breakpoints_.load();
-    }
-    void set_breakpoints(std::shared_ptr<const std::unordered_set<uint64_t>> bps) {
-        breakpoints_.store(std::move(bps));
-    }
 
     // vm 派生通知回调（GdbServer::start 注册、stop 清空）。整体替换 debug_hooks_。
     void set_debug_hooks(std::shared_ptr<const DebugHooks> hooks) {

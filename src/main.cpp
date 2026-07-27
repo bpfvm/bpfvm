@@ -221,8 +221,7 @@ int real_main(int argc, char** argv) {
         gdb_server = std::make_unique<GdbServer>(vm, gdb_port, load_info, gdb_stop_flag != 0);
         gdb_server->start();
     }
-    std::cerr<<(int)vm->run(options.get(), load_info)<<std::endl;
-    return vm->r(0);
+    return vm->run(options.get(), load_info);
 }
 
 int main(int argc, char** argv) {
