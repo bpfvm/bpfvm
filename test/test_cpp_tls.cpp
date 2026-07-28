@@ -1,20 +1,9 @@
-// emutls spike：验证 address_space(256) 标记的 TLS 变量在 bpfvm 上正确工作。
+// emutls spike：验证 thread_local 变量在 bpfvm 上正确工作。
+// 机制见 README「模拟 TLS (emutls)」。
 //
-// 机制（见 README.md 的 emutls 章节与 src/passes/BpfEmutls.cpp）：
-//   - `__mythread` 宏：BPF 上展开成 `__attribute__((address_space(256)))`，绕过
-//     clang 对 thread_local 的拒绝；host 上展开成真正的 thread_local 作对照。
-//   - BpfEmutls pass 把对 addrspace(256) 全局的访问改写成 `__bpf_fp_<EMUTLS_ID>`
-//     调用（复用 FP 通道 src_reg=2），VM 的 do_softfp 按 ID 分配/查每线程副本。
-//
-// 覆盖：零初始化、非零初始化模板、单线程读写、多线程隔离。
-// 不覆盖（后续扩展）：数组/struct 的 getelementptr 访问、取地址 &var（addrspace
+// 覆盖：零初始化、非零初始化模板、单线程读写、多线程隔离、数组/struct 的 GEP 访问。
+// 已知不覆盖：取地址 &var（addrspace 不兼容，编译期报错）。
 // 不兼容会编译错，是已知限制）。
-
-#ifdef __BPF__
-#define __mythread __attribute__((address_space(256)))
-#else
-#define __mythread thread_local
-#endif
 
 #include <pthread.h>
 #include <stdio.h>
@@ -22,14 +11,14 @@
 #include <unistd.h>
 
 // 零初始化（控制块 value=NULL，副本靠 mmap 清零）
-__mythread int counter = 0;
+thread_local int counter = 0;
 // 非零初始化（控制块 value 指向模板 __emutls_t.init_val，首次访问 memcpy）
-__mythread int init_val = 42;
+thread_local int init_val = 42;
 // 数组（经 GEP 访问）
-__mythread int arr[4] = {10, 20, 30, 40};
+thread_local int arr[4] = {10, 20, 30, 40};
 // struct（经 GEP 访问字段）
 struct Point { int x; int y; };
-__mythread Point pt = {1, 2};
+thread_local Point pt = {1, 2};
 
 struct Arg {
     int id;

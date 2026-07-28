@@ -162,7 +162,6 @@ protected:
     static auto& options(vm* v);
     static auto& signal_depth(vm* v);
     static auto& tp(vm* v);
-    static auto& emutls_slots(vm* v);
 public:
     virtual ~SyscallHandler() = default;
     virtual void init(const std::shared_ptr<vm>& v) = 0;
@@ -318,11 +317,6 @@ private:
     uint64_t interp_insns = 0;            // 解释器执行的指令数
     uint64_t tp_ = 0;                     // thread pointer（BPF_SYS_SET_TLS 设置；单线程 TLS 模拟）
 
-    // emutls：每线程的 TLS 副本地址数组（按下标索引，下标由控制块的 index 字段
-    // 全局原子分配）。每 vm（每线程）一份，天然隔离，无需 pthread_key。
-    // 存的是 guest 地址（do_mmap 返回值），guest 后续 load/store 经 mmu 命中。
-    std::vector<uint64_t> emutls_slots_;
-
     std::unique_ptr<JitCompilerBase> jit;
 
     // ERESTARTSYS：可重启 syscall 被信号打断后，syscall() 返回 SYSCALL_RESTART，
@@ -463,6 +457,5 @@ inline auto& SyscallHandler::maps_mutex(vm* v) { return v->maps_mutex; }
 inline auto& SyscallHandler::options(vm* v) { return v->options; }
 inline auto& SyscallHandler::signal_depth(vm* v) { return v->signal_depth; }
 inline auto& SyscallHandler::tp(vm* v) { return v->tp_; }
-inline auto& SyscallHandler::emutls_slots(vm* v) { return v->emutls_slots_; }
 
 #endif //INSN_H

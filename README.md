@@ -199,7 +199,7 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 
 **仍需注意**：
 *   `long double` == `double`（64-bit）在本目标上；使用 128-bit `long double` 精度的代码应改为 `double`。
-*   **数学函数：在 musl libm 与 VM 虚拟指令之间划分，分界线 = musl 函数体能否撑过 `instcombine`。** `floor`/`ceil`/`trunc`/`round`（+ `sin`/`cos`/`exp`/`log`/`pow`/...）来自 musl 的 `src/math/*.c`（通用纯 C；BPF 无 arch 专化）；`BpfLibcallLower` pass 把它们的*内联函数*形式（`@llvm.floor`、...）lower 成普通库调用（`call @floor`/`floorf`），并放行库调用形式让 libc 解析。`sqrt`/`fabs`/`copysign` 保留为 VM 虚拟指令（`BPF_FP_SQRT_*`/`FABS_*`/`COPYSIGN_*`）：`sqrt` 因为 JIT 发单条原生硬件指令（`sqrtsd`/`fsqrt`）；`fabs`/`copysign` 因为它们的 musl 函数体是单条按位 `and`/`or`，`-O1` instcombine 会把它*折叠回*同名内联函数（`@llvm.fabs`），所以 lower 成 `call @fabs` 会无限递归（`fabs` 调自己）——保留为 VM 指令绕开递归，无需在 pass 里写专门的按位逻辑。这三者（`sqrt`/`fabs`/`copysign`）在两个 `emit_call_softfp` 发射器里都有原生 JIT 用例（x86：xmm 上的 `sqrtsd`/`andps`/`orps`；AArch64：sqrt/fabs 用 `FSQRT`/`FABS`，copysign 用 GPR `and`/`or` 位掩码——它没有单条原生 FP 指令），故永不回退到解释器。它们的内联函数与库调用形式都被 `BpfSoftFp` 拦截并改写为对应 `BPF_FP_*`。VM 虚拟指令集因此保持：无 libc 对应物的 ISA 原语（算术/比较/转换）+ `sqrt` + `fabs`/`copysign` + emutls。
+*   **数学函数：在 musl libm 与 VM 虚拟指令之间划分，分界线 = musl 函数体能否撑过 `instcombine`。** `floor`/`ceil`/`trunc`/`round`（+ `sin`/`cos`/`exp`/`log`/`pow`/...）来自 musl 的 `src/math/*.c`（通用纯 C；BPF 无 arch 专化）；`BpfLibcallLower` pass 把它们的*内联函数*形式（`@llvm.floor`、...）lower 成普通库调用（`call @floor`/`floorf`），并放行库调用形式让 libc 解析。`sqrt`/`fabs`/`copysign` 保留为 VM 虚拟指令（`BPF_FP_SQRT_*`/`FABS_*`/`COPYSIGN_*`）：`sqrt` 因为 JIT 发单条原生硬件指令（`sqrtsd`/`fsqrt`）；`fabs`/`copysign` 因为它们的 musl 函数体是单条按位 `and`/`or`，`-O1` instcombine 会把它*折叠回*同名内联函数（`@llvm.fabs`），所以 lower 成 `call @fabs` 会无限递归（`fabs` 调自己）——保留为 VM 指令绕开递归，无需在 pass 里写专门的按位逻辑。这三者（`sqrt`/`fabs`/`copysign`）在两个 `emit_call_softfp` 发射器里都有原生 JIT 用例（x86：xmm 上的 `sqrtsd`/`andps`/`orps`；AArch64：sqrt/fabs 用 `FSQRT`/`FABS`，copysign 用 GPR `and`/`or` 位掩码——它没有单条原生 FP 指令），故永不回退到解释器。它们的内联函数与库调用形式都被 `BpfSoftFp` 拦截并改写为对应 `BPF_FP_*`。VM 虚拟指令集因此保持：无 libc 对应物的 ISA 原语（算术/比较/转换）+ `sqrt` + `fabs`/`copysign`。（emutls 不走 VM 虚拟指令——它经 `BpfEmutls` pass 改写为普通 `__emutls_get_address` 调用，运行时在 musl，见下文「模拟 TLS (emutls)」。）
 
 ### 函数调用约定突破
 
@@ -302,7 +302,7 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 
 **为本目标写 C++ 时要遵守的硬约束**：
 - **无异常**：`throw`/`try` 编译期被拒（未移植 `__cxa_throw`/`__cxa_personality`/libunwind）。RTTI 已启用；`typeid`/`dynamic_cast` 可用。
-- **`thread_local` 经 `address_space(256)`**（见下文「模拟 TLS (emutls)」）：C++ `thread_local` 关键字被 clang Sema 对 BPF 目标拒绝（无法用 `-femulated-tls` 绕过）；改用 `__mythread` 宏。
+- **`thread_local` 经 `address_space(256)`**（见下文「模拟 TLS (emutls)」）：C++ `thread_local` 关键字被 clang Sema 对 BPF 目标拒绝（无法用 `-femulated-tls` 绕过）。工具链经 `-Dthread_local='__attribute__((address_space(256)))'` 在预处理期把关键字替换成 address_space 属性（早于 Sema），故用户直接写标准 `thread_local`，无需项目专有宏。
 - **不能 `&thread_local_var`**：取 emutls 变量地址是编译错误（地址空间不同）；直接访问变量。
 
 **全局构造/析构**：经 `bpfvm-ld` 的 `.init_array`/`.fini_array` 框架支持（见 `src/elf_linker.cpp` 与下文「全局构造/析构」）。有非平凡构造/析构的全局对象可用：构造在 `main` 之前运行（定义序），析构在 `exit` 时运行（逆序，经 `_GLOBAL__sub_I_*` 中注册的 `__cxa_atexit`）。由 `test/test_cpp_ctor.cpp` 验证。
@@ -315,40 +315,30 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 
 #### 模拟 TLS (emutls)
 
-每线程存储通过「宏 + LLVM pass + VM 运行时」支持，复用浮点虚拟指令通道（`src_reg=2`）。
+每线程存储通过「`-D` 注入 + LLVM pass + musl 运行时」三层支持，全程是普通函数调用，linker/JIT/VM 无 emutls 专属代码。
 
-**用法**：
+**用法**：直接写标准的 `thread_local`，工具链在 BPF 编译期注入 `-Dthread_local='__attribute__((address_space(256)))'`：
 ```cpp
-#ifdef __BPF__
-#define __mythread __attribute__((address_space(256)))
-#else
-#define __mythread thread_local   // host 基线
-#endif
-
-__mythread int counter = 0;          // 零初始化
-__mythread int init_val = 42;        // 非零初始化（首次访问时模板拷贝）
-__mythread int arr[4] = {1,2,3,4};   // 数组（支持 GEP 访问）
+thread_local int counter = 0;          // 零初始化
+thread_local int init_val = 42;        // 非零初始化（首次访问时模板拷贝）
+thread_local int arr[4] = {1,2,3,4};   // 数组（支持 GEP 访问）
 struct Point { int x; int y; };
-__mythread Point pt = {1, 2};        // 结构体（支持字段访问）
+thread_local Point pt = {1, 2};        // 结构体（支持字段访问）
 ```
-在 host 上，`__mythread` 展开为真正的 `thread_local`，故同一源码在 `host` ctest 变体里充作基线。
+预处理期 `thread_local` 被替换成 `__attribute__((address_space(256)))`（早于 Sema，故绕过对 BPF `thread_local` 的拒绝；BPF.h `TLSSupported=false`，后端 `GlobalTLSAddress` ISel 会崩溃）。host 编译不注入该 `-D`，`thread_local` 保持原生语义，故同一源码在 `host` ctest 变体里充作基线。该 `-D` 仅注入 C++ flags（C 的 `thread_local` 来自 `<threads.h>` 宏，命令行 `-D` 会与之冲突；C 端 TLS 不在本方案覆盖范围）。
 
-**机制**（镜像 `BpfSoftFp` 架构；见 `src/passes/BpfEmutls.cpp`）：
-1. clang 发出 `addrspace(256)` 全局 + `load/store/GEP ... ptr addrspace(256)`——这完全绕过 Sema 的 `thread_local` 拒绝（BPF.h：`TLSSupported=false`）和 BPF 后端的 `GlobalTLSAddress` ISel 崩溃。
-2. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行）把每个对 `addrspace(256)` 全局的访问改写为：
-   - 一个控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value }`（零初始化时 init 模板指针为 null，否则指向拷贝出的 `@__emutls_t.<name>` 模板）；
-   - 一个调用 `__bpf_fp_<EMUTLS_ID>(i64 ctrl_ptr)` 返回每线程地址（调用发为 `extern __ksym`，段 `.ksyms`）。
-3. 链接器无需改动：`__bpf_fp_<ID>` 已被 `is_fp_ksym` 识别，后者把调用改写为 `src_reg=2` + `imm=<ID>`。`BPF_FP_EMUTLS_GET_ADDR` 即该 ID（在 `include/bpf_call.h`，附于 `bpf_fp_op`）。
-4. `vm::do_softfp` 派发 `BPF_FP_EMUTLS_GET_ADDR`（`src/insn.cpp`）：从 `r1` 读控制块，在 `vm::emutls_slots_` 中懒分配一个每线程槽（每个槽是一份新 `mmap`，作为 `memmap` 注册进 guest 地址空间），首次访问时拷贝 init 模板，并在 `r0` 返回 guest 地址。每个 VM（= 每个线程）有自己的 `emutls_slots_`，故隔离是自动的——无需 `pthread_key`。
-5. JIT：`emit_call_softfp` 对 `BPF_FP_EMUTLS_GET_ADDR` 返回 false，回退到 `emit_call_softfp_slow` → `helper_do_softfp` → `do_softfp`。无需改 JIT 发射器。
+**机制**（见 `src/passes/BpfEmutls.cpp` + `musl/src/thread/emutls.c`）：
+1. `-Dthread_local` 注入后，clang 发出 `addrspace(256)` 全局 + `load/store/GEP ... ptr addrspace(256)`。
+2. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行）为每个变量合成控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value }`（value 为 null=零初始化，否则指向模板 `@__emutls_t.<name>`），并把对该全局的访问改写为 `call ptr @__emutls_get_address(ptr @__emutls_v.<name>)` + 访问返回的每线程副本指针。
+3. bpfvm-ld 走普通 call 重定位 → PLT/GOT 合成，解析到 musl libc 的 `__emutls_get_address`。
+4. musl 运行时（`musl/src/thread/emutls.c`）用一个 `pthread_key` 把本线程的副本指针数组经 `pthread_setspecific` 挂在 `struct pthread::tsd[]` 上，按控制块 `index` 懒分配/查表（`malloc`/`realloc` 增长，线程退出时由 key destructor `free`），首次访问按模板 `memcpy`（零初始化则清零）。每线程隔离由 musl 的 tp（每 vm 一个 `tp_`）保证——不侵入 `struct pthread` 定义，与 compiler-rt/libgcc 的通行做法一致。
+
+**fork 语义**：副本数组与副本内存经 `malloc` 落在 guest 可写堆（CoW 段），`pthread_key` 是进程级。子进程的 `tsd[]` 继承父的指针，任一方写入触发 CoW 分叉——自动达到 POSIX fork 的"继承父值、之后独立"。线程（`pthread_create`、带 `CLONE_VM` 的 clone）各获独立 `struct pthread`（空 `tsd`），即标准 `thread_local` 语义。
 
 **限制**：
 - 仅平凡可析构类型（尚无 `thread_local` 析构的 `__cxa_thread_atexit`）。
 - `&var` 是编译错误（地址空间不匹配）；直接访问变量。
-- 每个 TLS 变量当前分配一整页 4 KiB（尚无 slab/arena）。
-- TLS 变量必须定义并使用于单个翻译单元内；不支持跨 TU 的 `extern __mythread`（控制块 `__emutls_v.<name>` 用内部链接）。
-
-**fork 语义**：经 `fork()` 创建的子进程（不带 `CLONE_VM` 的 clone）继承父进程当前 TLS 值（父进程的 `emutls_slots_` 被拷贝；每个槽的 guest 页 CoW 共享，故任一方写入触发 CoW 并分叉）。线程（`pthread_create`、带 `CLONE_VM` 的 clone）各获独立槽（无继承——标准 `thread_local` 语义）。
+- TLS 变量必须定义并使用于单个翻译单元内；不支持跨 TU 的 `extern thread_local`（控制块用内部链接）。
 
 #### 全局构造/析构
 

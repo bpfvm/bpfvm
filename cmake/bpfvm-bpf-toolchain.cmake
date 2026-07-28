@@ -30,6 +30,7 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
 set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
     -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
     -D_GNU_SOURCE \
+    -Dthread_local='__attribute__((address_space(256)))' \
     -D_LIBCPP_HAS_THREAD_API_PTHREAD \
     -D_LIBCPP_HAS_MUSL_LIBC \
     -D_LIBCPP_HAS_NO_INT128 \

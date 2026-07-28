@@ -1,27 +1,14 @@
 //===- BpfEmutls.cpp - emutls via address_space(256) ---------------------===//
 //
-// BPF 后端不支持 thread_local（Sema 直接拒，后端 ISel 遇 GlobalTLSAddress 会
-// crash）。本 pass 提供一条绕过路径：用户用 `__attribute__((address_space(256)))`
-// 标记"每线程一份"的变量（通常经 `__mythread` 宏），本 pass 在 IR 层把对
-// addrspace(256) 全局的访问改写成对 FP 通道虚拟指令的调用 + 对返回的普通指针
-// 的访问。
+// 为 BPF 目标提供 thread_local 支持。机制总览见 README「模拟 TLS (emutls)」；
+// 运行时在 musl 的 src/thread/emutls.c。
 //
-// 编码链路（复用 BpfSoftFp 的 FP 虚拟指令通道，linker/JIT 零额外改动）：
-//   1. 用户：`__mythread int x = 0;`（宏展开成 addrspace(256) 全局）
-//   2. clang：产出 `@x = addrspace(256) global i32 0` + `load/store/GEP ptr addrspace(256) @x`
-//   3. 本 pass：为 x 生成控制块 `@__emutls_v.x = {size, align, index, value*}`（+ 非
-//      零初始化时另生成模板 `@__emutls_t.x`），把所有对 addrspace(256) 全局的访问
-//      改写成：
-//        %p = call i64 @__bpf_fp_<EMUTLS_ID>(i64 ptrtoint(@__emutls_v.x))
-//        %q = inttoptr %p to ptr
-//        load/store/GEP ... ptr %q
-//      其中 `__bpf_fp_<EMUTLS_ID>` 是 extern + section ".ksyms"（与 FP 同手法）。
-//   4. clang 后端：emit `call -1`（src_reg=1）+ R_BPF_64_32 重定位。
-//   5. bpfvm-ld：识别 `__bpf_fp_` 前缀（is_fp_ksym，与 FP 共用），改写 call 的
-//      src_reg=2 + imm=<EMUTLS_ID>。无额外 linker 改动。
-//   6. VM/JIT：src_reg==2 走 do_softfp（FP 通道），switch 命中 BPF_FP_EMUTLS_GET_ADDR
-//      时从 r1 取控制块指针，分配/查每线程副本，返回地址写 r0。JIT 对该 ID 自动
-//      走 slow path（emit_call_softfp_slow → helper_do_softfp）。
+// 本 pass 在 IR 层把对 addrspace(256) 全局的访问改写成对普通函数
+// __emutls_get_address 的调用，再访问其返回的每线程副本指针：
+//   %p = call ptr @__emutls_get_address(ptr @__emutls_v.x)
+//   load/store/GEP ... ptr %p
+// 并为每个变量合成控制块 `@__emutls_v.<name> = {size, align, index, value*}`
+//（index 初值 0 由运行时懒分配；value 为 null 表示零初始化，否则指向模板全局）。
 //
 // 处理的 IR 形态：直接 load/store、GEP（含 -O0/-O1 下嵌在 load/store 指针 operand
 // 里的 ConstantExpr 形式 GEP/bitcast）。不支持：取地址 &var（addrspace 不兼容，
@@ -46,9 +33,6 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 
-// BPF_FP_EMUTLS_GET_ADDR 定义（复用 FP 通道）。
-#include "include/bpf_call.h"
-
 using namespace llvm;
 
 namespace {
@@ -65,21 +49,17 @@ StructType *getEmutlsControlType(LLVMContext &Ctx) {
     return StructType::get(Ctx, {I64, I64, I64, Ptr});
 }
 
-// 获取或声明 extern `ptr @__bpf_fp_<ID>(ptr)`，section ".ksyms"。
-// 复用 FP 通道（src_reg=2）：符号名形如 __bpf_fp_<ID>，linker 的 is_fp_ksym
-// 自动识别尾部数字并改写 src_reg=2 + imm=<ID>，零额外 linker 改动。
-// 入参用 i64 传递（与 FP ABI 一致：r1），结果也是 i64（r0）——指针当 i64 位模式。
+// 获取或声明 extern `ptr @__emutls_get_address(ptr)`。
+// 这是普通函数调用（不走 FP 虚拟指令通道），由 musl 的 emutls.c 提供真实定义，
+// 经 PLT/GOT 链路解析。入参为控制块指针，返回每线程副本地址——都是指针。
 FunctionCallee declareEmutlsGetAddress(Module &M) {
     LLVMContext &Ctx = M.getContext();
-    Type *I64 = Type::getInt64Ty(Ctx);
-    // (i64) -> i64：指针参数/返回值按位模式当 i64 传（与 FP ABI 一致）。
-    FunctionType *FTy = FunctionType::get(I64, {I64}, false);
-    std::string Name = "__bpf_fp_" + std::to_string(BPF_FP_EMUTLS_GET_ADDR);
-    FunctionCallee FC = M.getOrInsertFunction(Name, FTy);
+    Type *Ptr = PointerType::get(Ctx, 0);
+    // (ptr) -> ptr：直接用指针类型，无需 i64 位模式中转。
+    FunctionType *FTy = FunctionType::get(Ptr, {Ptr}, false);
+    FunctionCallee FC = M.getOrInsertFunction("__emutls_get_address", FTy);
     if (auto *F = dyn_cast<Function>(FC.getCallee())) {
         F->setLinkage(GlobalValue::ExternalLinkage);
-        if (!F->hasSection())
-            F->setSection(".ksyms");
     }
     return FC;
 }
@@ -179,11 +159,8 @@ struct BpfEmutlsPass : public PassInfoMixin<BpfEmutlsPass> {
     Value *materializeAddress(Instruction *I, GlobalVariable *Ctrl,
                               FunctionCallee GetAddr) {
         IRBuilder<> B(I);
-        Type *I64 = Type::getInt64Ty(I->getContext());
-        Type *Ptr0 = PointerType::get(I->getContext(), 0);
-        Value *CtrlI64 = B.CreatePtrToInt(Ctrl, I64);
-        Value *AddrI64 = B.CreateCall(GetAddr, {CtrlI64});
-        return B.CreateIntToPtr(AddrI64, Ptr0);
+        // __emutls_get_address(ptr ctrl) -> ptr，直接传控制块指针、直接返回。
+        return B.CreateCall(GetAddr, {Ctrl});
     }
 
     // 判断一个 Value（含 ConstantExpr）是否涉及某个 emutls 全局。

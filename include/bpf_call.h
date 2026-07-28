@@ -249,9 +249,6 @@ enum bpf_fp_op {
     BPF_FP_FABS_D,      // double fabs
     BPF_FP_COPYSIGN_F,  // float  copysign（二元）
     BPF_FP_COPYSIGN_D,  // double copysign
-    // 非浮点但复用同一 src_reg=2 通道（linker/JIT 零额外改动，只在 do_softfp
-    // 加 case）。emutls：r1 = __emutls_control*，返回每线程副本地址到 r0。
-    BPF_FP_EMUTLS_GET_ADDR,
 };
 
 #endif //BPF_CALL_H
