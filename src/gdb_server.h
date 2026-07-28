@@ -86,7 +86,6 @@ private:
     bool multiprocess_ = false;          // GDB 在 qSupported 里广告了 multiprocess+
     bool report_fork_events_ = false;    // GDB 在 qSupported 里广告了 fork-events+/vfork-events+
     bool report_exec_events_ = false;    // GDB 在 qSupported 里广告了 exec-events+
-    bool exit_notified_ = false;         // 已向 GDB 发过 W 包（避免重复）
     bool stop_at_start_ = false;         // --stop：run() 前冻结主 vm 等连接
     // handle_packet 内部标记：c/s/k/vCont 等已自行 send_packet，调用方据此跳过统一发送。
     bool self_replied_ = false;

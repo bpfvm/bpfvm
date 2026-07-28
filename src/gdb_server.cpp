@@ -345,7 +345,6 @@ void GdbServer::end_session() {
     multiprocess_ = false;
     report_fork_events_ = false;
     report_exec_events_ = false;
-    exit_notified_ = false;
     current_vm = main_vm;
     syscall_catch_.store(std::make_shared<const SyscallCatchCfg>());
 }
@@ -509,10 +508,16 @@ void GdbServer::wait_stopped(vm* v) {
     }
 }
 
-// 向 GDB 报告 vm 退出（W 包，只发一次）。
+// 向 GDB 报告 vm 退出（W 包，每个 vm 只发一次）。
+// 幂等靠 tasks_ 表本身：发完即 erase，下次查不到该 vm 直接返回——无需独立计数/标记，
+// 且天然 per-vm（多进程下各 vm 各自 erase，互不影响）。v 由调用方持 shared_ptr 保证存活，
+// 故读 v->r(0)/vm_tgid 安全。
 void GdbServer::send_exit_reply(vm* v) {
-    if(exit_notified_) return;
-    exit_notified_ = true;
+    uint64_t pid = v->sys()->id();
+    {
+        std::lock_guard<std::mutex> lk(tasks_mutex_);
+        if(tasks_.find(pid) == tasks_.end()) return;  // 已上报过（已 erase）则不重复
+    }
     unsigned long code = (unsigned long)(v->r(0) & 0xFF);
     char buf[64];
     // multiprocess 下 W 包带 ;process:<pid>（pPID.TID 的 PID 段）
@@ -526,7 +531,7 @@ void GdbServer::send_exit_reply(vm* v) {
     // 上报退出后从 tracee 表移除（释放 shared_ptr 引用）。vm 对象若再无其它引用即析构。
     // 对齐 ptrace：tracer 上报 tracee 退出后即释放 task_struct 引用。
     std::lock_guard<std::mutex> lk(tasks_mutex_);
-    tasks_.erase(v->sys()->id());
+    tasks_.erase(pid);
 }
 
 // T<sig> + thread:<tid>（multiprocess 用 pPID.TID）。fork_child 非 null 时改发 fork 事件
@@ -929,8 +934,9 @@ void GdbServer::server_loop() {
             bool got = recv_packet(pkt);
             if(!got) {
                 // recv_packet 返回 false：对端关闭(EOF)/硬错误，或 running_ 被 stop() 置 false。
-                // 对端关闭时，若 vm 已退出但还没发 W（例如断点停后用户直接断开），补发一次。
-                if(!exit_notified_ && is_vm_exited(main_vm.get())) {
+                // 对端关闭时，若主 vm 已退出但还没发 W（例如断点停后用户直接断开），补发一次。
+                // send_exit_reply 自身按 tasks_ 表幂等，已发过则不重复。
+                if(is_vm_exited(main_vm.get())) {
                     send_exit_reply(main_vm.get());
                 }
                 break;
