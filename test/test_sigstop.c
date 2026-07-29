@@ -44,19 +44,31 @@ int main(void) {
         _exit(42);
     }
 
-    /* Wait for child to create the before-marker and enter SIGSTOP */
-    while (!file_exists(MARKER_BEFORE)) {
-        sleep(1);
+    /* 等子进程真正进入 SIGSTOP 态：waitpid(WUNTRACED) 在子进程停止后返回，
+     * WIFSTOPPED 为真。这是 VM/内核保证的状态同步，取代原先「轮询 before-marker
+     * 文件 + sleep(1) 保险」—— 既更快又消除了「marker 存在但子进程还没执行到
+     * SIGSTOP」的竞态窗口。
+     * 此时子进程刚执行过 touch(MARKER_BEFORE)，尚未到 touch(MARKER_AFTER)：
+     * before-marker 必然存在、after-marker 必然不存在（SIGCONT 还没发）。 */
+    int stop_status;
+    if (waitpid(pid, &stop_status, WUNTRACED) != pid || !WIFSTOPPED(stop_status)) {
+        printf("FAIL: child did not stop (status=0x%x)\n", stop_status);
+        unlink(MARKER_BEFORE);
+        unlink(MARKER_AFTER);
+        return 1;
     }
-    sleep(1);
 
     /* Child must be stopped: before-marker exists, after-marker does not */
     if (!file_exists(MARKER_BEFORE)) {
         printf("FAIL: before-marker not found\n");
+        unlink(MARKER_BEFORE);
+        unlink(MARKER_AFTER);
         return 1;
     }
     if (file_exists(MARKER_AFTER)) {
         printf("FAIL: after-marker exists before SIGCONT, child was not stopped\n");
+        unlink(MARKER_BEFORE);
+        unlink(MARKER_AFTER);
         return 1;
     }
     printf("Child is stopped (before-marker exists, after-marker absent)\n");

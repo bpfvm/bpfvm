@@ -56,6 +56,12 @@ int main(void) {
     printf("waitid(P_PID, WEXITED) ok\n");
 
     /* --- 2) SIGKILL + P_ALL --- */
+    /* 同步管道：子进程进入死循环后通知父进程，取代盲等 sleep(2) */
+    int syncfd[2];
+    if (pipe(syncfd) < 0) {
+        printf("sync pipe failed\n");
+        return 1;
+    }
     pid_t child2 = fork();
     if (child2 < 0) {
         printf("fork2 failed\n");
@@ -63,11 +69,22 @@ int main(void) {
     }
     if (child2 == 0) {
         /* 死循环等待被杀 */
+        close(syncfd[0]);
+        /* 通知父进程：已进入死循环，可发 SIGKILL */
+        write(syncfd[1], "x", 1);
+        close(syncfd[1]);
         while (1) {
         }
         _exit(0);
     }
-    sleep(2);
+    /* 等子进程确认进入死循环（同步，不再依赖固定 sleep）*/
+    close(syncfd[1]);
+    char ack;
+    if (read(syncfd[0], &ack, 1) != 1) {
+        printf("child2 sync failed\n");
+        return 1;
+    }
+    close(syncfd[0]);
     if (kill(child2, SIGKILL) != 0) {
         printf("kill failed\n");
         return 1;

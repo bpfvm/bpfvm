@@ -4,6 +4,13 @@
 #include <sys/wait.h>
 
 int main(void) {
+    /* 同步管道：子进程进入死循环后通知父进程，取代盲等 sleep(2) */
+    int syncfd[2];
+    if (pipe(syncfd) < 0) {
+        printf("pipe failed\n");
+        return 1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         printf("fork failed\n");
@@ -12,14 +19,24 @@ int main(void) {
 
     if (pid == 0) {
         // Child process: infinite loop waiting to be killed
+        close(syncfd[0]);
+        /* 通知父进程：已进入死循环，可发 SIGKILL */
+        write(syncfd[1], "x", 1);
+        close(syncfd[1]);
         while (1) {
         }
         return 0;
     }
 
     // Parent process
-    // Sleep purely to ensure the child starts scheduling
-    sleep(2);
+    /* 等子进程确认进入死循环（同步，不再依赖固定 sleep）*/
+    close(syncfd[1]);
+    char ack;
+    if (read(syncfd[0], &ack, 1) != 1) {
+        printf("child sync failed\n");
+        return 1;
+    }
+    close(syncfd[0]);
 
     // Send SIGKILL
     if (kill(pid, SIGKILL) != 0) {
