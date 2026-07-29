@@ -118,6 +118,11 @@ struct LoadedObject {
     std::vector<DebugSec> debug_secs;  // 本 obj 拥有的 .debug_* 段（按出现顺序）
     // obj.sections[idx] -> debug_secs 下标；只对属于 debug 的 section 有效
     std::unordered_map<size_t, size_t> dbg_sec_local_idx;
+    // clang -fstack-size-section 产出的 .stack_sizes 段原始字节（keep_debug 时搬运）。
+    // 用于链接期修复 DW_OP_fbreg 偏移（见 fix_fbreg_offsets）。每条记录 =
+    // [8字节 ABS64 重定位 → 函数 .text 地址][ULEB128 stacksize]，重定位在 obj.relocations 里。
+    std::vector<uint8_t> stack_sizes_data;
+    size_t stack_sizes_sec_idx = SIZE_MAX;  // .stack_sizes 在 obj.sections 的下标（reloc 查找用）
 };
 
 // 全局符号表
@@ -418,6 +423,23 @@ private:
     std::unordered_map<std::string, GlobalSymbol> globals_;
     bool keep_debug_ = true;  // 默认保留 DWARF 调试段（对齐标准 ld）
     bool keep_symtab_ = true; // 默认输出静态 .symtab/.strtab（-s/--strip-all 关闭，对齐 ld）
+
+    // 函数 guest 地址 → 栈大小（来自 .stack_sizes，build_stack_size_map 填充）。
+    // 供 fix_fbreg_offsets 修正 DW_OP_fbreg 偏移（clang BPF 后端把栈变量偏移算错为
+    // +(stacksize-N)，正确应为 -N；linker 用此表把 +N 改成 +N-stacksize）。
+    std::unordered_map<uint64_t, uint64_t> stack_sizes_;
+
+    // loclistx 索引 → 所属函数栈大小（fix_fbreg_offsets 扫 .debug_info 时填）。
+    // .debug_loclists 里的 DW_OP_breg10 偏移有同 fbreg 一样的 bug（应为 -N 算成 +N），
+    // fix_loclists_breg10 用此表按 loclist 所属函数修正。
+    // 键 = loclists_base(合并段内绝对偏移) + loclistx 索引；与 fix_loclists_breg10 里
+    // 的 loclists_base + i 一致（注意：用【旧】base，即重建前的贡献区起点 +12）。
+    std::unordered_map<uint64_t, uint64_t> loclist_ss_;
+
+    // loclists_base 旧值 → 新值（fix_loclists_breg10 重建 .debug_loclists 后填）。
+    // 贡献区按真实长度重建（不再 padding），后续贡献区起点会位移 → 其 loclists_base 改变，
+    // remap_loclists_base 据此定长改写 .debug_info 里的 DW_AT_loclists_base(sec_offset)。
+    std::unordered_map<uint64_t, uint64_t> loclists_base_remap_;
 
     // 3 段布局结果（layout_segments 填充，write_elf 使用）
     struct SegInfo {
@@ -912,7 +934,8 @@ private:
             ls.name = nm ? nm : "";
             ls.size = shdr.sh_size;
             ls.loadable = is_loadable_section(shdr.sh_type) &&
-                          !is_debug_section(ls.name) && !is_dwarf_section(ls.name);
+                          !is_debug_section(ls.name) && !is_dwarf_section(ls.name) &&
+                          ls.name != ".stack_sizes";  // -fstack-size-section 的元数据段：不进 VM
             ls.writable = (shdr.sh_flags & SHF_WRITE) != 0;
             ls.executable = (shdr.sh_flags & SHF_EXECINSTR) != 0;
             ls.seg = classify_section(ls.executable, ls.writable);
@@ -970,6 +993,16 @@ private:
                         ds.data.assign((uint8_t*)d->d_buf, (uint8_t*)d->d_buf + d->d_size);
                         obj.dbg_sec_local_idx[sec_idx - 1] = obj.debug_secs.size();
                         obj.debug_secs.push_back(std::move(ds));
+                    }
+                }
+                // .stack_sizes（clang -fstack-size-section）：keep_debug 时搬运原始字节，
+                // 供 fix_fbreg_offsets 解出每个函数的栈大小。其重定位随 .rel.stack_sizes 进
+                // obj.relocations（target_sec = 本段下标）。
+                if (keep_debug_ && shdr.sh_type == SHT_PROGBITS && ls.name == ".stack_sizes") {
+                    Elf_Data* d = elf_getdata(scn, nullptr);
+                    if (d && d->d_size > 0) {
+                        obj.stack_sizes_data.assign((uint8_t*)d->d_buf, (uint8_t*)d->d_buf + d->d_size);
+                        obj.stack_sizes_sec_idx = sec_idx - 1;
                     }
                 }
                 continue;
@@ -1420,6 +1453,9 @@ private:
             // 合成 .debug_frame（clang BPF 不生成 CFI；GDB bt 靠它回溯栈）。
             // 在 collect_debug_sections 之后：它已跳过输入的空 .debug_frame，这里补合成版。
             synthesize_debug_frame(extras);
+            // 建 函数地址→栈大小 表（来自 -fstack-size-section 的 .stack_sizes），供
+            // fix_fbreg_offsets 修正 DW_OP_fbreg。不依赖 extras，只读 obj.stack_sizes_data。
+            build_stack_size_map();
         }
         // 2b. 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
         //     -s/--strip-all 时跳过（对齐标准 ld；运行时符号解析仍走 .dynsym）。
@@ -1437,14 +1473,31 @@ private:
         }
         ShstrtabOut names = build_shstrtab(extras, has_plt, has_gotplt, has_bss);
 
-        // 3. 计算文件布局
-        FileLayout layout = compute_file_layout(extras, extras_base, next_sh,
-                                                 names.shstrtab_idx, interp_idx, need_dynamic);
-
-        // 3a. DWARF 重定位 patch：debug 段在文件中的偏移已由 layout 算出，可填重定位值
+        // 2c. DWARF 重定位 patch + 偏移修正：必须在 compute_file_layout 之前完成，
+        //     因为 fix_fbreg_offsets / fix_loclists_breg10 可能改变 .debug_info /
+        //     .debug_loclists 长度（SLEB128 变长重写），若在布局后才改，后续段的文件偏移
+        //     会与变化后的尺寸不一致 → 段重叠/破坏。resolve_debug_value 用的是 guest 地址
+        //     （layout_segments 已设），不依赖文件布局，故提前到此处安全。
         if (emit_debug) {
             apply_debug_relocations(extras);
+            // 修正 .debug_info 里 DW_OP_fbreg 的错误偏移（clang BPF 后端 bug）。
+            // 必须在 apply_debug_relocations 之后：那时 .debug_addr 已 patch 为函数 guest
+            // 地址，fix_fbreg_offsets 据此把每条 fbreg 关联到所在函数的 stacksize 并改写。
+            // （同时填 loclist_ss_：loclistx 索引 → 所属函数 stacksize，供下一步用。）
+            fix_fbreg_offsets(extras);
+            // 修正 .debug_loclists 里 DW_OP_breg10 的错误偏移（同源 bug，参数/变量 spill 的位置）。
+            // 必须在 fix_fbreg_offsets 之后（用其填的 loclist_ss_）。三阶段重写：loclist 按真实
+            // 长度重建 → offset_table 重算 → 贡献区位移，产出 old_base→new_base 表。
+            fix_loclists_breg10(extras);
+            // 用 old_base→new_base 定长改写 .debug_info 里 DW_AT_loclists_base 的 sec_offset。
+            // 必须在 fix_loclists_breg10 之后（用其填的 loclists_base_remap_），且在最终 .debug_info
+            // （fix_fbreg_offsets 重建后）上扫描；定长改写不改长度，故不影响布局。
+            remap_loclists_base(extras);
         }
+
+        // 3. 计算文件布局（此时各 extras[].data 已是最终内容/尺寸）
+        FileLayout layout = compute_file_layout(extras, extras_base, next_sh,
+                                                 names.shstrtab_idx, interp_idx, need_dynamic);
 
         // 4. 回填动态 section 的 vaddr 并 patch DT_*
         std::unordered_map<size_t, uint64_t> dyn_vaddr_map;
@@ -1653,6 +1706,814 @@ private:
         sb.addralign = 8;
         sb.data = std::move(d);
         extras.push_back(std::move(sb));
+    }
+
+    // 解码 .stack_sizes：每个 obj 的 .stack_sizes + 其 .rel.stack_sizes，建立
+    // 函数 guest 地址 → 栈大小 的全局表 stack_sizes_。供 fix_fbreg_offsets 查询。
+    //
+    // .stack_sizes 记录格式（clang -fstack-size-section）：
+    //   每条 = [8 字节 ABS64 重定位 → 指向函数 .text 内地址][ULEB128 stacksize]
+    // 重定位是 SHT_REL（addend 嵌入在 .stack_sizes 字节里），符号是 STT_SECTION（.text），
+    // 故函数地址 = section.guest_addr + sym.value(0) + embedded addend。
+    // 注意：.stack_sizes 既非 loadable 也非 debug 段，loader 不会为它读 embedded addend
+    //（r.addend 保持 0），必须直接从 stack_sizes_data 读。
+    void build_stack_size_map() {
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            LoadedObject& obj = objects_[oi];
+            if (obj.stack_sizes_data.empty() || obj.stack_sizes_sec_idx == SIZE_MAX) continue;
+            const auto& data = obj.stack_sizes_data;
+            // 收集本 obj 所有 target 为 .stack_sizes 的重定位，按 offset 排序。
+            std::vector<const LoadedReloc*> rels;
+            for (const auto& r : obj.relocations) {
+                if (r.target_sec == obj.stack_sizes_sec_idx) rels.push_back(&r);
+            }
+            std::sort(rels.begin(), rels.end(),
+                      [](const LoadedReloc* a, const LoadedReloc* b){ return a->offset < b->offset; });
+            for (const LoadedReloc* rp : rels) {
+                const LoadedReloc& r = *rp;
+                if (r.sym_idx >= obj.symbols.size()) continue;
+                // section 符号(.text)的 guest 地址；STB_LOCAL 走 resolve_symbol 的 local 分支。
+                auto symval = resolve_symbol(oi, r.sym_idx);
+                if (!symval) continue;
+                // embedded addend：直接从 .stack_sizes 字节读 8 字节小端（type ABS64）。
+                if (r.offset + 8 > data.size()) continue;
+                uint64_t addend = 0;
+                memcpy(&addend, data.data() + r.offset, 8);
+                uint64_t func_addr = *symval + addend;
+                // stacksize：紧跟在 8 字节槽后的 ULEB128。
+                size_t p = r.offset + 8;
+                if (p >= data.size()) continue;
+                uint64_t stacksize = 0;
+                int shift = 0;
+                while (p < data.size()) {
+                    uint8_t b = data[p++];
+                    stacksize |= (uint64_t)(b & 0x7F) << shift;
+                    shift += 7;
+                    if (!(b & 0x80)) break;
+                }
+                stack_sizes_[func_addr] = stacksize;
+                if (g_debug)
+                    std::cerr << "[elf_linker] stacksize: 0x" << std::hex << func_addr << " = "
+                              << std::dec << stacksize << "\n";
+            }
+        }
+    }
+
+    // 修复 .debug_info 里 DW_OP_fbreg 的错误偏移（clang BPF 后端 bug）。
+    //
+    // 背景：clang BPF 把栈变量偏移算成 +(stacksize-N)（BPF frame base 是帧顶 R10，
+    // 通用实现按帧底算），正确应为 -N。本函数按所在函数的 stacksize 把 +N 改成 +N-stacksize。
+    //
+    // 难点：SLEB128 改写常变长(+4→-120 是 1→2 字节)，变长会移动后续 DIE 偏移，而
+    // .debug_info 里遍布 DW_FORM_ref1/2/4/8（CU 内 DIE 偏移引用，如 DW_AT_type）。
+    // in-place 改写若不同步 remap 这些 ref 就悬空 → "invalid abbreviation"。
+    //
+    // 解法（两遍 buffer 重建，避免 in-place 多级偏移级联）：
+    //   Pass A：逐 DIE 扫描，把每个 DIE 序列化成「重建字节块」。fbreg 改写直接产生新字节；
+    //           ref1/2/4/8 字段记位置+旧 CU 偏移值，待 Pass B remap。
+    //   Pass B：按 DIE 顺序算 old_off→new_off 映射，回填 ref 值；拼成新 CU，回填 unit_length。
+    //   长度变化的 CU 收集起来，最后一次性重建整段 .debug_info 贡献区。
+    //
+    // 只处理 .debug_info 内联的 DW_FORM_exprloc（实测 100% fbreg 在此形态）。
+    void fix_fbreg_offsets(std::vector<SecBuf>& extras) {
+        if (stack_sizes_.empty()) return;
+
+        // form 字节数（DWARF5 BPF 实际集）。定长返回字节数；变长返回 -1。
+        // form 编号见 DWARF5 §7.5.5（data1=0x0b；strx1/addrx1=0x25/0x29）。
+        auto form_fixed_size = [](uint64_t form) -> int {
+            switch (form) {
+            case 0x01: return 8;   // addr (BPF 8 字节)
+            case 0x0b: return 1;   // data1
+            case 0x05: return 2;   // data2
+            case 0x06: return 4;   // data4
+            case 0x07: return 8;   // data8
+            case 0x1e: return 16;  // data16
+            case 0x0c: return 1;   // flag (data1)
+            case 0x11: return 1;   // ref1
+            case 0x12: return 2;   // ref2
+            case 0x13: return 4;   // ref4
+            case 0x14: return 8;   // ref8
+            case 0x0e: return 4;   // strp (DWARF32)
+            case 0x17: return 4;   // sec_offset (DWARF32)
+            case 0x1f: return 4;   // line_strp (DWARF32)
+            case 0x25: return 1;   // strx1
+            case 0x26: return 2;   // strx2
+            case 0x27: return 3;   // strx3
+            case 0x28: return 4;   // strx4
+            case 0x29: return 1;   // addrx1
+            case 0x2a: return 2;   // addrx2
+            case 0x2b: return 3;   // addrx3
+            case 0x2c: return 4;   // addrx4
+            case 0x1c: return 4;   // ref_sup4
+            case 0x24: return 8;   // ref_sup8
+            default:   return -1;  // 变长/特殊
+            }
+        };
+        // CU 内 DIE 偏移引用的 form → 字节数（变长 ref_udata 返回 -1）。非 ref 返回 0。
+        auto ref_form_size = [](uint64_t form) -> int {
+            switch (form) {
+            case 0x11: return 1;  // ref1
+            case 0x12: return 2;  // ref2
+            case 0x13: return 4;  // ref4
+            case 0x14: return 8;  // ref8
+            default:   return 0;  // ref_udata(0x10,ULEB) 罕见，按非 ref 处理；ref_addr/ref_sup 是跨段绝对偏移不 remap
+            }
+        };
+        auto enc_uleb = [](std::vector<uint8_t>& o, uint64_t v){
+            do { uint8_t b = v & 0x7F; v >>= 7; if(v) b |= 0x80; o.push_back(b); } while(v);
+        };
+        auto enc_sleb = [](std::vector<uint8_t>& o, int64_t v){
+            while (true) {
+                uint8_t b = v & 0x7F; v >>= 7;
+                bool last = ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40)));
+                o.push_back(last ? b : (uint8_t)(b | 0x80));
+                if (last) break;
+            }
+        };
+
+        // 收集所有 obj 所有 CU 的重写（绝对段偏移），最后一次性应用到合并 .debug_info。
+        struct CURewrite { size_t start; size_t old_len; std::vector<uint8_t> new_bytes; };
+        std::vector<CURewrite> cu_rewrites;
+
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            LoadedObject& obj = objects_[oi];
+            DebugSec* info_ds = nullptr;
+            SecBuf* info_sec = nullptr;
+            for (auto& ds : obj.debug_secs) {
+                if (ds.name == ".debug_info" && ds.extra_idx < extras.size()) {
+                    info_ds = &ds; info_sec = &extras[ds.extra_idx]; break;
+                }
+            }
+            if (!info_sec) continue;
+            const SecBuf* abbr_sec = nullptr;
+            size_t abbr_contrib = 0;
+            for (const auto& ds : obj.debug_secs) {
+                if (ds.name == ".debug_abbrev" && ds.extra_idx < extras.size()) {
+                    abbr_sec = &extras[ds.extra_idx]; abbr_contrib = ds.contrib_off; break;
+                }
+            }
+            if (!abbr_sec) continue;
+            const SecBuf* addr_sec = nullptr;
+            for (const auto& ds : obj.debug_secs) {
+                if (ds.name == ".debug_addr" && ds.extra_idx < extras.size()) { addr_sec = &extras[ds.extra_idx]; break; }
+            }
+
+            // 解析 abbrev 表：table_key(段内起始偏移) -> {code -> {tag, has_children, [(attr,form,ic)]}}。
+            const auto& ad = abbr_sec->data;
+            struct AbbrevEntry {
+                uint64_t tag; bool has_children;
+                std::vector<std::array<uint64_t,3>> attrs;
+            };
+            std::unordered_map<size_t, std::unordered_map<uint64_t, AbbrevEntry>> abbr_tables;
+            {
+                size_t q = abbr_contrib;
+                while (q < ad.size()) {
+                    size_t table_start = q;
+                    std::unordered_map<uint64_t, AbbrevEntry> tab;
+                    bool any = false;
+                    while (q < ad.size()) {
+                        uint64_t code = 0; int sh = 0;
+                        while (q < ad.size()) { uint8_t b = ad[q++]; code |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                        if (code == 0) break;
+                        any = true;
+                        uint64_t tag = 0; sh = 0;
+                        while (q < ad.size()) { uint8_t b = ad[q++]; tag |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                        bool has_children = (q < ad.size()) && (ad[q++] != 0);
+                        AbbrevEntry e; e.tag = tag; e.has_children = has_children;
+                        while (q < ad.size()) {
+                            uint64_t attr = 0; sh = 0;
+                            while (q < ad.size()) { uint8_t b = ad[q++]; attr |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                            uint64_t form = 0; sh = 0;
+                            while (q < ad.size()) { uint8_t b = ad[q++]; form |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                            if (attr == 0 && form == 0) break;
+                            uint64_t ic = 0;
+                            if (form == 0x21) { sh = 0; while (q < ad.size()) { uint8_t b = ad[q++]; ic |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; } }
+                            e.attrs.push_back({attr, form, ic});
+                        }
+                        tab[code] = std::move(e);
+                    }
+                    abbr_tables[table_start] = std::move(tab);
+                    if (!any) break;
+                }
+            }
+
+            // 基于合并段（已 patch）分析：必须用 info_sec->data（apply_debug_relocations 已
+            // patch 了 DW_AT_addr_base/sec_offset 等），否则 addr_base/str_offsets_base 读到
+            // 未 patch 值。但要限制循环在本 obj 贡献区 [contrib_off, contrib_off+orig_size) 内，
+            // 不能越界读到别的 obj 的 CU（用错 abbrev 表 → 级联错位）。
+            const auto& d = info_sec->data;
+            const size_t contrib_start = info_ds->contrib_off;
+            const size_t contrib_end = info_ds->contrib_off + info_ds->data.size();
+            auto read_uleb = [&](size_t& pos) -> uint64_t {
+                uint64_t v = 0; int sh = 0;
+                while (pos < d.size()) { uint8_t b = d[pos++]; v |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                return v;
+            };
+
+            // ── 逐 CU 重建（ref 是 CU 内偏移，跨 CU 无依赖）。重写收集到全局 cu_rewrites。
+            // CU 遍历限制在本 obj 贡献区 [contrib_start, contrib_end)。
+            size_t p = contrib_start;
+            while (p + 12 <= contrib_end && p + 12 <= d.size()) {
+                uint32_t unit_length = 0; memcpy(&unit_length, d.data() + p, 4);
+                if (unit_length == 0xffffffff) break;  // DWARF64
+                if (unit_length < 8) break;
+                size_t cu_end = p + 4 + unit_length;
+                if (cu_end > contrib_end || cu_end > d.size()) break;  // 越出本 obj 贡献区
+                uint16_t version = 0; memcpy(&version, d.data() + p + 4, 2);
+                if (version < 4 || version > 5) { p = cu_end; continue; }
+                size_t hdr = p + 4;
+                size_t cu_die_start; uint32_t abbr_offset;
+                if (version >= 5) {
+                    abbr_offset = 0; memcpy(&abbr_offset, d.data() + hdr + 4, 4);
+                    cu_die_start = hdr + 8;
+                } else {
+                    abbr_offset = 0; memcpy(&abbr_offset, d.data() + hdr + 2, 4);
+                    cu_die_start = hdr + 7;
+                }
+                // abbr_offset 是 .debug_abbrev 段内绝对偏移（sec_offset，相对合并段头）。
+                // abbr_tables 的键是表在段内的绝对起始偏移（从 abbr_contrib 起扫描得到），
+                // 故直接用 abbr_offset 查（不要再加 abbr_contrib）。
+                size_t table_key = abbr_offset;
+                auto tit = abbr_tables.find(table_key);
+                if (tit == abbr_tables.end()) { p = cu_end; continue; }
+                const auto& tab = tit->second;
+                size_t cu_header_len = cu_die_start - p;
+                const size_t CU_BASE = p;  // ref 值是相对 CU 起点的偏移
+
+                // Pass A：每个 DIE = {old_off(相对CU), bytes(重建后), ref_edits[], has_fbreg}。
+                struct RefEdit { size_t byte_pos; uint64_t old_cu_off; size_t nbytes; };
+                struct DIE {
+                    uint64_t old_off;
+                    std::vector<uint8_t> bytes;
+                    std::vector<RefEdit> ref_edits;
+                    bool has_fbreg = false;
+                };
+                std::vector<DIE> dies;
+                std::vector<std::optional<uint64_t>> stk;  // 函数帧栈
+                uint64_t cur_addr_base = 8;
+                uint64_t cur_loclists_base = 0;  // 本 CU 的 .debug_loclists 偏移表起点(段内绝对)
+                bool cu_ok = true;
+                size_t q = cu_die_start;
+                while (q < cu_end) {
+                    size_t die_start = q;
+                    uint64_t code = read_uleb(q);
+                    DIE de;
+                    de.old_off = die_start - CU_BASE;
+                    if (code == 0) {
+                        de.bytes.push_back(0);
+                        if (!stk.empty()) stk.pop_back();
+                        dies.push_back(std::move(de));
+                        continue;
+                    }
+                    auto cit = tab.find(code);
+                    if (cit == tab.end()) { cu_ok = false; break; }
+                    const AbbrevEntry& e = cit->second;
+                    enc_uleb(de.bytes, code);
+
+                    std::optional<uint64_t> low_pc_addrx, low_pc_literal;
+                    bool found_low_pc = false;
+                    bool die_fbreg = false;
+
+                    for (const auto& a : e.attrs) {
+                        uint64_t attr = a[0], form = a[1];
+                        if (form == 0x21) continue;  // implicit_const
+                        if (form == 0x19) continue;  // flag_present
+
+                        if (form == 0x18) {  // DW_FORM_exprloc
+                            size_t len_prefix_start = q;
+                            uint64_t len = read_uleb(q);
+                            size_t expr_end = q + len;
+                            if (expr_end > cu_end) { cu_ok = false; break; }
+                            bool is_location = (attr == 0x02);
+                            std::optional<uint64_t> cur_ss =
+                                (is_location && !stk.empty()) ? stk.back() : std::nullopt;
+                            if (is_location && cur_ss) {
+                                std::vector<uint8_t> new_expr;
+                                size_t ep = q;
+                                while (ep < expr_end) {
+                                    if (d[ep] == 0x91 && ep + 1 < expr_end) {  // DW_OP_fbreg
+                                        new_expr.push_back(0x91); ep++;
+                                        int64_t stored = 0; int sh2 = 0;
+                                        while (ep < expr_end) {
+                                            uint8_t b = d[ep++]; stored |= (int64_t)(b & 0x7F) << sh2; sh2 += 7;
+                                            if (!(b & 0x80)) { if (b & 0x40) stored |= -((int64_t)1 << sh2); break; }
+                                        }
+                                        int64_t correct = stored - (int64_t)*cur_ss;
+                                        enc_sleb(new_expr, correct);
+                                        if (correct != stored) {
+                                            die_fbreg = true;
+                                            if (g_debug)
+                                                std::cerr << "[elf_linker] fbreg: stored=" << stored
+                                                          << " ss=" << *cur_ss << " -> " << correct << "\n";
+                                        }
+                                    } else {
+                                        new_expr.push_back(d[ep++]);
+                                    }
+                                }
+                                enc_uleb(de.bytes, (uint64_t)new_expr.size());
+                                de.bytes.insert(de.bytes.end(), new_expr.begin(), new_expr.end());
+                            } else {
+                                // 非 location / 无 stacksize：原样拷贝 len 前缀 + 表达式。
+                                de.bytes.insert(de.bytes.end(), d.begin() + len_prefix_start, d.begin() + expr_end);
+                            }
+                            q = expr_end;
+                            continue;
+                        }
+
+                        if (form == 0x1b || form == 0x1a || form == 0x0f || form == 0x10 ||
+                            form == 0x22 || form == 0x23) {  // ULEB 变长
+                            size_t s = q; uint64_t v = read_uleb(q);
+                            de.bytes.insert(de.bytes.end(), d.begin() + s, d.begin() + q);
+                            if (attr == 0x11) { found_low_pc = true; low_pc_addrx = v; }
+                            // DW_AT_location(loclistx) → 记录该 loclist 所属函数的 stacksize，
+                            // 供 fix_loclists_breg10 修 .debug_loclists 里的 DW_OP_breg10 偏移。
+                            // 键用 loclists_base + 索引（loclists_base 是偏移表段内绝对偏移，
+                            // 索引 *4 后定位偏移表项；loclists_base + 索引 唯一标识该 CU 的该 loclist）。
+                            if (attr == 0x02 && form == 0x22 && !stk.empty() && stk.back()) {
+                                loclist_ss_[cur_loclists_base + v] = *stk.back();
+                            }
+                            continue;
+                        }
+                        if (form == 0x0d) {  // SLEB 变长
+                            size_t s = q;
+                            while (q < cu_end) { uint8_t b = d[q++]; if (!(b & 0x80)) break; }
+                            de.bytes.insert(de.bytes.end(), d.begin() + s, d.begin() + q);
+                            continue;
+                        }
+                        int fsz = form_fixed_size(form);
+                        if (fsz > 0) {
+                            if (attr == 0x11) {
+                                found_low_pc = true;
+                                if (form == 0x01) { uint64_t v; memcpy(&v, d.data()+q, 8); low_pc_literal = v; }
+                                else if (form == 0x29) low_pc_addrx = d[q];
+                                else if (form == 0x2a) { uint16_t v; memcpy(&v, d.data()+q, 2); low_pc_addrx = v; }
+                                else if (form == 0x2b) { uint32_t v=0; memcpy(&v, d.data()+q, 3); low_pc_addrx = v; }
+                                else if (form == 0x2c) { uint32_t v; memcpy(&v, d.data()+q, 4); low_pc_addrx = v; }
+                            } else if (attr == 0x73 && form == 0x17) {  // DW_AT_addr_base
+                                uint32_t v; memcpy(&v, d.data()+q, 4); cur_addr_base = v;
+                            } else if (attr == 0x8c && form == 0x17) {  // DW_AT_loclists_base
+                                uint32_t v; memcpy(&v, d.data()+q, 4); cur_loclists_base = v;
+                            }
+                            int refsz = ref_form_size(form);
+                            if (refsz > 0) {
+                                uint64_t oldref = 0; memcpy(&oldref, d.data()+q, refsz);
+                                de.ref_edits.push_back({de.bytes.size(), oldref, (size_t)refsz});
+                                de.bytes.insert(de.bytes.end(), d.begin() + q, d.begin() + q + refsz);
+                            } else {
+                                de.bytes.insert(de.bytes.end(), d.begin() + q, d.begin() + q + fsz);
+                            }
+                            q += fsz;
+                        } else {
+                            cu_ok = false; break;
+                        }
+                    }
+                    if (!cu_ok) break;
+                    de.has_fbreg = die_fbreg;
+
+                    // 压/弹函数帧。
+                    if (e.tag == 0x2e && found_low_pc) {
+                        std::optional<uint64_t> func_addr;
+                        if (low_pc_literal) func_addr = *low_pc_literal;
+                        else if (low_pc_addrx && addr_sec) {
+                            size_t bo = (size_t)cur_addr_base + (size_t)(*low_pc_addrx) * 8;
+                            if (bo + 8 <= addr_sec->data.size()) {
+                                uint64_t fa = 0; memcpy(&fa, addr_sec->data.data() + bo, 8); func_addr = fa;
+                            }
+                        }
+                        if (func_addr) {
+                            auto sit = stack_sizes_.find(*func_addr);
+                            if (sit != stack_sizes_.end() && e.has_children) stk.push_back(sit->second);
+                            else if (e.has_children) stk.push_back(std::nullopt);
+                        } else if (e.has_children) stk.push_back(std::nullopt);
+                    } else if (e.has_children) {
+                        stk.push_back(stk.empty() ? std::nullopt : stk.back());
+                    }
+                    dies.push_back(std::move(de));
+                }
+                if (!cu_ok) { p = cu_end; continue; }
+
+                // 只有本 CU 有 fbreg 改写时才重建。
+                bool need = false;
+                for (auto& de : dies) if (de.has_fbreg) { need = true; break; }
+                if (!need) { p = cu_end; continue; }
+
+                // Pass B：算 old_off→new_off，回填 ref。
+                std::unordered_map<uint64_t, uint64_t> new_off;
+                uint64_t acc = cu_header_len;
+                for (auto& de : dies) { new_off[de.old_off] = acc; acc += de.bytes.size(); }
+                for (auto& de : dies) {
+                    for (auto& re : de.ref_edits) {
+                        auto it = new_off.find(re.old_cu_off);
+                        uint64_t nv = (it != new_off.end()) ? it->second : re.old_cu_off;
+                        memcpy(de.bytes.data() + re.byte_pos, &nv, re.nbytes);
+                    }
+                }
+                std::vector<uint8_t> new_cu;
+                new_cu.assign(d.begin() + p, d.begin() + p + cu_header_len);  // header 原样
+                for (auto& de : dies) new_cu.insert(new_cu.end(), de.bytes.begin(), de.bytes.end());
+                uint32_t newlen = (uint32_t)(new_cu.size() - 4);
+                memcpy(new_cu.data(), &newlen, 4);
+
+                cu_rewrites.push_back({p, cu_end - p, std::move(new_cu)});
+                p = cu_end;
+            }
+            // CU 重写已收集到全局 cu_rewrites（绝对段偏移），最后统一应用。
+        }
+
+        // 所有 obj 处理完：把收集的 CU 重写一次性应用到合并 .debug_info 段。
+        // cu_rewrites 按 start 排序后逐段替换；一次重建避免逐 obj 改写的偏移错乱。
+        if (!cu_rewrites.empty()) {
+            std::sort(cu_rewrites.begin(), cu_rewrites.end(),
+                      [](const CURewrite& a, const CURewrite& b){ return a.start < b.start; });
+            SecBuf* info_out = nullptr;
+            for (auto& obj : objects_)
+                for (auto& ds : obj.debug_secs)
+                    if (ds.name == ".debug_info" && ds.extra_idx < extras.size()) { info_out = &extras[ds.extra_idx]; break; }
+            if (info_out) {
+                const auto& src = info_out->data;
+                std::vector<uint8_t> out;
+                out.reserve(src.size());
+                size_t pos = 0;
+                for (auto& cr : cu_rewrites) {
+                    if (cr.start < pos) continue;  // 防御：重叠跳过
+                    out.insert(out.end(), src.begin() + pos, src.begin() + cr.start);
+                    out.insert(out.end(), cr.new_bytes.begin(), cr.new_bytes.end());
+                    pos = cr.start + cr.old_len;
+                }
+                out.insert(out.end(), src.begin() + pos, src.end());
+                info_out->data = std::move(out);
+            }
+        }
+    }
+
+    // 修正 .debug_loclists 里 DW_OP_breg10(0x7a) 的错误偏移（与 fbreg 同源 bug）。
+    // clang BPF 把栈变量偏移算成 +(stacksize-N)，正确应为 -N；breg10 直接相对 R10，
+    // 故同样用 stored - stacksize 修正。参数/变量 location 多走 loclist（被 spill），
+    // 不修则 GDB 读到帧头保存寄存器槽的垃圾。
+    //
+    // .debug_loclists（DWARF5）：每贡献区 = header[12B] + offset_table[N*4] + loclist 数据。
+    //   每条 loclist = 若干 entry + DW_LLE_end_of_list(0)。
+    //   DW_LLE_offset_pair(4)：[start:uleb][end:uleb][expr_len:uleb][expr]。
+    //   offset_table[i] = 第 i 条 loclist 起点相对 loclists_base 的偏移（loclistx 索引经此定位）；
+    //   loclists_base = 贡献区起点 + 12（offset_table 起点）。
+    //
+    // 三阶段完整重写（不再 padding 到原长，故 stacksize>64 的 SLEB128 变长 loclist 也能修）：
+    //   A. 每条 loclist 按修正后 SLEB128 的【真实长度】重建。
+    //   B. offset_table[i] 用新 loclist 起点相对新 loclists_base 的偏移重算（条数/定长 4B 不变，只值变）。
+    //   C. 贡献区按真实新长度拼接 → 后续贡献区起点位移 → 其 loclists_base 改变；
+    //      记录 old_base→new_base 到 loclists_base_remap_，由 remap_loclists_base 定长改写 .debug_info。
+    //
+    // 之所以可行：所有 loclist 引用都用 DW_FORM_loclistx（索引形式），consumer 只经 offset_table
+    // 定位每条 loclist 起点、读到自己的 end_of_list 即止，loclist 之间无需物理连续/定长。
+    void fix_loclists_breg10(std::vector<SecBuf>& extras) {
+        if (loclist_ss_.empty()) return;
+        auto enc_sleb = [](std::vector<uint8_t>& o, int64_t v){
+            while (true) {
+                uint8_t b = v & 0x7F; v >>= 7;
+                bool last = ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40)));
+                o.push_back(last ? b : (uint8_t)(b | 0x80));
+                if (last) break;
+            }
+        };
+        auto enc_uleb = [](std::vector<uint8_t>& o, uint64_t v){
+            do { uint8_t b = v & 0x7F; v >>= 7; if (v) b |= 0x80; o.push_back(b); } while (v);
+        };
+
+        // 先按贡献区在段内的出现顺序收集每个贡献区的重建结果，再统一拼到输出段，
+        // 这样跨贡献区的位移（阶段 C）可一次算清。
+        struct Contrib { size_t old_start; size_t old_len; std::vector<uint8_t> new_bytes; uint64_t old_base; };
+        std::vector<Contrib> contribs;
+        // 收集时记录贡献区在源段里的绝对起止，用于最后重建整段。
+
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            const auto& obj = objects_[oi];
+            const DebugSec* ll_ds = nullptr;
+            for (const auto& ds : obj.debug_secs) {
+                if (ds.name == ".debug_loclists" && ds.extra_idx < extras.size()) { ll_ds = &ds; break; }
+            }
+            if (!ll_ds) continue;
+            const SecBuf* ll_sec = &extras[ll_ds->extra_idx];
+            const auto& d = ll_sec->data;
+            const size_t cs = ll_ds->contrib_off;
+            const size_t ce = ll_ds->contrib_off + ll_ds->data.size();
+            if (cs + 12 > ce || cs + 12 > d.size()) continue;
+            uint32_t unit_length = 0; memcpy(&unit_length, d.data() + cs, 4);
+            if (unit_length == 0xffffffff || unit_length < 8) continue;
+            size_t hdr_end = cs + 4 + unit_length;  // 本贡献区结束（= unit_length 覆盖范围）
+            if (hdr_end > ce || hdr_end > d.size()) continue;
+            uint32_t off_cnt = 0; memcpy(&off_cnt, d.data() + cs + 8, 4);
+            size_t off_tbl = cs + 12;
+            size_t data_start = off_tbl + (size_t)off_cnt * 4;
+            if (data_start > hdr_end) continue;
+            const uint64_t old_base = cs + 12;  // 旧 loclists_base（offset_table 起点）；loclistx 键 = old_base + i
+
+            // 阶段 A：重建每条 loclist（按真实长度）。new_lists[i] = 该 loclist 重建后字节。
+            std::vector<std::vector<uint8_t>> new_lists(off_cnt);
+            bool any_change = false;
+            // parse_ok=false 表示本贡献区解析出错（未知 LLE code 等）→ 放弃，保留原字节。
+            bool parse_ok = true;
+
+            for (uint32_t i = 0; i < off_cnt && parse_ok; i++) {
+                uint32_t ll_off = 0; memcpy(&ll_off, d.data() + off_tbl + i * 4, 4);
+                size_t start = old_base + ll_off;  // loclist 实际段偏移
+                if (start < data_start || start >= hdr_end) { parse_ok = false; break; }
+                auto sit = loclist_ss_.find(old_base + i);
+                std::optional<uint64_t> ss = (sit != loclist_ss_.end())
+                    ? std::optional<uint64_t>(sit->second) : std::nullopt;
+                std::vector<uint8_t>& nb = new_lists[i];
+                bool changed = false;
+                size_t q = start;
+                // 通用 LLE entry 解析：code + (地址部分) + (表达式部分)。
+                //   0 end_of_list：无。1 base_addressx：[addrx:uleb]。6 base_address：[addr:8]。
+                //   2 startx_endx：[s:uleb][e:uleb] + expr。3 start_end：[s:8][e:8] + expr。
+                //   4 offset_pair：[s:uleb][e:uleb] + expr。5 default：expr。
+                //   7 startx_length：[s:uleb][len:uleb] + expr。
+                // 表达式部分（2/3/4/5/7）= [elen:uleb][bytes]，其中 breg10 可改写。
+                auto copy_uleb = [&]() -> bool {
+                    while (q < hdr_end) { uint8_t b = d[q++]; nb.push_back(b); if (!(b & 0x80)) return true; }
+                    return false;
+                };
+                auto copy_fixed = [&](size_t n) -> bool {
+                    if (q + n > hdr_end) return false;
+                    nb.insert(nb.end(), d.begin() + q, d.begin() + q + n);
+                    q += n; return true;
+                };
+                auto copy_expr_with_breg10 = [&]() -> bool {
+                    uint64_t elen = 0; int sh = 0;
+                    while (q < hdr_end) { uint8_t b = d[q++]; elen |= (uint64_t)(b & 0x7F) << sh; sh += 7; if (!(b & 0x80)) break; }
+                    size_t expr_end = q + elen;
+                    if (expr_end > hdr_end) return false;
+                    std::vector<uint8_t> new_expr;
+                    size_t ep = q;
+                    while (ep < expr_end) {
+                        if (d[ep] == 0x7a && ep + 1 < expr_end && ss) {
+                            new_expr.push_back(0x7a); ep++;
+                            int64_t stored = 0; int sh2 = 0;
+                            while (ep < expr_end) {
+                                uint8_t b = d[ep++]; stored |= (int64_t)(b & 0x7F) << sh2; sh2 += 7;
+                                if (!(b & 0x80)) { if (b & 0x40) stored |= -((int64_t)1 << sh2); break; }
+                            }
+                            int64_t correct = stored - (int64_t)*ss;
+                            enc_sleb(new_expr, correct);
+                            if (correct != stored) { changed = true;
+                                if (g_debug) std::cerr << "[elf_linker] breg10: stored=" << stored
+                                                       << " ss=" << *ss << " -> " << correct << "\n"; }
+                        } else {
+                            new_expr.push_back(d[ep++]);
+                        }
+                    }
+                    enc_uleb(nb, new_expr.size());
+                    nb.insert(nb.end(), new_expr.begin(), new_expr.end());
+                    q = expr_end;
+                    return true;
+                };
+                bool done = false;
+                while (q < hdr_end) {
+                    uint8_t code = d[q];
+                    if (code == 0) { nb.push_back(0); q++; done = true; break; }  // end_of_list
+                    nb.push_back(code); q++;
+                    bool ok = true;
+                    switch (code) {
+                    case 1: ok = copy_uleb(); break;                       // base_addressx
+                    case 6: ok = copy_fixed(8); break;                     // base_address
+                    case 5: ok = copy_expr_with_breg10(); break;           // default (expr)
+                    case 4: case 2:                                        // offset_pair / startx_endx
+                        ok = copy_uleb() && copy_uleb() && copy_expr_with_breg10(); break;
+                    case 3: ok = copy_fixed(8) && copy_fixed(8) && copy_expr_with_breg10(); break; // start_end
+                    case 7: ok = copy_uleb() && copy_uleb() && copy_expr_with_breg10(); break; // startx_length
+                    default: ok = false; break;                            // 未知 code：放弃本贡献区
+                    }
+                    if (!ok) break;
+                }
+                if (!done) parse_ok = false;  // 未正常遇到 end_of_list
+                if (changed) any_change = true;
+            }
+
+            if (!parse_ok || !any_change) {
+                // 解析失败或无可改写项 → 保留原贡献区字节，loclists_base 不变（old_base→old_base）。
+                contribs.push_back({cs, hdr_end - cs,
+                                    std::vector<uint8_t>(d.begin() + cs, d.begin() + hdr_end), old_base});
+                continue;
+            }
+
+            // 阶段 B：重算 offset_table（值变，条数/定长 4B 不变）。new_off_tbl[i] = 第 i 条
+            //   loclist 新起点 相对新 loclists_base(= 贡献区新起点+12) 的偏移。
+            //   新 loclist 体从 offset_table 之后开始排列，第 i 条起点 = off_cnt*4 + Σ_{j<i} new_lists[j].size()。
+            std::vector<uint8_t> new_off_tbl((size_t)off_cnt * 4, 0);
+            size_t acc = (size_t)off_cnt * 4;  // 相对 offset_table 起点的偏移
+            for (uint32_t i = 0; i < off_cnt; i++) {
+                uint32_t v = (uint32_t)acc;
+                memcpy(new_off_tbl.data() + (size_t)i * 4, &v, 4);
+                acc += new_lists[i].size();
+            }
+
+            // 阶段 C：拼新贡献区 = header(12, unit_length 待回填) + 新 offset_table + 新 loclist 体。
+            std::vector<uint8_t> nb;
+            nb.reserve(12 + new_off_tbl.size() + acc);
+            nb.insert(nb.end(), d.begin() + cs, d.begin() + cs + 12);  // 旧 header（unit_length 后回填）
+            nb.insert(nb.end(), new_off_tbl.begin(), new_off_tbl.end());
+            for (uint32_t i = 0; i < off_cnt; i++)
+                nb.insert(nb.end(), new_lists[i].begin(), new_lists[i].end());
+            uint32_t new_unit_length = (uint32_t)(nb.size() - 4);
+            memcpy(nb.data(), &new_unit_length, 4);
+
+            contribs.push_back({cs, hdr_end - cs, std::move(nb), old_base});
+        }
+
+        if (contribs.empty()) return;
+
+        // 阶段 C 续：按贡献区在源段里的顺序（old_start 升序）拼出整段，累计位移算 new_base。
+        std::sort(contribs.begin(), contribs.end(),
+                  [](const Contrib& a, const Contrib& b){ return a.old_start < b.old_start; });
+        // 收集每个贡献区前后两段之间源段里的"间隙"字节（不在任何 .debug_loclists 贡献区里，
+        // 例如段头/对齐填充），原样保留；位移也要计入。
+        SecBuf* ll_out = nullptr;
+        for (auto& obj : objects_)
+            for (auto& ds : obj.debug_secs)
+                if (ds.name == ".debug_loclists" && ds.extra_idx < extras.size()) { ll_out = &extras[ds.extra_idx]; break; }
+        if (!ll_out) return;
+        const auto& src = ll_out->data;
+        std::vector<uint8_t> out;
+        out.reserve(src.size());
+        size_t pos = 0;
+        for (auto& c : contribs) {
+            // 间隙 [pos, c.old_start)：原样拷贝，其内字节位移同 out 当前长度。
+            if (c.old_start > pos)
+                out.insert(out.end(), src.begin() + pos, src.begin() + c.old_start);
+            // 贡献区位移：old_base = old_start + 12 → new_base = out.size() + 12。
+            size_t new_start = out.size();
+            uint64_t new_base = new_start + 12;
+            loclists_base_remap_[c.old_base] = new_base;
+            out.insert(out.end(), c.new_bytes.begin(), c.new_bytes.end());
+            pos = c.old_start + c.old_len;
+        }
+        if (pos < src.size())
+            out.insert(out.end(), src.begin() + pos, src.end());
+        ll_out->data = std::move(out);
+    }
+
+    // 用 fix_loclists_breg10 产出的 old_base→new_base 表，定长改写 .debug_info 里所有
+    // DW_AT_loclists_base(0x8c) 的 4 字节 sec_offset 槽（DW_FORM_sec_offset=0x17, DWARF32 定长）。
+    // 贡献区按真实长度重建后位移，其 loclists_base（sec_offset，已由 apply_debug_relocations
+    // patch 为段内绝对偏移）必须同步更新，否则 loclistx 解引用越界。
+    //
+    // 这里只做【定长字节级改写】，不改 DIE 边界/长度，故可在 fix_fbreg_offsets（变长重建）
+    // 之后再扫一遍最终的 .debug_info。注意：fbreg 重建改变了各 obj 贡献区在合并段里的边界，
+    // 故不能按 obj 贡献区逐段扫（contrib_off/旧 data.size() 已失效），改为：
+    //   1. 把所有 obj 的 .debug_abbrev 合并成一张全局 abbrev 表（键=表段内绝对偏移，即 abbr_offset）；
+    //   2. 把整个合并 .debug_info 当作一条连续的 CU 流，从头扫到尾。
+    void remap_loclists_base(std::vector<SecBuf>& extras) {
+        if (loclists_base_remap_.empty()) return;
+
+        // 合并 .debug_info / .debug_abbrev 段（已在 fix_fbreg_offsets/apply_debug_relocations 后）。
+        SecBuf* info_out = nullptr;
+        const SecBuf* abbr_out = nullptr;
+        for (auto& obj : objects_) {
+            for (auto& ds : obj.debug_secs) {
+                if (ds.extra_idx >= extras.size()) continue;
+                if (ds.name == ".debug_info" && !info_out) info_out = &extras[ds.extra_idx];
+                if (ds.name == ".debug_abbrev" && !abbr_out) abbr_out = &extras[ds.extra_idx];
+            }
+        }
+        if (!info_out || !abbr_out) return;
+
+        const auto& ad = abbr_out->data;
+        // 全局 abbrev 表：表段内绝对偏移 -> {code -> [(attr,form)]}。扫一遍合并 .debug_abbrev。
+        std::unordered_map<size_t, std::unordered_map<uint64_t,
+            std::vector<std::pair<uint64_t,uint64_t>>>> abbr_tables;
+        {
+            size_t q = 0;
+            while (q < ad.size()) {
+                size_t table_start = q;
+                std::unordered_map<uint64_t, std::vector<std::pair<uint64_t,uint64_t>>> tab;
+                bool any = false;
+                while (q < ad.size()) {
+                    uint64_t code = 0; int sh = 0;
+                    while (q < ad.size()) { uint8_t b = ad[q++]; code |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                    if (code == 0) break;
+                    any = true;
+                    uint64_t tag = 0; sh = 0;
+                    while (q < ad.size()) { uint8_t b = ad[q++]; tag |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                    (void)tag;
+                    bool has_children = (q < ad.size()) && (ad[q++] != 0);
+                    std::vector<std::pair<uint64_t,uint64_t>> attrs;
+                    while (q < ad.size()) {
+                        uint64_t attr = 0; sh = 0;
+                        while (q < ad.size()) { uint8_t b = ad[q++]; attr |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                        uint64_t form = 0; sh = 0;
+                        while (q < ad.size()) { uint8_t b = ad[q++]; form |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+                        if (attr == 0 && form == 0) break;
+                        if (form == 0x21) { sh=0; while(q<ad.size()){uint8_t b=ad[q++]; if(!(b&0x80)) break;} }  // implicit_const ULEB
+                        attrs.emplace_back(attr, form);
+                    }
+                    (void)has_children;
+                    tab[code] = std::move(attrs);
+                }
+                abbr_tables[table_start] = std::move(tab);
+                if (!any) break;
+            }
+        }
+
+        // form 定长字节数（与 fix_fbreg_offsets 一致；变长返回 -1）。
+        auto form_fixed_size = [](uint64_t form) -> int {
+            switch (form) {
+            case 0x01: return 8;   // addr
+            case 0x0b: return 1;   // data1
+            case 0x05: return 2;   // data2
+            case 0x06: return 4;   // data4
+            case 0x07: return 8;   // data8
+            case 0x1e: return 16;  // data16
+            case 0x0c: return 1;   // flag
+            case 0x11: return 1;   // ref1
+            case 0x12: return 2;   // ref2
+            case 0x13: return 4;   // ref4
+            case 0x14: return 8;   // ref8
+            case 0x0e: return 4;   // strp (DWARF32)
+            case 0x17: return 4;   // sec_offset (DWARF32)
+            case 0x1f: return 4;   // line_strp (DWARF32)
+            case 0x25: return 1; case 0x26: return 2; case 0x27: return 3; case 0x28: return 4;  // strx1..4
+            case 0x29: return 1; case 0x2a: return 2; case 0x2b: return 3; case 0x2c: return 4;  // addrx1..4
+            case 0x1c: return 4; case 0x24: return 8;  // ref_sup4 / ref_sup8
+            default:   return -1;
+            }
+        };
+
+        auto& out = *info_out;  // 直接在最终 .debug_info 上定长改写
+        const auto& d = out.data;
+        auto read_uleb = [&](size_t& pos) -> uint64_t {
+            uint64_t v = 0; int sh = 0;
+            while (pos < d.size()) { uint8_t b = d[pos++]; v |= (uint64_t)(b&0x7F)<<sh; sh+=7; if(!(b&0x80)) break; }
+            return v;
+        };
+
+        // 整段 .debug_info 当作 CU 流，从头扫到尾（fbreg 重建后贡献区边界已变，不能按 obj 分段）。
+        size_t p = 0;
+        while (p + 12 <= d.size()) {
+            uint32_t unit_length = 0; memcpy(&unit_length, d.data() + p, 4);
+            if (unit_length == 0xffffffff) break;  // DWARF64（不支持）
+            if (unit_length < 8) break;
+            size_t cu_end = p + 4 + unit_length;
+            if (cu_end > d.size()) break;
+            uint16_t version = 0; memcpy(&version, d.data() + p + 4, 2);
+            if (version < 4 || version > 5) { p = cu_end; continue; }
+            size_t hdr = p + 4;
+            size_t cu_die_start; uint32_t abbr_offset;
+            if (version >= 5) {
+                abbr_offset = 0; memcpy(&abbr_offset, d.data() + hdr + 4, 4);
+                cu_die_start = hdr + 8;
+            } else {
+                abbr_offset = 0; memcpy(&abbr_offset, d.data() + hdr + 2, 4);
+                cu_die_start = hdr + 7;
+            }
+            auto tit = abbr_tables.find((size_t)abbr_offset);
+            if (tit == abbr_tables.end()) { p = cu_end; continue; }
+            const auto& tab = tit->second;
+
+            // 遍历本 CU 的 DIE，定位 loclists_base 槽。loclists_base 只出现在
+            // compile_unit DIE 上，但完整遍历也无害（null DIE 被当作分隔符跳过）。
+            size_t q = cu_die_start;
+            bool cu_done = false;
+            while (q < cu_end && !cu_done) {
+                uint64_t code = read_uleb(q);
+                if (code == 0) continue;  // null DIE（兄弟链表分隔符）
+                auto cit = tab.find(code);
+                if (cit == tab.end()) { cu_done = true; break; }
+                bool has_locbase = false; size_t locbase_slot = 0;
+                for (const auto& [attr, form] : cit->second) {
+                    if (form == 0x21) continue;       // implicit_const（值在 abbrev 里）
+                    if (form == 0x19) continue;       // flag_present（无数据）
+                    // 记 loclists_base 槽位置（改写前先跳过前面所有属性的长度）。
+                    if (attr == 0x8c && form == 0x17) {
+                        has_locbase = true; locbase_slot = q;
+                    }
+                    if (form == 0x18) {              // exprloc：[len:uleb][len bytes]
+                        uint64_t elen = read_uleb(q);
+                        q += elen;
+                        continue;
+                    }
+                    if (form == 0x1b || form == 0x1a || form == 0x0f || form == 0x10 ||
+                        form == 0x22 || form == 0x23) { read_uleb(q); continue; }
+                    if (form == 0x0d) { while (q < cu_end) { uint8_t b = d[q++]; if (!(b & 0x80)) break; } continue; }
+                    int fsz = form_fixed_size(form);
+                    if (fsz > 0) { q += fsz; continue; }
+                    // 遇未知 form：放弃本 CU（不改写），保底安全。
+                    cu_done = true; break;
+                }
+                if (cu_done) break;
+                // 定长改写 loclists_base（在最终 .debug_info 上）。
+                if (has_locbase && locbase_slot + 4 <= d.size()) {
+                    uint32_t oldv = 0; memcpy(&oldv, d.data() + locbase_slot, 4);
+                    auto rit = loclists_base_remap_.find(oldv);
+                    if (rit != loclists_base_remap_.end()) {
+                        uint32_t newv = (uint32_t)rit->second;
+                        memcpy(out.data.data() + locbase_slot, &newv, 4);
+                        if (g_debug)
+                            std::cerr << "[elf_linker] loclists_base: " << oldv << " -> " << newv << "\n";
+                    }
+                }
+            }
+            p = cu_end;
+        }
     }
 
     // 应用 DWARF 段的重定位（.rel.debug_*）。两类：

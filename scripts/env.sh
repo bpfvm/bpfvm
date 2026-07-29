@@ -27,7 +27,10 @@ COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -nostdinc -
 [ -f "$PASS_SOFTFP" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_SOFTFP"
 # BpfLibcallLower：intrinsic → musl libcall（memcpy/memmove/memset/trap/floor/ceil/trunc/round）。
 [ -f "$PASS_LIBCALLLOWER" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_LIBCALLLOWER"
-COMMON_CFLAGS="$COMMON_CFLAGS -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g"
+COMMON_CFLAGS="$COMMON_CFLAGS -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} -g -fstack-size-section"
+# -fstack-size-section：让 clang 产出 .stack_sizes 段（每函数一条：函数地址 + ULEB128 栈大小）。
+#   bpfvm-ld 在链接期据此修复 DW_OP_fbreg 偏移（clang BPF 后端把栈变量偏移算错的 bug，
+#   见 README「工具链 / bpfvm-ld → 调试信息 (DWARF)」一节）
 
 COMMON_LDFLAGS="-target bpf -nostdlib"
 

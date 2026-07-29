@@ -76,7 +76,7 @@ endif
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
 CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
             -nostdinc -fno-builtin -fno-math-errno \
-            -isystem ../root/include/ -isystem ../include -g \
+            -isystem ../root/include/ -isystem ../include -g -fstack-size-section \
             $(PASS_FLAGS)
 
 # === C++ 编译 flags ===

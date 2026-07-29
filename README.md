@@ -173,6 +173,24 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 - **符号表**：三种模式现在都输出静态 `.symtab`/`.strtab`，同时包含 GLOBAL 符号和 `STB_LOCAL` FUNC/OBJECT 符号（使 `objdump -d` 能标注本地函数边界）。`sh_info` 按 ELF 约定指向第一个 GLOBAL。PIE 模式下运行时符号解析仍用 `.dynsym`。
 - `.BTF`/`.BTF.ext`（BPF 内核元数据）和 `.llvm_addrsig` 仍被丢弃（VM 用不到）。
 
+#### 链接期修复 DWARF 栈变量偏移（clang BPF `frame-index` bug）
+
+**症状**：clang BPF 后端为栈变量生成的 DWARF 定位是错的，任何 DWARF 调试器（gdb）读 spilled 到栈的局部变量 / 参数都读到垃圾。`gdb bt` 时，栈上参数显示错误值（常表现为多个无关帧共用同一个指针），而寄存器里的参数正确，回溯本身（函数名 / 返回地址）也正确。
+
+  具体案例（busybox 在 `bpfvm --gdb` 下调试）：`read_key` 的 `fd` 被 `stxw [r10-8], r1` 写到 `[r10-8]`，但其 DWARF 定位读出来是 `DW_OP_breg10 +32` —— 即 gdb 去读 `[r10+32]`（帧头保存 r9 的槽）而非真实位置，于是显示 `fd=0x4034f5ec`（调用者的 r9）而非真实 fd。同类错误还影响 `ash_main::argc`（实际 `[r10-264]`，报成 `[r10+8]`），并让 `argv` 在很多帧里显示成同一个固定栈地址。
+
+**根因**：`BPFFrameLowering` 没有重写 `TargetFrameLowering::getFrameIndexReference()`。通用实现按帧*底*用栈大小重算栈对象偏移，该模型假定帧指针会在 prologue 中移动；而 BPF 用的是固定、只读的帧指针 R10，永远指向帧*顶*（即 `DW_AT_frame_base = DW_OP_reg10` 的语义）。于是 `[r10-N]` 的变量被标成 `DW_OP_fbreg +(stacksize-N)` —— 只有当帧底为基准时才正确。帧顶为基准时，正偏移就落进帧头 / 保存寄存器区，调试器读到错误槽。内核 eBPF 里一直潜伏（内核程序从不用 DWARF 调试器查栈变量），但破坏任何 BPF 用户态代码的 DWARF 调试。寄存器变量一直正确，因为其定位是 `DW_OP_regN`，不走这条路。
+
+**修复**：`bpfvm-ld` 在链接期修正错误的栈相对偏移。所有 BPF 构建都加 `-fstack-size-section`（`scripts/env.sh`、`musl/build.sh`、`test/Makefile`、`scripts/build_libcxx.sh`），让 clang 产出 `.stack_sizes` 段记录每个函数的栈大小。`bpfvm-ld` 消费它并改写 clang 输出 `+(stacksize-N)` 而非正确 `-N` 的两处（因为 BPF 帧基准 R10 是帧*顶*而非帧底）：
+
+1. **`.debug_info` 内联 `DW_FORM_exprloc` 里的 `DW_OP_fbreg`**（`fix_fbreg_offsets`）：每条 `+N` → `+N − stacksize`。因为 SLEB128 重编码可能变长，CU 用两遍 buffer 重建（Pass A 逐 DIE 序列化、Pass B 回填 `DW_FORM_ref1/2/4/8` 的 DIE 偏移并修正 `unit_length` / exprloc 长度）。
+
+2. **`.debug_loclists` 位置列表里的 `DW_OP_breg10`**（`fix_loclists_breg10` + `remap_loclists_base`）：函数中途被 spill 的参数 / 变量走 loclist，其 `breg10` 偏移有同样的 bug。所有 loclist 引用都用 `DW_FORM_loclistx`（索引形式），故每条 loclist 按修正后 SLEB128 的*真实*长度重建（不再 padding），再重算各贡献区的 `offset_table`，并把位移后的贡献区在 `.debug_info` 里的 `DW_AT_loclists_base`（sec_offset）定长改写（三阶段重写）。这处理了 stacksize > 64 时 loclist 变长的情况。
+
+`.stack_sizes` 段从输出中丢弃。端到端验证：`test/test_gdb_fbreg.c`（`bpfvm --gdb` 下 GDB 在强制 spill 的函数里读出 `x=11,y=22,z=33`）、busybox `.debug_info`（3029 条 fbreg 全部修正）和 busybox `.debug_loclists`（7691/7691 条 breg10 全部修正），以及 `llvm-dwarfdump --verify` 通过。
+
+**上游状态**：已在 `main` 由 [PR #204722](https://github.com/llvm/llvm-project/pull/204722) 修复（合并 `8140495e`，2026-06-22）。它落在 `release/22.x` 分支（2026-06-15）*之后*，故没有已发布的 clang 带它（截至 2026-07，19.x / 20.x / 21.x / 22.x 仍会 miscompile 调试信息）；一旦 clang 修复这个问题，`bpfvm-ld` 的改写就变成 no-op（没有错误偏移可修），但留着无害。
+
 ## 架构设计与实现
 
 由于 BPF 架构的特殊性，为本虚拟机开发 C/C++ 程序时存在若干硬限制。本仓库通过一组 LLVM pass 在编译期透明解除，**写 guest 代码时按标准 C/C++ 直接用即可**。下面给出完整的三层实现机制（约束 → 方案 → pass / 链接器 / VM 执行）。
