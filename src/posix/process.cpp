@@ -111,13 +111,27 @@ int64_t PosixSyscall::do_execveat(vm* v) {
             if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0});
         }
     }
-    // 等待同组其它线程退出（live_threads 降到 1）。带超时兜底防 spurious/死锁。
-    {
-        std::unique_lock<std::mutex> lk(tg->mtx);
-        tg->cv.wait_for(lk, std::chrono::seconds(5), [&]{
-            return tg->live_threads.load(std::memory_order_acquire) <= 1;
-        });
+    // 等待同组其它线程退出（live_threads 降到 1）。阻塞在自身 wait_for 上，sibling
+    // fini 减 live_threads 后经 wake_waiters 唤醒本线程（模型同 futex / waitpid）。
+    v->set_flags(vm::VM_BLOCKED);
+    while(true) {
+        {
+            std::lock_guard<std::mutex> lk(tg->mtx);
+            // 判定与注册同在 tg->mtx 内：与 sibling 的「fetch_sub → wake_waiters(持 mtx
+            // swap 列表)」互斥——见 >1 必有尚未退出的 sibling、其 fini 会 wake 我们；
+            if(tg->live_threads.load(std::memory_order_acquire) <= 1) break;
+            tg->waiters.push_back(v->shared_from_this());
+        }
+        if(v->wait_for(nullptr)){
+            //被打断
+            tg->remove_waiter(v);
+            v->clear_flags(vm::VM_BLOCKED);
+            return SYSCALL_RESTART;
+        }
+        v->set_flags(vm::VM_BLOCKED);   // wakeup(true) 清了 VM_BLOCKED，重置以便下轮阻塞
     }
+    v->clear_flags(vm::VM_BLOCKED);
+
     options(v).argv = std::move(argv_strings);
     options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
@@ -386,10 +400,7 @@ std::vector<uint64_t> PosixSyscall::list_pids() {
 }
 
 // wait4/waitid 共享的等待核心。idtype/id 用 POSIX 语义（P_ALL=0/P_PID=1/P_PGID=2），
-// 由两个 handler 把各自的 syscall 参数归一化后传入。options 已经过 handler 校验。
-// 选定 child 后只填充 out，不写 status/siginfo、不 erase pid_map（由 handler 按 WNOWAIT 决定）。
-// 返回值：负 errno=失败；SYSCALL_RESTART=被信号打断可重启；0=成功（out.child 可能为空，
-//   表示 WNOHANG 且无事件，handler 据此返回 0 pid）。
+// 由两个 handler 把各自的 syscall 参数归一化后传入。options 含 WNOHANG/WUNTRACED/WNOWAIT。
 int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options, wait_event& out) {
     // 收集候选子进程。Linux 语义：
     //   P_PID  (id > 0) → 指定 task（必须是自身子进程的线程组 leader）
@@ -408,8 +419,6 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
     };
 
     // 子进程是否有可报告事件：已退出（WIFEXITED/WIFSIGNALED）或已停止且 stop_reported（WIFSTOPPED）。
-    // stop_reported 由 stop_process 投 SIGCHLD 时置 true，消费后清——它兼做"该停止已通知过"
-    // 的去重标志：只有 stop_reported 为真的停止才可被报告（避免重复报告同一停止）。
     auto child_has_event = [](const std::shared_ptr<vm>& task_vm) -> bool {
         auto s = sys(task_vm.get());
         if(!s) return false;
@@ -418,99 +427,118 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
                 s->tg->stop_reported.load(std::memory_order_acquire));
     };
 
-    std::vector<std::shared_ptr<vm>> children;
-    {
+    // 原子选+回收一个有事件的子进程。持 pid_map_mutex：选 + erase/CAS 同锁，故并发 wait
+    // 同一子进程时只有首个进入者成功（erase 必返回 1；stop CAS 只成一次），余者不再从
+    // pid_map 见到该子进程（已 erase）或 stop_reported 已被清（CAS 失败）→ 跳过。
+    // exited 优先于 stopped：被 SIGKILL 的已停止进程，fini 设 tg->exited 但不清 tg->stopped
+    // 返回 1=已回收并填好 out；0=有匹配子进程但无可报告事件；-1=无匹配子进程(ECHILD)。
+    auto claim_one = [&]() -> int {
         std::lock_guard<std::mutex> lock(pid_map_mutex);
-        if(idtype == 1 /*P_PID*/) {
-            auto it = pid_map.find(static_cast<uint64_t>(id));
-            if(it == pid_map.end()) {
-                return -ECHILD;
-            }
-            auto child_sys = sys(it->second.get());
-            if(child_sys == nullptr || child_sys->tg->ppid.load() != tg->tgid) {
-                return -ECHILD;
-            }
-            children.push_back(it->second);
-        } else {
-            for(const auto& entry : pid_map) {
-                if(!match_child(entry.second)) continue;
-                children.push_back(entry.second);
-            }
-            // 优先返回已有事件的子进程（退出或已通知的停止）。
-            for(auto& c : children) {
-                if(child_has_event(c)) {
-                    children = {c};
-                    break;
+        bool any_match = false;
+        for(auto it = pid_map.begin(); it != pid_map.end();) {
+            if(!match_child(it->second)) { ++it; continue; }
+            any_match = true;
+            auto s = sys(it->second.get());
+            if(!s) { ++it; continue; }
+            auto child_vm = it->second;
+            if(s->tg->exited.load(std::memory_order_acquire)) {
+                // 退出事件：回收。WNOWAIT 不 erase（保留 zombie 供后续再 wait）。
+                if(!(options & WNOWAIT)) {
+                    it = pid_map.erase(it);
+                } else {
+                    ++it;
                 }
+                out.child = child_vm;
+                out.exited = true;
+                out.exit_code = static_cast<uint64_t>(s->tg->exit_code.load(std::memory_order_acquire));
+                return 1;
             }
+            if(s->tg->stopped.load(std::memory_order_acquire) &&
+               s->tg->stop_reported.load(std::memory_order_acquire)) {
+                // 停止事件。WNOWAIT 只读不消费：与 exited 分支不 erase 对称，保留 stop_reported
+                // 使随后再 wait 仍能报告同一次停止。非 WNOWAIT 才 CAS true→false 抢占报告权
+                // （进程仍存活，不 erase）；并发 wait 时 CAS 只成一次，余者跳过找下一个。
+                if(options & WNOWAIT) {
+                    out.child = child_vm;
+                    out.exited = false;
+                    out.stop_sig = s->tg->stop_sig.load(std::memory_order_acquire);
+                    return 1;
+                }
+                bool expected = true;
+                if(s->tg->stop_reported.compare_exchange_strong(expected, false,
+                                                                 std::memory_order_acq_rel)) {
+                    out.child = child_vm;
+                    out.exited = false;
+                    out.stop_sig = s->tg->stop_sig.load(std::memory_order_acquire);
+                    return 1;
+                }
+                // CAS 失败=已被别的线程报告，跳过找下一个。
+            }
+            ++it;
         }
-    }
+        return any_match ? 0 : -1;
+    };
 
-    if(children.empty()) {
-        return -ECHILD;
-    }
+    // 即拿即走：有已就绪事件直接回收。
+    int r = claim_one();
+    if(r == 1) return 0;
+    if(r == -1) return -ECHILD;  // 无匹配子进程
 
-    // 选一个有事件的子进程。无事件且非阻塞 → 立即返空 child；否则轮询 tg->cv 等事件。
-    std::shared_ptr<vm> child;
-    for(auto& c : children) {
-        if(child_has_event(c)) {
-            child = c;
-            break;
-        }
-    }
-    if((child == nullptr) && (options & WNOHANG)) {
+    // r == 0：有子进程但无事件。非阻塞 → 返空 child；否则阻塞等事件。
+    if(options & WNOHANG) {
         return 0;  // out.child 保持空，handler 据此返回 0
     }
 
-    while(child == nullptr) {
-        for(const auto& candidate : children) {
+    while(true) {
+        // 调用者自身被 VM_KILL / 收到信号 / GDB 请求停下 -> 标记为可重启。
+        // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
+        if(v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_SIGNAL_PENDING)) {
+            return SYSCALL_RESTART;
+        }
+        // 上一轮被唤醒后先试回收：可能事件在注册间隙到达。
+        int cr = claim_one();
+        if(cr == 1) return 0;
+        if(cr == -1) return -ECHILD;  // 子进程已被别的线程回收完
+
+        // 取当前存活子进程快照（注册目标）。持 pid_map_mutex 取 shared_ptr 防析构。
+        std::vector<std::shared_ptr<vm>> kids;
+        {
+            std::lock_guard<std::mutex> lock(pid_map_mutex);
+            for(const auto& kv : pid_map) {
+                if(match_child(kv.second)) kids.push_back(kv.second);
+            }
+        }
+        // 先置 VM_BLOCKED 再注册：wakeup(true) 靠清 VM_BLOCKED 让 wait_for 立即返回，
+        // 必须保证 waker 能在"我置位后"看到我的注册——置位在注册前，注册-检查又在
+        // 同一把子 tg->mtx 下与 fini 的"置 exited→wake_waiters(swap)"互斥，故不丢唤醒。
+        v->set_flags(vm::VM_BLOCKED);
+        bool has_event = false;
+        for(const auto& candidate : kids) {
             auto cs = sys(candidate.get());
             if(!cs) continue;
             {
-                std::unique_lock<std::mutex> lk(cs->tg->mtx);
-                // 子退出 或 子停止且已通知。notify 来自 fini()/stop_process()。
-                cs->tg->cv.wait_for(lk, std::chrono::milliseconds(100), [&]{
-                    return cs->tg->exited.load(std::memory_order_acquire) ||
-                           (cs->tg->stopped.load(std::memory_order_acquire) &&
-                            cs->tg->stop_reported.load(std::memory_order_acquire));
-                });
-            }
-            if(cs->tg->exited.load(std::memory_order_acquire)) {
-                child = candidate;
-                break;
-            }
-            if(cs->tg->stopped.load(std::memory_order_acquire) &&
-               cs->tg->stop_reported.load(std::memory_order_acquire)) {
-                child = candidate;
-                break;
-            }
-            // 调用者自身被 VM_KILL / 收到信号 / GDB 请求停下 -> 标记为可重启。
-            // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
-            // VM_DEBUG_STOP：GDB Ctrl-C/单步经 stop_all_vms 置位，要求本 vm 回解释器停下。
-            if(!pending_signals.empty() ||
-               (v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_DEBUG_STOP))) {
-                return SYSCALL_RESTART;
+                std::lock_guard<std::mutex> lk(cs->tg->mtx);
+                if(child_has_event(candidate)) {
+                    has_event = true;  // 已有事件，不注册，直接去 claim
+                    continue;
+                }
+                cs->tg->waiters.push_back(v->shared_from_this());
             }
         }
+        if(!has_event) {
+            // 阻塞直至子进程唤醒（wake_waiters→wakeup(true)）或被信号打断（-EINTR）；
+            // 无显式超时，依赖 wait_for 内部 1s 滚动兜底防 spurious 遗漏。
+            v->wait_for(nullptr);
+        }
+        v->clear_flags(vm::VM_BLOCKED);
+        // 从所有候选子的 waiters 摘除自己（被 wake 路径已摘的幂等空操作）。
+        for(const auto& candidate : kids) {
+            if(auto cs = sys(candidate.get())) {
+                cs->tg->remove_waiter(v);
+            }
+        }
+        // 回到循环顶重判 claim_one。
     }
-
-    //wait 不能加锁，否则会死锁
-    auto cs = sys(child.get());
-    out.child = child;
-    // exited 优先于 stopped：被 SIGKILL 的已停止进程，fini 设 tg->exited 但不清
-    // tg->stopped（只有 SIGCONT 清），必须按退出报告，否则父进程（如 dash `kill -9 %1`）
-    // 永不回收作业。
-    if(cs->tg->exited.load(std::memory_order_acquire)) {
-        out.exited = true;
-        out.exit_code = static_cast<uint64_t>(cs->tg->exit_code.load(std::memory_order_acquire));
-    } else {
-        // 报告停止。进程仍存活：不 erase pid_map，不清 stopped（SIGCONT 才清），
-        // 清 stop_reported 使下次停止能再投 SIGCHLD + 再被报告。
-        out.exited = false;
-        out.stop_sig = cs->tg->stop_sig.load(std::memory_order_acquire);
-        cs->tg->stop_reported.store(false, std::memory_order_release);
-    }
-    return 0;
 }
 
 // 把子进程 exit_code 编码成 wait4 的 int status（WIFEXITED/WIFSIGNALED）。
@@ -585,11 +613,6 @@ int64_t PosixSyscall::do_wait4(vm* v) {
         }
     }
 
-    // 退出的子进程回收 pid_map；停止的进程仍存活，不 erase。
-    if(ev.exited) {
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map.erase(cs->pid);
-    }
     return (int64_t)cs->pid;  // leader 的 pid（== tg->tgid）；停止/退出均返此值
 }
 
@@ -626,8 +649,10 @@ int64_t PosixSyscall::do_waitid(vm* v) {
     // 映射 waitid 的 idtype 到 do_wait_common 用的同一套（0/1/2 一致）。
     wait_event ev;
     // do_wait_common 内部用 WNOHANG/WUNTRACED；waitid 的 WEXITED 对应"报告退出"，
-    // 是 do_wait_common 默认行为（exited 优先），无需额外位；WNOWAIT 由本函数处理（不回收）。
-    int common_opts = (options & WNOHANG) | ((options & WUNTRACED) ? WUNTRACED : 0);
+    // 是 do_wait_common 默认行为（exited 优先），无需额外位；WNOWAIT 透传给
+    // do_wait_common 的 claim_one（不 erase，保留 zombie 供后续再 wait）。
+    int common_opts = (options & WNOHANG) | ((options & WUNTRACED) ? WUNTRACED : 0)
+                      | (options & WNOWAIT);
     int64_t rc = do_wait_common(v, idtype, id, common_opts, ev);
     if(rc != 0) {
         return rc;  // 负 errno / SYSCALL_RESTART
@@ -677,12 +702,6 @@ int64_t PosixSyscall::do_waitid(vm* v) {
         }
     }
 
-    // 回收：退出事件且未要求 WNOWAIT 才 erase。停止事件不回收（进程仍存活）。
-    if(ev.child != nullptr && ev.exited && !(options & WNOWAIT)) {
-        auto cs = sys(ev.child.get());
-        std::lock_guard<std::mutex> lock(pid_map_mutex);
-        pid_map.erase(cs->pid);
-    }
     return 0;  // waitid 成功返 0（不是 pid）
 }
 

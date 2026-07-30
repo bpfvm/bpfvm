@@ -3,6 +3,10 @@
 #include <sys/signalfd.h>   // host 侧 signalfd_siginfo 布局（与 guest 一致：128 字节）
 
 void PosixSyscall::notify_parent_sigchld() {
+    // 唤醒在本组 waiters 列表上等待的进程：本组刚发生可报告状态变化
+    // （fini 的 exited 置位 / stop_process 的 stopped 置位），调用方已在调用前设好状态
+    tg->wake_waiters();
+
     // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
     // 父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
     // （测试，sys() 返 nullptr）、或正常 PosixSyscall。前两者降级 no-op。
@@ -12,17 +16,15 @@ void PosixSyscall::notify_parent_sigchld() {
     auto parent_vm = find_task(parent_pid);
     if(!parent_vm) return;
 
-    // SIGCHLD 的 si_code/si_status 取决于子进程状态（对齐 Linux）：
-    //   stopped —— CLD_STOPPED，status = stop_sig
-    //   否则按 exit_code：<128 = CLD_EXITED + 退出码；>=128 = CLD_KILLED + 信号号
+    // SIGCHLD 的 si_code/si_status 取决于子进程状态（对齐 Linux），优先级与
+    // do_wait_common::claim_one 一致：exited 先于 stopped。
+    //   exited —— 按 exit_code：<128 = CLD_EXITED + 退出码；>=128 = CLD_KILLED + 信号号
+    //   否则 stopped —— CLD_STOPPED，status = stop_sig
     // （bpfvm 不区分 core dump，故无 CLD_DUMPED。）exit_code 的 -1 兜底（last 线程
     // 在 posix_syscall.cpp fini 里 CAS 成 128+9）保证退出路径总有合法值。
     int32_t code;
     int32_t status;
-    if(tg->stopped.load(std::memory_order_acquire)) {
-        code = CLD_STOPPED;
-        status = tg->stop_sig.load(std::memory_order_acquire);
-    } else {
+    if(tg->exited.load(std::memory_order_acquire)) {
         int ec = tg->exit_code.load(std::memory_order_acquire);
         if(ec >= 128) {
             code = CLD_KILLED;
@@ -31,6 +33,13 @@ void PosixSyscall::notify_parent_sigchld() {
             code = CLD_EXITED;
             status = ec;         // 原始退出码
         }
+    } else if(tg->stopped.load(std::memory_order_acquire)) {
+        code = CLD_STOPPED;
+        status = tg->stop_sig.load(std::memory_order_acquire);
+    } else {
+        // 无可报告状态（理论不应至此：调用方在置好 exited/stopped 后才调本函数）。
+        code = CLD_EXITED;
+        status = 0;
     }
     // sender = 本子进程的 pid（wait4 的 siginfo.si_pid 据此报告是谁退出/停止）。
     if(auto ps = sys(parent_vm.get())) {
@@ -45,16 +54,18 @@ void PosixSyscall::stop_process(int sig) {
     //   3) 给父进程投一次 SIGCHLD（去重 stop_reported），让 dash 的 wait/sigsuspend 唤醒
     tg->stopped.store(true, std::memory_order_release);
     tg->stop_sig.store(sig, std::memory_order_release);
+    std::vector<std::shared_ptr<vm>> to_wake;
     {
         std::lock_guard<std::mutex> lock(tg->mtx);
         for(auto& weak_vm : tg->threads) {
-            auto tvm = weak_vm.lock();
-            if(!tvm) {
-                continue;
+            if(auto tvm = weak_vm.lock()) {
+                to_wake.push_back(std::move(tvm));
             }
-            tvm->set_flags(vm::VM_STOPPED);
-            tvm->wakeup(false);
         }
+    }
+    for(auto& tvm : to_wake) {
+        tvm->set_flags(vm::VM_STOPPED);
+        tvm->wakeup(false);
     }
     bool expected = false;
     if(tg->stop_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -361,7 +372,22 @@ int64_t PosixSyscall::do_kill(vm* v) {
 
     for(auto& t : targets) {
         // kill/tgkill 来源：SI_USER（用户态发起），si_status=0。
-        if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, pid, SI_USER, 0});
+        auto s = sys(t.get());
+        if(!s) continue;
+        // SIGKILL 终止整个线程组，普通信号 Linux 投递给任一线程即可，
+        // 这里仍只给 leader（简化）
+        if(sig == SIGKILL) {
+            std::lock_guard<std::mutex> lock(s->tg->mtx);
+            for(auto& weak_vm : s->tg->threads) {
+                if(auto tvm = weak_vm.lock()) {
+                    if(auto ts = sys(tvm.get())) {
+                        ts->queue_signal(tvm.get(), {sig, pid, SI_USER, 0});
+                    }
+                }
+            }
+        } else {
+            s->queue_signal(t.get(), {sig, pid, SI_USER, 0});
+        }
     }
     return 0;
 }

@@ -1,13 +1,9 @@
 #include "posix_internal.h"
 
-// futex 等待桶：每个 (地址空间, guest addr) 一个 bucket，持有等待者 vm* 列表。
+// futex 等待桶：每个 (地址空间, guest addr) 一个 bucket，持有等待者 weak_ptr<vm> 列表。
 // 地址空间用 ThreadGroup 裸指针标识（CLONE_VM 线程共享 tg；fork 后不同 tg 即不同地址空间）。
-//
-// 列表里的 vm* 必然存活：拥有它的线程正阻塞在 futex_wait 内，未跑 fini，vm 不会析构；
-// 等待者返回前必先把自己摘掉（被 wakeup(true) 路径由 waker 摘，kill/超时/信号路径自己摘），故列表
-// 不会残留死 vm。这也顺带让 bucket 在 waiters 空时即 erase，避免表泄漏与 tg 指针悬垂。
 struct FutexBucket {
-    std::vector<vm*> waiters;
+    std::vector<std::weak_ptr<vm>> waiters;
 };
 struct FutexKeyHash {
     size_t operator()(const std::pair<ThreadGroup*, uint64_t>& p) const {
@@ -22,14 +18,16 @@ static void futex_detach(ThreadGroup* tg, uint64_t addr, vm* v) {
     auto it = g_futex_table.find({tg, addr});
     if(it == g_futex_table.end()) return;
     auto& w = it->second.waiters;
-    auto pos = std::find(w.begin(), w.end(), v);
-    if(pos != w.end()) {
-        w.erase(pos);
-    }
+    // 同时清掉已析构（expired）的失效 weak_ptr：惰性回收，避免长生存桶积压死条目。
+    w.erase(std::remove_if(w.begin(), w.end(),
+        [v](const std::weak_ptr<vm>& e){
+            auto sp = e.lock();
+            return !sp || sp.get() == v;
+        }), w.end());
     if(w.empty()) g_futex_table.erase(it);
 }
 
-// clear-child-tid 路径：持 g_futex_mutex 清零 *ctid（host 指针已由调用方 mmu_w 取得），
+// clear-child-tid 路径：持锁清零 *ctid（host 指针已由调用方 mmu_w 取得），
 // 再从 tid_address 的等待桶摘一个等待者唤醒。
 // 被封装在这里（而非 posix_syscall.cpp 的 fini 内联）是因为 g_futex_* 是本文件 static。
 void futex_child_tid_clear(ThreadGroup* tg, int* ctid, uint64_t tid_address) {
@@ -39,10 +37,17 @@ void futex_child_tid_clear(ThreadGroup* tg, int* ctid, uint64_t tid_address) {
     if(it == g_futex_table.end() || it->second.waiters.empty()) {
         return;
     }
-    vm* w = it->second.waiters.back();
-    it->second.waiters.pop_back();
+    // 摘一个仍存活的等待者；跳过已失效（持有者已析构）的 weak_ptr。
+    while(!it->second.waiters.empty()) {
+        auto sp = it->second.waiters.back().lock();
+        it->second.waiters.pop_back();
+        if(sp) {
+            if(it->second.waiters.empty()) g_futex_table.erase(it);
+            sp->wakeup(true);
+            return;
+        }
+    }
     if(it->second.waiters.empty()) g_futex_table.erase(it);
-    w->wakeup(true);
 }
 
 // 唤醒 addr 上最多 val 个等待者。返回实际唤醒数。
@@ -50,18 +55,27 @@ int PosixSyscall::futex_wake(ThreadGroup* tg, uint64_t addr, int val) {
     if(val <= 0) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(g_futex_mutex);
-    auto it = g_futex_table.find({tg, addr});
-    if(it == g_futex_table.end() || it->second.waiters.empty()) {
-        return 0;
+    std::vector<std::shared_ptr<vm>> to_wake;
+    int woken = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_futex_mutex);
+        auto it = g_futex_table.find({tg, addr});
+        if(it == g_futex_table.end() || it->second.waiters.empty()) {
+            return 0;
+        }
+        // 从尾部摘 val 个仍存活的等待者，跳过已失效的 weak_ptr。
+        while(woken < val && !it->second.waiters.empty()) {
+            auto sp = it->second.waiters.back().lock();
+            it->second.waiters.pop_back();
+            if(sp) { 
+                to_wake.push_back(std::move(sp));
+                woken++; 
+            }
+        }
+        if(it->second.waiters.empty()) g_futex_table.erase(it);
     }
-    int woken = std::min((int)it->second.waiters.size(), val);
-    for(int i = 0; i < woken; i++) {
-        vm* w = it->second.waiters.back();
-        it->second.waiters.pop_back();
-        w->wakeup(true);
-    }
-    if(it->second.waiters.empty()) g_futex_table.erase(it);
+    // 锁外唤醒：多个 waiter 逐个 wakeup 不串行占 g_futex_mutex，缩短表锁竞争窗口。
+    for(auto& w : to_wake) w->wakeup(true);
     return woken;
 }
 
@@ -79,13 +93,13 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
         std::lock_guard<std::mutex> flk(g_futex_mutex);
         if(*p != val) return -EAGAIN;
         auto it = g_futex_table.try_emplace(std::make_pair(tg, addr)).first;
-        it->second.waiters.push_back(v);
+        it->second.waiters.push_back(v->shared_from_this());
         v->set_flags(vm::VM_BLOCKED);
     }
 
     int rc = v->wait_for(timeout);
 
-    // 退出清理：摘自己（被 wake 路径 waker 已摘；kill/超时/信号路径这里摘）+ 清 VM_BLOCKED
+    // 退出清理：摘自己（被 wake 路径 waker 已摘或已析构则空操作）+ 清 VM_BLOCKED
     // （被 wake 路径外部已清，此处幂等）。仅取 g_futex_mutex，无嵌套锁。
     {
         std::lock_guard<std::mutex> flk(g_futex_mutex);

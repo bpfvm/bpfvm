@@ -8,7 +8,6 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <condition_variable>
 #include <optional>
 #include <unistd.h>
 #include <fcntl.h>   // AT_FDCWD（guest_abs_path/resolve_path 的 dirfd 默认值）
@@ -62,7 +61,29 @@ struct ThreadGroup {
     std::atomic<int>  stop_sig{-1};
     std::atomic<bool> stop_reported{false};
     std::mutex mtx;
-    std::condition_variable cv;
+    // 等待本组事件的 vm 列表（waitpid 的父进程 / exec 等同组线程收敛）。
+    // 可报告事件（exit/stop）或同组线程退出时，wake_waiters 摘所有等待者并 wakeup(true)。
+    std::vector<std::weak_ptr<vm>> waiters;
+    // 摘除一个等待者（幂等：waker 路径已摘或已失效则空操作）。等待者正常退出 wait_for
+    // 时自清，减少失效 weak_ptr 积压；析构兜底由 weak_ptr 失效保证。
+    void remove_waiter(vm* v) {
+        std::lock_guard<std::mutex> lk(mtx);
+        std::erase_if(waiters, [v](const std::weak_ptr<vm>& w){
+            return w.expired() || w.lock().get() == v;
+        });
+    }
+    // 唤醒所有等待者并清空列表。摘取列表在锁内、wakeup 在锁外：wakeup 取 vm::wait_mutex，
+    // 锁序 mtx → wait_mutex 与 stop_process 既有约定一致；锁外 broadcast 避免长广播持锁。
+    void wake_waiters() {
+        std::vector<std::weak_ptr<vm>> to_wake;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            to_wake.swap(waiters);
+        }
+        for(auto& w : to_wake) {
+            if(auto sp = w.lock()) sp->wakeup(true);
+        }
+    }
     std::vector<std::weak_ptr<vm>> threads;
     explicit ThreadGroup(uint64_t t) : tgid(t) {}
 };

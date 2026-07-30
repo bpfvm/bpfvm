@@ -107,10 +107,6 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
 
     // 线程组生命周期：减 live_threads，判定是否本组最后一个退出的线程。
     bool last = (tg->live_threads.fetch_sub(1, std::memory_order_acq_rel) == 1);
-    // 唤醒在 tg->cv 上等待的线程（do_execveat 杀同组其它线程后等 live_threads 收敛；
-    // waitpid 的子进程退出通知走下方 last 分支的 notify_all）。fetch_sub 与 notify 分离
-    // 是必要的：exec 执行者轮询 live_threads，这里减完后 notify 让它立即重判。
-    tg->cv.notify_all();
 
     // 本线程的信号上下文复位（与 last / pid_map 无关）。
     signal_depth(v.get()) = 0;
@@ -128,6 +124,9 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     }
 
     if(!last) {
+        // 覆盖 do_execveat 执行者等同组 sibling 退出（live_threads 收敛到 1）
+        // exec 线程自身仍存活、被计入 live_threads
+        tg->wake_waiters();
         return;
     }
 
@@ -151,7 +150,6 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     int expected = -1;
     tg->exit_code.compare_exchange_strong(expected, 128 + 9, std::memory_order_acq_rel);
     tg->exited.store(true, std::memory_order_release);
-    tg->cv.notify_all();
     // 子进程退出时给父进程投 SIGCHLD：让阻塞在 read/sigsuspend 的父（如 dash）被唤醒，
     // 进而 waitpid 回收。当前 dash 靠同步 waitpid 也能回收，但 SIGCHLD 使交互式 job-control
     // 行为正确（父不必轮询）。
