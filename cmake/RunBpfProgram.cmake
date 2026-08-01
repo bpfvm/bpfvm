@@ -161,11 +161,10 @@ foreach(v ${variants})
         file(COPY "${prog}" DESTINATION "${rootfs}")
         file(COPY "${ROOT_LIB}" DESTINATION "${rootfs}")
         if(nest_flag STREQUAL "1")
-            # 嵌套 chroot：-- 前是外层 bpfvm 选项（outer_env_args 注入 bpfvm.bpf 进程 environ，
-            # 供其 ldso 启动加载 libcxx.so）；-- 终止外层 getopt，避免 --root 被外层吞；
-            # -- 后是 bpfvm.bpf 的 argv：--root chroot 到 rootfs，inner_env_args 是 bpfvm.bpf
-            # 的 -e（其 load_elf 搜库 + 注入给测试程序），最后是 guest 路径测试程序。
-            set(cmd "${BPFVM}" ${outer_env_args} "--" "${BPFVM_BPF}" "--root" "${rootfs}" ${inner_env_args} "/${NAME}.${suffix}")
+            # 嵌套 chroot：outer_env_args 注入 bpfvm.bpf 进程 environ（供其 ldso 启动加载
+            # libcxx.so）；其后是 bpfvm.bpf 的 argv：--root chroot 到 rootfs，inner_env_args
+            # 是 bpfvm.bpf 的 -e（其 load_elf 搜库 + 注入给测试程序），最后是 guest 路径。
+            set(cmd "${BPFVM}" ${outer_env_args} "${BPFVM_BPF}" "--root" "${rootfs}" ${inner_env_args} "/${NAME}.${suffix}")
         else()
             set(cmd "${BPFVM}" "--root" "${rootfs}" ${guest_env_args} "/${NAME}.${suffix}")
         endif()
@@ -179,11 +178,10 @@ foreach(v ${variants})
         )
     else()
         if(nest_flag STREQUAL "1")
-            # 嵌套非 chroot：-- 前是外层 bpfvm 选项（outer_env_args 注入 bpfvm.bpf 进程 environ，
-            # 供其 ldso 启动加载 libcxx.so）；-- 终止外层 getopt（GNU getopt 默认 permute 会把
-            # ${BPFVM_BPF} 后的 inner_env_args 抢成外层选项，-- 阻止之）；-- 后是 bpfvm.bpf 的
-            # argv：inner_env_args 是 bpfvm.bpf 的 -e（其 load_elf 搜库 + 注入给测试程序）。
-            set(cmd "${BPFVM}" ${outer_env_args} "--" "${BPFVM_BPF}" ${inner_env_args} "${prog}")
+            # 嵌套非 chroot：outer_env_args 注入 bpfvm.bpf 进程 environ（供其 ldso 启动加载
+            # libcxx.so）；其后是 bpfvm.bpf 的 argv：inner_env_args 是 bpfvm.bpf 的 -e
+            # （其 load_elf 搜库 + 注入给测试程序），最后是 guest 路径。
+            set(cmd "${BPFVM}" ${outer_env_args} "${BPFVM_BPF}" ${inner_env_args} "${prog}")
         else()
             set(cmd "${BPFVM}" ${guest_env_args} "${prog}")
         endif()

@@ -64,7 +64,7 @@ int real_main(int argc, char** argv) {
     uint16_t gdb_port = 0;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vl:S:R:e:tTg:", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+vl:S:R:e:tTg:", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'v':
             options->verbose = true;
