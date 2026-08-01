@@ -809,8 +809,8 @@ int vm::wait_for(const struct timespec* timeout) {
             rc = 0;
             break;
         }
-        if(f & (VM_KILLED | VM_SIGNAL_PENDING | VM_STOPPED)) {
-            rc = -EINTR;                        // 交回 safepoint：投递信号 / 退出 / 停止阻塞
+        if(f & (VM_KILLED | VM_SIGNAL_PENDING | VM_STOPPED | VM_DEBUG_STOP)) {
+            rc = -EINTR;                        // 交回 safepoint：投递信号 / 退出 / 停止阻塞 / GDB 请求停
             break;
         }
         if(has_deadline) {
@@ -1189,11 +1189,8 @@ bool vm::safepoint() {
 }
 
 void vm::debug_park() {
-    // GDB 停止的阻塞入口（断点/单步/syscall catch/请求停 命中后调）。设 VM_DEBUG_STOP（GDB
-    // 专属阻塞位）后 cond_wait，等 GDB continue 清 VM_DEBUG_STOP + wakeup 唤醒。与 POSIX 作业
-    // 控制 VM_STOPPED 独立：continue 只清 VM_DEBUG_STOP，不清 VM_STOPPED。停止模型详见
-    // gdb_server.h 文件头。
-    set_flags(VM_DEBUG_STOP);
+    // GDB 停止的阻塞消费入口：调用方须已置 VM_DEBUG_STOP（见 gdb_server.h 停止模型）。本函数纯
+    // 消费——cond_wait 等 GDB continue 清 VM_DEBUG_STOP + wakeup 唤醒，不自己 set flag。
     pthread_mutex_lock(&wait_mutex);
     while(true) {
         uint32_t f = flags.load(std::memory_order_acquire);
@@ -1252,12 +1249,11 @@ bool vm::step() {
         dump(pc_, cur);
     }
     if(flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) {
-        // GDB 调试停止点：取指后执行前，由 breakpoint 钩子统一判定是否停（请求停 stepping
-        // 或断点命中）。命中即 debug_park。详见 gdb_server.h 文件头停止模型。
+        // 取指后执行前的停止点：breakpoint 钩子命中断点或消费单步请求时 set VM_DEBUG_STOP，
+        // 此处统一判 flag 后 debug_park（停止模型见 gdb_server.h）。
         auto hooks = debug_hooks_.load();
-        if(hooks && hooks->breakpoint && hooks->breakpoint(this)) {
-            debug_park();
-        }
+        if(hooks) hooks->breakpoint(this);
+        if(flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) debug_park();
     }
     bool ok = false;
     switch(cur->code & 0x07) {

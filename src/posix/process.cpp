@@ -492,7 +492,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
     while(true) {
         // 调用者自身被 VM_KILL / 收到信号 / GDB 请求停下 -> 标记为可重启。
         // 不查 VM_EXITED：它在 run() 末尾才置，线程卡在 wait 内部时恒为假。
-        if(v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_SIGNAL_PENDING)) {
+        if(v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_SIGNAL_PENDING | vm::VM_DEBUG_STOP)) {
             return SYSCALL_RESTART;
         }
         // 上一轮被唤醒后先试回收：可能事件在注册间隙到达。

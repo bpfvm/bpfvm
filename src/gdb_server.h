@@ -8,26 +8,33 @@
 //
 // 启动行为（QEMU 对齐）：
 //   - 默认（--gdb）：主 vm 全速 JIT 跑，GDB 连上才 attach pid 1 停在当前 pc。
-//   - --stop：run() 前冻结主 vm 在入口（VM_DEBUG_ATTACHED + mark_stepping(1)），GDB 连上
+//   - --stop：run() 前冻结主 vm 在入口（VM_DEBUG_ATTACHED + VM_DEBUG_STOP），GDB 连上
 //     后 continue 才放行。
 // 可重复 attach + 单连接：断开/detach 后被 trace 的 vm 恢复全速，server 回 accept 等下次连接；
 // 新 GDB 连上重新 attach pid 1。同一时刻只允许一个 GDB 会话。
 //
 // ── 停止模型（核心，各处不再重复）──
 // 被调试 vm 置 VM_DEBUG_ATTACHED：compile() 据此返回 nullptr（禁 JIT——JIT 只在循环头插
-// safepoint，无法支持任意 pc 的断点/单步）；step() 取指后调 DebugHooks::breakpoint 钩子
-// 判定是否停。钩子统一回答「该 vm 在当前 pc 是否该停」：
-//   • TaskEntry::stepping 为真 → 请求停（一次性，查中即清），命中；
-//   • 否则查 TaskEntry::breakpoints（per-vm 软断点集），命中则停。
-// 钩子返回 true 即 debug_park：设 VM_DEBUG_STOP（阻塞位）+ cond_wait，等 GDB continue
-// 清 VM_DEBUG_STOP + wakeup 放行。所有「请求停」（单步 s / step-over / attach / all-stop
-// 协调 / Ctrl-C / fork）由 GDB 线程经 mark_stepping 写入 stepping，由 vm 线程在钩子内消费——
-// vm 停下即消费，下次 continue 不误停。
+// safepoint，无法支持任意 pc 的断点/单步）；step() 取指后调 DebugHooks::breakpoint 钩子（void）
+// 判定是否落实停止。钩子命中条件即 set VM_DEBUG_STOP（GDB 请求停的主信号），step() 见 flag 即
+// debug_park。两种命中来源：
+//   • TaskEntry::breakpoints 命中当前 pc（软断点）→ set STOP；
+//   • TaskEntry::stepping 为真（单步/step-over 的一次性放行请求）→ 消费 stepping + set STOP。
+// debug_park 是纯消费者：只 cond_wait 等 GDB continue 清 VM_DEBUG_STOP + wakeup 放行，不自己
+// set flag（消费者不生产）。
+//   即时停（Ctrl-C / attach / all-stop 协调 / fork / exec / syscall catch / 断点命中）由 GDB
+// server 侧代码（request_stop / 各事件回调 / 钩子命中分支）置 VM_DEBUG_STOP。flag 立即跨线程
+// 可见，wait_any_stopped 的 settled 判定据此即时识别「已请求停」，step()/wait_for 据此判停/
+// 打断阻塞。
+//   单步 s / step-over 用 stepping 字段（与 STOP 独立的一次性放行信号）：放行时清 STOP（让
+// debug_park 退出）+ 设 stepping + wakeup，vm 跑一条到下个 step() 钩子消费 stepping 并 set STOP
+// 落实停。
 //   VM_DEBUG_STOP 是 GDB 专属阻塞位，与 POSIX 作业控制 VM_STOPPED（SIGSTOP/SIGCONT）完全
 // 独立：continue 只清 VM_DEBUG_STOP，不清 VM_STOPPED。
-//   vm 可能阻塞在 host syscall（poll/read/futex/wait）不回解释器，此时 stepping 不被检查到，
-// 故配合 host_signal（pthread_kill SIGUSR1，空 handler 不带 SA_RESTART）让宿主阻塞 syscall
-// 返回 EINTR 回解释器，钩子才消费。
+//   vm 可能阻塞在 host syscall（poll/read）或内部 wait_for（futex/waitpid）不回解释器，此时
+// flag 不被检查到，故 request_stop/stop_all_vms 配合 wakeup（踢 cond_wait/wait_for，后者 mask
+// 含 VM_DEBUG_STOP）+ host_signal（pthread_kill SIGUSR1，空 handler 不带 SA_RESTART，让宿主阻塞
+// syscall 返回 EINTR）回解释器，钩子/判位才生效。
 //
 // ── fork 跟踪（follow-fork-mode / detach-on-fork）──
 // 协商 fork-events+ 后，fork 时父停下并上报 T05fork:<child>，GDB 据此按 follow/detach 决策。
@@ -42,8 +49,9 @@
 // 下宿主路径与 guest 视角路径不同。复用 syscall_return 钩子检测（execveat 成功即 r(0)==0 时），
 //
 // ── all-stop ──
-// 任一 vm 命中断点/单步/异常停下后，stop_all_vms 对其余运行中 vm mark_stepping + host_signal，
-// 各 vm 在下个 step() 钩子消费即停；continue/vCont 时按 action 放行。
+// 任一 vm 命中断点/单步/异常停下后，stop_all_vms 对其余运行中 vm set VM_DEBUG_STOP +
+// wakeup + host_signal，各 vm 在下个 step() 钩子/判位即停（含阻塞在 futex/waitpid 的 vm）；
+// continue/vCont 时按 action 放行。
 //
 
 #ifndef GDB_SERVER_H
@@ -110,7 +118,7 @@ private:
         std::shared_ptr<vm> vmp;                                // 该 task 的 vm 引用
         std::unordered_set<uint64_t> breakpoints;               // per-vm 软断点集（见文件头 per-pspace 说明）
         std::string exec_path;                                  // 待上报 exec 事件（空=无）
-        bool stepping = false;                                  // GDB 临时停止请求位（一次性，见文件头）
+        bool stepping = false;                                  // 单步/step-over 的放行信号（一次性，查中即清）；详见文件头。
         vm* fork_child = nullptr;                               // 待上报 fork 事件（子 vm*，nullptr=无）
         std::pair<uint32_t, bool> syscall_event = {0, false};   // 待上报 syscall 事件（{0,false}=无）
     };
@@ -143,7 +151,8 @@ private:
     // with_task 薄封装（调用点更直白）：
     std::shared_ptr<vm> find_task(uint64_t pid);           // 取 vm 引用（持锁，找不到返回 nullptr）
     bool has_breakpoint(vm* v, uint64_t addr) const;       // step-over 判定用
-    void mark_stepping(vm* v);                             // 记请求停（GDB 线程）
+    void mark_stepping(vm* v);                             // 单步/step-over：设 stepping 字段（放行信号，GDB 线程）
+    void request_stop(vm* v);                              // 请求停：set VM_DEBUG_STOP + wakeup + host_signal（GDB 线程）
     // 存入 tasks_（key = v->sys()->id()）。bps 为初始断点集（主 vm/attach 传空集，fork 子传父的
     // 快照）。已存在则整体覆盖。
     void register_task(std::shared_ptr<vm> v,
@@ -160,14 +169,15 @@ private:
 
     // all-stop 协调：
     void continue_all_vms();   // 放行所有被 VM_DEBUG_STOP 阻塞的 vm
-    void stop_all_vms();       // 让所有运行中 vm 停下（mark_stepping + host_signal）
+    void stop_all_vms();       // 让所有运行中 vm 停下（set VM_DEBUG_STOP + wakeup + host_signal）
     void detach_vm(vm* v);  // D;pid：detach 单进程，脱离调试器恢复全速
 
     // vm 派生通知回调（父 vm 在 do_clone 内同步调用）。子继承 VM_DEBUG_ATTACHED + 断点集快照 +
-    // mark_stepping 停首条；真 fork 且协商了 fork-events+ 时另写父的 fork_child 字段供上报。
+    // set VM_DEBUG_STOP 停首条；真 fork 且协商了 fork-events+ 时另写父的 fork_child 字段供上报。
     void on_create_vm(vm* parent, vm* child, bool is_thread);
-    // 构建 syscall 钩子回调（entry/return）：命中 catch 配置则记事件 + debug_park 阻塞。
-    std::function<bool(vm*, uint32_t)> make_syscall_cb(bool is_entry);
+    // 构建 syscall 钩子回调（entry/return）：命中 catch 配置/exec 事件则记事件 + set VM_DEBUG_STOP。
+    // return 钩子（is_entry=false）额外处理 exec 事件。
+    std::function<void(vm*, uint32_t)> make_syscall_cb(bool is_entry);
 
     // 单步/越步放行（resume 用于 's'；resume_continue 用于 'c'，不阻塞等下次停下，交给 wait_any_stopped）。
     void resume(vm* v, bool single_step);

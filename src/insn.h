@@ -281,14 +281,13 @@ struct DebugHooks {
     // vm 派生（fork / CLONE_THREAD）通知：父 vm 在 do_clone 内同步调用。
     std::function<void(vm* parent, vm* child, bool is_thread)> create;
     // syscall entry/return 钩子：do_syscall 在执行真 syscall 的前/后同步调用。回调在 vm 线程
-    // 内执行——回调阻塞即 vm 阻塞，返回即 vm 继续。命中 catch 则 debug_park 阻塞 + 记待上报
-    // 事件，由 GDB 线程发停止回复（all-stop 协调要求）。
-    std::function<bool(vm* v, uint32_t call)> syscall_entry;
-    std::function<bool(vm* v, uint32_t call)> syscall_return;
-    // 取指后执行前的停止点检查（软断点）。返回 true 表示命中，调用方据此 debug_park。由 GdbServer
-    // 注册：闭包查 gdbserver 自维护的 per-vm 断点集与 stepping 字段（模型与 syscall 钩子查
-    // syscall_catch_ 一致）。停止语义详见 gdb_server.h 文件头。
-    std::function<bool(vm* v)> breakpoint;
+    // 内执行——回调阻塞即 vm 阻塞，返回即 vm 继续。命中 catch/exec 事件则回调自行
+    // set_flags(VM_DEBUG_STOP)，调用方据此 debug_park（停止模型见 gdb_server.h 文件头）。
+    std::function<void(vm* v, uint32_t call)> syscall_entry;
+    std::function<void(vm* v, uint32_t call)> syscall_return;
+    // 取指后执行前的停止点检查（软断点）。命中断点则 set_flags(VM_DEBUG_STOP)，调用方据此
+    // debug_park。由 GdbServer 注册：闭包查 gdbserver 自维护的 per-vm 断点集。
+    std::function<void(vm* v)> breakpoint;
 };
 class AtomicDebugHooks {
 public:
@@ -340,7 +339,8 @@ private:
     // 处理 syscall 形式的 BPF call 指令（src_reg=0）。
     bool do_syscall(uint32_t call) {
         if((flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) && debug_hooks_.load()) {
-            debug_hooks_.load()->syscall_entry(this, call) ? debug_park() : void();
+            debug_hooks_.load()->syscall_entry(this, call);  // 命中则内部 set VM_DEBUG_STOP
+            if(flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) debug_park();
         }
         int64_t ret = (options.sys->syscall)(this, call);
         if(ret == SYSCALL_RESTART) {
@@ -357,8 +357,8 @@ private:
         }
         // return 钩子仅在 syscall 真正执行后报（重启/退出不报，符合 ptrace 语义）。
         if((flags.load(std::memory_order_acquire) & VM_DEBUG_ATTACHED) && debug_hooks_.load()) {
-            // 每次获取最新的hooker
-            debug_hooks_.load()->syscall_return(this, call) ? debug_park() : void();
+            debug_hooks_.load()->syscall_return(this, call);  // 命中 catch/exec 则 set VM_DEBUG_STOP
+            if(flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) debug_park();
         }
         return true;
     }
@@ -381,7 +381,7 @@ public:
     static constexpr uint32_t VM_BUDGET_EXCEEDED = 0x10;
     static constexpr uint32_t VM_BLOCKED = 0x20; //内部暂停，在wait_for等待
     static constexpr uint32_t VM_DEBUG_ATTACHED = 0x40;   //GDB 已 attach：JIT 跳过、解释器每步经 breakpoint 钩子判定
-    static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 停止阻塞位：debug_park 设、continue 清；与 POSIX 的 VM_STOPPED 独立
+    static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 请求停：钩子/事件回调/request_stop 设，debug_park 消费，continue 清；wait_for mask 含之以打断阻塞
 
     vm(Token);
     ~vm();

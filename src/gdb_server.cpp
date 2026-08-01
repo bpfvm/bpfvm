@@ -68,33 +68,31 @@ void GdbServer::start() {
     hooks->create = [this](vm* p, vm* c, bool t){ this->on_create_vm(p, c, t); };
     hooks->syscall_entry = make_syscall_cb(true);
     hooks->syscall_return = make_syscall_cb(false);
-    // breakpoint 钩子：统一回答「该 vm 在当前 pc 是否该停」。详见文件头停止模型。
-    hooks->breakpoint = [this](vm* v) -> bool {
+    // breakpoint 钩子：命中断点或消费单步请求时 set VM_DEBUG_STOP。已被请求停则早返保持 flag。
+    hooks->breakpoint = [this](vm* v) -> void {
+        if(v->get_flags() & vm::VM_DEBUG_STOP) return;
         uint64_t pc = v->pc();
-        bool stop = false;
-        // 一次 with_task 完成「stepping 查中即清 + 断点命中查询」。vm 不在表里（未 attach）则不停。
+        // vm 不在表里（未 attach）则不停。命中断点或 stepping 即 set flag 当生产者。
         with_task(v, [&](TaskEntry& e){
             if(e.stepping) {
-                e.stepping = false;
-                stop = true;
-            } else {
-                stop = e.breakpoints.count(pc) != 0;
+                e.stepping = false;              // 消费单步/step-over 请求
+                v->set_flags(vm::VM_DEBUG_STOP);
+            } else if(e.breakpoints.count(pc)) {
+                v->set_flags(vm::VM_DEBUG_STOP);
             }
         });
-        return stop;
     };
     main_vm->set_debug_hooks(hooks);
 
     if(stop_at_start_) {
         // --stop（对齐 QEMU -S）：run() 前冻结主 vm 在入口。必须在 run() 启动前设置，否则与首条指令
-        // 竞态。此处不能调 register_task/mark_stepping——它们内部用 v->sys()->id() 取 pid，而
+        // 竞态。此处不能调 register_task/request_stop——它们内部用 v->sys()->id() 取 pid，而
         // vm::run() 才会把 options（含 sys）赋给 vm（run 前 vm->options.sys 是空 shared_ptr）。
-        // 根进程 pid 恒为 1，直接用字面量建 entry + 置 stepping。GDB 连上后 attach_on_connect 会
-        // 用 sys() 重新 register（insert_or_assign 覆盖此临时 entry）。
-        main_vm->set_flags(vm::VM_DEBUG_ATTACHED);
+        // 根进程 pid 恒为 1，直接用字面量建 entry。GDB 连上后 attach_on_connect 会用 sys() 重新
+        // register（insert_or_assign 覆盖此临时 entry）。
+        main_vm->set_flags(vm::VM_DEBUG_ATTACHED | vm::VM_DEBUG_STOP);
         std::lock_guard<std::mutex> lk(tasks_mutex_);
         tasks_[1] = TaskEntry{main_vm, {}, {}};
-        tasks_[1].stepping = true;
     }
     // 默认（不带 --stop）：不在 start 登记 main_vm——它是 GDB attach 后才接管的调试簿记，
     // 由 attach_on_connect() 首次连接时 register + 停在当前 pc。主 vm 全速 JIT 跑到那时。
@@ -309,16 +307,23 @@ bool GdbServer::is_vm_exited(vm* v) {
 }
 
 void GdbServer::mark_stepping(vm* v) {
+    // 单步/step-over 的放行信号（一次性，breakpoint 钩子查中即清 + set VM_DEBUG_STOP）。
     with_task(v, [](TaskEntry& e){ e.stepping = true; });
+}
+
+void GdbServer::request_stop(vm* v) {
+    // 置 VM_DEBUG_STOP + wakeup（踢 debug_park / wait_for）+ host_signal（让 host 阻塞 syscall EINTR）。
+    v->set_flags(vm::VM_DEBUG_STOP);
+    v->wakeup(false);
+    auto Sys = v->sys();
+    if(Sys) Sys->host_signal(v, 0);
 }
 
 void GdbServer::attach_on_connect() {
     if(main_vm->get_flags() & vm::VM_DEBUG_ATTACHED) return;
     register_task(main_vm);
     main_vm->set_flags(vm::VM_DEBUG_ATTACHED);
-    mark_stepping(main_vm.get());  // 停在当前 pc
-    main_vm->wakeup(false);
-    main_vm->sys()->host_signal(main_vm.get(), 0);  // EINTR 阻塞 syscall，尽快回解释器
+    request_stop(main_vm.get());  // 停在当前 pc（set flag + wakeup + host_signal）
 }
 
 void GdbServer::end_session() {
@@ -371,8 +376,8 @@ void GdbServer::stop_all_vms() {
         uint32_t f = v->get_flags();
         if(!(f & vm::VM_DEBUG_ATTACHED)) return;
         if(f & (vm::VM_DEBUG_STOP | vm::VM_STOPPED | vm::VM_EXITED | vm::VM_KILLED)) return;
-        e.stepping = true;
-        v->wakeup(false);   // 唤醒可能阻塞在 VM_BLOCKED 的 vm
+        v->set_flags(vm::VM_DEBUG_STOP);
+        v->wakeup(false);   // 唤醒可能阻塞在 VM_BLOCKED / wait_for 的 vm（mask 含 VM_DEBUG_STOP）
         v->sys()->host_signal(v.get(), 0);
     });
 }
@@ -402,10 +407,9 @@ void GdbServer::on_create_vm(vm* parent, vm* child, bool is_thread) {
     child->set_flags(vm::VM_DEBUG_ATTACHED);
     bool want_fork_event = (!is_thread && report_fork_events_);
 
-    // 一次锁内完成：register 子（建 entry + 填 vmp/bps）→ mark_stepping(子 停首条) →
-    // [fork-events: 写父 fork_child + mark_stepping(父 停)]。子停首条是 all-stop 正确性要求：
-    // 派生的子必须立即停下纳入协调，否则会在父命中断点时自由跑完，破坏 all-stop。
-    // tasks_ 以 pid 为 key，这里用 parent/child 的 sys()->id() 取 key（手头有 vm，免中间变量）。
+    // 一次锁内完成：register 子 → set VM_DEBUG_STOP(子 停首条) → [fork-events: 写父 fork_child +
+    // set VM_DEBUG_STOP(父 停)]。子停首条是 all-stop 正确性要求：派生的子必须立即停下纳入协调，
+    // 否则会在父命中断点时自由跑完，破坏 all-stop。
     std::lock_guard<std::mutex> lk(tasks_mutex_);
     std::unordered_set<uint64_t> child_bps;
     auto pit = tasks_.find(parent->sys()->id());
@@ -414,19 +418,19 @@ void GdbServer::on_create_vm(vm* parent, vm* child, bool is_thread) {
     auto& ce = tasks_[child->sys()->id()];
     ce.vmp = child->shared_from_this();
     ce.breakpoints = std::move(child_bps);
-    ce.stepping = true;
+    child->set_flags(vm::VM_DEBUG_STOP);   // 子停首条指令
 
     if(want_fork_event && pit != tasks_.end()) {
         pit->second.fork_child = child;   // 存子 vm*（子已 register 进表），供 send_stop_reply 上报
-        pit->second.stepping = true;
+        parent->set_flags(vm::VM_DEBUG_STOP);   // 父停 fork
     }
 }
 
-// syscall 钩子回调：在 vm 线程内同步执行（do_syscall 前后）。命中 catch 配置则记待上报事件
-// + debug_park 阻塞，由 GDB 线程 wait_any_stopped 发停止回复、continue_all_vms 放行后回调返回。
-// return 钩子（is_entry=false）额外处理 exec 事件
-std::function<bool(vm*, uint32_t)> GdbServer::make_syscall_cb(bool is_entry) {
-    return [this, is_entry](vm* v, uint32_t call) -> bool {
+// syscall 钩子回调：在 vm 线程内同步执行（do_syscall 前后）。命中 catch 配置 / exec 事件则记待
+// 上报事件 + set_flags(VM_DEBUG_STOP)（do_syscall 据此 debug_park）。return 钩子（is_entry=false）
+// 额外处理 exec 事件。
+std::function<void(vm*, uint32_t)> GdbServer::make_syscall_cb(bool is_entry) {
+    return [this, is_entry](vm* v, uint32_t call) -> void {
         // exec 事件：仅 return 钩子、仅 EXECVEAT、仅成功时（r(0)==0，do_execveat 已替换地址空间）。
         // 先于 catch 配置判定——exec 是独立功能，不依赖 QCatchSyscalls。未 attach 则跳过。
         // call 是编码后的 BPF_CALL_ID(sysno)（含 0x10000 基址），用 BPF_CALL_TO_ID 还原后比较。
@@ -435,27 +439,25 @@ std::function<bool(vm*, uint32_t)> GdbServer::make_syscall_cb(bool is_entry) {
            && (int64_t)v->r(0) == 0) {
             std::lock_guard<std::mutex> lk(tasks_mutex_);
             auto it = tasks_.find(v->sys()->id());
-            if(it != tasks_.end()) {
+            if(it != tasks_.end() && report_exec_events_) {
                 it->second.breakpoints.clear();  // 旧程序地址空间已失效
-                if(report_exec_events_) {
-                    it->second.exec_path = v->image().exe;  // 宿主路径（GDB open 用）
-                    it->second.stepping = true;             // 停新程序首条指令（all-stop 协调要求）
-                    return true;  // debug_park：停住等 GDB continue
-                }
+                it->second.exec_path = v->image().exe;  // 宿主路径（GDB open 用）
+                v->set_flags(vm::VM_DEBUG_STOP);  // 停新程序首条指令（all-stop 协调要求）
+                return;  // debug_park：停住等 GDB continue
             }
         }
         auto cfg = syscall_catch_.load();
-        if(!cfg->enabled) return false;
+        if(!cfg->enabled) return;
         uint32_t sysno = BPF_CALL_TO_ID(call);
         bool hit = cfg->sysnos->empty() || cfg->sysnos->count(sysno) != 0;
-        if(!hit) return false;
+        if(!hit) return;
         // 记待上报事件。pid 对应的 task 必已 register（fork 子经 on_create_vm 登记，主 vm 在 start）。
         {
             std::lock_guard<std::mutex> lk(tasks_mutex_);
             auto it = tasks_.find(v->sys()->id());
             if(it != tasks_.end()) it->second.syscall_event = {sysno, is_entry};
         }
-        return true;
+        v->set_flags(vm::VM_DEBUG_STOP);  // 命中 catch：当生产者
     };
 }
 
@@ -463,6 +465,8 @@ void GdbServer::resume(vm* v, bool single_step) {
     bool need_step_over = (!single_step) && has_breakpoint(v, v->pc());
     v->clear_flags(vm::VM_DEBUG_STOP);
     if(single_step || need_step_over) {
+        // 单步/step-over：清 STOP 放行（debug_park 退出）+ 设 stepping；breakpoint 钩子消费 stepping
+        // 并 set STOP 落实停。
         mark_stepping(v);
         v->wakeup(false);
         wait_stopped(v);
@@ -477,8 +481,9 @@ void GdbServer::resume(vm* v, bool single_step) {
 // 越过断点（若命中）后放行，不阻塞等下次停下（交给调用方的 wait_any_stopped）。
 void GdbServer::resume_continue(vm* v) {
     if(has_breakpoint(v, v->pc())) {
-        mark_stepping(v);
+        // step-over：清 STOP 放行 + 设 stepping，钩子消费 stepping 落实停。
         v->clear_flags(vm::VM_DEBUG_STOP);
+        mark_stepping(v);
         v->wakeup(false);
         wait_stopped(v);
         if(is_vm_exited(v)) return;
@@ -498,8 +503,7 @@ void GdbServer::wait_stopped(vm* v) {
             ssize_t n = recv(client_fd_, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
             if(n == 1 && peek == '\x03') {
                 recv(client_fd_, &peek, 1, MSG_DONTWAIT);  // 消费 0x03
-                mark_stepping(v);
-                v->sys()->host_signal(v, 0);
+                request_stop(v);  // set flag + wakeup + host_signal
                 continue;
             }
         }
@@ -641,10 +645,9 @@ void GdbServer::wait_any_stopped(std::shared_ptr<vm>& out_hit_vm, vm* preferred,
             } else if(in_watch && is_exited(f) && hit_phase < EXITED) {
                 hit_phase = EXITED; hit_vm = e.vmp; hit_fork_child = e.fork_child;
             }
-            // 判 all-settled：已停或已请求停（stepping）。已请求未停唯有 stepping 可辨（vm 真停下后
-            // consume 掉 stepping 并置 VM_DEBUG_STOP，二者不会同时为真）。不等「已请求未停」的 vm
-            // 能避免死锁：父在 waitpid 阻塞等子、子在断点停被冻住，二者互相等待——父已 mark_stepping
-            // 即视为就绪向 GDB 回报，continue 释放子后父 waitpid 自然返回。
+            // all-settled 判定：已停（VM_DEBUG_STOP/VM_STOPPED/EXITED/KILLED）或已放行单步
+            // （stepping）均视为就绪。stepping 覆盖单步放行后到 vm 在下个 step() 钩子消费 stepping
+            // 置 STOP 之间的窗口（含被步进的指令进入阻塞 syscall、暂不回钩子的情形）。
             if(!(f & vm::VM_DEBUG_ATTACHED)) return;
             bool settled = (f & (vm::VM_DEBUG_STOP | vm::VM_STOPPED
                                  | vm::VM_EXITED | vm::VM_KILLED)) || e.stepping;
@@ -814,25 +817,27 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         set_action(pa.target, pa.act);
     }
 
-    // ── 第二阶段：c 动作 pc 命中断点的 vm 串行 step-over（step-over 用 stepping 字段）。
+    // ── 第二阶段：c 动作 pc 命中断点的 vm 串行 step-over（step-over 用 stepping 放行信号）。
     std::vector<std::shared_ptr<vm>> need_step;
     for_each_task([&](TaskEntry& e){
         if(is_vm_exited(e.vmp.get()) || !is_attached(e.vmp.get())) return;
         auto it = action_of.find(e.vmp.get());
         if(it == action_of.end() || it->second != 'c') return;
         if(e.breakpoints.count(e.vmp->pc()) != 0) {
-            e.stepping = true;
             need_step.push_back(e.vmp);
         }
     });
     for(auto& v : need_step) {
+        // step-over：清 STOP 放行 + 设 stepping，钩子消费 stepping 落实停。
         v->clear_flags(vm::VM_DEBUG_STOP);
+        mark_stepping(v.get());
         v->wakeup(false);
         wait_stopped(v.get());
         if(is_vm_exited(v.get())) action_of.erase(v.get());
     }
 
-    // ── 第三阶段：按动作统一放行。s 动作 mark_stepping；released 给 wait_any_stopped 的 watch_vms。
+    // ── 第三阶段：按动作统一放行：c 动作清 STOP + wakeup；s 动作清 STOP + 设 stepping；t 动作
+    // 保持 stopped。released 给 wait_any_stopped 的 watch_vms。
     std::vector<vm*> released;
     std::vector<std::shared_ptr<vm>> release_vms;
     for_each_task([&](TaskEntry& e){
@@ -841,12 +846,15 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         if(it == action_of.end()) return;
         char act = it->second;
         if(act == 't') return;  // 保持 stopped
-        if(act == 's') e.stepping = true;
         released.push_back(e.vmp.get());
         release_vms.push_back(e.vmp);
     });
     for(auto& v : release_vms) {
-        v->clear_flags(vm::VM_DEBUG_STOP);
+        char act = action_of[v.get()];
+        v->clear_flags(vm::VM_DEBUG_STOP);  // 清上轮停止状态
+        if(act == 's') {
+            mark_stepping(v.get());  // 单步：放行后跑一条，钩子消费 stepping 落实停
+        }
         v->wakeup(false);
     }
 
@@ -1295,7 +1303,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
         if(pkt.rfind("vAttach", 0) == 0) {
             // vAttach;pid：attach 到指定 pid。decode_tid 查 tasks_（已 trace 的 vm），查不到则从
             // syscall 层 pid_map 兜底（search_pid_map=true，找尚未被 trace 的存活 vm）。登记后若未
-            // attached 则置 attach + mark_stepping 停在当前 pc。
+            // attached 则置 attach + request_stop 停在当前 pc。
             auto semi = pkt.find(';');
             if(semi == std::string::npos) return "E01";
             std::shared_ptr<vm> v = decode_tid(pkt.substr(semi + 1), /*search_pid_map=*/true);
@@ -1303,8 +1311,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
             register_task(v);
             if(!(v->get_flags() & vm::VM_DEBUG_ATTACHED)) {
                 v->set_flags(vm::VM_DEBUG_ATTACHED);
-                mark_stepping(v.get());
-                v->sys()->host_signal(v.get(), 0);
+                request_stop(v.get());
             }
             current_vm = v;
             return multiprocess_ ? ("T05thread:" + encode_tid(v.get()) + ";") : "S05";
