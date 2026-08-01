@@ -225,52 +225,24 @@ ElfLoadInfo vm::load_elf(const char* elf_file_path, const std::map<std::string, 
 }
 
 /*
- * Stack Frame Layout:
+ * Stack Frame Layout（frame_base[0] 编码见 insn.h）：
  *
- * frame_base[0] 编码（见 insn.h 的 FRAME_FLAG_* / frame_*）：
- *   bit  0..31 : 本函数栈帧总长度 = stack_limit + alloca_len
- *   bit     32 : is_signal（1=信号帧 / 0=普通帧）；其余保留。
+ * old_r10 / RA 固定在 r10+8 / r10+16（与帧类型无关），这样 DWARF CFI 一套规则即可
+ * 通吃普通帧和信号帧（elf_linker.cpp 合成 .debug_frame）。
  *
- * Normal Frame (64 bytes):
- * +------------------+
- * | flags+total_len  | frame_base[0]
- * +------------------+
- * | r6               | frame_base[1]
- * | r7               | frame_base[2]
- * | r8               | frame_base[3]
- * | r9               | frame_base[4]
- * +------------------+
- * | old_r10 (SP)     | frame_base[5]
- * +------------------+
- * | return_address   | frame_base[6]
- * +------------------+
- * | unused           | frame_base[7]
- * +------------------+
- *
- * Signal Frame (128 bytes):
- * +------------------+
- * | flags+total_len  | frame_base[0]
- * +------------------+
- * | r0               | frame_base[1]
- * | r1               | frame_base[2]
- * | r2               | frame_base[3]
- * | r3               | frame_base[4]
- * | r4               | frame_base[5]
- * | r5               | frame_base[6]
- * | r6               | frame_base[7]
- * | r7               | frame_base[8]
- * | r8               | frame_base[9]
- * | r9               | frame_base[10]
- * +------------------+
- * | old_r10 (SP)     | frame_base[11]
- * +------------------+
- * | return_address   | frame_base[12]
- * +------------------+
- * | unused (3 slots) | frame_base[13..15]
- * +------------------+
+ * 公共头 [0..6]（普通/信号帧一致）：
+ * +------------------+-------------+
+ * | is_signal+len    | frame_base[0]   r10+0
+ * | old_r10 (SP)     | frame_base[1]   r10+8
+ * | return_address   | frame_base[2]   r10+16
+ * | r6/r7/r8/r9      | frame_base[3..6] r10+24..48
+ * +------------------+-------------+
+ * 普通帧 64B：以上 [0..6] + [7] unused。
+ * 信号帧 128B：[0..6] + frame_base[7..12]=r0..r5（caller-saved，信号可打断任意时刻），
+ *              [13..15] unused。
  */
 bool vm::push_frame(uint64_t return_addr, bool is_signal) {
-    uint32_t frame_size = is_signal ? 128 : 64;
+    uint32_t frame_size = is_signal ? SIGNAL_FRAME_SIZE : NORMAL_FRAME_SIZE;
     // 调用者（被中断函数）栈帧的总长度 = stack_limit + alloca_len，读"当前 r10
     //   处那个帧"frame_base[0] 的低 32 位。调用者的局部变量区是
     //   [r10 - stack_limit, r10]，alloca 区在其下 [r10 - total_len, r10 - stack_limit]。
@@ -294,29 +266,24 @@ bool vm::push_frame(uint64_t return_addr, bool is_signal) {
         return false;
     }
 
-    // flags + total_len(=stack_limit)：新函数的局部变量区，尚未 alloca。
+    // is_signal 标志位(bit32) + total_len(=stack_limit，低 32 位)；新函数局部变量区尚未 alloca。
     frame_base[0] = frame_flags_make(is_signal, options.stack_limit);
+    // 公共锚点：old_r10 / RA 固定在 [1] / [2]（与帧类型无关）。
+    frame_base[1] = r(10);
+    frame_base[2] = return_addr;
+    frame_base[3] = r(6);
+    frame_base[4] = r(7);
+    frame_base[5] = r(8);
+    frame_base[6] = r(9);
     if (is_signal) {
         signal_depth++;
-        frame_base[1] = r(0);
-        frame_base[2] = r(1);
-        frame_base[3] = r(2);
-        frame_base[4] = r(3);
-        frame_base[5] = r(4);
-        frame_base[6] = r(5);
-        frame_base[7] = r(6);
-        frame_base[8] = r(7);
-        frame_base[9] = r(8);
-        frame_base[10] = r(9);
-        frame_base[11] = r(10);
-        frame_base[12] = return_addr;
-    } else {
-        frame_base[1] = r(6);
-        frame_base[2] = r(7);
-        frame_base[3] = r(8);
-        frame_base[4] = r(9);
-        frame_base[5] = r(10);
-        frame_base[6] = return_addr;
+        // 信号帧额外保存 caller-saved r0..r5（信号可打断任意时刻）。
+        frame_base[7]  = r(0);
+        frame_base[8]  = r(1);
+        frame_base[9]  = r(2);
+        frame_base[10] = r(3);
+        frame_base[11] = r(4);
+        frame_base[12] = r(5);
     }
 
     r(10) = frame_base_addr;
@@ -372,27 +339,22 @@ uint64_t vm::pop_frame() {
     uint64_t old_sp;
     uint64_t ret_addr;
     bool is_signal = frame_is_signal(frame_base[0]);
+    // 公共锚点：old_r10 / RA 固定在 [1] / [2]。
+    old_sp = frame_base[1];
+    ret_addr = frame_base[2];
+    r(6) = frame_base[3];
+    r(7) = frame_base[4];
+    r(8) = frame_base[5];
+    r(9) = frame_base[6];
     if (is_signal) {
         signal_depth--;
-        r(0) = frame_base[1];
-        r(1) = frame_base[2];
-        r(2) = frame_base[3];
-        r(3) = frame_base[4];
-        r(4) = frame_base[5];
-        r(5) = frame_base[6];
-        r(6) = frame_base[7];
-        r(7) = frame_base[8];
-        r(8) = frame_base[9];
-        r(9) = frame_base[10];
-        old_sp = frame_base[11];
-        ret_addr = frame_base[12];
-    } else {
-        r(6) = frame_base[1];
-        r(7) = frame_base[2];
-        r(8) = frame_base[3];
-        r(9) = frame_base[4];
-        old_sp = frame_base[5];
-        ret_addr = frame_base[6];
+        // 信号帧额外恢复 caller-saved r0..r5。
+        r(0) = frame_base[7];
+        r(1) = frame_base[8];
+        r(2) = frame_base[9];
+        r(3) = frame_base[10];
+        r(4) = frame_base[11];
+        r(5) = frame_base[12];
     }
 
     if(options.verbose) {
@@ -759,8 +721,9 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
             break;
         }
         bool is_signal = frame_is_signal(frame_base[0]);
-        uint64_t old_sp   = is_signal ? frame_base[11] : frame_base[5];
-        uint64_t ret_addr = is_signal ? frame_base[12] : frame_base[6];
+        // old_r10 / RA 统一在 [1] / [2]（与帧类型无关）。
+        uint64_t old_sp   = frame_base[1];
+        uint64_t ret_addr = frame_base[2];
         std::cerr << (is_signal ? " [signal]" : "");
         if (old_sp == 0 || old_sp <= cur_sp || ret_addr == 0) {
             // 到达栈底
@@ -1444,7 +1407,8 @@ bool vm::setup_stack(const std::vector<std::string>& argv,
 
     reg[10] = STACK_BASE + STACK_SIZE - 8;
 
-    // 哨兵：在初始 r10 处写一个合法 frame[0]，模拟"调用者帧"，给_start的局部变量用
+    // 哨兵：在初始 r10 处写一个合法 frame[0]，模拟"调用者帧"，给_start的局部变量用。
+    // 用普通帧 size；total_len = stack_limit（无 alloca）。
     *(uint64_t*)mmu_w(reg[10]) = frame_flags_make(false, options.stack_limit);
 
     if(options.raw_stack) {

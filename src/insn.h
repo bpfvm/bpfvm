@@ -29,9 +29,12 @@ extern std::mutex log_mutex;
 #define STACK_SIZE (8 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
 
-// 栈帧 frame_base[0] 的编码（flags + 栈长度）：
-//   bit  0..31 : 本函数栈帧的总长度 = stack_limit + alloca_len
-//   bit     32 : is_signal（1=信号帧 / 0=普通帧）；其余高位保留。
+// 栈帧 frame_base[0] 的编码：
+//   bit 0..31 : 本函数栈帧总长度 = stack_limit + alloca_len
+//   bit    32 : is_signal（1=信号帧 128B / 0=普通帧 64B）；其余高位保留。
+// 帧布局详见 insn.cpp 的 Stack Frame Layout。
+constexpr uint32_t NORMAL_FRAME_SIZE = 64;
+constexpr uint32_t SIGNAL_FRAME_SIZE = 128;
 #define FRAME_FLAG_SIGNAL  (1ull << 32)
 #define FRAME_LEN_MASK     0xFFFFFFFFull          // 低 32 位 = stack_limit + alloca_len
 #define frame_flags_make(is_sig, total_len) \

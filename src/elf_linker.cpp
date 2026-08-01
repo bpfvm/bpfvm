@@ -1561,22 +1561,17 @@ private:
     }
 
     // 合成 .debug_frame：clang 的 BPF backend 不输出 CFI（CIE 仅 DW_CFA_nop，FDE 空），
-    // GDB 的 bt 无法回溯。这里按本 VM 的帧布局合成正确的 DWARF CFI。
+    // GDB 的 bt 无法回溯。这里按本 VM 的帧布局（见 insn.cpp Stack Frame Layout）合成 CFI。
+    // r10 全程指向帧头且不变（BPF ABI，frame pointer 只读），old_r10/RA 固定在 r10+8/+16，
+    // 故 CIE 用 DWARF expression 对所有 PC 给出统一规则，一套即通吃普通/信号帧：
+    //   CFA = *(r10 + 8)   caller 的 r10，GDB 把它当上一帧 frame base 继续回溯。
+    //   RA  = *(r10 + 16)  帧头返回地址槽。
     //
-    // 帧布局（push_frame，insn.cpp:267-319）：每个函数的帧由 caller 的 call 指令压入，
-    // callee 的 r10 全程指向帧头（BPF ABI，frame pointer 只读）。普通帧 64 字节：
-    //   [r10+0]=flags+len, [+8/16/24/32]=caller r6/r7/r8/r9, [+40]=caller r10, [+48]=RA
+    // RA 列号 11 是 DWARF 逻辑列（r0..r10 对应列 0..10，列 11 专属 RA），GDB 的
+    // dwarf2_frame_cache 会特殊处理该列。
     //
-    // CFI 规则用 DWARF expression 而非静态偏移，关键在 [+40] 槽：
-    //   CFA = *(r10 + 40)   —— push_frame 瞬间记下的 caller r10，GDB 把它当上一帧的
-    //                          frame base 继续回溯。
-    //   RA  = *(r10 + 48)   —— 帧头返回地址槽。
-    //
-    // RA 列号 11 是 DWARF 逻辑列（DWARF 允许 return_address_reg ≥ num_regs），不是 BPF
-    // 物理寄存器（BPF 只有 r0..r10）。GDB 的 dwarf2_frame_cache 会特殊处理该列。
-    //
-    // _start 的帧 RA 槽=0（push_frame(0)），FDE 用 DW_CFA_undefined 覆盖 RA 规则，
-    // 让 GDB 在此干净停止回溯（否则会按默认规则读到 0，显示 "0x0 in ??"）。
+    // _start 的帧 RA 槽=0（push_frame(0)）。其 FDE 用 DW_CFA_undefined 覆盖 RA 规则，
+    // 使 GDB 在此停止回溯。
     void synthesize_debug_frame(std::vector<SecBuf>& extras) {
         std::vector<uint8_t> d;  // .debug_frame 数据
         auto push_u8  = [&](uint8_t v){ d.push_back(v); };
@@ -1626,26 +1621,23 @@ private:
         push_sleb(8);           // data_alignment_factor（保持 8；expression 不用它）
         push_uleb(11);          // return_address_register（r0..r10=列0..10，RA=列11；见函数头注释）
 
-        // initial_instructions：用 expression 定义默认展开规则，对所有 PC 生效（r10 全程不变）。
-        // CFA = *(r10 + 40)：读帧头 [+40] 槽 = caller 的 r10（push_frame 瞬间记下，与 alloca 无关）。
-        //   expression = DW_OP_breg10(40), DW_OP_deref
+        // initial_instructions：用 expression 定义默认展开规则，对所有 PC 生效。
+        // CFA = *(r10 + 8)：DW_OP_breg10(8), DW_OP_deref。
         push_u8(0x0f);          // DW_CFA_def_cfa_expression
         push_expr([&]{
             push_u8(0x7a);      // DW_OP_breg10
-            push_sleb(40);      // +40
+            push_sleb(8);       // +8
             push_u8(0x06);      // DW_OP_deref
         });
-        // RA 的值存在帧头 [+48] 槽。
-        //   注意 DW_CFA_expression 的语义（见 GDB dwarf2/frame.c:1159 SAVED_EXP 分支）：
-        //   expression 计算的是"返回地址存放的地址"，GDB 会自动去该地址读值。
-        //   因此 expression 只需算出 r10+48，不带 DW_OP_deref（否则会二次解引用）。
-        //   这与上面 CFA 的 def_cfa_expression 不同——后者 expression 结果直接是 CFA 值，
-        //   故需要 DW_OP_deref。
+        // RA 存于帧头 [+16] 槽。两种 CFA 指令的 expression 语义不同：
+        //   DW_CFA_def_cfa_expression（上面）：expression 结果 = CFA 值，故需 deref。
+        //   DW_CFA_expression（这里）：expression 结果 = RA 的存放地址，GDB 据此再读值，
+        //   故只算出 r10+16，不带 deref。
         push_u8(0x10);          // DW_CFA_expression
         push_uleb(11);          // RA 列
         push_expr([&]{
             push_u8(0x7a);      // DW_OP_breg10
-            push_sleb(48);      // +48（返回地址存放的地址；GDB 自动从此处读值）
+            push_sleb(16);      // +16（返回地址存放的地址；GDB 自动从此处读值）
         });
         patch_length(cie_len_off);
 
