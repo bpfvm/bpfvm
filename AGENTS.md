@@ -25,7 +25,7 @@
 - `passes/`: LLVM pass plugins (compiled into `build/lib*.so`, loaded by `clang -fpass-plugin=...`).
     - `BpfWideArgs.cpp`: lifts the BPF limit (5-arg, struct return, variadic, by-value aggregate params) + `BpfByvalTmpPass` (≤16B by-value double-free fix) + `BpfAtomicLowerPass` (lowers plain atomic load/store — eBPF ISA only has RMW atomics; unlocks static guards in locale/iostream). See the ABI workarounds section (函数调用约定突破) in README.
     - `BpfSoftFp.cpp`: rewrites floating-point IR into soft-float library calls, enabling `float`/`double` support. See the floating-point support section in README.
-    - `BpfEmutls.cpp`: emulated TLS via `address_space(256)`. See the emulated TLS (emutls) section in README.
+    - `BpfEmutls.cpp`: emulated TLS via `annotate("emutls")`. See the emulated TLS (emutls) section in README.
     - `BpfLibcallLower.cpp`: lowers memcpy/memmove/memset/trap + floor/ceil/trunc/round intrinsics into musl calls.
 - `musl/`: default C library for BPF targets (musl 1.2.6 port); built via `sh musl/build.sh` → installs to `root/{include,lib}`. Porting internals in the musl porting section of README.
 - `dash/`: shell sources for the BPF cross-build.

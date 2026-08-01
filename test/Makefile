@@ -37,16 +37,16 @@ WIDEARGS := $(wildcard ../build/libBpfWideArgs.so)
 # BpfSoftFp：浮点运算（fadd/fmul/fcmp/...）在 IR 层替换成 BPF_FP_* call（src_reg=2，
 #   FP 专用通道），绕过 BPF 后端对浮点的拒绝；VM 侧 do_softfp 用宿主硬件浮点执行。
 SOFTFP := $(wildcard ../build/libBpfSoftFp.so)
-# BpfEmutls：把 address_space(256) 全局改写成 __emutls_get_address 调用，实现
-#   thread_local 语义（机制见 README「模拟 TLS (emutls)」）。对无 addrspace(256) 的源
-#   是 no-op，故 C/C++ 统一注入无害；address_space(256) 入口仅经 CXX_FLAGS 的
-#   -Dthread_local 注入（C 的 thread_local/_Thread_local 仍被 Sema 拒绝）。
+# BpfEmutls：把 annotate("emutls") 全局改写成 __emutls_get_address 调用，实现
+#   thread_local 语义（机制见 README「模拟 TLS (emutls)」）。对无 emutls 标注的源是
+#   no-op，故 C/C++ 统一注入无害；annotate 仅经 CXX_FLAGS 的 -Dthread_local 注入
+#  （C 的 thread_local/_Thread_local 仍被 Sema 拒绝）。
 EMUTLS := $(wildcard ../build/libBpfEmutls.so)
 # BpfLibcallLower：@llvm.memcpy/memmove/memset/trap + floor/ceil/trunc/round intrinsic
 #   → 对 musl 函数的 call。C++ 结构体拷贝/vector realloc 必需
 LIBCALL := $(wildcard ../build/libBpfLibcallLower.so)
 
-# 所有 pass 对 C/C++ 统一注入（emutls pass 对无 addrspace(256) 的 C 源是 no-op）。
+# 所有 pass 对 C/C++ 统一注入（emutls pass 对无 emutls 标注的 C 源是 no-op）。
 PASS_FLAGS :=
 ifneq ($(WIDEARGS),)
 PASS_FLAGS += -fpass-plugin=$(WIDEARGS)
@@ -103,7 +103,7 @@ CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
              -D_LIBCPP_HAS_NO_INT128 \
              $(if $(LIBCXX_INC),-isystem $(LIBCXX_INC)) \
              -isystem ../root/include/ -isystem ../include \
-             -Dthread_local='__attribute__((address_space(256)))' \
+             -Dthread_local='__attribute__((annotate("emutls")))' \
              $(PASS_FLAGS)
 
 # === Host 原生构建 ===

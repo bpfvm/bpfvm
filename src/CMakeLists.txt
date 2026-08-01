@@ -89,7 +89,7 @@ set_target_properties(BpfSoftFp PROPERTIES
 )
 message(STATUS "BpfSoftFp: enabled (plugin -> ${CMAKE_BINARY_DIR}/libBpfSoftFp.so)")
 
-# BpfEmutls：把 address_space(256) 全局改写成 __emutls_get_address 调用
+# BpfEmutls：把 annotate("emutls") 全局改写成 __emutls_get_address 调用
 # （绕过 BPF 后端对 thread_local 的拒绝）。由 clang -fpass-plugin= 加载。
 add_library(BpfEmutls MODULE passes/BpfEmutls.cpp)
 target_include_directories(BpfEmutls PRIVATE ${CMAKE_SOURCE_DIR})

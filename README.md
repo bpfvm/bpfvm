@@ -105,7 +105,7 @@ make -C test
 │   ├── passes/               # LLVM pass 插件（编译为 build/lib*.so，由 clang -fpass-plugin= 加载）
 │   │   ├── BpfWideArgs.cpp   #   突破 5 参数限制 + 返回结构体 + 变参函数 + by-value 聚合参数
 │   │   ├── BpfSoftFp.cpp     #   把浮点 IR 改写为软浮点 call（启用 float/double）
-│   │   ├── BpfEmutls.cpp     #   emutls（address_space(256) → 每线程存储）
+│   │   ├── BpfEmutls.cpp     #   emutls（annotate("emutls") → 每线程存储）
 │   │   └── BpfLibcallLower.cpp #  memcpy/memmove/memset/trap + floor/ceil/... → musl 调用
 │   └── insn_test.cpp         # 指令集单元测试
 ├── include/              # BPF Guest 程序使用的头文件（syscall ID、POSIX 类型、浮点 call 编号）
@@ -320,8 +320,8 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 
 **为本目标写 C++ 时要遵守的硬约束**：
 - **无异常**：`throw`/`try` 编译期被拒（未移植 `__cxa_throw`/`__cxa_personality`/libunwind）。RTTI 已启用；`typeid`/`dynamic_cast` 可用。
-- **`thread_local` 经 `address_space(256)`**（见下文「模拟 TLS (emutls)」）：C++ `thread_local` 关键字被 clang Sema 对 BPF 目标拒绝（无法用 `-femulated-tls` 绕过）。工具链经 `-Dthread_local='__attribute__((address_space(256)))'` 在预处理期把关键字替换成 address_space 属性（早于 Sema），故用户直接写标准 `thread_local`，无需项目专有宏。
-- **不能 `&thread_local_var`**：取 emutls 变量地址是编译错误（地址空间不同）；直接访问变量。
+- **`thread_local` 经 `annotate("emutls")`**（见下文「模拟 TLS (emutls)」）：C++ `thread_local` 关键字被 clang Sema 对 BPF 目标拒绝（无法用 `-femulated-tls`）。工具链经 `-Dthread_local='__attribute__((annotate("emutls")))'` 在预处理期把关键字替换成 `annotate` 属性（早于 Sema）。
+- **`&thread_local_var`**：函数内可取地址（`return &var;`、作实参、`int *p = &var;` 等逃逸形式 pass 都会改写为 `__emutls_get_address` 返回的副本指针）；**全局初始化器里取地址 `int *gp = &var;` 不支持**，pass 编译期报错（没有函数上下文插入 `__emutls_get_address`）。
 
 **全局构造/析构**：经 `bpfvm-ld` 的 `.init_array`/`.fini_array` 框架支持（见 `src/elf_linker.cpp` 与下文「全局构造/析构」）。有非平凡构造/析构的全局对象可用：构造在 `main` 之前运行（定义序），析构在 `exit` 时运行（逆序，经 `_GLOBAL__sub_I_*` 中注册的 `__cxa_atexit`）。由 `test/test_cpp_ctor.cpp` 验证。
 
@@ -335,27 +335,28 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 
 每线程存储通过「`-D` 注入 + LLVM pass + musl 运行时」三层支持，全程是普通函数调用，linker/JIT/VM 无 emutls 专属代码。
 
-**用法**：直接写标准的 `thread_local`，工具链在 BPF 编译期注入 `-Dthread_local='__attribute__((address_space(256)))'`：
+**用法**：直接写标准的 `thread_local`，工具链在 BPF 编译期注入 `-Dthread_local='__attribute__((annotate("emutls")))'`：
 ```cpp
 thread_local int counter = 0;          // 零初始化
 thread_local int init_val = 42;        // 非零初始化（首次访问时模板拷贝）
 thread_local int arr[4] = {1,2,3,4};   // 数组（支持 GEP 访问）
 struct Point { int x; int y; };
 thread_local Point pt = {1, 2};        // 结构体（支持字段访问）
+int *p = &counter;                     // 函数内取地址（支持，见下）
 ```
-预处理期 `thread_local` 被替换成 `__attribute__((address_space(256)))`（早于 Sema，故绕过对 BPF `thread_local` 的拒绝；BPF.h `TLSSupported=false`，后端 `GlobalTLSAddress` ISel 会崩溃）。host 编译不注入该 `-D`，`thread_local` 保持原生语义，故同一源码在 `host` ctest 变体里充作基线。该 `-D` 仅注入 C++ flags（C 的 `thread_local` 来自 `<threads.h>` 宏，命令行 `-D` 会与之冲突；C 端 TLS 不在本方案覆盖范围）。
+预处理期 `thread_local` 被替换成 `__attribute__((annotate("emutls")))`（早于 Sema，故绕过对 BPF `thread_local` 的拒绝；BPF.h `TLSSupported=false`，后端 `GlobalTLSAddress` ISel 会崩溃）。变量仍是普通 `addrspace(0)` 全局，clang 只是把它标进 `@llvm.global.annotations`，pass 解析该数组反查哪些是 emutls 变量。host 编译不注入该 `-D`，`thread_local` 保持原生语义，故同一源码在 `host` ctest 变体里充作基线。该 `-D` 仅注入 C++ flags（C 的 `thread_local` 来自 `<threads.h>` 宏，命令行 `-D` 会与之冲突；C 端 TLS 不在本方案覆盖范围）。
 
-**机制**（见 `src/passes/BpfEmutls.cpp` + `musl/src/thread/emutls.c`）：
-1. `-Dthread_local` 注入后，clang 发出 `addrspace(256)` 全局 + `load/store/GEP ... ptr addrspace(256)`。
-2. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行）为每个变量合成控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value }`（value 为 null=零初始化，否则指向模板 `@__emutls_t.<name>`），并把对该全局的访问改写为 `call ptr @__emutls_get_address(ptr @__emutls_v.<name>)` + 访问返回的每线程副本指针。
-3. bpfvm-ld 走普通 call 重定位 → PLT/GOT 合成，解析到 musl libc 的 `__emutls_get_address`。
-4. musl 运行时（`musl/src/thread/emutls.c`）用一个 `pthread_key` 把本线程的副本指针数组经 `pthread_setspecific` 挂在 `struct pthread::tsd[]` 上，按控制块 `index` 懒分配/查表（`malloc`/`realloc` 增长，线程退出时由 key destructor `free`），首次访问按模板 `memcpy`（零初始化则清零）。每线程隔离由 musl 的 tp（每 vm 一个 `tp_`）保证——不侵入 `struct pthread` 定义，与 compiler-rt/libgcc 的通行做法一致。
+**机制**（见 `src/passes/BpfEmutls.cpp` + `musl/src/thread/bpf/emutls.c`）：
+1. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行，即优化 pipeline 最前——此时 `-O1` 常量折叠尚未执行）解析 `@llvm.global.annotations` 反查所有标注 `emutls` 的全局，为每个合成控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value, ptr dtor }`（value 为 null=零初始化，否则指向模板 `@__emutls_t.<name>`），并把对该全局的访问（含函数内取地址 `&var` 的 ret/call/store 逃逸形式）改写为 `call ptr @__emutls_get_address(ptr @__emutls_v.<name>)` + 访问返回的每线程副本指针。
+2. bpfvm-ld 走普通 call 重定位 → PLT/GOT 合成，解析到 musl libc 的 `__emutls_get_address`。
+3. musl 运行时（`musl/src/thread/bpf/emutls.c`）用一个 `pthread_key` 把本线程的副本指针数组经 `pthread_setspecific` 挂在 `struct pthread::tsd[]` 上，按控制块 `index` 懒分配/查表（`malloc`/`realloc` 增长，线程退出时由 key destructor `free`），首次访问按模板 `memcpy`（零初始化则清零）。每线程隔离由 musl 的 tp（每 vm 一个 `tp_`）保证——不侵入 `struct pthread` 定义，与 compiler-rt/libgcc 的通行做法一致。
+4. 非平凡析构：clang 因 `thread_local` 被替换成 `annotate` 属性而走普通全局的进程级 `__cxa_atexit(dtor, &var, dso)`（仅析构主线程副本）。pass 的 `collectDtors` 从 init 函数里识别这条 `__cxa_atexit`（arg1 是某 emutls 全局），把 dtor 转移进控制块字段并删除原 call；`__emutls_get_address` 在每线程首次分配副本时若 `ctrl->dtor` 非空，调 `__cxa_thread_atexit(dtor, 本副本地址, NULL)` 注册本副本析构。dso 句柄不转移——BPF 无 dlopen/dlclose，运行时不按 DSO 过滤。每线程析构链由 `__pthread_run_cxa_dtors` 在 `__pthread_tsd_run_dtors` 开头（子线程）和 `exit()`（主线程）逆序调用——C++ ABI 要求 thread_local dtor 早于 pthread_key dtor（含 emutls 副本内存 `free`），故析构时副本内存仍有效。覆盖见 `test/test_thread_local_dtor.cpp`。
 
 **fork 语义**：副本数组与副本内存经 `malloc` 落在 guest 可写堆（CoW 段），`pthread_key` 是进程级。子进程的 `tsd[]` 继承父的指针，任一方写入触发 CoW 分叉——自动达到 POSIX fork 的"继承父值、之后独立"。线程（`pthread_create`、带 `CLONE_VM` 的 clone）各获独立 `struct pthread`（空 `tsd`），即标准 `thread_local` 语义。
 
 **限制**：
-- 仅平凡可析构类型（尚无 `thread_local` 析构的 `__cxa_thread_atexit`）。
-- `&var` 是编译错误（地址空间不匹配）；直接访问变量。
+- 仅聚合初始化（无用户构造函数）：`thread_local T x{7};` / `thread_local T x;` 仅当 `T` 是聚合类型（或仅有隐式默认构造）时支持——其 initializer 直接进 GV。**带用户自定义构造函数的类型（如 `thread_local std::string s;`）pass 编译期报错**：pass 跑在 `-O1` 优化前，此时构造调用还在 init 函数里，pass 无法把它迁移成每线程执行，放行会丢构造且只构造一次。非平凡析构已支持，可用「聚合构造 + 用户析构」形态（`struct T { int v; ~T(){...} }; thread_local T x{7};`）。
+- 全局初始化器里不能 `&var`：`int *gp = &tls_var;`（initializer 是编译期 Constant，无函数上下文插 `__emutls_get_address`）pass 编译期报错；函数内的 `&var` 完全支持（ret/call/store 均可）。
 - TLS 变量必须定义并使用于单个翻译单元内；不支持跨 TU 的 `extern thread_local`（控制块用内部链接）。
 
 #### 全局构造/析构

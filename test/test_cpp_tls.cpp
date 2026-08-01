@@ -1,9 +1,8 @@
 // emutls spike：验证 thread_local 变量在 bpfvm 上正确工作。
 // 机制见 README「模拟 TLS (emutls)」。
 //
-// 覆盖：零初始化、非零初始化模板、单线程读写、多线程隔离、数组/struct 的 GEP 访问。
-// 已知不覆盖：取地址 &var（addrspace 不兼容，编译期报错）。
-// 不兼容会编译错，是已知限制）。
+// 覆盖：零初始化、非零初始化模板、单线程读写、多线程隔离、数组/struct 的 GEP 访问、
+// 取地址 &var（函数内逃逸：ret/call arg/store）、聚合初始化非平凡类型（无用户构造函数）。
 
 #include <pthread.h>
 #include <stdio.h>
@@ -20,10 +19,30 @@ thread_local int arr[4] = {10, 20, 30, 40};
 struct Point { int x; int y; };
 thread_local Point pt = {1, 2};
 
+// 聚合初始化的非平凡类型（无用户构造函数，initializer 直接进 GV；非平凡析构由
+// collectDtors 处理）——「带析构的 thread_local」的可用形态。
+struct Tracker { int v; ~Tracker(); };
+thread_local Tracker tracked{7};
+
+// 函数内取地址 &var：pass 把 &var 在使用点改写为 __emutls_get_address 返回的副本
+// 指针。覆盖三种逃逸形态：ret / call arg / store。
+static int *get_counter_addr() { return &counter; }       // ret 形态
+// consume_ptr 标 noinline，确保 &init_val 真正跨越函数边界（call arg 形态）而非被
+// -O1 内联消解掉。
+extern "C" int consume_ptr(int *p) __attribute__((noinline));
+static int via_call_arg() { return consume_ptr(&init_val); } // call arg 形态
+
 struct Arg {
     int id;
     int result;
 };
+
+// consume_ptr：返回 *p，验证传入的是有效副本指针。
+extern "C" __attribute__((noinline)) int consume_ptr(int *p) { return *p; }
+
+// Tracker 的析构定义：累加到全局计数，便于校验主线程副本被析构。
+static volatile int g_tracked_dtor_sum = 0;
+Tracker::~Tracker() { g_tracked_dtor_sum += v; }
 
 static void *worker(void *p) {
     struct Arg *a = (struct Arg *)p;
@@ -54,6 +73,31 @@ int main() {
 
     if (c != 6 || iv != 42 || arr_sum != 169 || pt_sum != 15) {
         printf("FAIL single-thread: c=%d iv=%d arr=%d pt=%d\n", c, iv, arr_sum, pt_sum);
+        return 1;
+    }
+
+    // (1b) 聚合初始化非平凡类型：tracked.v 应为模板初值 7（首次访问 memcpy 模板）
+    int tv = tracked.v;
+    tracked.v = 100;
+    int tv2 = tracked.v;
+    if (tv != 7 || tv2 != 100) {
+        printf("FAIL tracked: tv=%d tv2=%d expected 7,100\n", tv, tv2);
+        return 1;
+    }
+
+    // (1c) 取地址 &var：
+    //   get_counter_addr() 返回 counter 副本指针 → 经它写入应改 counter
+    //   via_call_arg() 把 &init_val 传入外部函数 → 应读到模板初值 42
+    counter = 11;
+    int *cp = get_counter_addr();
+    *cp = 22;   // 经指针写，counter 应变 22
+    int counter_via_ptr = counter;   // 直接读验证
+    counter = 33;
+    int counter_via_ptr2 = *get_counter_addr();  // 再次经指针读
+    int iv_via_call = via_call_arg();  // &init_val 经 call arg
+    if (counter_via_ptr != 22 || counter_via_ptr2 != 33 || iv_via_call != 42) {
+        printf("FAIL &var: cp=%d cp2=%d iv_call=%d expected 22,33,42\n",
+               counter_via_ptr, counter_via_ptr2, iv_via_call);
         return 1;
     }
 

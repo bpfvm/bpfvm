@@ -144,6 +144,9 @@ if [ -n "$LIBCXXABI_SRC" ]; then
     #                                 无引用，纳入是死代码。
     #   cxa_personality.cpp        — 含 throw，-fno-exceptions 下编不过；异常人格函数，不需要。
     #   cxa_thread_atexit.cpp      — 用 __thread 原生 TLS，BPF 不支持，编不过。
+    #                                 __cxa_thread_atexit 符号改由 musl 提供（见
+    #                                 musl/src/thread/bpf/cxa_thread_atexit.c），配合 emutls
+    #                                 控制块的 dtor 字段实现 thread_local 每线程析构。
     ABI_EXCLUDE="cxa_exception.cpp cxa_exception_storage.cpp cxa_personality.cpp cxa_thread_atexit.cpp"
     n=0
     for src in "$LIBCXXABI_SRC"/*.cpp; do
