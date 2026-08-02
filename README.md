@@ -201,17 +201,17 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 
 **方案：一批以 BPF `call` 编码的浮点「虚拟指令」**
 
-核心思想是**通过 BPF `call` 机制模拟一批浮点指令**，然后在流水线的每一处都把它当作单条指令处理。具体地，每个浮点操作被赋予一个稳定的数字 ID——`include/bpf_call.h` 中的 `BPF_CALL_FP_*` 族（如 `BPF_CALL_FP_ADD_D`、`BPF_CALL_FP_D2SI`、`BPF_CALL_FP_CMP_D`）——在 BPF 程序中最终变成一条 `call <imm>`，且 **`src_reg=2`（专用浮点通道）**。这刻意把浮点与系统调用（`src_reg=0`）分开：解释器和 JIT 把 `src_reg=2` 直接派发到浮点路径（`do_softfp` / `emit_call_softfp`），完全不碰 syscall handler。每条浮点指令自包含：从 `r1`/`r2` 读操作数（位模式），用宿主硬件 FP 计算结果，把位模式写回 `r0`。运行时没有函数调用、没有栈帧、操作数与结果之间没有 VM 状态穿梭——它就是一条恰好用 `call` 操作码承载的指令。
+核心思想是**通过 BPF `call` 机制模拟一批浮点指令**，然后在流水线的每一处都把它当作单条指令处理。具体地，每个浮点操作被赋予一个稳定的数字 ID——`include/bpf_fp.h` 中的 `BPF_FP_*` 族（如 `BPF_FP_ADD_D`、`BPF_FP_D2SI`、`BPF_FP_CMP_D`）——在 BPF 程序中最终变成一条 `call <imm>`，且 **`src_reg=2`（专用浮点通道）**。这刻意把浮点与系统调用（`src_reg=0`）分开：解释器和 JIT 把 `src_reg=2` 直接派发到浮点路径（`do_softfp` / `emit_call_softfp`），完全不碰 syscall handler。每条浮点指令自包含：从 `r1`/`r2` 读操作数（位模式），用宿主硬件 FP 计算结果，把位模式写回 `r0`。运行时没有函数调用、没有栈帧、操作数与结果之间没有 VM 状态穿梭——它就是一条恰好用 `call` 操作码承载的指令。
 
 这跨三层实现（无 guest 侧胶水）：
 
-1. **`BpfSoftFp` LLVM pass**（`src/passes/BpfSoftFp.cpp`，自动编进 `build/libBpfSoftFp.so`，由 `test/Makefile` 自动注入）——*IR* 阶段：把每条浮点 IR 指令（`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`、fp↔int 转换、`fpext`/`fptrunc`、以及 `fmuladd`/`fma`/`sqrt` 内联函数）改写为对 `extern __ksym` 函数 `__bpf_fp_<ID>`（段 `.ksyms`）的调用，其中 `<ID>` 是十进制 `BPF_CALL_FP_*` 值。后端把它当作普通的未解析外部调用 lower：参数按 BPF 调用约定落到 `r1`/`r2`/...、结果落到 `r0`（这是关键的稳定性属性——它用的是后端原生调用 lowering，而非 InlineAsm 那种 `"r"`/`"=r"` 约束无法钉住物理寄存器的把戏）。`fcmp` 展开成**两**次调用（`CMP` + `UNORD`），从而精确重建每个 IEEE-754 谓词。
+1. **`BpfSoftFp` LLVM pass**（`src/passes/BpfSoftFp.cpp`，自动编进 `build/libBpfSoftFp.so`，由 `test/Makefile` 自动注入）——*IR* 阶段：把每条浮点 IR 指令（`fadd`/`fsub`/`fmul`/`fdiv`/`fneg`/`fcmp`、fp↔int 转换、`fpext`/`fptrunc`、以及 `fmuladd`/`fma`/`sqrt` 内联函数）改写为对 `extern __ksym` 函数 `__bpf_fp_<ID>`（段 `.ksyms`）的调用，其中 `<ID>` 是十进制 `BPF_FP_*` 值。后端把它当作普通的未解析外部调用 lower：参数按 BPF 调用约定落到 `r1`/`r2`/...、结果落到 `r0`（这是关键的稳定性属性——它用的是后端原生调用 lowering，而非 InlineAsm 那种 `"r"`/`"=r"` 约束无法钉住物理寄存器的把戏）。`fcmp` 展开成**两**次调用（`CMP` + `UNORD`），从而精确重建每个 IEEE-754 谓词。
 
 2. **`bpfvm-ld` 链接器**——*字节码改写*阶段：clang 把它们发成 `call -1`（`src_reg=1` 占位）+ 指向 `__bpf_fp_<ID>` 的 `R_BPF_64_32` 重定位。链接器识别 `__bpf_fp_` 符号名，从名字解析 `<ID>`（无查表——ID 就在名字里），把指令改写为 `src_reg=2` + `imm=<ID>`。同时对这些名字抑制 "undefined symbol"（VM 在运行时解释它们），并跳过它们的 PLT/GOT 合成（它们不是真正的跨模块调用）。
 
-3. **执行**——两条路径都解析同一个 `BPF_CALL_FP_*` ID（来自 `imm`），用宿主硬件 FP 执行（操作数为 `i64` 位模式，结果写 `r0`）：
+3. **执行**——两条路径都解析同一个 `BPF_FP_*` ID（来自 `imm`），用宿主硬件 FP 执行（操作数为 `i64` 位模式，结果写 `r0`）：
    - **解释器**：`insn.cpp` 的 `do_softfp`——经 `src_reg=2` 派发分支直达，也是 JIT 的兜底。
-   - **JIT**：`emit_call_softfp()` 识别 ID 并内联发射宿主原生 FP 代码。因为 JIT 把全部 11 个 BPF 寄存器常驻在物理寄存器中，r1/r2/r0 已就位（x86：R9/R10/R8；AArch64：X10/X11/X9）——无需 flush、无需 VM 退出，该操作只是指令流里又一条指令。各 arch 的细节与 bring-up 期间踩过的编码坑都注释在每个 `emit_call_softfp` 现场。这一层唯一要紧的架构差异：**AArch64 有原生 `FCVTZU`/`UCVTF`，每条 `BPF_CALL_FP_*` 都能原生处理；而 x86 缺少无符号 fp↔int 转换（需 AVX-512），故 x86 上无符号转换类 ID 回退到 `do_softfp`**（经 `emit_call_softfp_slow` → `helper_do_softfp`，一个与 syscall 路径解耦的专用 FP 兜底 helper）。
+   - **JIT**：`emit_call_softfp()` 识别 ID 并内联发射宿主原生 FP 代码。因为 JIT 把全部 11 个 BPF 寄存器常驻在物理寄存器中，r1/r2/r0 已就位（x86：R9/R10/R8；AArch64：X10/X11/X9）——无需 flush、无需 VM 退出，该操作只是指令流里又一条指令。各 arch 的细节与 bring-up 期间踩过的编码坑都注释在每个 `emit_call_softfp` 现场。这一层唯一要紧的架构差异：**AArch64 有原生 `FCVTZU`/`UCVTF`，每条 `BPF_FP_*` 都能原生处理；而 x86 缺少无符号 fp↔int 转换（需 AVX-512），故 x86 上无符号转换类 ID 回退到 `do_softfp`**（经 `emit_call_softfp_slow` → `helper_do_softfp`，一个与 syscall 路径解耦的专用 FP 兜底 helper）。
 
 **ABI 细节**：浮点值以 IEEE-754 位模式存于 64 位 BPF 寄存器/栈槽——无精度损失。`printf("%f", x)` 之类的变参通过现有的 `BpfWideArgs` pass 工作（`va_list` 槽为 8 字节）。`printf %f` 格式化由默认 musl libc 提供（musl 的 printf 原生处理 `%f`/`%e`/`%g`）
 

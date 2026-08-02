@@ -5,7 +5,7 @@
 // 承载所有拆出 .cpp 共用的 include 组与参数转换辅助函数，避免每个文件重复一大段。
 
 #include "posix_syscall.h"
-#include "include/bpf_call.h"
+#include "include/bpf_syscall.h"
 
 namespace bpf{
     #define BPF_NO_SYSCALL

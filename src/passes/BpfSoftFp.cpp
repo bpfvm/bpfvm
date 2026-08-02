@@ -1,6 +1,6 @@
 //===- BpfSoftFp.cpp - 虚拟 FP 指令的编码 pass ----------------------------===//
 //
-// 虚拟 FP 指令的设计见 include/bpf_call.h（bpf_fp_op enum 段注释）。本 pass
+// 虚拟 FP 指令的设计见 include/bpf_fp.h（BPF_FP_* 宏段注释）。本 pass
 // 负责编码阶段：在 IR 层把每个浮点运算指令替换成一次对 extern __ksym 函数
 // `__bpf_fp_<ID>` 的调用，绕过后端在 ISel 阶段对 fadd/fmul/... 的拒绝
 // （"A call to built-in function '__adddf3' is not supported"）。
@@ -52,9 +52,9 @@ static const char *suffix(Type *Ty) {
 }
 
 // ---- BPF_FP_* helper 编号：单一数据源 ----
-// 直接复用 include/bpf_call.h 的定义（BPF_CALL_BASE + BPF_FP_* 宏），
-// 避免在 pass 里手抄一份容易不一致的编号表。bpf_call.h 是纯宏/enum，C++ 兼容。
-#include "include/bpf_call.h"
+// 直接复用 include/bpf_fp.h 的定义（BPF_FP_* enum），
+// 避免在 pass 里手抄一份容易不一致的编号表。bpf_fp.h 是纯 enum，C++ 兼容。
+#include "include/bpf_fp.h"
 
 // 把一个操作数转成 i64 位模式，供 FP helper 的整数 ABI 传递：
 //   - float/double：bitcast 到 i32/i64 后再 zext 到 i64（位模式原样）；

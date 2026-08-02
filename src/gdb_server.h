@@ -58,7 +58,7 @@
 #define GDB_SERVER_H
 
 #include "insn.h"
-#include "include/bpf_call.h"  // BPF_CALL_TO_ID（syscall 钩子算 sysno）
+#include "include/bpf_syscall.h"  // BPF_CALL_TO_ID（syscall 钩子算 sysno）
 
 #include <atomic>
 #include <functional>

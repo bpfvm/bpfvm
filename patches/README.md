@@ -47,7 +47,7 @@ fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
    a bogus length, and it aborts with `std::length_error: cannot create
    std::vector larger than max_size`. A real-looking name makes `gdb_fopen`
    fail cleanly (file not found), and catch syscall works with numbers only
-   (BPF uses its own `bpf_syscall_id` enum, not Linux numbers, so no upstream
+   (BPF uses its own `BPF_CALL_*` IDs, not Linux numbers, so no upstream
    XML applies anyway). Bpfvm's sysno in `catch syscall N` is
    `BPF_CALL_TO_ID(call)` (e.g. `BPF_SYS_clock_gettime` = 38).
 

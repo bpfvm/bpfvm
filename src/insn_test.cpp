@@ -1,5 +1,5 @@
 #include "insn.h"
-#include "include/bpf_call.h"
+#include "include/bpf_syscall.h"
 #include <iostream>
 #include <cassert>
 #include <cstdio>

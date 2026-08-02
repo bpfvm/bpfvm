@@ -366,7 +366,7 @@ private:
         return true;
     }
 
-    // 虚拟浮点指令（src_reg=2）的解释器实现（见 include/bpf_call.h 的 bpf_fp_op enum）。
+    // 虚拟浮点指令（src_reg=2）的解释器实现（编号见 include/bpf_fp.h 的 BPF_FP_* 宏）。
     bool do_softfp(uint32_t call);
 
     friend class SyscallHandler;

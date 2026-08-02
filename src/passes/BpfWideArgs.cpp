@@ -45,7 +45,7 @@
 //
 //===----------------------------------------------------------------------===*/
 
-#include "include/bpf_call.h"   // BPF_CALL_ALLOCA（VLA 路径用）
+#include "include/bpf_syscall.h"   // BPF_CALL_ALLOCA（VLA 路径用）
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"

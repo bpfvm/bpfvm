@@ -22,7 +22,7 @@ endforeach()
 
 # 对象库：VM 核心 + JIT + main + POSIX 全部源（与 host 一致）。
 add_library(bpfvm_bpf_obj OBJECT ${_abs_sources})
-# 项目头搜索路径（insn.h / posix_syscall.h / bpf_call.h 等）。
+# 项目头搜索路径（insn.h / posix_syscall.h / bpf_syscall.h 等）。
 target_include_directories(bpfvm_bpf_obj PRIVATE
     ${BPFVM_ROOT}
     ${BPFVM_ROOT}/src

@@ -3,7 +3,7 @@
 //
 
 #include "insn.h"
-#include "include/bpf_call.h"   // BPF_CALL_TO_ID / BPF_FP_*（do_syscall 拦截 FP 段）
+#include "include/bpf_fp.h"
 #include <iostream>
 
 #include "jit/jit.h"
@@ -422,10 +422,10 @@ int64_t vm::alloca(int64_t inc) {
 // r1/r2 是操作数位模式，用宿主硬件浮点算出结果，位模式写回 r0。
 // 解释器经 src_reg=2 的 dispatch 直达此处；JIT 无原生 lowering 时（如 x86 的
 // uint 转换）经 emit_call_softfp_slow 回退到此处（helper_do_softfp）。
-// call 即 imm 字段，本身就是 bpf_fp_op 枚举值（1..N，无 BASE 偏移），直接 switch。
+// call 即 imm 字段，本身就是 BPF_FP_* 编号（1..N，无 BASE 偏移），直接 switch。
 // ---------------------------------------------------------------------------
 bool vm::do_softfp(uint32_t call) {
-    const uint32_t op = call;   // FP 编号空间独立，imm 即 enum 值，无需 BPF_CALL_TO_ID
+    const uint32_t op = call;   // FP 编号空间独立，imm 即 BPF_FP_* 值，无需 BPF_CALL_TO_ID
 
     // 取出两个 i64 操作数（比较/算术用 r1,r2；一元只用 r1）。
     // 题外：glue 函数中所有位转换（double<->i64）已被 clang 优化为寄存器直传，
