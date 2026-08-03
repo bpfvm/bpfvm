@@ -2,14 +2,18 @@
 #include <iostream>
 #include <algorithm>
 
-// 在 maps 列表里对 [base, end) 打洞：把所有与之重叠的 memmap 切成至多三段，
+// 在 maps（vector）里对 [base, end) 打洞：把所有与之重叠的 memmap 切成至多三段，
 // 保留不重叠的左 [paddr,base) / 右 [end, paddr+size) 两段，删掉中间重叠段。
 // host 内存经 cow_data 共享（同 do_mprotect 的切分模式），避免双重释放。
 // 供 MAP_FIXED（do_mmap）按 Linux 语义打洞用。
-static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
-    for (auto it = ml.begin(); it != ml.end();) {
-        memmap& m = *it;
-        if (end <= m.paddr || base >= m.paddr + m.size) { ++it; continue; }  // 不重叠
+static void punch_hole(std::vector<memmap>& ml, uint64_t base, uint64_t end) {
+    std::vector<memmap> out;
+    out.reserve(ml.size());
+    for (auto& m : ml) {
+        if (end <= m.paddr || base >= m.paddr + m.size) {  // 不重叠，原样保留
+            out.push_back(std::move(m));
+            continue;
+        }
         const bool own_host = m.data.get_deleter().owned;
         if (!m.cow_data && own_host) {
             m.cow_data = std::shared_ptr<unsigned char>(
@@ -20,7 +24,7 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
         std::shared_ptr<unsigned char> cb = m.cow_data;
         const uint32_t fl = m.flags;
         const uint64_t m_end = m.paddr + m.size;
-        // 左段
+        // 左段（保留不重叠的左侧）
         if (m.paddr < base) {
             memmap left;
             left.paddr = m.paddr;
@@ -29,9 +33,9 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
             left.set_data(hbase, left.size, false);
             left.cow_data = cb;
             left.path = m.path;
-            ml.insert(it, std::move(left));
+            out.push_back(std::move(left));
         }
-        // 右段
+        // 右段（保留不重叠的右侧）
         if (end < m_end) {
             memmap right;
             right.paddr = end;
@@ -40,10 +44,11 @@ static void punch_hole(std::list<memmap>& ml, uint64_t base, uint64_t end) {
             right.set_data(hbase + (end - m.paddr), right.size, false);
             right.cow_data = cb;
             right.path = m.path;
-            ml.insert(it, std::move(right));
+            out.push_back(std::move(right));
         }
-        it = ml.erase(it);
+        // 重叠段丢弃（m 析构时若仍 own host 会 munmap；上面已把 owned 置 false）
     }
+    ml = std::move(out);
 }
 
 int64_t PosixSyscall::do_mmap(vm* v) {
@@ -179,9 +184,9 @@ int64_t PosixSyscall::do_mprotect(vm* v) {
     // 遍历所有与 [addr, addr+len) 重叠的映射，逐一应用权限（Linux mprotect 可跨多个
     // VMA）。guest ldso 的 DT_TEXTREL 对整模块 mprotect(map, map_len, RWX)，此时模块
     // 已被 map_library 的 mmap_fixed 切成 text/rodata/data 多段，必须跨段处理。
-    for (auto it = ml.begin(); it != ml.end();) {
-        memmap& m = *it;
-        if (range_hi <= m.paddr || range_lo >= m.paddr + m.size) { ++it; continue; }  // 不重叠
+    for (size_t i = 0; i < ml.size(); ) {
+        memmap& m = ml[i];
+        if (range_hi <= m.paddr || range_lo >= m.paddr + m.size) { ++i; continue; }  // 不重叠
         // 子区间 = 本 map 与请求范围的交集
         uint64_t sub_lo = std::max(range_lo, m.paddr);
         uint64_t sub_hi = std::min(range_hi, m.paddr + m.size);
@@ -227,24 +232,32 @@ int64_t PosixSyscall::do_mprotect(vm* v) {
                     return -errno;
                 }
             }
-            // 按 paddr 升序插回 next 前：先 left、再 mid、再 right。每次 insert(next,X)
-            // 把 X 放到 next 正前，先插的离 next 远、后插的紧贴 next，最终 left,mid,right。
-            // 顺序搞反会让列表失序，尾部分配器 ml.back() 取错元素->mmap 地址碰撞。
-            auto next = ml.erase(it);
-            if (left.size) ml.insert(next, std::move(left));
-            ml.insert(next, std::move(mid));
-            if (right.size) ml.insert(next, std::move(right));
-            it = next;  // next 指向插入块之后的元素，继续
+            // 用「构造新 vector」式替换，避免 vector insert/erase 的迭代器失效
+            // 顺序：left（若有）→ mid → right（若有），保持 paddr 升序（尾部分配器
+            // ml.back() 依赖有序，否则 mmap 地址碰撞）。
+            std::vector<memmap> rebuilt;
+            rebuilt.reserve(ml.size() + 2);
+            for (size_t j = 0; j < ml.size(); ++j) {
+                if (j == i) {
+                    if (left.size)  rebuilt.push_back(std::move(left));
+                    rebuilt.push_back(std::move(mid));
+                    if (right.size) rebuilt.push_back(std::move(right));
+                } else {
+                    rebuilt.push_back(std::move(ml[j]));
+                }
+            }
+            ml = std::move(rebuilt);
+            i = 0;  // 重建后从头扫（N 通常 <100，开销可忽略）
         } else {
             // 整张 map 都在范围内
-            if (new_flags == (m.flags & kProtMask)) { ++it; continue; }  // no-op
+            if (new_flags == (m.flags & kProtMask)) { ++i; continue; }  // no-op
             if (own_host) {
                 if (mprotect(m.data.get(), m.size, prot) == -1) {
                     return -errno;
                 }
             }
             m.flags = (m.flags & ~kProtMask) | new_flags;
-            ++it;
+            ++i;
         }
     }
     v->flush_tlb();

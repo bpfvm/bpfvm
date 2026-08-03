@@ -1605,6 +1605,10 @@ public:
 //       /expandPartwordAtomicRMW 算法（llvm/lib/CodeGen/AtomicExpandPass.cpp），展开后
 //       生成普通 i32 atomic，VM 的 do_atomic 原生支持（BPF_W），无需改 VM。
 //       解锁 atomic<bool>/char/short 等标准 C++ 写法。
+//   D3: atomic_thread_fence（任意 ordering）→ 直接删除。BPF 无 fence 指令，ISel 对
+//       AtomicFence 报 "Cannot select"。本 VM 单线程顺序执行 + RMW 原子已带全屏障
+//       语义，fence 是空操作。解锁 OpenSSL threads 模式（BIO_free 等的
+//       __atomic_thread_fence）。见 run() 内 D3 段。
 //   i32/i64 的 RMW/cmpxchg 不动（后端原生支持）。
 //
 // 时机：OptimizerLastEPCallback（晚跑，与 VLA/ByvalTmp 同列）。晚跑能让优化器
@@ -1882,6 +1886,7 @@ public:
         SmallVector<StoreInst *, 16> Stores;
         SmallVector<AtomicCmpXchgInst *, 16> NarrowCmpXchgs;
         SmallVector<AtomicRMWInst *, 16> NarrowRMWs;
+        SmallVector<FenceInst *, 16> Fences;
         for(BasicBlock &BB : F) {
             for(Instruction &I : BB) {
                 if(auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -1899,8 +1904,23 @@ public:
                     if(!RMW->isFloatingPointOperation() &&
                        RMW->getType()->getIntegerBitWidth() < 32)
                         NarrowRMWs.push_back(RMW);
+                } else if(isa<FenceInst>(&I)) {
+                    // D3: atomic_thread_fence → 删除（见下文 D3 段）。
+                    Fences.push_back(cast<FenceInst>(&I));
                 }
             }
+        }
+
+        // D3: atomic_thread_fence（任意 ordering）→ 直接删除。
+        // BPF 后端无 fence 指令（eBPF ISA 只有 RMW 原子 lock_xadd/xchg/cmpxchg，无独立
+        // 内存屏障），ISel 对 AtomicFence 节点报 "Cannot select"。本 VM 单线程顺序执行
+        // guest 指令，RMW 原子本身已带全屏障语义，跨线程同步靠 futex（do_futex 的
+        // g_futex_mutex 提供顺序），fence 在 IR 层是无操作的空壳。fence 无返回值、无 user，
+        // eraseFromParent 即可。解锁 OpenSSL threads 模式（BIO_free 等引用计数路径的
+        // __atomic_thread_fence）。
+        for(FenceInst *FI : Fences) {
+            FI->eraseFromParent();
+            Changed = true;
         }
 
         // D2 先展开窄原子（会插入普通 load，不该被 D1 再降级）。

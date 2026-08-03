@@ -1267,7 +1267,7 @@ void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
     // TLB fast path (1MB granularity)
-    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    auto& entry = tlb[tlb_index(addr)];
     if(addr >= entry.guest_base && end <= entry.guest_end) {
         return entry.host_base + (addr - entry.guest_base);
     }
@@ -1276,10 +1276,12 @@ void* vm::mmu(uint64_t addr, size_t size) {
 
 void* vm::mmu_slow(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
-    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    auto& entry = tlb[tlb_index(addr)];
     std::lock_guard<std::mutex> lock(*maps_mutex);
+    // maps 按 paddr 升序（addmem 维护）。一旦 map.paddr > addr，后续不可能命中，提前退出。
     for(const auto& map: *maps) {
-        if(addr >= map.paddr && end <= map.paddr + map.size) {
+        if(map.paddr > addr) break;          // 已越过 addr，后续段基址更大，必不命中
+        if(end <= map.paddr + map.size) {    // 含 addr..end（addr>=paddr 已由上一行保证）
             entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
             return map.data.get() + (addr - map.paddr);
         }
@@ -1291,7 +1293,7 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
     // TLB fast path (1MB granularity, only when writable and no CoW pending)
-    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    auto& entry = tlb[tlb_index(addr)];
     if(addr >= entry.guest_base && end <= entry.guest_end
        && (entry.flags & PF_W) && !entry.cow) {
         return entry.host_base + (addr - entry.guest_base);
@@ -1301,10 +1303,11 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
 
 void* vm::mmu_w_slow(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
-    auto& entry = tlb[(addr >> 20) & (TLB_SIZE - 1)];
+    auto& entry = tlb[tlb_index(addr)];
     std::lock_guard<std::mutex> lock(*maps_mutex);
     for(auto& map: *maps) {
-        if(addr >= map.paddr && end <= map.paddr + map.size) {
+        if(map.paddr > addr) break;          // 已越过 addr，后续段基址更大，必不命中
+        if(end <= map.paddr + map.size) {    // 含 addr..end（addr>=paddr 已由上一行保证）
             if(!(map.flags & PF_W)) return nullptr;
             if(map.cow_data) { // CoW triggered: copy on write
                 if(map.cow_data.use_count() == 1) {
@@ -1318,7 +1321,22 @@ void* vm::mmu_w_slow(uint64_t addr, size_t size) {
                     auto* p = (unsigned char*)mmap(nullptr, map.size, prot,
                                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                     if(p == MAP_FAILED) return nullptr;
+                    // 容错：map.data 指向的 host 页可能因 do_mprotect 切分后 host 权限未同步
+                    // 而处于 PROT_NONE（musl mallocng 先 mmap(PROT_NONE) 再 mprotect(RW)，
+                    // 切分后未改权限的子段 host 页仍 PROT_NONE）。直接 memcpy 会 host SIGSEGV。
+                    // 临时开读权限拷贝，然后恢复成与 guest flags 一致的 host 权限。
+                    // mprotect 失败则源页不可读，无法拷贝 —— 释放新页并返回 nullptr（让调用方
+                    // 报 EFAULT），绝不把未初始化的 p 当 CoW 结果交出去（否则静默数据损坏）。
+                    if (mprotect(map.data.get(), map.size, PROT_READ) != 0) {
+                        munmap(p, map.size);
+                        return nullptr;
+                    }
                     memcpy(p, map.data.get(), map.size);
+                    int orig_prot = PROT_NONE;
+                    if (map.flags & PF_R) orig_prot |= PROT_READ;
+                    if (map.flags & PF_W) orig_prot |= PROT_WRITE;
+                    if (map.flags & PF_X) orig_prot |= PROT_EXEC;
+                    mprotect(map.data.get(), map.size, orig_prot);
                     map.cow_data.reset();
                     map.set_data(p, map.size);
                 }

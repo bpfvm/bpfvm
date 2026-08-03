@@ -50,14 +50,29 @@ sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，�
 ```
 *默认安装前缀是项目根目录的 `root/`，所有构建脚本/Makefile 统一引用 `-Iroot/include`、`-Lroot/lib`。*
 
-### 构建 Demo Rootfs (dash + busybox)
+### 构建 Demo Rootfs
 
-一键构建 `dash` 和 `busybox`，并将 C/C++ 运行时（musl、libcxx）与可执行文件统一安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
+`scripts/build_root.sh` 统一构建 C/C++ 运行时（musl、libcxx）与可执行文件，安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
 
 ```bash
-./scripts/build_root.sh   # = 构建 musl → root/{include,lib}；合成 libc.so/libcxx.so；构建 dash/busybox → root/bin
+./scripts/build_root.sh                # 默认：musl libc + libc.so + libcxx + busybox
+./scripts/build_root.sh dash sbase     # 额外构建 dash / sbase（可多选）
+./scripts/build_root.sh openssl        # 额外构建 OpenSSL（库 + CLI）
 # 运行 dash（示例）
 ./build/bpfvm root/bin/dash
+```
+
+### 构建 OpenSSL 3.0（库 + CLI）
+
+`./scripts/build_root.sh openssl` 交叉编译 OpenSSL 3.0：产出 `root/lib/{libcrypto.a,libssl.a}`、`root/lib/{libcrypto.so,libssl.so}`、`root/include/openssl/` 头文件，以及 **`root/bin/openssl` CLI**（OpenSSL 自链的自包含静态 PIE，ssl/crypto/libc 全静态打入，无 DT_NEEDED，直接 `./build/bpfvm root/bin/openssl` 可跑）。Configure 经 `--config=cmake/openssl-bpf.conf` 注入 `bpf-unknown-none` 目标定义（`THIRTY_TWO_BIT` bignum 避开 `__int128`、`sys_id=BPFVM`、`thread_scheme=pthreads`），不改 OpenSSL 源码。
+
+```bash
+./scripts/build_root.sh openssl  # → root/lib/{libcrypto,libssl}.{a,so} + root/bin/openssl
+./build/bpfvm root/bin/openssl version
+# 实际用法（文件 I/O / 对称加密 / 公钥签名 / TLS 客户端都可用）：
+printf 'abc' | ./build/bpfvm root/bin/openssl dgst -sha256
+./build/bpfvm root/bin/openssl genrsa 512        # RSA（计算密集，大密钥较慢）
+./build/bpfvm root/bin/openssl s_client -connect example.com:443 -servername example.com  # 真实 TLS 握手
 ```
 
 ## 运行与测试

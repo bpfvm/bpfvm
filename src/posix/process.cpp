@@ -378,6 +378,23 @@ int64_t PosixSyscall::do_getppid(vm*) {
     return (int64_t)tg->ppid.load();
 }
 
+// 身份查询：bpfvm 是单用户系统，uid/euid/gid/egid 恒为 0。
+// 语义上与宿主 init(0,0) 一致；OPENSSL_issetugid 据此判定非 setugid 运行。
+int64_t PosixSyscall::do_getuid(vm*)   { return 0; }
+int64_t PosixSyscall::do_geteuid(vm*)  { return 0; }
+int64_t PosixSyscall::do_getgid(vm*)   { return 0; }
+int64_t PosixSyscall::do_getegid(vm*)  { return 0; }
+
+int64_t PosixSyscall::do_getgroups(vm* v) {
+    // 无补充组。size==0 时返 0（组数）；size>0 时填 0 个仍返 0；size<0 返 -EINVAL。
+    int size = arg_s32(v->r(1));
+    if(size < 0) {
+        return -EINVAL;
+    }
+    // list 非空但无组可填：不写入，直接返 0（补充组个数）。
+    return 0;
+}
+
 // 在 pid_map 中按 pid 查找 task，返回 vm shared_ptr（持锁内取出，调用方持有期间 vm 不会析构）。
 std::shared_ptr<vm> PosixSyscall::find_task(uint64_t target_pid) {
     std::lock_guard<std::mutex> lock(pid_map_mutex);

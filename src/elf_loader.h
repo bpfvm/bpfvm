@@ -43,7 +43,7 @@ struct memmap {
     std::string path;
     memmap() = default;
     memmap(memmap&&) = default;
-    ~memmap() = default;
+    memmap& operator=(memmap&&) = default;
     void set_data(unsigned char* p, size_t sz, bool own = true) {
         data = std::unique_ptr<unsigned char, DataDeleter>(p, DataDeleter{sz, own});
     }

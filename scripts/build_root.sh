@@ -3,10 +3,14 @@ set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # 公共 env（ROOT_DIR / COMMON_CFLAGS / pass 探测 / make_ld_wrapper 等）见 scripts/env.sh。
-# 本脚本所有产物（musl/libcxx 库 + 头 + dash/sbase/busybox 可执行）统一装到 root/：
+# 本脚本所有产物（musl/libcxx 库 + 头 + 各可执行）统一装到 root/：
 #   root/include：musl C 头（bits/、sys/…）。
-#   root/lib：libc.a/libm.a/…、dlstart.lo/dynlink.lo、libc.so→ld-bpf.so、libcxx.a/libcxx.so。
-#   root/bin：dash/sbase/busybox。
+#   root/lib：libc.a/libm.a/…、dlstart.lo/dynlink.lo、libc.so→ld-bpf.so、libcxx.a/libcxx.so、libcrypto/libssl.{a,so}。
+#   root/bin：dash/sbase/busybox/openssl。
+#
+# 用法：
+#   ./scripts/build_root.sh                # 默认：musl + libc.so + libcxx + busybox
+#   ./scripts/build_root.sh dash sbase ... # 额外构建指定组件（dash / sbase / openssl，可多选）
 make_ld_wrapper
 ROOT_BIN_DIR="${ROOT_DIR}/root/bin"
 mkdir -p "${ROOT_BIN_DIR}"
@@ -121,9 +125,130 @@ build_busybox() {
     cp -f "${ROOT_DIR}/busybox/busybox.linked" "${ROOT_BIN_DIR}/busybox" 2>/dev/null || true
 }
 
+# 构建 OpenSSL（可选组件；源码不纳入版本控制，浅克隆 openssl-3.0 到 openssl/）。
+# 产物：root/lib/{libcrypto,libssl}.{a,so} + root/include/openssl/ + root/bin/openssl。
+#   - .a 由 make build_libs 产出；.so 从 .a 用 bpfvm-ld -shared 合成（依赖 libc.so）。
+#   - CLI 由 make build_programs 让 OpenSSL 自链为静态自包含 PIE（ssl/crypto/libc 全静态打入）。
+# 依赖：build_libc_bpfso 已产出 libc.so（.so 合成与 CLI 链接都用到）。
+# Configure 配置见 cmake/openssl-bpf.conf；no-* 裁剪理由见该文件尾部注释。
+build_openssl() {
+    echo "Building OpenSSL..."
+    local OPENSSL_DIR="${ROOT_DIR}/openssl"
+    local PREFIX="${ROOT_DIR}/root"
+    local BUILD_DIR="${ROOT_DIR}/build/openssl"
+    local BPF_CONF="${ROOT_DIR}/cmake/openssl-bpf.conf"
+
+    if [ ! -d "${OPENSSL_DIR}/.git" ]; then
+        echo "Cloning openssl-3.0 into ${OPENSSL_DIR} ..."
+        git clone --depth 1 -b openssl-3.0 https://github.com/openssl/openssl.git "${OPENSSL_DIR}"
+    fi
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cd "${OPENSSL_DIR}"
+    make clean || true
+
+    echo "=== Configuring OpenSSL (bpf-unknown-none) ==="
+    # OpenSSL 专属 CFLAGS 调整（在 COMMON_CFLAGS 基础上）：
+    #   去 -g / -fstack-size-section：clang BPF + -g 对部分外部函数声明 ICE（详见 AGENTS.md #213714）。
+    #   -Wno-error=int-conversion：o_str.c 的 strerror_r(int)→char* 赋值（仅错误路径）。
+    #   -bpf-stack-size=131072：apps 大函数（s_client/s_server/s_speed）单帧 >16KB。
+    local OPENSSL_CFLAGS="${COMMON_CFLAGS//-g/}"
+    OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-fstack-size-section/} -Wno-error=int-conversion"
+    OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-bpf-stack-size=16384/-bpf-stack-size=131072}"
+
+    # LDLIBS 经 BIN_EX_LIBS 注入 -l:libc.a 补 _start + libc/pthread 符号（bpfvm-ld 是 -nostdlib 语义）。
+    CFLAGS="${OPENSSL_CFLAGS}" \
+    LDFLAGS="${COMMON_LDFLAGS}" \
+    LDLIBS="-L${PREFIX}/lib -l:libc.a" \
+    CC="${CLANG_WRAPPER}" \
+    AR="ar" \
+    RANLIB="ranlib" \
+    perl ./Configure \
+        --config="${BPF_CONF}" \
+        --prefix="${PREFIX}" \
+        --openssldir="/etc/ssl" \
+        threads \
+        no-tests no-rdrand no-egd no-ktls no-weak-ssl-ciphers no-cmp \
+        --with-rand-seed=getrandom \
+        bpf-unknown-none
+
+    local JOBS="${OSS_BUILD_JOBS:-$(nproc)}"
+
+    echo "=== Building libcrypto.a / libssl.a ==="
+    make -j"${JOBS}" build_generated build_libs
+
+    echo "=== 收集库产物 ==="
+    local LIBCRYPTO=$(find "${OPENSSL_DIR}" -name libcrypto.a -not -path '*/test/*' 2>/dev/null | head -1)
+    local LIBSSL=$(find "${OPENSSL_DIR}" -name libssl.a -not -path '*/test/*' 2>/dev/null | head -1)
+    echo "libcrypto.a: ${LIBCRYPTO}"
+    echo "libssl.a:     ${LIBSSL}"
+    [ -n "${LIBCRYPTO}" ] && [ -n "${LIBSSL}" ] || {
+        echo "[build_openssl] 未找到 libcrypto.a/libssl.a（build_libs 失败？）" >&2
+        exit 1
+    }
+
+    mkdir -p "${PREFIX}/lib" "${PREFIX}/include" "${PREFIX}/bin"
+    cp -f "${LIBCRYPTO}" "${PREFIX}/lib/libcrypto.a"
+    cp -f "${LIBSSL}" "${PREFIX}/lib/libssl.a"
+
+    # 头文件：install_sw 只装头+库（不装 man），失败则手工拷。
+    if ! make install_sw DESTDIR="${BUILD_DIR}/install_root" >/dev/null 2>&1; then
+        echo "[build_openssl] make install_sw 失败，手工拷头"
+        mkdir -p "${PREFIX}/include/openssl"
+        cp -f "${OPENSSL_DIR}"/include/openssl/*.h "${PREFIX}/include/openssl/"
+        cp -f "${OPENSSL_DIR}"/include/openssl/opensslconf.h "${PREFIX}/include/openssl/"
+    else
+        rm -rf "${PREFIX}/include/openssl"
+        if [ -d "${BUILD_DIR}/install_root${PREFIX}/include/openssl" ]; then
+            cp -r "${BUILD_DIR}/install_root${PREFIX}/include/openssl" "${PREFIX}/include/openssl"
+        fi
+    fi
+    echo "libcrypto.a / libssl.a / 头文件安装完成"
+
+    # 合成 .so（依赖链 libssl.so → libcrypto.so → libc.so，需 libc.so 已存在）。
+    echo "=== 合成 libcrypto.so / libssl.so (bpfvm-ld -shared) ==="
+    "${BPFVM_LD}" -shared --soname libcrypto.so \
+        "${PREFIX}/lib/libcrypto.a" \
+        -L "${PREFIX}/lib" -l:libc.so \
+        -o "${PREFIX}/lib/libcrypto.so"
+    "${BPFVM_LD}" -shared --soname libssl.so \
+        "${PREFIX}/lib/libssl.a" \
+        -L "${PREFIX}/lib" -l:libcrypto.so -l:libc.so \
+        -o "${PREFIX}/lib/libssl.so"
+
+    # CLI：make build_programs 让 OpenSSL 自链 apps/openssl（静态自包含 PIE）。
+    echo "=== Building openssl CLI (apps/openssl via make build_programs) ==="
+    cd "${OPENSSL_DIR}"
+    make -j"${JOBS}" build_programs
+    [ -x "${OPENSSL_DIR}/apps/openssl" ] || {
+        echo "[build_openssl] make 未产出 apps/openssl（build_programs 失败？）" >&2
+        exit 1
+    }
+    cp -f "${OPENSSL_DIR}/apps/openssl" "${PREFIX}/bin/openssl"
+    echo "OpenSSL 完成: ${PREFIX}/bin/openssl + lib/{libcrypto,libssl}.{a,so}"
+}
+
+# ----------------------------------------------------------------------------
+# 调度：默认构建基础库 + busybox；命令行参数指定额外组件（dash / sbase / openssl）。
+# ----------------------------------------------------------------------------
+# 先校验参数，避免用户传错时白跑完整基础构建。
+for comp in "$@"; do
+    case "$comp" in
+        dash|sbase|openssl) ;;
+        *) echo "[build_root] 未知组件: $comp（可用: dash / sbase / openssl）" >&2; exit 1 ;;
+    esac
+done
+
 build_musl
 build_libc_bpfso
 build_libcxx
-build_dash
-#build_sbase
 build_busybox
+
+for comp in "$@"; do
+    case "$comp" in
+        dash)    build_dash ;;
+        sbase)   build_sbase ;;
+        openssl) build_openssl ;;
+    esac
+done

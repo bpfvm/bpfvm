@@ -95,6 +95,12 @@
 #define BPF_SYS_EPOLL_CTL       82  /* epoll_ctl(epfd, op, fd, epoll_event*) */
 #define BPF_SYS_EPOLL_PWAIT     83  /* epoll_pwait(...) — epoll_wait() 复用；第 6 参 sigsetsize 走 r0 */
 #define BPF_SYS_SIGNALFD4       84  /* signalfd4(fd, sigset*, sigsetsize, flags) — signalfd() 复用 */
+#define BPF_SYS_PSELECT6        85  /* pselect6(n, fd_set* r, w, e, timespec* ts, sigmask_data*) — select() 复用 */
+#define BPF_SYS_GETUID          86  /* getuid() — bpfvm 单用户 uid=0，供 OPENSSL_issetugid 等查询 */
+#define BPF_SYS_GETEUID         87  /* geteuid() */
+#define BPF_SYS_GETGID          88  /* getgid() */
+#define BPF_SYS_GETEGID         89  /* getegid() */
+#define BPF_SYS_GETGROUPS       90  /* getgroups(size, gid_t list[]) — bpfvm 无补充组，返回 0 */
 
 #define BPF_CALL_BASE 0x10000u
 #define BPF_CALL_ID(id) (BPF_CALL_BASE + (uint32_t)(id))
@@ -188,5 +194,11 @@
 #define BPF_CALL_EPOLL_CTL        BPF_CALL_ID(BPF_SYS_EPOLL_CTL)
 #define BPF_CALL_EPOLL_PWAIT      BPF_CALL_ID(BPF_SYS_EPOLL_PWAIT)
 #define BPF_CALL_SIGNALFD4        BPF_CALL_ID(BPF_SYS_SIGNALFD4)
+#define BPF_CALL_GETUID           BPF_CALL_ID(BPF_SYS_GETUID)
+#define BPF_CALL_GETEUID          BPF_CALL_ID(BPF_SYS_GETEUID)
+#define BPF_CALL_GETGID           BPF_CALL_ID(BPF_SYS_GETGID)
+#define BPF_CALL_GETEGID          BPF_CALL_ID(BPF_SYS_GETEGID)
+#define BPF_CALL_GETGROUPS        BPF_CALL_ID(BPF_SYS_GETGROUPS)
+#define BPF_CALL_PSELECT6         BPF_CALL_ID(BPF_SYS_PSELECT6)
 
 #endif //BPF_SYSCALL_H

@@ -114,7 +114,7 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
     if(!getenv("BPF_TEST_NO_CLEAN_MMAP")) {
         // 释放本线程的地址空间引用：僵尸不再持地址空间。
         // 必须在 clear-child-tid（用 mmu_w 访问 maps）之后；本 vm 此后不再访存。
-        maps_ptr(v.get()) = std::make_shared<std::list<memmap>>();
+        maps_ptr(v.get()) = std::make_shared<std::vector<memmap>>();
     }
 
     // 非 leader 线程：从 pid_map 移除（不可 waitpid）。leader 留给 waitpid 回收。
@@ -386,6 +386,7 @@ int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     case BPF_SYS_FUTEX:          return do_futex(v);
     case BPF_SYS_ALLOCA:         return do_alloca(v);
     case BPF_SYS_POLL:           return do_poll(v);
+    case BPF_SYS_PSELECT6:       return do_pselect6(v);
     // —— 网络（透传 host socket fd）——
     case BPF_SYS_SOCKET:         return do_socket(v);
     case BPF_SYS_SOCKETPAIR:     return do_socketpair(v);
@@ -408,6 +409,12 @@ int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     case BPF_SYS_EPOLL_PWAIT:    return do_epoll_pwait(v);
     // —— signalfd ——
     case BPF_SYS_SIGNALFD4:      return do_signalfd4(v);
+    // —— 身份查询（单用户 uid=gid=0）——
+    case BPF_SYS_GETUID:         return do_getuid(v);
+    case BPF_SYS_GETEUID:        return do_geteuid(v);
+    case BPF_SYS_GETGID:         return do_getgid(v);
+    case BPF_SYS_GETEGID:        return do_getegid(v);
+    case BPF_SYS_GETGROUPS:      return do_getgroups(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG

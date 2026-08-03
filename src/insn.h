@@ -218,6 +218,12 @@ struct TlbEntry {
 constexpr size_t TLB_SIZE = 16;
 static_assert((TLB_SIZE & (TLB_SIZE - 1)) == 0, "TLB_SIZE must be power of 2");
 
+// TLB 索引：把 1MB 页号（addr>>20）的高位异或折叠回低位。
+// 单纯 `(addr>>20) & (N-1)` 只用 bits[27:20] 的低 log2(N) 位，会丢掉区分
+constexpr size_t tlb_index(uint64_t addr) {
+    return ((addr >> 20) ^ (addr >> 28)) & (TLB_SIZE - 1);
+}
+
 // 本仓库的 BPF-on-BPF 自举 target（cmake/bpfvm-bpf-toolchain.cmake）用 libc++ LLVM 19，
 // 其 std::atomic<shared_ptr<T>> 至今未实现（__cpp_lib_atomic_shared_ptr 未定义、实例化即报
 // "no member named 'atomic'"，llvm-project#99980）。insn.h 被两个 target 共享，故按
@@ -309,7 +315,7 @@ private:
     struct vmImage vmImage;
     uint64_t pc_;
     uint64_t reg[11];
-    std::shared_ptr<std::list<memmap>> maps = std::make_shared<std::list<memmap>>();
+    std::shared_ptr<std::vector<memmap>> maps = std::make_shared<std::vector<memmap>>();
     std::shared_ptr<std::mutex> maps_mutex = std::make_shared<std::mutex>();
     pthread_mutex_t wait_mutex;
     pthread_cond_t wait_cv;

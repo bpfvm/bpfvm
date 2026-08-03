@@ -1,6 +1,8 @@
 #include "posix_internal.h"
 
 #include <asm/ioctl.h>
+#include <sys/ioctl.h>   // FIONBIO/FIONREAD（socket 非阻塞/可读字节查询，OpenSSL BIO 用）
+#include <sys/select.h>  // fd_set / FD_ZERO / FD_SET（do_pselect6）
 
 int64_t PosixSyscall::do_umask(vm* v) {
     uint32_t new_mask = arg_u32(v->r(1));
@@ -272,6 +274,12 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         } else if(request == TIOCGWINSZ || request == TIOCSWINSZ) {
             write_back = (request == TIOCGWINSZ);
             psize = sizeof(struct winsize);
+        } else if(request == FIONBIO || request == FIONREAD) {
+            // FIONBIO/FIONREAD：旧式无 _IOC_DIR 编码的 ioctl，arg 指向 int。
+            // FIONBIO 读取该 int（非阻塞标志），FIONREAD 写回该 int（可读字节数）。
+            // 与 _IOC_DIR 探测分支（psize=0 → arg 当裸值）不同，这两个必须翻译指针。
+            write_back = (request == FIONREAD);
+            psize = sizeof(int);
         } else {
             // 其余（含 TIOCSPTLCK/TIOCGPTN 及任意 dir-encoded ioctl）：按 Linux 编码判方向。
             size_t ioctl_size = (request >> 16) & 0x3FFF;
@@ -374,4 +382,88 @@ int64_t PosixSyscall::do_poll(vm* v) {
     }
     // POLLNVAL 与就地就绪条目按 POSIX 都算"有事件"，加入返回计数。
     return rc + preset;
+}
+
+int64_t PosixSyscall::do_pselect6(vm* v) {
+    // pselect6(n, fd_set* rfds, fd_set* wfds, fd_set* efds, timespec* ts, sigmask_data*)
+    // select() 在 musl 里经 BpfWideArgs 转成本调用（6 参）。把 fd_set 位图转成 pollfd
+    // 数组复用 host poll，再把 revents 写回位图。ts==NULL 表示永久阻塞。
+    int n = arg_s32(v->r(1));
+    if(n < 0) return -EINVAL;
+    if(n > FD_SETSIZE) n = FD_SETSIZE;  // OpenSSL 传 fd<FD_SETSIZE；超过无意义
+
+    fd_set *grfds = (fd_set*)v->r(2) ? (fd_set*)v->mmu_w(v->r(2), sizeof(fd_set)) : nullptr;
+    fd_set *gwfds = (fd_set*)v->r(3) ? (fd_set*)v->mmu_w(v->r(3), sizeof(fd_set)) : nullptr;
+    fd_set *gefds = (fd_set*)v->r(4) ? (fd_set*)v->mmu_w(v->r(4), sizeof(fd_set)) : nullptr;
+    if((v->r(2) && !grfds) || (v->r(3) && !gwfds) || (v->r(4) && !gefds)) {
+        return -EFAULT;
+    }
+    // 超时：pselect6 第 5 参是 timespec*（select 经 musl 转换）。NULL=永久阻塞。
+    int timeout_ms = -1;
+    if(v->r(5)) {
+        const struct timespec* ts = (const struct timespec*)v->mmu(v->r(5), sizeof(struct timespec));
+        if(!ts) return -EFAULT;
+        if(ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;
+        // 上限钳制（tv_sec*1000 在 tv_sec≈INT_MAX/1000 处溢出 int）。永久阻塞用 -1。
+        if(ts->tv_sec > (int64_t)INT32_MAX / 1000) timeout_ms = INT32_MAX;
+        else timeout_ms = (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+    }
+    // 第 6 参 sigmask_data 暂忽略（单线程，原子切换信号掩码无意义）。r0 经 BpfWideArgs 传入。
+
+    // 把 fd_set 的三个位图合成 pollfd 数组（一个 fd 可能同时关心读/写/异常）。
+    std::vector<struct pollfd> hfds;
+    hfds.reserve(n);
+    // 记录每个 pollfd 对应的 guest fd + 关心异常，用于回写 fd_set。
+    std::vector<int> gfd_map;
+    std::vector<char> want_except;
+    int invalid_count = 0;
+    // 虚拟 fd（/proc 等，host_fd()<0）算"就地就绪"，不进 host poll（无真实 fd 可等）。
+    // 回写阶段会 FD_ZERO 清空全部位图后靠下面的列表回填，故虚拟 fd 的就绪位需单独记录，
+    // 否则会被清空（原实现只 continue 导致丢失）。与 do_poll 的就地就绪一致。
+    std::vector<int> vfd_r, vfd_w;
+    for(int fd = 0; fd < n; ++fd) {
+        bool in_r = grfds && FD_ISSET(fd, grfds);
+        bool in_w = gwfds && FD_ISSET(fd, gwfds);
+        bool in_e = gefds && FD_ISSET(fd, gefds);
+        if(!in_r && !in_w && !in_e) continue;
+
+        auto fd_h = ps->find_fd(fd);
+        if(!fd_h) {
+            invalid_count++;  // fd 未打开：实际 select 对非法 fd 返回 -EBADF；这里近似跳过。
+            continue;
+        }
+        int hfd = fd_h->host_fd();
+        if(hfd < 0) {
+            if(in_r) vfd_r.push_back(fd);  // 虚拟 fd 读就绪
+            if(in_w) vfd_w.push_back(fd);  // 虚拟 fd 写就绪
+            continue;
+        }
+        short events = (in_r ? POLLIN : 0) | (in_w ? POLLOUT : 0);
+        hfds.push_back({hfd, events, 0});
+        gfd_map.push_back(fd);
+        want_except.push_back(in_e ? 1 : 0);
+    }
+    int virtual_ready = vfd_r.size() + vfd_w.size();
+
+    // preset>0（有非法 fd 或虚拟 fd 已就绪）时强制 timeout=0 立即返回，与 do_poll 一致。
+    int preset = invalid_count + virtual_ready;
+    int rc = ::poll(hfds.data(), hfds.size(), preset > 0 ? 0 : timeout_ms);
+    if(rc == -1) return -errno;
+
+    // 清空并回写三个 fd_set（只置 poll 结果对应的位）。
+    if(grfds) FD_ZERO(grfds);
+    if(gwfds) FD_ZERO(gwfds);
+    if(gefds) FD_ZERO(gefds);
+    int ready = 0;
+    for(size_t i = 0; i < hfds.size(); ++i) {
+        int fd = gfd_map[i];
+        if(hfds[i].revents & (POLLIN | POLLHUP | POLLERR)) { if(grfds) FD_SET(fd, grfds); ready++; }
+        if(hfds[i].revents & (POLLOUT | POLLERR))           { if(gwfds) FD_SET(fd, gwfds); ready++; }
+        // POLLPRI 对应 select 的 except 集合（OOB 数据 / 异常）
+        if((hfds[i].revents & POLLPRI) && want_except[i])   { if(gefds) FD_SET(fd, gefds); ready++; }
+    }
+    // 虚拟 fd 的就地就绪位：回写阶段 FD_ZERO 清空过，这里补置。
+    for(int fd : vfd_r) FD_SET(fd, grfds);
+    for(int fd : vfd_w) FD_SET(fd, gwfds);
+    return ready + preset;
 }

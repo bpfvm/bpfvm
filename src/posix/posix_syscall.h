@@ -321,6 +321,11 @@ public:
     int64_t do_clone(vm* v);
     int64_t do_getpid(vm*);
     int64_t do_getppid(vm*);
+    int64_t do_getuid(vm*);
+    int64_t do_geteuid(vm*);
+    int64_t do_getgid(vm*);
+    int64_t do_getegid(vm*);
+    int64_t do_getgroups(vm* v);
     int64_t do_wait4(vm* v);
     int64_t do_waitid(vm* v);
     int64_t do_dup(vm* v);
@@ -364,6 +369,7 @@ public:
     int64_t do_futex(vm* v);
     int64_t do_alloca(vm* v);
     int64_t do_poll(vm* v);
+    int64_t do_pselect6(vm* v);
     int64_t do_socket(vm* v);
     int64_t do_socketpair(vm* v);
     int64_t do_bind(vm* v);

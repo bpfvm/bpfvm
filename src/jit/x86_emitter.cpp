@@ -615,11 +615,16 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
         emit8(0x48); emit8(0x05); emit32((uint32_t)(int32_t)offset); // add rax, offset
     }
 
-    // Compute TLB index into R11: ((addr >> 20) & (TLB_SIZE-1)) * sizeof(TlbEntry)
-    // mov r11, rax
+    // Compute TLB index into R11: tlb_index(addr) * sizeof(TlbEntry)
+    // tlb_index = ((addr>>20) ^ (addr>>28)) & (TLB_SIZE-1)
+    // mov r11, rax ; shr r11, 20
     emit8(0x49); emit8(0x89); emit8(0xC3);
-    // shr r11, 20
     emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(20);
+    // mov rcx, rax ; shr rcx, 28 ; xor r11, rcx
+    //   xor r11,rcx = REX.WB(0x49) 31 /r  ModRM=0xCB(mod=11 reg=001(rcx) r/m=011(r11+REX.B))
+    emit8(0x48); emit8(0x89); emit8(0xC1);
+    emit8(0x48); emit8(0xC1); emit8(0xE9); emit8(28);
+    emit8(0x49); emit8(0x31); emit8(0xCB);
     // and r11d, (TLB_SIZE-1)
     emit8(0x41); emit8(0x81); emit8(0xE3); emit32(TLB_SIZE - 1);
     // shl r11d, shift  (TlbEntry size is power of 2)
