@@ -529,10 +529,10 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     if (offset != 0) add_imm(X0, X0, offset, true);
 
     // X15 = TLB entry pointer = vm_ptr + off_tlb + tlb_index(addr) * sizeof(TlbEntry)
-    // tlb_index = ((addr>>20) ^ (addr>>28)) & (TLB_SIZE-1)
-    lsr_imm(X1, X0, 28, true);          // X1 = addr>>28
-    lsr_imm(X15, X0, 20, true);         // X15 = addr>>20
-    eor_reg(X15, X15, X1, true);        // X15 = (addr>>20) ^ (addr>>28)
+    // tlb_index = ((addr>>12) ^ (addr>>20)) & (TLB_SIZE-1)
+    lsr_imm(X1, X0, 20, true);          // X1 = addr>>20
+    lsr_imm(X15, X0, 12, true);         // X15 = addr>>12
+    eor_reg(X15, X15, X1, true);        // X15 = (addr>>12) ^ (addr>>20)
     and_imm(X15, X15, TLB_SIZE - 1, true);
     lsl_imm(X15, X15, __builtin_ctz(sizeof(TlbEntry)), true);
     add_reg(X15, X15, X28, true);

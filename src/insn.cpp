@@ -10,6 +10,7 @@
 #include "include/auxv.h"
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 #if defined(__x86_64__)
 #include "jit/jit_compiler.h"
@@ -1274,19 +1275,28 @@ void* vm::mmu(uint64_t addr, size_t size) {
     return mmu_slow(addr, size);
 }
 
-void* vm::mmu_slow(uint64_t addr, size_t size) {
+// 二分查找包含 [addr, addr+size) 的段。调用方须持 maps_mutex。maps 须按 paddr 升序。
+std::vector<memmap>::iterator vm::find_map_locked(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
+    // upper_bound 找第一个 paddr > addr 的段，--it 得到 paddr <= addr 的最大段。
+    auto it = std::upper_bound(maps->begin(), maps->end(), addr,
+        [](uint64_t a, const memmap& m) { return a < m.paddr; });
+    if(it == maps->begin()) return maps->end();  // 所有段 paddr > addr
+    --it;
+    if(end <= it->paddr + it->size) {            // 含 addr..end（addr>=paddr 已由二分保证）
+        return it;
+    }
+    return maps->end();
+}
+
+void* vm::mmu_slow(uint64_t addr, size_t size) {
     auto& entry = tlb[tlb_index(addr)];
     std::lock_guard<std::mutex> lock(*maps_mutex);
-    // maps 按 paddr 升序（addmem 维护）。一旦 map.paddr > addr，后续不可能命中，提前退出。
-    for(const auto& map: *maps) {
-        if(map.paddr > addr) break;          // 已越过 addr，后续段基址更大，必不命中
-        if(end <= map.paddr + map.size) {    // 含 addr..end（addr>=paddr 已由上一行保证）
-            entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
-            return map.data.get() + (addr - map.paddr);
-        }
-    }
-    return nullptr;
+    auto it = find_map_locked(addr, size);
+    if(it == maps->end()) return nullptr;
+    const auto& map = *it;
+    entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
+    return map.data.get() + (addr - map.paddr);
 }
 
 void* vm::mmu_w(uint64_t addr, size_t size) {
@@ -1302,52 +1312,48 @@ void* vm::mmu_w(uint64_t addr, size_t size) {
 }
 
 void* vm::mmu_w_slow(uint64_t addr, size_t size) {
-    uint64_t end = addr + size;
     auto& entry = tlb[tlb_index(addr)];
     std::lock_guard<std::mutex> lock(*maps_mutex);
-    for(auto& map: *maps) {
-        if(map.paddr > addr) break;          // 已越过 addr，后续段基址更大，必不命中
-        if(end <= map.paddr + map.size) {    // 含 addr..end（addr>=paddr 已由上一行保证）
-            if(!(map.flags & PF_W)) return nullptr;
-            if(map.cow_data) { // CoW triggered: copy on write
-                if(map.cow_data.use_count() == 1) {
-                    // 唯一引用，直接偷：解除 cow_data 的所有权，unique_ptr 接管
-                    std::get_deleter<DataDeleter>(map.cow_data)->owned = false;
-                    map.cow_data.reset();
-                    map.data.get_deleter().owned = true;
-                } else {
-                    int prot = PROT_READ | PROT_WRITE;
-                    if(map.flags & PF_X) prot |= PROT_EXEC;
-                    auto* p = (unsigned char*)mmap(nullptr, map.size, prot,
-                                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    if(p == MAP_FAILED) return nullptr;
-                    // 容错：map.data 指向的 host 页可能因 do_mprotect 切分后 host 权限未同步
-                    // 而处于 PROT_NONE（musl mallocng 先 mmap(PROT_NONE) 再 mprotect(RW)，
-                    // 切分后未改权限的子段 host 页仍 PROT_NONE）。直接 memcpy 会 host SIGSEGV。
-                    // 临时开读权限拷贝，然后恢复成与 guest flags 一致的 host 权限。
-                    // mprotect 失败则源页不可读，无法拷贝 —— 释放新页并返回 nullptr（让调用方
-                    // 报 EFAULT），绝不把未初始化的 p 当 CoW 结果交出去（否则静默数据损坏）。
-                    if (mprotect(map.data.get(), map.size, PROT_READ) != 0) {
-                        munmap(p, map.size);
-                        return nullptr;
-                    }
-                    memcpy(p, map.data.get(), map.size);
-                    int orig_prot = PROT_NONE;
-                    if (map.flags & PF_R) orig_prot |= PROT_READ;
-                    if (map.flags & PF_W) orig_prot |= PROT_WRITE;
-                    if (map.flags & PF_X) orig_prot |= PROT_EXEC;
-                    mprotect(map.data.get(), map.size, orig_prot);
-                    map.cow_data.reset();
-                    map.set_data(p, map.size);
-                }
-                flush_tlb();
+    auto it = find_map_locked(addr, size);
+    if(it == maps->end()) return nullptr;
+    auto& map = *it;
+    if(!(map.flags & PF_W)) return nullptr;
+    if(map.cow_data) { // CoW triggered: copy on write
+        if(map.cow_data.use_count() == 1) {
+            // 唯一引用，直接偷：解除 cow_data 的所有权，unique_ptr 接管
+            std::get_deleter<DataDeleter>(map.cow_data)->owned = false;
+            map.cow_data.reset();
+            map.data.get_deleter().owned = true;
+        } else {
+            int prot = PROT_READ | PROT_WRITE;
+            if(map.flags & PF_X) prot |= PROT_EXEC;
+            auto* p = (unsigned char*)mmap(nullptr, map.size, prot,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if(p == MAP_FAILED) return nullptr;
+            // 容错：map.data 指向的 host 页可能因 do_mprotect 切分后 host 权限未同步
+            // 而处于 PROT_NONE（musl mallocng 先 mmap(PROT_NONE) 再 mprotect(RW)，
+            // 切分后未改权限的子段 host 页仍 PROT_NONE）。直接 memcpy 会 host SIGSEGV。
+            // 临时开读权限拷贝，然后恢复成与 guest flags 一致的 host 权限。
+            // mprotect 失败则源页不可读，无法拷贝 —— 释放新页并返回 nullptr（让调用方
+            // 报 EFAULT），绝不把未初始化的 p 当 CoW 结果交出去（否则静默数据损坏）。
+            if (mprotect(map.data.get(), map.size, PROT_READ) != 0) {
+                munmap(p, map.size);
+                return nullptr;
             }
-            // Fill TLB after CoW is resolved
-            entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
-            return map.data.get() + (addr - map.paddr);
+            memcpy(p, map.data.get(), map.size);
+            int orig_prot = PROT_NONE;
+            if (map.flags & PF_R) orig_prot |= PROT_READ;
+            if (map.flags & PF_W) orig_prot |= PROT_WRITE;
+            if (map.flags & PF_X) orig_prot |= PROT_EXEC;
+            mprotect(map.data.get(), map.size, orig_prot);
+            map.cow_data.reset();
+            map.set_data(p, map.size);
         }
+        flush_tlb();
     }
-    return nullptr;
+    // Fill TLB after CoW is resolved
+    entry = {map.paddr, map.paddr + map.size, map.data.get(), map.flags, !!map.cow_data};
+    return map.data.get() + (addr - map.paddr);
 }
 
 void vm::dump_stats() const {
