@@ -46,6 +46,13 @@ build_libc_bpfso() {
         "${ROOT_DIR}/root/lib/dynlink.lo" \
         -o "${ROOT_DIR}/root/lib/ld-bpf.so"
     ln -sf ld-bpf.so "${ROOT_DIR}/root/lib/libc.so"
+    # 子库的 .so 软链 → libc.so：musl 把 m/rt/pthread/dl/... 全合并进 libc，
+    # 静态侧已在 musl/build.sh 建 lib<sub>.a→libc.a；动态侧补 lib<sub>.so→libc.so，
+    # 否则 -lm/-lrt/-lpthread/-ldl 等在 -L root/lib 找不到 .so 会漏到 host
+    # /usr/lib 的同名 linker script（非 ELF）→ bpfvm-ld 加载失败。
+    for sub in m rt pthread crypt util xnet resolv dl; do
+        ln -sf libc.so "${ROOT_DIR}/root/lib/lib${sub}.so"
+    done
     rm "${ROOT_DIR}/root/lib/dlstart.lo" "${ROOT_DIR}/root/lib/dynlink.lo"
 }
 
@@ -157,10 +164,11 @@ build_openssl() {
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-fstack-size-section/} -Wno-error=int-conversion"
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-bpf-stack-size=16384/-bpf-stack-size=131072}"
 
-    # LDLIBS 经 BIN_EX_LIBS 注入 -l:libc.a 补 _start + libc/pthread 符号（bpfvm-ld 是 -nostdlib 语义）。
+    # LDLIBS 经 BIN_EX_LIBS 注入 -l:libc.so：补 _start + libc/pthread 符号（bpfvm-ld 是
+    # -nostdlib 语义），并让 openssl 作为 DT_NEEDED libc.so 的动态可执行（纯动态，省产物体积）。
     CFLAGS="${OPENSSL_CFLAGS}" \
     LDFLAGS="${COMMON_LDFLAGS}" \
-    LDLIBS="-L${PREFIX}/lib -l:libc.a" \
+    LDLIBS="-L${PREFIX}/lib -l:libc.so" \
     CC="${CLANG_WRAPPER}" \
     AR="ar" \
     RANLIB="ranlib" \

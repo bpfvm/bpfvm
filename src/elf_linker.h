@@ -61,4 +61,13 @@ bool link_bpf_exe(const std::vector<std::string>& inputs, const std::string& out
                   const std::string& entry_name = "_start",
                   bool keep_debug = false, bool keep_symtab = true);
 
+// Partial link / 增量链接（-r / --relocatable，对齐标准 ld -r）：
+// - 输入若干 ET_REL（.o）和/或 archive（.a），不接受共享库
+// - 合并同名段、保留未解析符号、保留重定位（不应用）
+// - 产出单个 ET_REL：无 PT_LOAD/入口/GOT-PLT，重定位以 SHT_RELA 形式保留待后续链接解析
+// 失败返回 false。
+bool link_bpf_relocatable(const std::vector<std::string>& inputs, const std::string& out_path,
+                          const std::vector<std::string>& archives,
+                          bool keep_debug = true);
+
 #endif // ELF_LINKER_H

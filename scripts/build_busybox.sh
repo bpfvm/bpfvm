@@ -1,14 +1,13 @@
 #!/bin/bash
 # 构建 busybox for BPF。
-# 策略：让 kbuild 只编译出各子目录的 built-in.o / lib.a（make busybox-all），
-# 链接绕过 scripts/trylink（它对 -Wl,--sort-section 等 bpfvm-ld 不认的选项做探针会失败），
-# 改用 bpfvm-ld 手动链接。
+# make busybox_unstripped 编译所有 built-in.o/lib.a 后走 scripts/trylink 最终链接。
+# bpfvm-ld 已兼容 trylink（忽略 --start-group/--sort-*、吞掉 -Map 等带参选项、
+# 按内容分发输入、支持 -r），且 libm.a 等子库软链接到 libc.a（-lm 即 -lc），
+# trylink 直接产出最终二进制。
 #
-# 默认动态链接（与 build_root.sh 的 dash/sbase 一致）：
-#   生成 PIE ET_DYN，libc.so 作为 DT_NEEDED 依赖，多个 BPF 程序共享同一份 libc.so。
+# 动态（默认）：PIE ET_DYN，libc.so 作为 DT_NEEDED 依赖。
 #   运行：./build/bpfvm -- busybox/busybox.linked [applet ...]
-# 静态链接：LINK_MODE=static ./scripts/build_busybox.sh
-#   生成自包含 ET_EXEC（体积大，无运行时依赖）。
+# 静态：LINK_MODE=static ./scripts/build_busybox.sh，产出自包含 ET_EXEC。
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
@@ -16,6 +15,22 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 COMMON_CFLAGS="${COMMON_CFLAGS} -D__linux__"
 BB_DIR="${ROOT_DIR}/busybox"
 make_ld_wrapper
+
+# 屏蔽系统 bpf-gcc，让 clang fallback 到 host gcc：
+# bpf-gcc 的 *link spec 不透传 -static 给 ld（upstream binutils-bpf 缺陷），静态模式下产出
+# 会是 PIE 而非 ET_EXEC。在 wrapper 目录放 bpf-gcc → host gcc 软链并前置到 PATH，clang 查
+# bpf-gcc 时优先命中它（host gcc 正确透传 -static）。系统 bpf-gcc 不动，仅影响本构建。
+if [ -n "${LD_WRAPPER_DIR}" ] && [ -x /usr/bin/gcc ]; then
+    ln -sf /usr/bin/gcc "${LD_WRAPPER_DIR}/bpf-gcc"
+    cat > "${LD_WRAPPER_DIR}/clang" <<EOF
+#!/bin/bash
+export COMPILER_PATH="${LD_WRAPPER_DIR}"
+export PATH="${LD_WRAPPER_DIR}:\${PATH}"
+exec "$(command -v clang)" "\$@"
+EOF
+    chmod +x "${LD_WRAPPER_DIR}/clang"
+    CLANG_WRAPPER="${LD_WRAPPER_DIR}/clang"
+fi
 
 configure() {
     echo "=== Configuring busybox ==="
@@ -71,10 +86,13 @@ configure() {
         CONFIG_FEATURE_SH_STANDALONE
         CONFIG_FEATURE_SH_NOFORK
     )
+    # 静态模式开启 CONFIG_STATIC（影响 trylink 的 --gc-sections 决策）。
+    [ "${LINK_MODE}" = "static" ] && enable+=(CONFIG_STATIC)
     for cfg in "${enable[@]}"; do
         sed -i "s|^# ${cfg} is not set|${cfg}=y|" .config
         sed -i "s|^${cfg}=.*|${cfg}=y|" .config
     done
+    [ "${LINK_MODE}" != "static" ] && sed -i "s|^CONFIG_STATIC=y|# CONFIG_STATIC is not set|" .config
 
     # olddefconfig 同步依赖关系
     make HOSTCC=gcc CC="${CLANG_WRAPPER}" olddefconfig >/dev/null 2>&1 || true
@@ -85,68 +103,20 @@ configure() {
 }
 
 build() {
-    echo "=== Building busybox (编译各 built-in.o) ==="
+    echo "=== Building busybox ==="
     cd "${BB_DIR}"
-    # make busybox_unstripped 会先把所有 $(busybox-all) 的 built-in.o/lib.a 编出来，
-    # 最后才走 trylink。trylink 对 bpfvm-ld 不兼容会失败，但此时 .o 都已生成。
-    # 这里允许失败，后面手动链接。
-    make -k -j4 \
+    # trylink 直接产出最终二进制（动态 PIE / 静态 ET_EXEC，见顶部说明）。
+    local ldflags="-target bpf -nostdlib -L${ROOT_DIR}/root/lib"
+    [ "${LINK_MODE}" = "static" ] && ldflags="${ldflags} -static"
+    make -j4 \
          HOSTCC=gcc \
          CC="${CLANG_WRAPPER}" \
          ARCH=bpf \
          CROSS_COMPILE= \
          KBUILD_VERBOSE=0 \
          CFLAGS="${COMMON_CFLAGS}" \
-         LDFLAGS="-target bpf -nostdlib -L${ROOT_DIR}/root/lib" \
-         busybox_unstripped || true
-    local rc=${PIPESTATUS[0]}
-    echo "=== make 退出码 ${rc}（链接阶段失败是预期的，检查 .o 产物）==="
-    ls -la busybox_unstripped 2>/dev/null || echo "(无 busybox_unstripped，需要手动链接)"
-}
-
-# 收集所有真实 .o 文件到全局数组 OBJS。
-# kbuild 的 built-in.o 是用 `ld -r` 合并的，但 bpfvm-ld 不支持 -r，
-# 因此这些 built-in.o 是空的 ar 归档。改为直接收集所有真实 .o 文件
-# （排除 built-in.o/lib.a 这些中间聚合产物），一次性交给 bpfvm-ld 链接。
-collect_objs() {
-    OBJS=()
-    while IFS= read -r f; do
-        OBJS+=("$f")
-    done < <(find . -name '*.o' \
-                -not -name 'built-in.o' \
-                -not -path './.git/*' \
-                -not -path './scripts/*' 2>/dev/null | sort)
-    echo "收集到 ${#OBJS[@]} 个 .o 文件"
-}
-
-# 动态链接：与 build_root.sh 的 dash 一致，生成 PIE ET_DYN，libc.so 作为 DT_NEEDED 依赖。
-# 运行时 bpfvm 从 root/lib/（或 LD_LIBRARY_PATH）解析 libc.so；多个动态可执行文件共享
-# 同一份 libc.so，整体体积比静态链接小（busybox 自身不含 musl 代码）。
-link_dyn() {
-    echo "=== 手动链接 busybox (动态，bpfvm-ld) ==="
-    cd "${BB_DIR}"
-    collect_objs
-    "${BPFVM_LD}" -L "${ROOT_DIR}/root/lib" -l c "${OBJS[@]}" -o busybox.linked
-    local rc=${PIPESTATUS[0]}
-    echo "=== 链接退出码 ${rc} ==="
-    if [ -f busybox.linked ]; then
-        file busybox.linked
-        ls -la busybox.linked
-    fi
-}
-
-# 静态链接：把 libc.a 整体并入 busybox，生成自包含的 ET_EXEC。体积大但无运行时依赖。
-link_static() {
-    echo "=== 手动链接 busybox (静态，bpfvm-ld) ==="
-    cd "${BB_DIR}"
-    collect_objs
-    "${BPFVM_LD}" -static  "${OBJS[@]}" "${ROOT_DIR}/root/lib/libc.a" -o busybox.out
-    local rc=${PIPESTATUS[0]}
-    echo "=== 链接退出码 ${rc} ==="
-    if [ -f busybox.out ]; then
-        file busybox.out
-        ls -la busybox.out
-    fi
+         LDFLAGS="${ldflags}" \
+         busybox_unstripped
 }
 
 LINK_MODE="${LINK_MODE:-dyn}"
@@ -162,8 +132,10 @@ if ! perl -0777 -ne 'exit 0 if /static void __attribute__\(\(noinline\)\)\npopst
 fi
 
 build
-if [ "${LINK_MODE}" = "static" ]; then
-    link_static
-else
-    link_dyn
-fi
+
+# trylink 产出即最终二进制，mv为约定文件名（动态 busybox.linked / 静态 busybox.out）。
+cd "${BB_DIR}"
+OUT=$([ "${LINK_MODE}" = "static" ] && echo busybox.out || echo busybox.linked)
+mv busybox_unstripped "${OUT}"
+file "${OUT}"
+ls -la "${OUT}"

@@ -26,8 +26,10 @@
 #include <libgen.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <string>
+#include <vector>
 
-enum class Mode { STATIC_EXE, DYNAMIC_EXE, SHARED_LIB };
+enum class Mode { STATIC_EXE, DYNAMIC_EXE, SHARED_LIB, RELOCATABLE };
 
 struct Options {
     Mode mode = Mode::DYNAMIC_EXE;  // 默认动态链接（对齐标准 ld）
@@ -64,28 +66,55 @@ static void usage(const char* prog) {
 int main(int argc, char** argv) {
     Options opt;
 
-    // 手动扫描 argv，兼容 clang/gcc 风格命令行（让 autoconf 项目的 $(CCLD) 可以直接调用）
+    // 预处理 argv：把 -Wl,X,Y,Z 按逗号拆开成独立 token（剥离 -Wl, 前缀），
+    // 后续解析逻辑只需处理裸 ld 选项（如 -Map、--sort-common）。-Wl, 单独成 token 忽略。
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a.rfind("-Wl,", 0) == 0) {
+            std::string body = a.substr(4);
+            std::vector<std::string> parts;
+            size_t start = 0;
+            while (true) {
+                size_t comma = body.find(',', start);
+                if (comma == std::string::npos) { parts.push_back(body.substr(start)); break; }
+                parts.push_back(body.substr(start, comma - start));
+                start = comma + 1;
+            }
+            // 跳过空子项（如 -Wl, 末尾多余逗号）
+            for (auto& p : parts) {
+                if (!p.empty()) args.push_back(p);
+            }
+        } else {
+            args.push_back(a);
+        }
+    }
+
+    // 手动扫描展开后的 args，兼容 clang/gcc 风格命令行（让 autoconf 项目的 $(CCLD) 可以直接调用）
     // 已知 bpfvm-ld flags：-o, -e, -l, -l:, -L, -shared, -static, --soname, --entry
     // 已知 clang/gcc 编译 flags（来自 CFLAGS，链接时传入，需忽略）：
-    //   -target, -nostdlib, -Wl,..., -isystem, -I, -D, -O, -g, -std=, -m*, -f*, -W,
+    //   -target, -nostdlib, -isystem, -I, -D, -O, -g, -std=, -m*, -f*, -W,
     //   -bpf-stack-size=, -mllvm, ...
     auto ignore_flag = [&](const std::string& a) {
         std::cerr << "[bpfvm-ld] ignoring flag: " << a << "\n";
     };
-    auto next_arg = [&](int& i, const char* flag) -> const char* {
-        if (i + 1 >= argc) {
+    auto next_arg = [&](size_t& i, const char* flag) -> const char* {
+        if (i + 1 >= args.size()) {
             std::cerr << basename(argv[0]) << ": " << flag << " requires an argument\n";
             return nullptr;
         }
-        return argv[++i];
+        return args[++i].c_str();
     };
 
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
+    for (size_t i = 0; i < args.size(); i++) {
+        const std::string& a = args[i];
 
         // --long options
         if (a == "--shared") { opt.mode = Mode::SHARED_LIB; continue; }
         if (a == "--static") { opt.static_flag = true; opt.mode = Mode::STATIC_EXE; continue; }
+        // -r / --relocatable：partial link，合并输入 ET_REL/归档为单个 ET_REL（保留重定位、
+        // 不解析符号、无 segment/入口）。须在下方 catch-all 单 token 跳过之前识别。
+        if (a == "--relocatable" || a == "-r") { opt.mode = Mode::RELOCATABLE; continue; }
         if (a == "--soname") {
             const char* v = next_arg(i, "--soname");
             if (!v) return 1;
@@ -165,8 +194,13 @@ int main(int argc, char** argv) {
         if (a == "-target" || a == "-isystem" || a == "-I" || a == "-D" || a == "-include" ||
             a == "-mllvm" || a == "-Xclang" || a == "-add-plugin" || a == "-plugin-arg" ||
             a == "-x" ||
-            a == "-plugin" || a == "-rpath" || a == "-rpath-link" || a == "-T") {
-            if (i + 1 < argc) { ignore_flag(a + " " + argv[i + 1]); i++; }
+            a == "-plugin" || a == "-rpath" || a == "-rpath-link" || a == "-T" ||
+            // 标准 ld 带参数选项（bpfvm-ld 不实现其语义，但须吞掉参数避免被当输入文件）
+            a == "-Map" || a == "-Script" || a == "-version-script" ||
+            a == "-dynamic-linker" || a == "-default-symver" ||
+            a == "-wrap" || a == "-defsym" || a == "-exclude-libs" ||
+            a == "-y" || a == "-m" || a == "-z" || a == "-O") {
+            if (i + 1 < args.size()) { ignore_flag(a + " " + args[i + 1]); i++; }
             else ignore_flag(a);
             continue;
         }
@@ -223,10 +257,12 @@ int main(int argc, char** argv) {
         } else if (ends_with(l, ".a") || ends_with(l, ".so")) {
             // 命令行直接传文件名（如 testgot_lib.a）：当文件路径搜索，不加 lib 前缀
             candidates.push_back(l);
-        } else if (opt.static_flag) {
+        } else if (opt.static_flag || opt.mode == Mode::RELOCATABLE) {
+            // -static 与 -r 都只搜 lib<name>.a：partial link 不接受共享库输入（标准 ld 同此）
             candidates.push_back("lib" + l + ".a");
         } else {
-            candidates.push_back(l + ".so");
+            // 对齐标准 ld：-l <name> 搜 lib<name>.so，找不到再搜 lib<name>.a。
+            candidates.push_back("lib" + l + ".so");
             candidates.push_back("lib" + l + ".a");
         }
         std::string found;
@@ -246,6 +282,9 @@ int main(int argc, char** argv) {
     const bool keep_symtab = !opt.strip_all;
     if (opt.mode == Mode::STATIC_EXE) {
         ok = link_bpf_object(opt.inputs, opt.output, resolved_libs, keep_debug, keep_symtab);
+    } else if (opt.mode == Mode::RELOCATABLE) {
+        // partial link：合并输入 .o/.a 为单个 ET_REL（保留重定位，不解析符号）
+        ok = link_bpf_relocatable(opt.inputs, opt.output, resolved_libs, keep_debug);
     } else if (opt.mode == Mode::DYNAMIC_EXE) {
         ok = link_bpf_exe(opt.inputs, opt.output, resolved_libs, opt.entry_name, keep_debug, keep_symtab);
     } else if (opt.mode == Mode::SHARED_LIB) {

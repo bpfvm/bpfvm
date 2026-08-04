@@ -23,8 +23,10 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <optional>
 #include <cstring>
@@ -47,12 +49,6 @@ enum SegClass : uint8_t { SEG_TEXT, SEG_RODATA, SEG_DATA };
 // 运行期加载器（elf_loader.cpp）也用同一定值定位 PLT 桩。
 constexpr size_t kPltStubSize = 40;
 
-// 后缀匹配（按扩展名分流输入文件类型时用）
-bool ends_with(const std::string& s, const std::string& suf) {
-    return s.size() >= suf.size() &&
-           s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
-}
-
 // 单个加载后的 section
 struct LoadedSection {
     std::string name;
@@ -64,6 +60,11 @@ struct LoadedSection {
     bool executable = false;
     SegClass seg = SEG_RODATA;
     bool loadable = false;     // PROGBITS 或 NOBITS（.bss）
+    // 原始 ELF 元数据，-r (partial link) 合并段/重写 shdr 时需忠实保留。
+    // final-link 路径不读这些字段，默认值不影响其行为。
+    Elf64_Xword sh_flags = 0;    // 原 sh_flags（SHF_ALLOC|SHF_EXECINSTR|SHF_WRITE 等）
+    Elf64_Xword addralign = 1;   // 原 sh_addralign
+    Elf64_Xword entsize = 0;     // 原 sh_entsize
 };
 
 // 符号
@@ -74,6 +75,7 @@ struct LoadedSym {
     uint64_t size = 0;
     int binding = 0;
     int type = 0;
+    int visibility = STV_DEFAULT;  // 符号可见性（st_other 低 2 位）。hidden 不导出到 .dynsym
     bool defined = false;       // sec_idx != SIZE_MAX
 };
 
@@ -84,6 +86,7 @@ struct LoadedReloc {
     int type;
     size_t sym_idx;             // LoadedObject::symbols 下标
     int64_t addend = 0;         // SHT_RELA: 来自 r_addend；SHT_REL: 加载时从 patch 点读取
+    bool is_rela = true;        // 来源段 SHT_RELA(true)/SHT_REL(false)；-r 统一输出为 RELA
 };
 
 // 调试 section（.debug_*）的搬运记录。debug 段非 VM-loadable，不进 host pool、不占 guest
@@ -141,6 +144,9 @@ struct SecBuf {
     Elf64_Word info = 0;
     Elf64_Xword addralign = 1;
     Elf64_Xword entsize = 0;
+    // 逻辑大小。-r (partial link) 的 NOBITS 段（.bss）无数据但需非零 size；
+    // PROGBITS 段与 data.size() 等价。final-link 路径不读此字段。
+    Elf64_Xword size = 0;
 };
 
 // build_dynamic_sections 的输出：6 个动态相关 section 在 extras[] 的索引
@@ -396,6 +402,7 @@ public:
         STATIC_EXE,   // 输入 .o + 命令行 -l archive，输出完全自包含的 ET_EXEC
         SHARED_LIB,   // -shared：输入 .a/.o，输出 .so（ET_DYN + .dynsym 导出表 + DT_SONAME，PIE）
         DYNAMIC_EXE,  // 默认：输入 .o + -l .so，输出 PIE ET_DYN + DT_NEEDED
+        RELOCATABLE,  // -r：输入 .o/.a，合并为单个 ET_REL（保留重定位、不解析符号，无 segment/入口）
     };
 
 private:
@@ -423,6 +430,16 @@ private:
     std::unordered_map<std::string, GlobalSymbol> globals_;
     bool keep_debug_ = true;  // 默认保留 DWARF 调试段（对齐标准 ld）
     bool keep_symtab_ = true; // 默认输出静态 .symtab/.strtab（-s/--strip-all 关闭，对齐 ld）
+
+    // === -r (RELOCATABLE) 专用状态 ===
+    // (obj_idx, sec_idx) → 该输入段在合并输出段中的字节贡献起点
+    std::map<std::pair<size_t,size_t>, size_t> rel_contrib_off_;
+    // (obj_idx, sec_idx) → 该输入段对应的输出 section 在 extras_ 里的下标
+    std::map<std::pair<size_t,size_t>, size_t> rel_sec_out_index_;
+    // (obj_idx, sym_idx) → 该输入符号在输出 .symtab 中的索引（供重定位 r_info 重索引）
+    std::map<std::pair<size_t,size_t>, size_t> rel_sym_out_index_;
+    // 仍 UND 的符号名 → 输出 symtab 索引（UND 条目无 obj/si，按名查）
+    std::unordered_map<std::string, size_t> rel_und_name_index_;
 
     // 函数 guest 地址 → 栈大小（来自 .stack_sizes，build_stack_size_map 填充）。
     // 供 fix_fbreg_offsets 修正 DW_OP_fbreg 偏移（clang BPF 后端把栈变量偏移算错为
@@ -511,11 +528,46 @@ public:
     void set_keep_debug(bool b) { keep_debug_ = b; }
     void set_keep_symtab(bool b) { keep_symtab_ = b; }
 
-    // 按扩展名加载一个输入：.a→归档(全展开)、.so→动态符号(读 dynsym+DT_NEEDED)、.o(及其它)→目标文件
+    // 输入文件按内容（而非扩展名）判定的类型。kbuild 产出的 built-in.o 名字固定，
+    // 内容却可能是空 ar 归档（lib-y 目录占位）或 ET_DYN（obj-y 目录 clang -r 产物），
+    // 按扩展名分发会误判，故统一嗅探 magic + ELF e_type。
+    enum class InputKind { ARCHIVE, REL, DYN, NOT_FOUND };
+    InputKind classify_input(const std::string& path) {
+        std::vector<uint8_t> data;
+        if (!read_file(path, data)) return InputKind::NOT_FOUND;
+        // ar 归档 magic "!<arch>\n"（含 8 字节空归档）
+        static const char ar_magic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', '\n'};
+        if (data.size() >= 8 && memcmp(data.data(), ar_magic, 8) == 0)
+            return InputKind::ARCHIVE;
+        // ELF：嗅探 e_type 区分 ET_REL 与 ET_DYN/ET_EXEC
+        Elf* elf = elf_memory((char*)data.data(), data.size());
+        if (elf && elf_kind(elf) == ELF_K_ELF) {
+            GElf_Ehdr ehdr;
+            if (gelf_getehdr(elf, &ehdr) == &ehdr) {
+                elf_end(elf);
+                return (ehdr.e_type == ET_REL) ? InputKind::REL : InputKind::DYN;
+            }
+        }
+        if (elf) elf_end(elf);
+        // 既非 ar 也非 ELF：交给 load_rel_file 走原有报错路径（保持兼容）
+        return InputKind::REL;
+    }
+
+    // 按文件实际内容加载：ar 归档→全展开、ET_REL→目标、ET_DYN→动态符号+DT_NEEDED。
     bool load_input(const std::string& in) {
-        if (ends_with(in, ".a")) { load_archive_file(in); return true; }
-        if (ends_with(in, ".so")) { return load_bpfso_symbols(in); }
-        return load_rel_file(in) != SIZE_MAX;
+        switch (classify_input(in)) {
+            case InputKind::NOT_FOUND:
+                std::cerr << "[elf_linker] cannot find input: " << in << "\n";
+                return false;
+            case InputKind::ARCHIVE:
+                load_archive_file(in);   // 空/有成员归档都正确处理（空归档天然无害）
+                return true;
+            case InputKind::DYN:
+                return load_bpfso_symbols(in);   // 只读 .dynsym + DT_NEEDED，不并入段
+            case InputKind::REL:
+                return load_rel_file(in) != SIZE_MAX;
+        }
+        return false;
     }
 
     // 执行链接
@@ -525,6 +577,11 @@ public:
         if (elf_version(EV_CURRENT) == EV_NONE) {
             std::cerr << "[elf_linker] libelf init failed\n";
             return false;
+        }
+
+        // -r (partial link) 走独立路径，不复用 final-link 的 layout/reloc/入口机器
+        if (mode_ == Mode::RELOCATABLE) {
+            return run_relocatable(inputs);
         }
 
         if (mode_ == Mode::STATIC_EXE) {
@@ -556,22 +613,30 @@ public:
                 }
             }
         } else if (mode_ == Mode::DYNAMIC_EXE) {
-            // 动态主程序：依赖按扩展名分流（对齐标准 ld 行为）——
-            //   .a → 静态拉入归档成员（符号进 globals_，调用按内部相对 call 解析）；
-            //   .o → 当作附加对象静态链入；
-            //   .so → 动态依赖（只读 dynsym + DT_NEEDED，跨模块调用走 PLT/GOT）。
-            // 再加载主 .o。
+            // 动态主程序：依赖按文件实际内容分流——
+            //   ar 归档 → 静态拉入成员（符号进 globals_，内部相对 call 解析）；
+            //   ET_REL → 当作附加对象静态链入；
+            //   ET_DYN/ET_EXEC → 动态依赖（只读 dynsym + DT_NEEDED，跨模块调用走 PLT/GOT）。
             for (const auto& dep : dep_paths_) {
-                if (ends_with(dep, ".a")) {
-                    load_archive_file(dep);
-                } else if (ends_with(dep, ".o")) {
-                    if (load_rel_file(dep) == SIZE_MAX) {
+                switch (classify_input(dep)) {
+                    case InputKind::NOT_FOUND:
                         std::cerr << "[elf_linker] failed to load dep: " << dep << "\n";
                         return false;
-                    }
-                } else if (!load_bpfso_symbols(dep)) {
-                    std::cerr << "[elf_linker] failed to load dep: " << dep << "\n";
-                    return false;
+                    case InputKind::ARCHIVE:
+                        load_archive_file(dep);
+                        break;
+                    case InputKind::REL:
+                        if (load_rel_file(dep) == SIZE_MAX) {
+                            std::cerr << "[elf_linker] failed to load dep: " << dep << "\n";
+                            return false;
+                        }
+                        break;
+                    case InputKind::DYN:
+                        if (!load_bpfso_symbols(dep)) {
+                            std::cerr << "[elf_linker] failed to load dep: " << dep << "\n";
+                            return false;
+                        }
+                        break;
                 }
             }
             // 加载所有输入（.o/.a/.so，按类型分流）
@@ -860,10 +925,447 @@ public:
         }
     }
 
+    // ======================================================================
+    // === -r (RELOCATABLE / partial link) 独立路径 =========================
+    // 与 final-link 完全分离：不调 layout_segments/apply_relocations/GOT-PLT/
+    // 入口解析；自己合并段、重建 symtab、重写重定位、写 ET_REL。
+    // 标准语义：合并同名段、保留未解析符号、保留重定位（不应用）、无 segment/入口。
+    // ======================================================================
+
+    bool run_relocatable(const std::vector<std::string>& inputs) {
+        // 1. 加载输入（仅 ET_REL + ar 归档；classify_input 会把 .so/ET_DYN 也分流，
+        //    但 partial link 不接受共享库——遇到 ET_DYN 输入直接报错）
+        for (const auto& in : inputs) {
+            auto kind = classify_input(in);
+            if (kind == InputKind::DYN) {
+                std::cerr << "[elf_linker] -r (partial link) does not accept shared object input: "
+                          << in << " (only .o/.a)\n";
+                return false;
+            }
+            if (!load_input(in)) {
+                std::cerr << "[elf_linker] failed to load: " << in << "\n";
+                return false;
+            }
+        }
+        for (const auto& a : explicit_archives_) {
+            load_archive_file(a);
+        }
+        // 2. register_globals：建立 globals_（强覆盖弱），供 symtab 去重 + UND 判定
+        for (size_t i = 0; i < objects_.size(); i++) {
+            register_globals(i);
+        }
+        // 3. partial link 允许未解析符号——不调 check_undefined_symbols
+        return true;
+    }
+
+    // 合并所有输入对象的 loadable 段（按完整段名）到 extras，并填 rel_contrib_off_/
+    // rel_sec_out_index_。同名段顺序拼接，.bss(NOBITS) 只累加 size 不写数据。
+    void merge_rel_sections(std::vector<SecBuf>& extras) {
+        // name → (extras 下标, 当前累计字节)
+        std::unordered_map<std::string, std::pair<size_t, size_t>> merged;
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (size_t si = 1; si < objects_[oi].sections.size(); si++) {
+                const auto& ls = objects_[oi].sections[si];
+                if (!ls.loadable) continue;
+                auto align = ls.addralign ? ls.addralign : 1;
+                auto it = merged.find(ls.name);
+                if (it == merged.end()) {
+                    SecBuf sb;
+                    sb.name = ls.name;
+                    sb.type = (ls.type == SHT_NOBITS) ? SHT_NOBITS : SHT_PROGBITS;
+                    sb.flags = ls.sh_flags;
+                    sb.addralign = align;
+                    sb.entsize = ls.entsize;
+                    sb.size = ls.size;  // 逻辑大小（NOBITS 无 data，靠此字段承载）
+                    // 首份贡献区数据
+                    if (ls.type != SHT_NOBITS && ls.size > 0) {
+                        sb.data.assign(objects_[oi].host_mem + ls.offset,
+                                       objects_[oi].host_mem + ls.offset + ls.size);
+                    }
+                    rel_contrib_off_[{oi, si}] = 0;
+                    rel_sec_out_index_[{oi, si}] = extras.size();
+                    merged[ls.name] = {extras.size(), ls.size};
+                    extras.push_back(std::move(sb));
+                } else {
+                    auto& [idx, acc] = it->second;
+                    auto& out = extras[idx];
+                    // 对齐填充到 align 倍数
+                    if (align > 1 && (acc % align) != 0) {
+                        size_t pad = align - (acc % align);
+                        if (out.type != SHT_NOBITS) {
+                            out.data.insert(out.data.end(), pad, 0);
+                        }
+                        acc += pad;
+                    }
+                    // 取最大对齐
+                    if (align > out.addralign) out.addralign = align;
+                    rel_contrib_off_[{oi, si}] = acc;
+                    rel_sec_out_index_[{oi, si}] = idx;
+                    if (ls.type != SHT_NOBITS && ls.size > 0) {
+                        out.data.insert(out.data.end(),
+                                        objects_[oi].host_mem + ls.offset,
+                                        objects_[oi].host_mem + ls.offset + ls.size);
+                    }
+                    acc += ls.size;
+                    out.size = acc;  // PROGBITS: == data.size()；NOBITS: 逻辑大小
+                }
+            }
+        }
+    }
+
+    // -r 专用：合并 DWARF 调试段（.debug_*）与 .stack_sizes 到 extras（非 ALLOC
+    // SHT_PROGBITS），按名拼接保留原始字节，供后续 final-link 消费。keep_debug_ 关闭时跳过。
+    void merge_rel_debug_sections(std::vector<SecBuf>& extras) {
+        if (!keep_debug_) return;
+        // name → (extras 下标, 累计字节)
+        std::unordered_map<std::string, std::pair<size_t, size_t>> merged;
+        auto append = [&](size_t oi, size_t sec_idx, const std::string& name,
+                          Elf64_Xword align, const std::vector<uint8_t>& data) {
+            if (align == 0) align = 1;
+            auto it = merged.find(name);
+            if (it == merged.end()) {
+                SecBuf sb;
+                sb.name = name;
+                sb.type = SHT_PROGBITS;
+                sb.flags = 0;       // 非 ALLOC
+                sb.addralign = align;
+                sb.data = data;
+                sb.size = data.size();
+                rel_contrib_off_[{oi, sec_idx}] = 0;
+                rel_sec_out_index_[{oi, sec_idx}] = extras.size();
+                merged[name] = {extras.size(), data.size()};
+                extras.push_back(std::move(sb));
+            } else {
+                auto& [idx, acc] = it->second;
+                auto& out = extras[idx];
+                if (align > 1 && (acc % align) != 0) {
+                    size_t pad = align - (acc % align);
+                    out.data.insert(out.data.end(), pad, 0);
+                    acc += pad;
+                }
+                if (align > out.addralign) out.addralign = align;
+                rel_contrib_off_[{oi, sec_idx}] = acc;
+                rel_sec_out_index_[{oi, sec_idx}] = idx;
+                out.data.insert(out.data.end(), data.begin(), data.end());
+                acc += data.size();
+                out.size = acc;
+            }
+        };
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (const auto& ds : objects_[oi].debug_secs) {
+                // -r 不合成 .debug_frame：保留输入原样（final-link 才合成 CFI）
+                append(oi, ds.sec_idx, ds.name, ds.addralign, ds.data);
+            }
+            // .stack_sizes（clang -fstack-size-section）：元数据段，供后续 final-link 的
+            // fix_fbreg_offsets 解出栈大小。按名合并，重定位随通用路径重写。
+            if (objects_[oi].stack_sizes_sec_idx != SIZE_MAX &&
+                !objects_[oi].stack_sizes_data.empty()) {
+                append(oi, objects_[oi].stack_sizes_sec_idx, ".stack_sizes", 1,
+                       objects_[oi].stack_sizes_data);
+            }
+        }
+    }
+
+    // 构建 -r 的 .symtab/.strtab：输出所有 local（含 STT_SECTION）、保留原 binding、
+    // 未解析符号作 SHN_UNDEF、st_value 用合并段内偏移。填 rel_sym_out_index_。
+    // 返回 (symtab 在 extras 的下标, strtab 在 extras 的下标)。
+    std::pair<size_t, size_t> build_rel_symtab(std::vector<SecBuf>& extras) {
+        SecBuf strtab;
+        strtab.name = ".strtab";
+        strtab.type = SHT_STRTAB;
+        strtab.data.push_back(0);
+        strtab.addralign = 1;
+        auto add_name = [&](const std::string& n) -> Elf64_Word {
+            if (n.empty()) return 0;
+            Elf64_Word off = (Elf64_Word)strtab.data.size();
+            strtab.data.insert(strtab.data.end(), n.begin(), n.end());
+            strtab.data.push_back(0);
+            return off;
+        };
+
+        SecBuf symtab;
+        symtab.name = ".symtab";
+        symtab.type = SHT_SYMTAB;
+        symtab.addralign = 8;
+        symtab.entsize = sizeof(Elf64_Sym);
+
+        size_t sym_count = 0;
+        // NULL 符号（index 0）
+        Elf64_Sym zsym = {};
+        symtab.data.insert(symtab.data.end(), (uint8_t*)&zsym, (uint8_t*)&zsym + sizeof(zsym));
+        sym_count++;
+
+        // 计算某输入符号在合并段的值：contrib_off + sym.value
+        auto sym_value = [&](size_t oi, const LoadedSym& s) -> uint64_t {
+            if (s.sec_idx == SIZE_MAX) return s.value;  // UND/ABS：原值
+            auto cit = rel_contrib_off_.find({oi, s.sec_idx});
+            if (cit == rel_contrib_off_.end()) return s.value;
+            return cit->second + s.value;
+        };
+        // 计算某输入符号的输出 shndx
+        auto sym_shndx = [&](size_t oi, const LoadedSym& s) -> Elf64_Half {
+            if (s.sec_idx == SIZE_MAX) {
+                return (s.type == STT_FILE) ? SHN_ABS : SHN_UNDEF;
+            }
+            auto sit = rel_sec_out_index_.find({oi, s.sec_idx});
+            // +1: NULL shdr 占 index 0，合并段从 index 1 开始
+            return sit != rel_sec_out_index_.end() ? (Elf64_Half)(sit->second + 1) : SHN_UNDEF;
+        };
+
+        auto emit = [&](size_t oi, size_t si, const LoadedSym& s) {
+            Elf64_Sym es = {};
+            es.st_name = add_name(s.name);
+            es.st_info = GELF_ST_INFO(s.binding, s.type);
+            es.st_other = GELF_ST_VISIBILITY(s.visibility);  // 保留原可见性
+            es.st_shndx = sym_shndx(oi, s);
+            es.st_value = sym_value(oi, s);
+            es.st_size = s.size;
+            symtab.data.insert(symtab.data.end(), (uint8_t*)&es, (uint8_t*)&es + sizeof(es));
+            rel_sym_out_index_[{oi, si}] = sym_count;
+            sym_count++;
+        };
+
+        // 1. 本地符号（STB_LOCAL）：所有类型，含 STT_SECTION/STT_FILE。
+        //    同名段合并后，每个输入对象的 STT_SECTION 符号须各自保留——它们被本对象的
+        //    重定位引用（r_info 指向本 obj 的 section 符号），合并段后 shndx 改指合并段，
+        //    value 改指贡献区起点。
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (size_t si = 1; si < objects_[oi].symbols.size(); si++) {  // 跳过 index 0 (NULL 符号)
+                const auto& s = objects_[oi].symbols[si];
+                if (s.binding != STB_LOCAL) continue;
+                emit(oi, si, s);
+            }
+        }
+        symtab.info = (Elf64_Word)sym_count;  // sh_info = 第一个 non-local 的索引
+
+        // 2. global/weak 符号：每个名字输出一条（取 globals_ 的胜出定义，保留其 binding）；
+        //    同时为所有引用过但无定义的 UND 名字输出 SHN_UNDEF 条目。
+        // 先输出有定义的 global/weak
+        for (const auto& kv : globals_) {
+            size_t oi = kv.second.obj_idx;
+            size_t si = kv.second.sym_idx;
+            const auto& s = objects_[oi].symbols[si];
+            emit(oi, si, s);
+        }
+        // 再输出仍 UND 的（被重定位引用但无 globals_ 定义）：每个唯一名字一条
+        std::unordered_set<std::string> seen_und;
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (size_t si = 1; si < objects_[oi].symbols.size(); si++) {  // 跳过 NULL 符号
+                const auto& s = objects_[oi].symbols[si];
+                if (s.defined) continue;              // 已处理
+                if (s.binding == STB_LOCAL) continue; // local UND 不输出
+                // 已有定义的符号名不输出 UND 条目（定义在 globals_ 里，已输出）
+                if (globals_.count(s.name)) continue;
+                if (!seen_und.insert(s.name).second) continue;  // 去重
+                Elf64_Sym es = {};
+                es.st_name = add_name(s.name);
+                es.st_info = GELF_ST_INFO(s.binding, s.type);
+                es.st_other = GELF_ST_VISIBILITY(s.visibility);  // 保留原可见性
+                es.st_shndx = SHN_UNDEF;
+                es.st_value = 0;
+                es.st_size = 0;
+                symtab.data.insert(symtab.data.end(), (uint8_t*)&es, (uint8_t*)&es + sizeof(es));
+                rel_und_name_index_[s.name] = sym_count;
+                sym_count++;
+            }
+        }
+
+        size_t strtab_idx = extras.size();
+        extras.push_back(std::move(strtab));
+        size_t symtab_idx = extras.size();
+        extras.push_back(std::move(symtab));
+        extras[symtab_idx].link = (Elf64_Word)strtab_idx + 1;  // +1: NULL shdr 占 index 0
+        return {symtab_idx, strtab_idx};
+    }
+
+    // 重写重定位：按【输出目标段】(rel_sec_out_index_ 的值，即合并后的段) 重组为 SHT_RELA。
+    // 多个输入对象的 .text 合并成一个输出 .text 后，它们各自的 .rela.text 须合并成一个
+    // .rela.text（目标段 index 相同）。r_offset 重定位到合并段内（contrib_off + r.offset），
+    // r_info 重索引到输出 symtab，addend 原样保留。不跳过任何重定位类型（含 call type 10）。
+    void build_rel_relocations(std::vector<SecBuf>& extras, size_t symtab_idx) {
+        // 输出目标段 index → (extras 下标, 段名)
+        std::map<size_t, size_t> outsec_to_rela;
+        for (size_t oi = 0; oi < objects_.size(); oi++) {
+            for (const auto& r : objects_[oi].relocations) {
+                if (r.target_sec >= objects_[oi].sections.size()) continue;
+                auto sit = rel_sec_out_index_.find({oi, r.target_sec});
+                if (sit == rel_sec_out_index_.end()) continue;
+                size_t out_sec_idx = sit->second;  // 合并后的输出段在 extras 的下标
+                const auto& target = objects_[oi].sections[r.target_sec];
+                auto it = outsec_to_rela.find(out_sec_idx);
+                size_t idx;
+                if (it == outsec_to_rela.end()) {
+                    SecBuf sb;
+                    sb.name = std::string(".rela") + target.name;  // .rela.text 等
+                    sb.type = SHT_RELA;
+                    sb.addralign = 8;
+                    sb.entsize = sizeof(Elf64_Rela);
+                    sb.link = (Elf64_Word)symtab_idx + 1;  // +1: NULL shdr 占 index 0
+                    sb.info = (Elf64_Word)out_sec_idx + 1; // 目标合并段 shdr index
+                    idx = extras.size();
+                    extras.push_back(std::move(sb));
+                    outsec_to_rela[out_sec_idx] = idx;
+                } else {
+                    idx = it->second;
+                }
+                Elf64_Rela rela = {};
+                // r_offset 重定位到合并段内
+                auto cit = rel_contrib_off_.find({oi, r.target_sec});
+                uint64_t contrib = (cit != rel_contrib_off_.end()) ? cit->second : 0;
+                rela.r_offset = contrib + r.offset;
+                // r_info 重索引：优先按 (obj, sym_idx) 查已映射的输出索引；
+                // 若查不到（UND 符号引用，本 obj 内未定义），按符号名查 globals_ 定义者；
+                // 再不行查 rel_und_name_index_（仍 UND 的符号）。
+                size_t out_sym = 0;
+                auto symit = rel_sym_out_index_.find({oi, r.sym_idx});
+                if (symit != rel_sym_out_index_.end()) {
+                    out_sym = symit->second;
+                } else if (r.sym_idx < objects_[oi].symbols.size()) {
+                    const auto& rsym = objects_[oi].symbols[r.sym_idx];
+                    auto git = globals_.find(rsym.name);
+                    if (git != globals_.end()) {
+                        auto g2 = rel_sym_out_index_.find({git->second.obj_idx, git->second.sym_idx});
+                        if (g2 != rel_sym_out_index_.end()) out_sym = g2->second;
+                    }
+                    if (out_sym == 0) {
+                        auto uit = rel_und_name_index_.find(rsym.name);
+                        if (uit != rel_und_name_index_.end()) out_sym = uit->second;
+                    }
+                }
+                rela.r_info = ELF64_R_INFO(out_sym, (uint64_t)r.type);
+                rela.r_addend = r.addend;  // 原样保留
+                extras[idx].data.insert(extras[idx].data.end(),
+                                        (uint8_t*)&rela, (uint8_t*)&rela + sizeof(rela));
+            }
+        }
+    }
+
+    // -r 文件布局：ehdr → extras 数据(顺序，按 addralign 对齐) → shdr 表
+    struct RelLayout {
+        std::vector<uint64_t> extra_offs;  // 每个 extra 的文件 offset
+        uint64_t sh_off = 0;               // shdr 表 offset
+        Elf64_Half shnum = 0;
+        Elf64_Half shstrndx = 0;
+    };
+
+    bool write_rel_impl(FILE* f) {
+        // 1. 合并 loadable 段 + （keep_debug 时）DWARF/.stack_sizes 段
+        std::vector<SecBuf> extras;
+        merge_rel_sections(extras);
+        merge_rel_debug_sections(extras);
+
+        // 2. symtab + strtab
+        auto [symtab_idx, strtab_idx] = build_rel_symtab(extras);
+
+        // 3. 重定位段
+        build_rel_relocations(extras, symtab_idx);
+
+        // 4. .shstrtab（收集所有 extra 名字）
+        SecBuf shstrtab;
+        shstrtab.name = ".shstrtab";
+        shstrtab.type = SHT_STRTAB;
+        shstrtab.data.push_back(0);  // index 0 = 空名
+        shstrtab.addralign = 1;
+        std::vector<Elf64_Word> name_offs;
+        auto add_shstr = [&](const std::string& n) -> Elf64_Word {
+            Elf64_Word off = (Elf64_Word)shstrtab.data.size();
+            shstrtab.data.insert(shstrtab.data.end(), n.begin(), n.end());
+            shstrtab.data.push_back(0);
+            return off;
+        };
+        for (auto& e : extras) name_offs.push_back(add_shstr(e.name));
+        Elf64_Word shstrtab_name_off = add_shstr(".shstrtab");
+        size_t shstrtab_idx = extras.size();
+        extras.push_back(std::move(shstrtab));
+        name_offs.push_back(shstrtab_name_off);  // 与 extras 对齐，shstrtab 自身名字占一位
+
+        // 5. 计算文件布局
+        RelLayout L;
+        uint64_t off = sizeof(Elf64_Ehdr);  // 无 phdr
+        L.extra_offs.resize(extras.size());
+        for (size_t i = 0; i < extras.size(); i++) {
+            uint64_t align = extras[i].addralign ? extras[i].addralign : 1;
+            if (align > 1) off = (off + align - 1) & ~(align - 1);
+            L.extra_offs[i] = off;
+            if (extras[i].type != SHT_NOBITS) {
+                off += extras[i].data.size();
+            }
+            // NOBITS 不占文件空间
+        }
+        // shdr 表 8 字节对齐
+        off = (off + 7) & ~uint64_t(7);
+        L.sh_off = off;
+        L.shnum = (Elf64_Half)(extras.size() + 1);  // +1: NULL shdr
+        L.shstrndx = (Elf64_Half)shstrtab_idx + 1;  // +1: NULL shdr 占 index 0
+
+        // 6. 写 Ehdr
+        Elf64_Ehdr eh = {};
+        eh.e_ident[0] = 0x7f; eh.e_ident[1] = 'E'; eh.e_ident[2] = 'L'; eh.e_ident[3] = 'F';
+        eh.e_ident[4] = ELFCLASS64; eh.e_ident[5] = ELFDATA2LSB; eh.e_ident[6] = EV_CURRENT;
+        eh.e_ident[7] = ELFOSABI_NONE;
+        eh.e_type = ET_REL;
+        eh.e_machine = EM_BPF;
+        eh.e_version = EV_CURRENT;
+        eh.e_entry = 0;
+        eh.e_phoff = 0;   // REL 无 program header
+        eh.e_shoff = L.sh_off;
+        eh.e_flags = 0;
+        eh.e_ehsize = sizeof(Elf64_Ehdr);
+        eh.e_phentsize = 0;
+        eh.e_phnum = 0;
+        eh.e_shentsize = sizeof(Elf64_Shdr);
+        eh.e_shnum = L.shnum;
+        eh.e_shstrndx = L.shstrndx;
+        if (fwrite(&eh, sizeof(eh), 1, f) != 1) return false;
+
+        // 7. 写 extras 数据（NOBITS 跳过）
+        for (size_t i = 0; i < extras.size(); i++) {
+            if (extras[i].type == SHT_NOBITS) continue;
+            if (fseek(f, (long)L.extra_offs[i], SEEK_SET) != 0) return false;
+            if (!extras[i].data.empty()) {
+                if (fwrite(extras[i].data.data(), extras[i].data.size(), 1, f) != 1) return false;
+            }
+        }
+
+        // 8. 写 shdr 表：NULL + 每个 extra 一条
+        if (fseek(f, (long)L.sh_off, SEEK_SET) != 0) return false;
+        Elf64_Shdr null_sh = {};
+        if (fwrite(&null_sh, sizeof(null_sh), 1, f) != 1) return false;
+        for (size_t i = 0; i < extras.size(); i++) {
+            Elf64_Shdr sh = {};
+            sh.sh_name = name_offs[i];
+            sh.sh_type = extras[i].type;
+            sh.sh_flags = extras[i].flags;
+            sh.sh_addr = 0;  // REL 无虚拟地址
+            sh.sh_offset = (extras[i].type == SHT_NOBITS) ? 0 : L.extra_offs[i];
+            // NOBITS（.bss）无 data，逻辑大小记在 size 字段；其余用 data 实际字节数
+            sh.sh_size = (extras[i].type == SHT_NOBITS) ? extras[i].size : extras[i].data.size();
+            sh.sh_link = extras[i].link;
+            sh.sh_info = extras[i].info;
+            sh.sh_addralign = extras[i].addralign;
+            sh.sh_entsize = extras[i].entsize;
+            if (fwrite(&sh, sizeof(sh), 1, f) != 1) return false;
+        }
+        return true;
+    }
+
     uint64_t entry() const { return entry_; }
 
     bool write_elf(const std::string& path) {
         if (!pool_ || pool_used_ == 0) return false;
+
+        // -r 走独立 writer（ET_REL，无 segment/phdr）
+        if (mode_ == Mode::RELOCATABLE) {
+            FILE* f = fopen(path.c_str(), "wb");
+            if (!f) {
+                std::cerr << "[elf_linker] cannot write " << path << ": " << strerror(errno) << "\n";
+                return false;
+            }
+            bool ok = write_rel_impl(f);
+            fclose(f);
+            if (ok) chmod(path.c_str(), 0644);  // 中间 .o，无可执行位
+            return ok;
+        }
 
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) {
@@ -939,6 +1441,9 @@ private:
             ls.writable = (shdr.sh_flags & SHF_WRITE) != 0;
             ls.executable = (shdr.sh_flags & SHF_EXECINSTR) != 0;
             ls.seg = classify_section(ls.executable, ls.writable);
+            ls.sh_flags = shdr.sh_flags;
+            ls.addralign = shdr.sh_addralign ? shdr.sh_addralign : 1;
+            ls.entsize = shdr.sh_entsize;
             obj.sections.push_back(ls);
         }
 
@@ -1058,6 +1563,7 @@ private:
                     ls.size = sym.st_size;
                     ls.binding = GELF_ST_BIND(sym.st_info);
                     ls.type = GELF_ST_TYPE(sym.st_info);
+                    ls.visibility = GELF_ST_VISIBILITY(sym.st_other);
                     if (sym.st_shndx == SHN_UNDEF || sym.st_shndx >= SHN_LORESERVE) {
                         ls.defined = false;
                         ls.sec_idx = SIZE_MAX;
@@ -1091,6 +1597,7 @@ private:
                 LoadedReloc r;
                 r.target_sec = target_sec;
                 if (shdr.sh_type == SHT_RELA) {
+                    r.is_rela = true;
                     GElf_Rela rela;
                     gelf_getrela(d, i, &rela);
                     r.offset = rela.r_offset;
@@ -1098,6 +1605,7 @@ private:
                     r.sym_idx = GELF_R_SYM(rela.r_info);
                     r.addend = rela.r_addend;
                 } else {
+                    r.is_rela = false;
                     GElf_Rel rel;
                     gelf_getrel(d, i, &rel);
                     r.offset = rel.r_offset;
@@ -1382,6 +1890,9 @@ private:
             if (binding != STB_GLOBAL && binding != STB_WEAK) continue;
             if (type != STT_FUNC && type != STT_OBJECT) continue;
             if (sym.st_shndx == SHN_UNDEF) continue;  // 导入符号，不是导出
+            // hidden 符号不跨模块可见，跳过（防御性：正确生成的 .so 不该在 .dynsym 含 hidden
+            // 符号，但保护下游不被错误产物污染）。
+            if (GELF_ST_VISIBILITY(sym.st_other) == STV_HIDDEN) continue;
             char* nm = elf_strptr(elf, dynsym_link, sym.st_name);
             if (!nm || !*nm) continue;
             bpfso_symbols_[nm] = sym.st_value;
@@ -2600,7 +3111,7 @@ private:
             Elf64_Sym s = {};
             s.st_name = add_name(sym.name);
             s.st_info = GELF_ST_INFO(bind, sym.type == 0 ? STT_FUNC : sym.type);
-            s.st_other = 0;
+            s.st_other = GELF_ST_VISIBILITY(sym.visibility);  // 保留原可见性
             s.st_shndx = sym_to_shndx(obj, sym.sec_idx, bss_shndx, seg_shndx);
             s.st_value = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
             s.st_size = sym.size;
@@ -2730,6 +3241,9 @@ private:
         for (const auto& kv : globals_) {
             const auto& sym = objects_[kv.second.obj_idx].symbols[kv.second.sym_idx];
             if (sym.name.empty()) continue;
+            // hidden 符号不导出到 .dynsym（标准 ELF 语义：不可被其它模块引用）。
+            // 本链接单元内的引用由 .rela.dyn 的 def_in_unit 分支处理，故不导出无副作用。
+            if (sym.visibility == STV_HIDDEN) continue;
             if (export_name_off.find(sym.name) != export_name_off.end()) continue;
             Elf64_Word off = (Elf64_Word)dynstr.data.size();
             dynstr.data.insert(dynstr.data.end(), sym.name.begin(), sym.name.end());
@@ -2781,10 +3295,16 @@ private:
         for (const auto& kv : globals_) {
             const auto& obj = objects_[kv.second.obj_idx];
             const auto& sym = obj.symbols[kv.second.sym_idx];
+            // hidden 符号不导出到 .dynsym（与 dynstr 收集处一致）。
+            if (sym.visibility == STV_HIDDEN) continue;
             Elf64_Sym s = {};
             auto it = export_name_off.find(sym.name);
             if (it != export_name_off.end()) s.st_name = it->second;
             s.st_info = GELF_ST_INFO(STB_GLOBAL, sym.type == 0 ? STT_FUNC : sym.type);
+            // 保留原符号 visibility（st_other 低 2 位）。非 hidden 符号（DEFAULT/PROTECTED）
+            // 也写出真实值，而非一律 0——PROTECTED 符号导出但不可被预empt（本链接器/loader
+            // 目前不区分，但写出正确值让 ELF 符合标准语义）。
+            s.st_other = GELF_ST_VISIBILITY(sym.visibility);
             s.st_shndx = sym_to_shndx(obj, sym.sec_idx, bss_shndx, seg_shndx);
             s.st_value = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
             s.st_size = sym.size;
@@ -2859,8 +3379,9 @@ private:
 
         // .rela.dyn：PIC 模式下需要运行时重定位的项（lddw/数据指针绝对地址）。
         //   - R_BPF_64_64 (lddw, type 1) / R_BPF_64_ABS64 (数据指针, type 2) / R_BPF_64_NODYLD32 (type 4)
-        //   - 本模块符号：用 NULL 符号(idx 0) + addend = 符号相对地址，VM resolve 返回 load_base
-        //   - UND 符号：查 .dynsym 索引，VM 按名解析
+        //   - 本链接单元内定义的符号（含本 obj 定义 + UND 但由同链接单元的 .o/.a 提供）：
+        //     用 NULL 符号(idx 0) + addend = 符号相对地址，VM resolve 返回 load_base。
+        //   - 真正的外部 UND 符号（本链接单元不提供，来自 .so）：查 .dynsym 索引，VM 按名解析。
         // call (type 10) 不记：构建期已处理（内部相对 call / UND 走 PLT）
         SecBuf reladyn;
         reladyn.name = ".rela.dyn";
@@ -2880,14 +3401,18 @@ private:
                 if (target.executable) has_textrel = true;
                 Elf64_Rela rela = {};
                 rela.r_offset = target.guest_addr + r.offset;
-                if (sym.defined) {
-                    // 用 globals_ 解析后的地址（resolve_symbol），而非本 obj 内的局部定义地址。
-                    // 否则 weak 符号被 strong 覆盖时（如 musl __stdio_exit.o 的 weak
-                    // __stdout_used 被 stdout.o 的 strong 覆盖），addend 仍指向 weak 的
-                    // .bss.dummy_file（值 0），运行时 __stdio_exit 读到 NULL 不刷新 stdout。
+                // 判断符号是否在本链接单元内有定义：本 obj 定义，或 UND 但由同链接单元的
+                // 其它 .o/.a 提供（globals_/synthetic_globals_ 命中）。两者都走本模块内部
+                // 引用（sym_idx=0 + addend=解析地址），不查 .dynsym。
+                bool def_in_unit = sym.defined ||
+                    globals_.count(sym.name) ||
+                    synthetic_globals_.count(sym.name);
+                if (def_in_unit) {
+                    // 用 globals_ 解析后的地址（resolve_symbol），而非本 obj 内的局部定义地址：
+                    // weak 符号被 strong 覆盖时 addend 必须指向胜出定义，否则读到错误地址。
                     auto resolved = resolve_symbol(oi, r.sym_idx);
                     uint64_t sym_addr = resolved.value_or(
-                        sec_guest_addr_of(objects_[oi], sym.sec_idx) + sym.value);
+                        sym.defined ? (sec_guest_addr_of(objects_[oi], sym.sec_idx) + sym.value) : 0);
                     rela.r_info = ELF64_R_INFO(0, r.type);
                     rela.r_addend = sym_addr + r.addend;
                 } else {
@@ -3673,6 +4198,15 @@ bool link_bpf_exe(const std::vector<std::string>& inputs, const std::string& out
     linker.set_entry_name(entry_name);
     linker.set_keep_debug(keep_debug);
     linker.set_keep_symtab(keep_symtab);
+    if (!linker.run(inputs)) return false;
+    return linker.write_elf(out_path);
+}
+
+bool link_bpf_relocatable(const std::vector<std::string>& inputs, const std::string& out_path,
+                          const std::vector<std::string>& archives, bool keep_debug) {
+    Linker linker(Linker::Mode::RELOCATABLE);
+    linker.set_archives(archives);
+    linker.set_keep_debug(keep_debug);
     if (!linker.run(inputs)) return false;
     return linker.write_elf(out_path);
 }

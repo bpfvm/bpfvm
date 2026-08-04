@@ -142,8 +142,11 @@ libgot.host.a: libgot.host.o
 libgot.host.so: libgot.host.o
 	$(HOST_CC) -shared $< -o $@
 
-# test_dyn_data.host：链入 libgot.host.a（host 上跨模块直接静态链，验证逻辑等价）。
+# test_dyn_data.host / test_mixed_link.host：链入 libgot.host.a（host 上跨模块直接静态链，
+# 验证逻辑等价）。两用例引用的 got_* 符号都在 libgot.host.a 内。
 test_dyn_data.host: test_dyn_data.c libgot.host.a
+	$(HOST_CC) $(HOST_CFLAGS) $< libgot.host.a -o $@ $(HOST_LDFLAGS)
+test_mixed_link.host: test_mixed_link.c libgot.host.a
 	$(HOST_CC) $(HOST_CFLAGS) $< libgot.host.a -o $@ $(HOST_LDFLAGS)
 
 host-build: $(HOST_TARGETS) $(CXX_HOST_TARGETS) libgot.host.so
@@ -157,10 +160,11 @@ all: $(TARGETS) $(DYN_TARGETS) $(CXX_TARGETS) $(CXX_DYN_TARGETS) host-build
 #   - 静态（.out）：链 libcxx.a（C++ runtime + libc++ 库符号，静态链入）。
 #   - 动态（.linked）：链 libcxx.so（生成 DT_NEEDED libcxx.so，运行时走 PLT/GOT + .rela.dyn）。
 # C 用例不链 libcxx——保持 C 测试对 C++ 库零依赖（纯净环境未构建 libcxx 时 C 测试仍可用）。
-# test_dyn_data 另有显式规则（需额外链 libgot.so/libgot.a），从静态模式规则里排除，
-# 避免 recipe 重叠（"overriding recipe" 警告）；它仍在 $(TARGETS)/$(DYN_TARGETS) 里，由 all 构建。
-STATIC_OUT     := $(filter-out test_dyn_data.out,$(TARGETS))
-STATIC_LINKED  := $(filter-out test_dyn_data.linked,$(DYN_TARGETS))
+# test_dyn_data / test_mixed_link 另有显式规则（需额外链 libgot.so/libgot.a），从静态/动态
+# 模式规则里排除，避免 recipe 重叠（"overriding recipe" 警告）；它们仍在 $(TARGETS)/
+# $(DYN_TARGETS) 里，由 all 构建。
+STATIC_OUT     := $(filter-out test_dyn_data.out test_mixed_link.out,$(TARGETS))
+STATIC_LINKED  := $(filter-out test_dyn_data.linked test_mixed_link.linked,$(DYN_TARGETS))
 $(STATIC_OUT): %.out: %.o
 	../build/bpfvm-ld -static $< -L ../root/lib -l:libc.a -o $@
 $(STATIC_LINKED): %.linked: %.o $(LIBC_BPFSO)
@@ -192,8 +196,16 @@ test_dyn_data.linked: test_dyn_data.o $(GOT_SO)
 test_dyn_data.out: test_dyn_data.o libgot.a
 	../build/bpfvm-ld -static $< libgot.a -L ../root/lib -l:libc.a -o $@
 
+# test_mixed_link：混合链接（.a 静态库 + .so 动态库）。
+# .linked：libgot.a + libc.a（静态链入）+ libgot.so + libc.so（动态依赖）。
+# .out：纯静态对照（与 test_dyn_data.out 同构）。
+test_mixed_link.linked: test_mixed_link.o libgot.a $(GOT_SO)
+	../build/bpfvm-ld $< libgot.a -L ../root/lib -l:libc.a -L . -l:libgot.so -L ../root/lib -l:libc.so -o $@
+test_mixed_link.out: test_mixed_link.o libgot.a
+	../build/bpfvm-ld -static $< libgot.a -L ../root/lib -l:libc.a -o $@
+
 # 标记 .o 为中间文件，make 构建后会自动删除（和其他 .o 行为一致）
-.INTERMEDIATE: libgot.o test_dyn_data.o libgot.host.o
+.INTERMEDIATE: libgot.o test_dyn_data.o test_mixed_link.o libgot.host.o
 
 clean:
 	rm -f $(TARGETS) $(DYN_TARGETS) $(HOST_TARGETS) \
