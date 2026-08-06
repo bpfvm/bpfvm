@@ -127,9 +127,11 @@ public:
     bool emit_call_softfp(const bpf_insn* insn);
     void emit_call_softfp_slow(const bpf_insn* insn, int current_index,
                                uint64_t entry_gpa);
-    void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa);
+    void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
+                       std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
+                       std::vector<size_t>& call_cache_offs);
     void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
-    void emit_exit();
+    void emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
     // --- Patching (AArch64-specific: B.cond imm19, B imm26) ---
     void patch_branch_cond(size_t inst_offset, size_t target_offset);

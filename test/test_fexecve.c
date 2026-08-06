@@ -20,6 +20,14 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+/* bionic 不暴露 fexecve() wrapper。Android 上用 execveat(AT_EMPTY_PATH) 实现 fexecve
+ *（与 musl 的 fexecve 实现同理）。 */
+static int fexecve(int fd, char *const argv[], char *const envp[]) {
+    return (int)syscall(SYS_execveat, fd, "", argv, envp, AT_EMPTY_PATH);
+}
+#endif
 
 #define SENTINEL "FEXECVE_REEXEC=1"
 

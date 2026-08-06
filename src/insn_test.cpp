@@ -1238,7 +1238,7 @@ void test_syscall_mmap_readonly_rejects_write() {
     auto mapped = static_cast<const uint32_t*>(ebpf_vm->mmu(mapped_addr, sizeof(uint32_t)));
     bool success = (mapped_addr != 0 &&
                     mapped != nullptr &&
-                    ret == mapped_addr &&
+                    ret == 137 &&
                     *mapped == 0);
     print_test_result("test_syscall_mmap_readonly_rejects_write", success);
     assert(success);

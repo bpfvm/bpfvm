@@ -28,11 +28,12 @@ template<typename T>
 concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
                               std::vector<JumpPlaceholder>& jmps,
                               std::vector<AbortPatchInfo>& aborts,
+                              std::vector<size_t>& cache_offs,
                               uint64_t gpa, uint64_t ret_gpa, uint64_t callee_gpa,
                               const HelperTable& helpers,
                               const bpf_insn* entry_pc) {
     // VM state setup
-    e.set_vm_offsets(0u, 0u, 0u, 0u);
+    e.set_vm_offsets(0u, 0u, 0u, 0u, 0u, 0u);
     e.set_budget(0u, 0u, false, false);
     e.set_helpers(helpers);
 
@@ -50,9 +51,9 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     e.emit_ja(insn, idx, jmps);
     e.emit_ja32(insn, idx, jmps);
     e.emit_call_syscall(insn, idx, gpa);
-    e.emit_call_bpf(ret_gpa, callee_gpa);
+    e.emit_call_bpf(ret_gpa, callee_gpa, aborts, idx, cache_offs);
     e.emit_call_indirect(insn, gpa);
-    e.emit_exit();
+    e.emit_exit(aborts, idx);
 
     // Buffer access
     { e.size() } -> std::same_as<size_t>;
@@ -82,6 +83,8 @@ public:
     // Returns nullptr if the instruction cannot be JIT-compiled.
     JitFunction* compile(vm* v, uint64_t gpa) override;
     void clear() override { functions_.clear(); failed_.clear(); call_counts_.clear(); }
+    // callee 已编译则返回其 entry_fast 入口，否则 nullptr。
+    void* resolve_call(vm* v, uint64_t callee_gpa) override;
 
 private:
     // VM field offsets
@@ -91,6 +94,8 @@ private:
     static const size_t off_tlb_;
     static const size_t off_insn_count_;
     static const size_t off_insn_limit_;
+    static const size_t off_stack_limit_;
+    static const size_t off_scratch_;
 
     std::unordered_map<uint64_t, JitFunction> functions_;
     std::unordered_set<uint64_t> failed_;
@@ -108,6 +113,9 @@ private:
     static void helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target);
     static void helper_call_bpf(vm* v, uint64_t ret_gpa, uint64_t callee_gpa);
     static int helper_return_to_caller(vm* v, uint64_t ret_gpa);
+    // inline cache miss 慢路径：查 callee；命中则 *slot=target 返回 target，
+    //   未编译则 v->pc_=callee_gpa 返回 nullptr。
+    static void* helper_resolve_and_cache(vm* v, uint64_t callee_gpa, uint64_t* slot);
     static void* helper_mmu(vm* v, uint64_t addr, uint64_t size);
     static void* helper_mmu_w(vm* v, uint64_t addr, uint64_t size);
 
@@ -121,6 +129,7 @@ private:
     bool emit_instruction(EmitterT& e, const bpf_insn* entry_pc, uint64_t entry_gpa, int i,
                           std::vector<JumpPlaceholder>& placeholders,
                           std::vector<AbortPatchInfo>& abort_patches,
+                          std::vector<size_t>& call_cache_offs,
                           int& compiled_count);
 
     // Allocate executable memory (W^X), return pointer or nullptr.

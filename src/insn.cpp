@@ -747,9 +747,12 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
         std::cerr << "  Start: 0x" << std::hex << map.paddr
                   << " End: 0x" << (map.paddr + map.size)
                   << " Size: 0x" << map.size
-                  << " Flags: " << perm << std::dec 
+                  << " Flags: " << perm << std::dec
                   << " Path: " << map.path << std::endl;
     }
+    // 内存违例一律视为致命：置 VM_KILLED，把退出码翻成 128+SIGKILL。
+    flags.fetch_or(VM_KILLED, std::memory_order_release);
+    r(0) = 128 + SIGKILL;
 }
 
 int vm::wait_for(const struct timespec* timeout) {
@@ -1123,6 +1126,8 @@ bool vm::alu(const bpf_insn* cur) {
 
 
 bool vm::safepoint() {
+    // 清 JIT 中止标志：已回到 step/解释器，标志使命完成。
+    flags.fetch_and(~VM_JIT_ABORT, std::memory_order_release);
     // 仅在非信号上下文中处理新信号，避免信号处理嵌套
     if(signal_depth == 0) {
         if(!deliver_signal()) {

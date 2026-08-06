@@ -198,6 +198,8 @@ int main() {
     }
 
     // ===== (7) create_hard_link / hard_link_count =====
+#if !defined(__ANDROID__)
+    // Android 文件系统禁止 app 创建硬链接（EPERM），跳过本组验证。
     fs::path hlink = root / "a_hard.txt";
     fs::create_hard_link(fpath, hlink, ec);
     if (ec) {
@@ -211,6 +213,7 @@ int main() {
         }
         if (!fs::exists(hlink)) { printf("FAIL hard_link exists\n"); ++failures; }
     }
+#endif
 
     // ===== (8) rename =====
     fs::path rfrom = root / "rfrom.txt";
@@ -322,11 +325,13 @@ int main() {
     }
 
     // ===== (15) remove / remove_all =====
+#if !defined(__ANDROID__)
     if (!fs::remove(hlink, ec) || ec) {
         printf("FAIL remove(hlink): ec=%s\n", ec.message().c_str());
         ++failures;
     }
     if (fs::exists(hlink)) { printf("FAIL remove(hlink) still exists\n"); ++failures; }
+#endif
 
     auto removed = fs::remove_all(root, ec);
     if (ec || removed == static_cast<uintmax_t>(0)) {

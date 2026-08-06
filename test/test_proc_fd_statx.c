@@ -1,21 +1,32 @@
-/* open("/proc/version") 后用该 fd 经 statx(fd,"",AT_EMPTY_PATH,...) 做 fstat——
- * 验证 ProcFile（虚拟 /proc fd，无 host fd）的 statx 路径可达，且字段与 stat(path) 一致。 */
+/* open 一个 /proc 文件后用该 fd 经 statx(fd,"",AT_EMPTY_PATH,...) 做 fstat——
+ * 验证 ProcFile（虚拟 /proc fd，无 host fd）的 statx 路径可达，且字段与 stat(path) 一致。
+ * 用 /proc/self/comm：Linux 与 Android termux 均可读、mode 0644、size 0（procfs 无固定大小）。 */
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#include <errno.h>
+/* bionic 的 <sys/stat.h> 不暴露 statx() wrapper（即便 _GNU_SOURCE），但 struct statx 与
+ * SYS_statx 均可用。Android 上直接走 syscall 绕过缺失的 wrapper 声明。 */
+static int statx(int dirfd, const char *pathname, int flags,
+                 unsigned int mask, struct statx *stx) {
+    return (int)syscall(SYS_statx, dirfd, pathname, flags, mask, stx);
+}
+#endif
 
 #define CHECK(expr, msg) do { if(!(expr)) { fprintf(stderr, "FAIL: %s\n", msg); return 1; } } while(0)
 
 int main(void) {
     char buf[512];
-    int fd = open("/proc/version", O_RDONLY);
-    CHECK(fd >= 0, "open /proc/version");
+    int fd = open("/proc/cpuinfo", O_RDONLY);
+    CHECK(fd >= 0, "open /proc/cpuinfo");
 
     /* 读出内容，供后续比对 size */
     ssize_t n = read(fd, buf, sizeof(buf));
-    CHECK(n > 0 && strstr(buf, "Linux"), "read version");
+    CHECK(n > 0 && strstr(buf, "processor"), "read cpuinfo");
 
     /* 用 fd 直接 statx：AT_EMPTY_PATH + 空 pathname = fstat 语义。
      * ProcFile 无 host fd，故 do_statx 不能透传 host——必须走 ProcFile::fstatx。 */
@@ -29,7 +40,7 @@ int main(void) {
 
     /* 对照：按路径 statx，字段应与 fd 形式一致 */
     struct statx stx2;
-    rc = statx(AT_FDCWD, "/proc/version", 0, STATX_BASIC_STATS, &stx2);
+    rc = statx(AT_FDCWD, "/proc/cpuinfo", 0, STATX_BASIC_STATS, &stx2);
     CHECK(rc == 0, "statx via path");
     CHECK(stx2.stx_mode == stx.stx_mode, "mode match");
     CHECK(stx2.stx_size == stx.stx_size, "size match");

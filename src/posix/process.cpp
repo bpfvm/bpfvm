@@ -341,6 +341,10 @@ int64_t PosixSyscall::do_clone(vm* v) {
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
         auto* child = static_cast<std::shared_ptr<vm>*>(arg);
         (*child)->run();
+        // host pthread 即将结束：清 tid，防止线程组内其他线程退出时（do_exit_group 等）
+        // 遍历 tg->threads 对已结束的 pthread 调 pthread_kill（bionic 对失效 pthread_t
+        // 会 abort，glibc 仅返回错误）。queue_signal 等的 if(tid!=0) 守卫据此跳过。
+        sys(child->get())->tid = 0;
         delete child;
         return nullptr;
     }, holder);

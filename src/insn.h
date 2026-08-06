@@ -327,6 +327,9 @@ private:
     uint64_t insn_count = 0;              // 已执行指令计数（JIT+解释器共用，单线程访问）
     uint64_t interp_insns = 0;            // 解释器执行的指令数
     uint64_t tp_ = 0;                     // thread pointer（BPF_SYS_SET_TLS 设置；单线程 TLS 模拟）
+    // 内联 push_frame 时暂存 frame_base：write-probe 的内联 TLB 踩掉全部 scratch 寄存器，
+    //   frame_base 无处安放；压栈会在 abort 跳 .flush_and_exit 时栈失衡。存这里安全。
+    uint64_t jit_scratch = 0;
 
     std::unique_ptr<JitCompilerBase> jit;
 
@@ -394,6 +397,7 @@ public:
     static constexpr uint32_t VM_BLOCKED = 0x20; //内部暂停，在wait_for等待
     static constexpr uint32_t VM_DEBUG_ATTACHED = 0x40;   //GDB 已 attach：JIT 跳过、解释器每步经 breakpoint 钩子判定
     static constexpr uint32_t VM_DEBUG_STOP = 0x80;       //GDB 请求停：钩子/事件回调/request_stop 设，debug_park 消费，continue 清；wait_for mask 含之以打断阻塞
+    static constexpr uint32_t VM_JIT_ABORT = 0x100; //longjmp 等改 pc 时置之，让 JIT 调用链各层 .cont vm_exit 回 step。safepoint() 清之
 
     vm(Token);
     ~vm();

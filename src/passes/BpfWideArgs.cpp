@@ -1150,7 +1150,10 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
         if (idx < F.arg_size()) {
             F.removeParamAttr(idx, Attribute::ReadOnly);
             F.removeParamAttr(idx, Attribute::ReadNone);
+#if LLVM_VERSION_MAJOR < 21
+            // LLVM 21 起 NoCapture 移除（并入 captures 语义），无需也无法 remove。
             F.removeParamAttr(idx, Attribute::NoCapture);
+#endif
         }
     }
     // 函数级的 readonly/readnone 也得清（pop_arg 整体被标 readonly）。

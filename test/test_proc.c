@@ -80,12 +80,13 @@ int main(void) {
     CHECK(ln > 0, "cwd link");
     fprintf(stderr, "10:cwd link\n");
 
-    /* readlink 穿透 /proc 到 host 符号链接：root→/，再读 /lib（host 上常是 → usr/lib 的链接）。
-       无 chroot 时 /proc/self/root/lib 即 host /lib，readlink 应返回其 target。 */
-    ln = readlink("/proc/self/root/lib", linkbuf, sizeof(linkbuf));
+    /* readlink 穿透 /proc 到 host 符号链接：root→/，再读 /bin（Linux 上常是 → usr/bin 的
+       链接，Android 上 → /system/bin 的链接）。无 chroot 时 /proc/self/root/bin 即 host
+       /bin，readlink 应返回其 target。选 /bin 而非 /lib：跨 Linux/Android 均为 symlink。 */
+    ln = readlink("/proc/self/root/bin", linkbuf, sizeof(linkbuf));
     linkbuf[ln > 0 ? ln : 0] = '\0';
-    CHECK(ln > 0, "root/lib readlink escapes proc");
-    fprintf(stderr, "10a:root/lib readlink\n");
+    CHECK(ln > 0, "root/bin readlink escapes proc");
+    fprintf(stderr, "10a:root/bin readlink\n");
 
     /* [pid]/* 测试 */
     n = read_file("/proc/self/comm", buf, sizeof(buf));

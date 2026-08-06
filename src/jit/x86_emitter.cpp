@@ -1614,26 +1614,145 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
 // ---------------------------------------------------------------------------
 // CALL BPF-to-BPF (src_reg==1)
 //
-// 目标函数需要从 vm->reg[] 读取参数，所以需要完整 flush。
-// 编译完成后跳回 vm_exit，让 step() 循环重新编译目标函数。
+// fast path（flags==0、callee 已缓存）零 C 调用、零 flush/reload：
+//   flags-check → 内联 push_frame → inline cache → 命中 call r11 进 entry_fast
+//   → callee 经 vm_exit ret 回 .cont（只 reload r10 + flag-check + pc-check）。
+//   r0=R8（vm_exit 不 pop）、r6-r9/RBP（callee-saved 由 pop 还原）、r1-r5 失效，故无 reload。
+//
+// .slow_resolve（cache miss）：spill r0-r5 护参 → helper_resolve_and_cache（查 callee、
+//   命中填槽）→ restore → call r11。
+// .not_compiled：未编译 → flush + vm_exit 回 step() 编译 callee。
+// .slow：flags≠0 → helper_call_bpf（push_frame+设 pc）→ vm_exit。
+// .overflow：栈溢出 → VM_KILLED → vm_exit。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa) {
-    // flush_to_vm 已经将所有寄存器写回 vm->reg[]，
-    // 后续不能再走 flush_and_exit（会把被 CALL 踩掉的垃圾值写回），
-    // 所有跳转都直接到 vm_exit。
+void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
+                               std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
+                               std::vector<size_t>& call_cache_offs) {
+    // 1. 调用点 safepoint：flags≠0 走 .slow
+    emit8(0x83); emit8(modrm(2, 7, X86::RBP)); emit32((uint32_t)off_flags_);
+    emit8(0x00);                            // cmp dword [rbp+off_flags], 0
+    size_t flags_jnz = size();
+    emit8(0x0F); emit8(0x85); emit32(0);    // JNZ .slow
+    // entry_fast 信任 x86 寄存器（见 entry_fast 注释），故 fast path 无 flush。
+
+    // 2. 内联 push_frame（仅用 RAX/RCX/R11 scratch，不碰 r1-r5 参数与 r6-r9/r10）
+    // 2a. 读 cur_frame[0]（caller 帧头 total_len 在低 32 位）
+    auto rctx = begin_mem_access(X86::R15, 0, 8, /*is_write=*/false);  // RAX = cur_frame host
+    emit8(0x48); emit8(0x8B); emit8(0x08);  // mov rcx, [rax]  (cur_frame[0])
+    emit8(0x89); emit8(0xC9);                // mov ecx, ecx    (total_len = 低32, 零扩展)
+    mov_r64(X86::RAX, X86::R15);             // mov rax, r15    (rax = r10 = old sp)
+    sub64();                                 // sub rax, rcx    (rax = r10 - caller_total_len)
+    sub64_imm(64);                           // sub rax, 64     (rax = frame_base)
+    cmp64_imm((int32_t)STACK_BASE);          // cmp rax, STACK_BASE
+    size_t overflow_jb = size();
+    emit8(0x0F); emit8(0x82); emit32(0);     // JB .overflow (frame_base < STACK_BASE)
+    store_r64((int32_t)off_scratch_, X86::RAX);  // 暂存 frame_base（write-probe 会踩 scratch）
+    finish_mem_access(rctx, abort_patches, bpf_index);
+
+    // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
+    auto wctx = begin_mem_access(X86::RAX, 0, 64, /*is_write=*/true);  // RAX = 帧 host
+    //   [rax+0]  = stack_limit（frame_flags_make(false, stack_limit) = stack_limit）
+    load_r64(X86::RCX, (int32_t)off_stack_limit_);
+    emit8(0x48); emit8(0x89); emit8(0x08);                 // mov [rax], rcx
+    //   [rax+8]  = old r10 (R15，尚未更新)
+    emit8(0x4C); emit8(0x89); emit8(0x78); emit8(0x08);   // mov [rax+8], r15
+    //   [rax+16] = ret_gpa
+    emit8(0x48); emit8(0xB9); emit64(ret_gpa);            // mov rcx, ret_gpa
+    emit8(0x48); emit8(0x89); emit8(0x48); emit8(0x10);   // mov [rax+0x10], rcx
+    //   [rax+24..48] = r6..r9 (RBX/R12/R13/R14)
+    emit8(0x48); emit8(0x89); emit8(0x58); emit8(0x18);   // mov [rax+0x18], rbx
+    emit8(0x4C); emit8(0x89); emit8(0x60); emit8(0x20);   // mov [rax+0x20], r12
+    emit8(0x4C); emit8(0x89); emit8(0x68); emit8(0x28);   // mov [rax+0x28], r13
+    emit8(0x4C); emit8(0x89); emit8(0x70); emit8(0x30);   // mov [rax+0x30], r14
+    //   r10 = frame_base（从暂存读回）。同步 vm->reg[10]：entry_fast 不 load r10，
+    //   R15 即真理源；且 .not_compiled 时 step 经正常入口也从 vm->reg[10] 读。
+    load_r64(X86::R15, (int32_t)off_scratch_);            // mov r15, [rbp+off_scratch]
+    store_r64((int32_t)(off_reg_ + 10 * 8), X86::R15);     // mov [rbp+reg+10*8], r15
+    finish_mem_access(wctx, abort_patches, bpf_index);
+
+    // 3. inline cache：mov rax, [slot_addr]; test; jz .slow_resolve
+    size_t slot_imm_off = size() + 2;                      // imm64 在 mov rax,imm64 中的偏移
+    emit8(0x48); emit8(0xB8); emit64(0);                   // mov rax, <slot_addr>（占位）
+    call_cache_offs.push_back(slot_imm_off);              // compile() patch 成 &call_cache[idx]
+    emit8(0x48); emit8(0x8B); emit8(0x00);                // mov rax, [rax]（缓存 target）
+    test_rax_rax();
+    size_t cache_jz = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                  // JZ .slow_resolve
+
+    // 4. cache 命中：call r11 进 entry_fast。RBP 已是 vm*，无需 mov rdi,rbp（RDI=r3，会踩参数）。
+    emit8(0x4C); emit8(0x8B); emit8(0xD8);               // mov r11, rax
+    emit8(0x41); emit8(0xFF); emit8(0xD3);                // call r11
+    size_t after_call_jmp = size();
+    emit8(0xE9); emit32(0);                               // jmp .cont（占位）
+
+    // 5. .slow_resolve（cache miss）：spill r0-r5 护参 → 查 callee 填槽 → restore → call r11
+    size_t slow_resolve = size();
+    patch_branch_cond(cache_jz, slow_resolve);
+    spill_caller_saved();
+    mov_r64(X86::RDI, X86::RBP);                          // mov rdi, rbp（vm*，helper 入参）
+    emit8(0x48); emit8(0xBE); emit64(callee_gpa);        // mov rsi, callee_gpa
+    emit8(0x48); emit8(0xBA);                             // mov rdx, <slot_addr>（占位）
+    size_t slot_arg_off = size();
+    emit64(0);
+    call_cache_offs.push_back(slot_arg_off);
+    call_helper(helpers_.resolve_and_cache);
+    restore_caller_saved();
+    test_rax_rax();
+    size_t nc_jz = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                  // JZ .not_compiled
+    emit8(0x4C); emit8(0x8B); emit8(0xD8);               // mov r11, rax
+    emit8(0x41); emit8(0xFF); emit8(0xD3);                // call r11
+    size_t sr_jmp = size();
+    emit8(0xE9); emit32(0);                               // jmp .cont
+
+    // 6. .not_compiled：未编译。step 经正常入口从 vm->reg[] load r0-r9，故须 flush（r10 已写）。
+    size_t not_compiled = size();
+    patch_branch_cond(nc_jz, not_compiled);
     flush_to_vm();
-
-    // helper_call_bpf(vm*, ret_gpa, callee_gpa): push_frame + v->pc = mmu(callee_gpa)
-    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
-    emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
-    emit8(0x48); emit8(0xBA); emit64(callee_gpa);             // mov rdx, callee_gpa
-    call_helper(helpers_.call_bpf);
-
-    // 跳到 vm_exit（让 step() 循环重新进入 JIT）
-    size_t jmp_off = size();
+    size_t nc_jmp = size();
     emit8(0xE9); emit32(0);
-    patch_branch_uncond(jmp_off, vm_exit_offset);
+    patch_branch_uncond(nc_jmp, vm_exit_offset);
+
+    // 7. .slow：flags≠0 → helper_call_bpf（push_frame+设 pc）→ vm_exit
+    size_t slow = size();
+    patch_branch_cond(flags_jnz, slow);
+    flush_to_vm();
+    mov_r64(X86::RDI, X86::RBP);
+    emit8(0x48); emit8(0xBE); emit64(ret_gpa);
+    emit8(0x48); emit8(0xBA); emit64(callee_gpa);
+    call_helper(helpers_.call_bpf);
+    size_t slow_jmp = size();
+    emit8(0xE9); emit32(0);
+    patch_branch_uncond(slow_jmp, vm_exit_offset);
+
+    // 8. .overflow：栈溢出 → VM_KILLED → vm_exit
+    size_t overflow = size();
+    patch_branch_cond(overflow_jb, overflow);
+    emit8(0xF0); emit8(0x83); emit8(modrm(2, 1, X86::RBP));  // lock or [rbp+off_flags], VM_KILLED
+    emit32((uint32_t)off_flags_); emit8(0x04);
+    size_t ov_jmp = size();
+    emit8(0xE9); emit32(0);
+    patch_branch_uncond(ov_jmp, vm_exit_offset);
+
+    // 9. .cont：callee 经 vm_exit ret 返回。无 reload——r0=R8、r6-r9/RBP 由 pop 还原。
+    //    唯 r10 须 reload（pop 还原 callee 入口 r10=frame_base，caller 需 old_sp，emit_exit
+    //    已写 vm->reg[10]）。flag-check 捕 VM_JIT_ABORT/信号；pc-check 兜底非正常返回。
+    size_t cont_target = size();
+    patch_branch_uncond(after_call_jmp, cont_target);
+    patch_branch_uncond(sr_jmp, cont_target);
+    load_r64(X86::R15, (int32_t)(off_reg_ + 10 * 8));  // r10 = vm->reg[10] (= old_sp)
+    emit8(0x83); emit8(modrm(2, 7, X86::RBP)); emit32((uint32_t)off_flags_);
+    emit8(0x00);                            // cmp dword [rbp+off_flags], 0
+    size_t cont_jnz = size();
+    emit8(0x0F); emit8(0x85); emit32(0);    // JNZ vm_exit
+    load_r64(X86::RAX, (int32_t)off_pc_);            // mov rax, [rbp+off_pc]
+    emit8(0x48); emit8(0xB9); emit64(ret_gpa);       // mov rcx, ret_gpa
+    cmp64();                                          // cmp rax, rcx
+    size_t cont_jne = size();
+    emit8(0x0F); emit8(0x85); emit32(0);    // JNE vm_exit
+    patch_branch_cond(cont_jnz, vm_exit_offset);
+    patch_branch_cond(cont_jne, vm_exit_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,39 +1777,76 @@ void X86Emitter::emit_call_indirect(const bpf_insn* insn,
 }
 
 // ---------------------------------------------------------------------------
-// EXIT
+// EXIT (BPF_EXIT)
+//
+// 内联 pop_frame：读帧取 ret_addr(frame[2])、old_sp(frame[1])、frame[0] flags，
+//   从帧取 r6..r9 写 vm->reg[6..9]（BPF 后端对未用 r6..r9 的函数不 spill/reload，x86 值
+//   不可信，必从帧取）；写 vm->reg[0]=r0(R8)、vm->reg[10]=old_sp、vm->pc_=ret_addr。
+//   r0 留 R8：fast path 经 vm_exit ret 回 .cont，.cont 用 R8 取返回值，不 reload。
+//   信号帧在 frame[7..12] 存被中断处 caller-saved r0..r5，须一并恢复。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_exit() {
-    flush_to_vm();
+void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
+    // 1. 内联 pop_frame：读 frame[0..12]（104B，覆盖普通 64B + 信号 128B 的 r0..r5）。
+    auto ctx = begin_mem_access(X86::R15, 0, 104, /*is_write=*/false);  // RAX = frame host
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x10);   // mov rcx, [rax+0x10]  (ret_addr = frame[2])
+    emit8(0x48); emit8(0x8B); emit8(0x50); emit8(0x08);   // mov rdx, [rax+0x08]  (old_sp = frame[1])
+    emit8(0x4C); emit8(0x8B); emit8(0x18);               // mov r11, [rax]      (frame[0] flags，检测 is_signal)
+    store_r64((int32_t)off_scratch_, X86::RAX);           // 暂存 frame host（下文 store 复用 RAX）
+    finish_mem_access(ctx, abort_patches, bpf_index);
 
-    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
-    call_helper(helpers_.pop_frame);
+    // 2. 栈底检查：ret_addr==0 → 哨兵帧（程序退出），置 VM_EXITED。
+    emit8(0x48); emit8(0x85); emit8(0xC9);                 // test rcx, rcx
+    size_t stack_bottom_jz = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                  // JZ .stack_bottom
 
-    test_rax_rax();
-    size_t has_ret_jcc = size();
-    emit8(0x0F); emit8(0x85); emit32(0);  // JNZ .has_ret_addr
+    // 3. vm->pc_ = ret_addr；vm->reg[0]=r0；r6..r9/10 从帧取写 vm->reg[]。
+    store_r64((int32_t)off_pc_, X86::RCX);                 // vm->pc_ = ret_addr
+    store_r64((int32_t)(off_reg_ + 0 * 8), X86::R8);       // vm->reg[0] = r0（信号帧下方覆盖）
+    load_r64(X86::RAX, (int32_t)off_scratch_);             // RAX = frame host
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x18);   // mov rcx, [rax+0x18]  (r6)
+    store_r64((int32_t)(off_reg_ + 6 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x20);   // mov rcx, [rax+0x20]  (r7)
+    store_r64((int32_t)(off_reg_ + 7 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x28);   // mov rcx, [rax+0x28]  (r8)
+    store_r64((int32_t)(off_reg_ + 8 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x30);   // mov rcx, [rax+0x30]  (r9)
+    store_r64((int32_t)(off_reg_ + 9 * 8), X86::RCX);
+    store_r64((int32_t)(off_reg_ + 10 * 8), X86::RDX);     // vm->reg[10] = old_sp(frame[1])
 
-    // Stack bottom: set VM_EXITED flag
-    // lock or dword [rbp + off_flags], VM_EXITED(1)
-    emit8(0xF0); emit8(0x83); emit8(0x8D);
-    emit32((uint32_t)off_flags_);
-    emit8(0x01);
-    size_t stack_bottom_jmp = size();
-    emit8(0xE9); emit32(0);
-    patch_branch_uncond(stack_bottom_jmp, vm_exit_offset);
-
-    // .has_ret_addr: return to caller
-    size_t has_ret_target = size();
-    patch_branch_cond(has_ret_jcc, has_ret_target);
-
-    mov_r64(X86::RDI, X86::RBP);
-    mov_r64(X86::RSI, X86::RAX);                              // mov rsi, rax (return addr)
-    call_helper(helpers_.return_to_caller);
+    // 4. 信号帧：r0..r5 从 frame[7..12](@+0x38..0x60) 覆盖写 vm->reg[0..5]。
+    //    is_signal = frame[0] bit32。普通帧（bit32=0）跳过。
+    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(32);     // shr r11, 32
+    emit8(0x45); emit8(0x85); emit8(0xDB);                 // test r11d, r11d
+    size_t sig_je = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                   // JE .no_signal
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x38);   // mov rcx, [rax+0x38]  (r0)
+    store_r64((int32_t)(off_reg_ + 0 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x40);   // mov rcx, [rax+0x40]  (r1)
+    store_r64((int32_t)(off_reg_ + 1 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x48);   // mov rcx, [rax+0x48]  (r2)
+    store_r64((int32_t)(off_reg_ + 2 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x50);   // mov rcx, [rax+0x50]  (r3)
+    store_r64((int32_t)(off_reg_ + 3 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x58);   // mov rcx, [rax+0x58]  (r4)
+    store_r64((int32_t)(off_reg_ + 4 * 8), X86::RCX);
+    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x60);   // mov rcx, [rax+0x60]  (r5)
+    store_r64((int32_t)(off_reg_ + 5 * 8), X86::RCX);
+    size_t no_signal = size();
+    patch_branch_cond(sig_je, no_signal);
 
     size_t exit_jmp = size();
     emit8(0xE9); emit32(0);
     patch_branch_uncond(exit_jmp, vm_exit_offset);
+
+    // 5. .stack_bottom：flush r0(退出码) + 置 VM_EXITED + vm_exit
+    size_t stack_bottom = size();
+    patch_branch_cond(stack_bottom_jz, stack_bottom);
+    store_r64((int32_t)(off_reg_ + 0 * 8), X86::R8);       // vm->reg[0] = 退出码
+    emit8(0xF0); emit8(0x83); emit8(0x8D); emit32((uint32_t)off_flags_); emit8(0x01);
+    size_t sb_jmp = size();
+    emit8(0xE9); emit32(0);
+    patch_branch_uncond(sb_jmp, vm_exit_offset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,7 +1876,7 @@ size_t X86Emitter::emit_prologue() {
         load_r64(BPF_REG_MAP[i], (int32_t)(off_reg_ + i * 8));
     }
 
-    // jmp .entry
+    // jmp .entry（走入口 safepoint）
     jmp_rel32();
     size_t entry_jmp_offset = size() - 5;
 
@@ -1749,6 +1905,22 @@ size_t X86Emitter::emit_prologue() {
     emit8(0xE9); emit32(0);
     patch_branch_uncond(jmp_off, vm_exit_offset);
 
+    // .entry_fast: 跨函数直跳第二入口（caller 用 call r11 进入）。跳过 .entry safepoint
+    //   （caller 已做 flags-check），且不从 vm->reg[] 加载——caller 在 call r11 前已把
+    //   r1-r5(参数)、r6-r9(callee-saved)、r10(frame_base 由 push_frame 设入 R15) 备好，
+    //   r0 为死值，RBP=vm* 跨 call 保留。故无 flush/reload、无 mov rbp,rdi（RDI=r3 会踩参数）。
+    entry_fast_offset = size();
+    push_rbp();
+    push_reg(X86::RBX);
+    push_reg(X86::R12);
+    push_reg(X86::R13);
+    push_reg(X86::R14);
+    push_reg(X86::R15);
+    emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);  // sub rsp, 8
+    // RBP 已是 vm*（跨 call 保留），无 mov rbp,rdi、无 vm->reg[] load（见上注释）。
+    jmp_rel32();
+    size_t fast_jmp_offset = size() - 5;
+
     // .entry: 入口 safepoint
     size_t entry_offset = size();
     patch_branch_uncond(entry_jmp_offset, entry_offset);
@@ -1766,6 +1938,9 @@ size_t X86Emitter::emit_prologue() {
 
     // Safepoint 返回后 reload caller-saved（callee-saved 自动存活）
     reload_caller_saved();
+
+    // 第一条 BPF 指令从这里开始。entry_fast 直接到此。
+    patch_branch_uncond(fast_jmp_offset, size());
 
     return flush_and_exit_offset;
 }

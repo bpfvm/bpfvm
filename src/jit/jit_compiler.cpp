@@ -33,6 +33,10 @@ template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_insn_count_     = offsetof(vm, insn_count);
 template<typename EmitterT>
 const size_t JitCompiler<EmitterT>::off_insn_limit_     = offsetof(vm, options) + offsetof(vmOptions, insn_limit);
+template<typename EmitterT>
+const size_t JitCompiler<EmitterT>::off_stack_limit_    = offsetof(vm, options) + offsetof(vmOptions, stack_limit);
+template<typename EmitterT>
+const size_t JitCompiler<EmitterT>::off_scratch_        = offsetof(vm, jit_scratch);
 #pragma GCC diagnostic pop
 
 template<typename EmitterT>
@@ -84,6 +88,9 @@ bool JitCompiler<EmitterT>::helper_do_syscall(vm* v, uint32_t call_id) {
         return false;
     }
     if (v->pc_ != saved_pc) {
+        // pc 被改（如 longjmp）。置 VM_JIT_ABORT，让调用链各层 .cont 的 flag-check
+        // 级联 vm_exit，最终由 step() 接管新 pc。safepoint() 清此位。
+        v->flags.fetch_or(vm::VM_JIT_ABORT, std::memory_order_release);
         v->pc_ += sizeof(bpf_insn);
         return false;
     }
@@ -148,6 +155,19 @@ int JitCompiler<EmitterT>::helper_return_to_caller(vm* v, uint64_t ret_gpa) {
 }
 
 template<typename EmitterT>
+void* JitCompiler<EmitterT>::helper_resolve_and_cache(vm* v, uint64_t callee_gpa, uint64_t* slot) {
+    // inline cache miss 慢路径。push_frame 已由 JIT 内联完成，这里查 callee：命中填槽并
+    //   返回 entry_fast 入口；未编译则 v->pc_=callee_gpa 返回 nullptr（回 step() 编译）。
+    void* target = v->jit->resolve_call(v, callee_gpa);
+    if (target) {
+        *slot = (uint64_t)target;
+        return target;
+    }
+    v->pc_ = callee_gpa;
+    return nullptr;
+}
+
+template<typename EmitterT>
 void* JitCompiler<EmitterT>::helper_mmu(vm* v, uint64_t addr, uint64_t size) {
     return v->mmu_slow(addr, (size_t)size);
 }
@@ -172,9 +192,22 @@ HelperTable JitCompiler<EmitterT>::make_helper_table() const {
     h.call_indirect = (void*)&helper_call_indirect;
     h.call_bpf = (void*)&helper_call_bpf;
     h.return_to_caller = (void*)&helper_return_to_caller;
+    h.resolve_and_cache = (void*)&helper_resolve_and_cache;
     h.mmu = (void*)&helper_mmu;
     h.mmu_w = (void*)&helper_mmu_w;
     return h;
+}
+
+// resolve_call — 由 helper_resolve_and_cache（cache miss 慢路径）调用，返回 callee 的
+//   entry_fast 入口；未编译返回 nullptr。
+
+template<typename EmitterT>
+void* JitCompiler<EmitterT>::resolve_call(vm* /*v*/, uint64_t callee_gpa) {
+    auto it = functions_.find(callee_gpa);
+    if (it == functions_.end()) return nullptr;
+    auto& f = it->second;
+    if (!f.code || f.entry_fast_offset == 0) return nullptr;
+    return (char*)f.code + f.entry_fast_offset;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +341,7 @@ template<typename EmitterT>
 bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_pc, uint64_t entry_gpa, int i,
                                                std::vector<JumpPlaceholder>& placeholders,
                                                std::vector<AbortPatchInfo>& abort_patches,
+                                               std::vector<size_t>& call_cache_offs,
                                                int& compiled_count) {
     const bpf_insn* insn = entry_pc + i;
     uint8_t cls = insn->code & 0x07;
@@ -364,7 +398,7 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa    = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
                 uint64_t callee_gpa = entry_gpa + (uint64_t)(i + 1 + insn->imm) * sizeof(bpf_insn);
-                e.emit_call_bpf(ret_gpa, callee_gpa);
+                e.emit_call_bpf(ret_gpa, callee_gpa, abort_patches, i, call_cache_offs);
                 compiled_count++;
             } else if (insn->src_reg == 2) {
                 // 浮点专用通道：先 JIT 原生（emit_call_softfp），未命中（如 x86 的
@@ -379,7 +413,7 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
                 return false;
             }
         } else if (op == BPF_EXIT) {
-            e.emit_exit();
+            e.emit_exit(abort_patches, i);
             compiled_count++;
         } else {
             if (!e.emit_jmp(insn, i, true, placeholders)) return false;
@@ -516,13 +550,14 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     bool insn_count_enabled = getenv("BPF_DEBUG") || v->options.insn_limit != 0;
     bool budget_enabled = v->options.insn_limit != 0;
     EmitterT e;
-    e.set_vm_offsets(off_reg_, off_pc_, off_flags_, off_tlb_);
+    e.set_vm_offsets(off_reg_, off_pc_, off_flags_, off_tlb_, off_stack_limit_, off_scratch_);
     e.set_budget(off_insn_count_, off_insn_limit_, insn_count_enabled, budget_enabled);
     e.set_helpers(make_helper_table());
 
     // Emit code
     std::vector<JumpPlaceholder> placeholders;
     std::vector<AbortPatchInfo> abort_patches;
+    std::vector<size_t> call_cache_offs;   // inline cache 槽地址占位（imm64）的 buffer 偏移
     std::vector<uint32_t> pc_offsets(num_insns, UINT32_MAX);
 
     size_t flush_and_exit_offset = e.emit_prologue();
@@ -541,7 +576,7 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         }
 
         if (!emit_instruction(e, entry_pc, entry_gpa, i,
-                              placeholders, abort_patches, compiled_count)) {
+                              placeholders, abort_patches, call_cache_offs, compiled_count)) {
             failed_.insert(gpa);
             record_compile_time();
             return nullptr;
@@ -570,18 +605,34 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         e.patch_branch_cond(ap.jump_offset, flush_and_exit_offset);
     }
 
+    // 建 JitFunction 条目（finalize 前建，以便 call_cache 落地、取稳定槽地址）。
+    auto& func = functions_[gpa];
+    func.gpa = gpa;
+    // 每个 call site 有 2 个占位（fast path 读 cache + slow_resolve 传 helper），二者在
+    // call_cache_offs 中相邻成对（同一 emit_call_bpf 内连续 push），共用 1 个 cache 槽：
+    // 占位 2k/2k+1 → slot k。
+    size_t n_slots = (call_cache_offs.size() + 1) / 2;
+    func.call_cache.assign(n_slots, 0);
+
+    // Patch inline cache 槽地址占位 = &func.call_cache[slot_idx]，在 e.data()（RW）上 patch，
+    // 随 finalize_code memcpy 进 RX 页——无运行时代码 patch，W^X 保持。
+    for (size_t i = 0; i < call_cache_offs.size(); i++) {
+        size_t slot_idx = i / 2;
+        uint64_t slot_addr = (uint64_t)(uintptr_t)&func.call_cache[slot_idx];
+        memcpy(e.data() + call_cache_offs[i], &slot_addr, sizeof(slot_addr));
+    }
+
     // Finalize
     void* code_mem = finalize_code(e);
-    if (!code_mem) { record_compile_time(); return nullptr; }
+    if (!code_mem) { functions_.erase(gpa); record_compile_time(); return nullptr; }
 
     stats.jit_compiles++;
     stats.jit_compiled_insns += compiled_count;
-    auto& func = functions_[gpa];
     func.code = code_mem;
     func.insn_count = compiled_count;
     func.code_size = (e.size() + 4095) & ~(size_t)4095;
-    func.gpa = gpa;
     func.pc_offsets = std::move(pc_offsets);
+    func.entry_fast_offset = e.get_entry_fast_offset();  // 由 emit_prologue 生成
     record_compile_time();
     return &func;
 }
