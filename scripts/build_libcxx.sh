@@ -75,17 +75,15 @@ OBJS=""
 if [ -d "$LIBCXX_SRC" ]; then
     echo "==> libc++ sources detected: $LIBCXX_SRC"
     # 编译 $LIBCXX_SRC 下全部 .cpp，仅排除少数在 BPF 上编不过或有冲突的：
-    #   charconv.cpp      — 浮点 to_chars 调 ryu/d2s.cpp 等（__multi3 int128 乘法，BPF
-    #                       后端拒绝）；charconv.cpp 本身可编但浮点路径链接期缺 ryu 符号，
-    #                       排除避免库带未定义引用。整数 to_chars 是 header-only，不受影响。
     #   new.cpp           — 与 stdlib_new_delete.cpp 的 operator new/delete 符号完全重叠
     #                       （二选一取 libc++abi 版的 stdlib_new_delete.cpp）。
     # memory_resource.cpp 靠 stdlib_new_delete 的对齐版 operator new/delete
     #   （St11align_val_t）满足 pmr 引用。expected.cpp 在 c++23 下
     # #if _LIBCPP_STD_VER >= 23 门控的声明可见（STL_CXX_FLAGS 已是 c++23）。
     # 其余全部纳入（algorithm/string/vector/regex/iostream/thread/memory_resource/expected/
-    #   atomic/chrono/random/strstream/...）。fstream.cpp 编译为 0 符号（模板实例化被 #if 包），无副作用。
-    EXCLUDE="charconv.cpp new.cpp"
+    #   atomic/chrono/random/strstream/charconv/...）。fstream.cpp 编译为 0 符号（模板
+    #   实例化被 #if 包），无副作用。
+    EXCLUDE="new.cpp"
     n=0
     for src in "$LIBCXX_SRC"/*.cpp; do
         b=$(basename "$src")
@@ -96,11 +94,22 @@ if [ -d "$LIBCXX_SRC" ]; then
     done
     echo "   [OK] libc++ sources ($n, excluded: $EXCLUDE)"
 
+    # ryu 浮点格式化算法（charconv.cpp 的浮点 to_chars 调用 __f2s_buffered_n /
+    # __d2s_buffered_n / __d2fixed_buffered_n 等）。必须随 charconv 一起编译，否则
+    # 库带未定义引用。ryu 源依赖 -D_LIBCPP_HAS_NO_INT128 走 long long fallback（见下）。
+    for src in "$LIBCXX_SRC"/ryu/*.cpp; do
+        b=$(basename "$src")
+        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/ryu_${b%.cpp}.o"
+        OBJS="$OBJS build/libcxx_obj/ryu_${b%.cpp}.o"
+    done
+    echo "   [OK] ryu (浮点 to_chars)"
+
     # filesystem 子系统（解锁 <filesystem>）。编译 $LIBCXX_SRC/filesystem/ 下全部 .cpp。
-    # 关键：必须配合 -D_LIBCPP_HAS_NO_INT128（见上 STL_CXX_FLAGS）——BPF 后端不支持
-    #   __int128 乘除法（__multi3/__divti3/__muloti4），而 file_clock::rep 默认是
-    #   __int128_t。定义该宏让 rep 退化为 long long；int128_builtins.cpp 整体被 #if 包裹，
-    #   定义后变空 TU（不产 __muloti4 符号，也无冲突）。
+    # 关键：必须配合 -D_LIBCPP_HAS_NO_INT128（见上 STL_CXX_FLAGS）——BPF 后端 i128 乘法
+    #   已由 BpfSoftFp 支持（BPF_FP_MUL128），但 i128 除法/取模（__divti3/__modti3）仍
+    #   不支持，而 file_clock::rep 默认是 __int128_t，operations.cpp 的 __last_write_time
+    #   会产生 __divti3。定义该宏让 rep 退化为 long long；int128_builtins.cpp 整体被 #if
+    #   包裹，定义后变空 TU（不产 __muloti4 符号，也无冲突）。
     for src in "$LIBCXX_SRC"/filesystem/*.cpp; do
         b=$(basename "$src")
         clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/fs_${b%.cpp}.o"

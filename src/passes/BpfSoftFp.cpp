@@ -137,35 +137,47 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
     return Call;  // 已是 i64
 }
 
-// 计算 64×64→128 无符号乘法的高 64 位（schoolbook 展开）。
-//
-// 用于拦截 @llvm.umul.with.overflow.i64：后端会把该 intrinsic lower 成 __multi3
-// 调用，BPF ISel 一律拒绝（"__multi3 not supported"）。这里在 IR 层用 4 次
-// 32×32 BPF_MUL + 移位/加法构造高位，纯原生 ALU，零递归触发宽乘。
-//
-// 数学推导（aH/aL/bH/bL 均为 32 位）：
-//   a*b = (aH*bH)<<64 + (aH*bL + aL*bH)<<32 + aL*bL
-//   高 64 = aH*bH + ((aH*bL + aL*bH) + (aL*bL >> 32)) >> 32
-//         = aH*bH + (cross + carry_LL) >> 32
-// 32×32→64 乘法对 BPF BPF_MUL 是原生操作（操作数掩码到 32 位，乘积完整落在 64 位）。
-static Value *emitUmulHi64(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb) {
+// 发射 BPF_FP_UMULH（softfp 通道），取 64×64→128 的高半。用于 mul i128 与
+// umul.with.overflow 的高位提取。
+static Value *emitMul128Hi(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb) {
     Type *I64Ty = Type::getInt64Ty(Ctx);
-    Constant *MASK32 = ConstantInt::get(I64Ty, 0xFFFFFFFFULL);
-    Constant *BITS32 = ConstantInt::get(I64Ty, 32);
+    return emitDirectFpCall(B, Ctx, BPF_FP_UMULH, {A, Bb}, I64Ty);
+}
 
-    Value *aL = B.CreateAnd(A,  MASK32);
-    Value *aH = B.CreateLShr(A, BITS32);
-    Value *bL = B.CreateAnd(Bb, MASK32);
-    Value *bH = B.CreateLShr(Bb, BITS32);
-
-    Value *LL    = B.CreateMul(aL, bL);                    // aL*bL (32x32->64)
-    Value *t1    = B.CreateMul(aH, bL);                    // aH*bL
-    Value *t2    = B.CreateMul(aL, bH);                    // aL*bH
-    Value *cross = B.CreateAdd(B.CreateAdd(t1, t2),
-                               B.CreateLShr(LL, BITS32));  // cross + LL>>32
-    Value *hi    = B.CreateAdd(B.CreateMul(aH, bH),
-                               B.CreateLShr(cross, BITS32)); // aH*bH + cross>>32
-    return hi;
+// 把 mul i128 的操作数归约成 i64。前提：操作数真值 <2^64（mul i128 在实际代码中
+// 的来源——zext i64、i64 范围常量、掩码后的值——均满足）。各形态处理：
+//   - zext i64→i128             → 原 i64
+//   - and i128 X, (2^k-1), k≤64  → trunc X to i64（掩码保证值 <2^k，trunc 不丢信息）
+//   - i128 常量 ≤2^64-1         → trunc to i64
+//   - 其它                       → trunc to i64（前提不成立时丢精度）
+static Value *narrowToI64(IRBuilder<> &B, Value *V) {
+    Type *I64Ty = Type::getInt64Ty(B.getContext());
+    // zext i64→i128：直接取原值。
+    if (auto *ZE = dyn_cast<ZExtInst>(V)) {
+        if (ZE->getSrcTy()->isIntegerTy(64) && ZE->getDestTy()->isIntegerTy(128))
+            return ZE->getOperand(0);
+    }
+    // and i128 X, (2^k-1)：掩码使值 <2^k≤2^64，trunc X 即正确低半。
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+        if (BO->getOpcode() == Instruction::And && BO->getType()->isIntegerTy(128)) {
+            if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+                APInt Cp1 = C->getValue() + 1;          // C 是 2^k-1 ⟺ C+1 是 2 的幂
+                if (Cp1.isPowerOf2() && Cp1.getActiveBits() <= 64) {
+                    // (and X, 2^k-1) 取低 k 位。trunc 到 i64 后须【保留掩码】，
+                    // 否则 X 的 bit k..63 脏数据会污染 mul 操作数。
+                    Value *tr = B.CreateTrunc(BO->getOperand(0), I64Ty);
+                    return B.CreateAnd(tr, ConstantInt::get(I64Ty, C->getValue().trunc(64)));
+                }
+            }
+        }
+    }
+    // i128 常量（≤2^64-1）：trunc 取低半。
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+        if (C->getValue().getActiveBits() <= 64)
+            return ConstantInt::get(I64Ty, C->getValue().trunc(64));
+    }
+    // 兜底：trunc。仅在 V 真值 <2^64 时正确。
+    return B.CreateTrunc(V, I64Ty);
 }
 
 
@@ -181,6 +193,89 @@ static bool softenFunction(Function &F) {
     for (BasicBlock &BB : F) {
         for (Instruction &I : make_early_inc_range(BB)) {
             IRBuilder<> B(&I);
+
+            // ---- mul i128：唯一 BPF 后端无法 lower 的 i128 运算（会变 __multi3，
+            // 而 i128 不能作 ABI 返回值）。操作数经 narrowToI64 归约成 i64（实际
+            // 操作数真值均 <2^64），用 lo=原生 mul i64 + hi=BPF_FP_UMULH 组装回 i128，
+            // 交后端 lower 后续 add/lshr/phi/icmp 等。
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                if (BO->getOpcode() == Instruction::Mul &&
+                    BO->getType()->isIntegerTy(128)) {
+                    Value *A64 = narrowToI64(B, BO->getOperand(0));
+                    Value *B64 = narrowToI64(B, BO->getOperand(1));
+                    Type *I128Ty = Type::getInt128Ty(Ctx);
+                    Type *I64Ty = Type::getInt64Ty(Ctx);
+                    Constant *BITS64 = ConstantInt::get(I64Ty, 64);
+                    Value *Lo = B.CreateMul(A64, B64);          // 低半：原生 mul i64
+                    Value *Hi = emitMul128Hi(B, Ctx, A64, B64); // 高半：BPF_FP_UMULH
+                    // 组装回 i128：(zext hi << 64) | zext lo。后续 add/lshr 由后端 lower。
+                    Value *Prod = B.CreateOr(B.CreateShl(B.CreateZExt(Hi, I128Ty), BITS64),
+                                             B.CreateZExt(Lo, I128Ty));
+                    BO->replaceAllUsesWith(Prod);
+                    ToErase.push_back(BO);
+                    Changed = true;
+                    continue;
+                }
+            }
+
+            // ---- 变量移位 i128：shl/lshr by <runtime>（后端发 __ashlti3/__lshrti3）----
+            // 常量移位后端原生支持，只处理变量移位（OpenSSL 仅 f_generic 的 gf_serialize/
+            // gf_deserialize 各 1 处）。把 i128 值拆成 (lo,hi)，按 K<64 / K>=64 两分支用
+            // 原生 64 位变量移位实现，再组装回 i128 喂后续 or/trunc（后端原生）。
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                unsigned Op = BO->getOpcode();
+                if ((Op == Instruction::Shl || Op == Instruction::LShr) &&
+                    BO->getType()->isIntegerTy(128) &&
+                    !isa<ConstantInt>(BO->getOperand(1))) {
+                    Type *I128Ty = Type::getInt128Ty(Ctx);
+                    Type *I64Ty = Type::getInt64Ty(Ctx);
+                    Constant *BITS64 = ConstantInt::get(I64Ty, 64);
+                    // 拆 (lo,hi)：操作数已是 i128，后端尚未 lower；手动 trunc 取两半。
+                    Value *X = BO->getOperand(0);
+                    Value *xLo = B.CreateTrunc(X, I64Ty);
+                    Value *xHi = B.CreateTrunc(B.CreateLShr(X, BITS64), I64Ty);
+                    Value *k64 = B.CreateZExt(BO->getOperand(1), I64Ty);
+                    Value *isSmall = B.CreateICmpULT(k64, BITS64);
+                    // 交叉项里的 (64-K) 在 K==0 时等于 64，lshr/shl i64 by 64 是 poison
+                    //（BPF 硬件把移位量按 6 位掩码，实测退成 >>0/<<0，把本应为 0 的交叉项
+                    // 变成完整操作数）。拆成两个永不超过 63 的移位：x<>(64-K)，
+                    // 因 63-K ∈ [0,63] 恒为合法移位量，且两步合起来 == 移位 (64-K)
+                    //（=64 时结果为 0，与数学语义一致）。
+                    Constant *BITS63 = ConstantInt::get(I64Ty, 63);
+                    Constant *ONE    = ConstantInt::get(I64Ty, 1);
+                    Value *kInvM1 = B.CreateSub(BITS63, k64);   // 63-K，合法移位量
+                    Value *rep = nullptr;
+                    if (Op == Instruction::Shl) {
+                        // K<64:  lo=xLo<<K,        hi=(xHi<<K)|(xLo>>(64-K))
+                        // K>=64: lo=0,             hi=xLo<<(K-64)
+                        Value *loS = B.CreateShl(xLo, k64);
+                        Value *hiS = B.CreateOr(B.CreateShl(xHi, k64),
+                                                B.CreateLShr(B.CreateLShr(xLo, kInvM1), ONE));
+                        Value *loB = ConstantInt::get(I64Ty, 0);
+                        Value *hiB = B.CreateShl(xLo, B.CreateSub(k64, BITS64));
+                        Value *lo = B.CreateSelect(isSmall, loS, loB);
+                        Value *hi = B.CreateSelect(isSmall, hiS, hiB);
+                        rep = B.CreateOr(B.CreateShl(B.CreateZExt(hi, I128Ty), BITS64),
+                                         B.CreateZExt(lo, I128Ty));
+                    } else { // LShr
+                        // K<64:  lo=(xLo>>K)|(xHi<<(64-K)), hi=xHi>>K
+                        // K>=64: lo=xHi>>(K-64),           hi=0
+                        Value *loS = B.CreateOr(B.CreateLShr(xLo, k64),
+                                                B.CreateShl(B.CreateShl(xHi, kInvM1), ONE));
+                        Value *hiS = B.CreateLShr(xHi, k64);
+                        Value *loB = B.CreateLShr(xHi, B.CreateSub(k64, BITS64));
+                        Value *hiB = ConstantInt::get(I64Ty, 0);
+                        Value *lo = B.CreateSelect(isSmall, loS, loB);
+                        Value *hi = B.CreateSelect(isSmall, hiS, hiB);
+                        rep = B.CreateOr(B.CreateShl(B.CreateZExt(hi, I128Ty), BITS64),
+                                         B.CreateZExt(lo, I128Ty));
+                    }
+                    BO->replaceAllUsesWith(rep);
+                    ToErase.push_back(BO);
+                    Changed = true;
+                    continue;
+                }
+            }
 
             // ---- 二元算术：fadd/fsub/fmul/fdiv ----
             if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
@@ -374,22 +469,21 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
-                // umul.with.overflow：__builtin_mul_overflow(uint64_t,...) 的 IR 形态。
-                // 后端会 lower 成 __multi3 调用，BPF ISel 一律拒绝。这里在 IR 层展开成
-                // schoolbook 32×32 ALU（Lo = 原生 BPF_MUL 截断，Hi = emitUmulHi64），
-                // 并按 {i64,i1} 语义重写 extractvalue users：index 0→Lo，index 1→Ov。
+                // umul.with.overflow（__builtin_mul_overflow 的 IR 形态）：用
+                // Lo = 原生 BPF_MUL 截断 + Hi = BPF_FP_UMULH 展开，按 {i64,i1}
+                // 语义重写 extractvalue：index 0→Lo，index 1→Ov(=Hi!=0)。
                 // 注意：II->getType() 是 {i64,i1} struct，不能用 suffix(Ty) 判断
-                // （会返回 nullptr 漏过），必须用 operand 类型判断。只处理 i64 重载
-                // （现实 __multi3 唯一来源）；i32 等窄类型 BPF 原生支持，留给后端。
+                // （会返回 nullptr 漏过），必须用 operand 类型判断。只处理 i64 重载；
+                // i32 等窄类型 BPF 原生支持，留给后端。
                 if (II->getIntrinsicID() == Intrinsic::umul_with_overflow) {
                     Type *OpTy = II->getArgOperand(0)->getType();
                     if (!OpTy->isIntegerTy(64)) continue;
 
                     Value *A  = II->getArgOperand(0);
                     Value *Bb = II->getArgOperand(1);
-                    Value *Lo = B.CreateMul(A, Bb);                               // 低位：原生 BPF_MUL
-                    Value *Hi = emitUmulHi64(B, Ctx, A, Bb);                       // 高位：schoolbook
-                    Value *Ov = B.CreateICmpNE(Hi, ConstantInt::get(OpTy, 0));     // 溢出 = 高位非零
+                    Value *Lo = B.CreateMul(A, Bb);                          // 低位：原生 mul i64
+                    Value *Hi = emitMul128Hi(B, Ctx, A, Bb);                 // 高位：BPF_FP_UMULH
+                    Value *Ov = B.CreateICmpNE(Hi, ConstantInt::get(OpTy, 0)); // 溢出 = 高位非零
 
                     SmallVector<User *, 4> Users(II->user_begin(), II->user_end());
                     for (User *U : Users) {

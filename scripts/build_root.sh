@@ -159,10 +159,19 @@ build_openssl() {
     # OpenSSL 专属 CFLAGS 调整（在 COMMON_CFLAGS 基础上）：
     #   去 -g / -fstack-size-section：clang BPF + -g 对部分外部函数声明 ICE（详见 AGENTS.md #213714）。
     #   -Wno-error=int-conversion：o_str.c 的 strerror_r(int)→char* 赋值（仅错误路径）。
-    #   -bpf-stack-size=131072：apps 大函数（s_client/s_server/s_speed）单帧 >16KB。
+    #   -bpf-stack-size=131072：apps 大函数（s_client/s_server/s_speed）单帧 >16KB；
+    #     curve25519/curve448 域运算也需大栈（SIXTY_FOUR_BIT_LONG 下展开更大）。
+    #   -UOPENSSL_NO_ASM：SIXTY_FOUR_BIT_LONG 下 BN_UMULT_HIGH/LOHI 需过 bn_local.h:362 的
+    #       !OPENSSL_NO_ASM 守卫（no-asm 只定义 OPENSSL_NO_ASM，不定义 OPENSSL_NO_INLINE_ASM）。
+    #       这里 undef 它使 __int128 宏分支激活。仅影响预处理宏——asm 源文件列表由 build.info 的
+    #       !$disabled{asm} 控制，与 CFLAGS 无关，故不会拉入 x86 asm。
+    # __SIZEOF_INT128__ 全局启用：BpfSoftFp pass 的 i128 标量替换把所有 i128 运算
+    # （mul/add/sub/phi/...，覆盖 bn 的 BN_UMULT_HIGH 与 curve448/curve25519 的域运算）
+    # 分解为 (lo,hi) 对，用原生 64 位 ALU 重写，不再触发 __multi3/__ashlti3 等。
     local OPENSSL_CFLAGS="${COMMON_CFLAGS//-g/}"
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-fstack-size-section/} -Wno-error=int-conversion"
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-bpf-stack-size=16384/-bpf-stack-size=131072}"
+    OPENSSL_CFLAGS="${OPENSSL_CFLAGS} -UOPENSSL_NO_ASM -D__SIZEOF_INT128__=16"
 
     # LDLIBS 经 BIN_EX_LIBS 注入 -l:libc.so：补 _start + libc/pthread 符号（bpfvm-ld 是
     # -nostdlib 语义），并让 openssl 作为 DT_NEEDED libc.so 的动态可执行（纯动态，省产物体积）。

@@ -6,8 +6,8 @@
  *   __builtin_mul_overflow → @llvm.umul.with.overflow.i64
  *   → BPF 后端 lower 成 __multi3 调用 → BPF ISel 拒绝("__multi3 not supported")
  *
- * BpfSoftFp pass 在 IR 层把 umul.with.overflow 展开成 schoolbook
- * 32×32 乘法 + 移位/加法(纯原生 BPF ALU),消除 __multi3 调用。
+ * BpfSoftFp pass 在 IR 层把 umul.with.overflow 展开成
+ * 原生 mul i64(低位) + BPF_FP_UMULH(高位,走 softfp 通道),消除 __multi3 调用。
  *
  * 用 volatile 输入防常量折叠,强制走运行时 umul.with.overflow 路径。
  * 对照 x86 原生结果,全部断言通过则 exit(0),任一失败 exit(1)。

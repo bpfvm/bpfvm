@@ -57,5 +57,8 @@
 #define BPF_FP_FABS_D      36   // double fabs
 #define BPF_FP_COPYSIGN_F  37   // float  copysign（二元）
 #define BPF_FP_COPYSIGN_D  38   // double copysign
+// 整数宽乘取高半（非浮点，复用 src_reg=2 通道）。
+// r0 = (a*b) >> 64。低半由调用方用原生 mul i64 另算。
+#define BPF_FP_UMULH       39   // (i64 a, i64 b) -> r0 = (a*b) >> 64
 
 #endif //BPF_FP_H

@@ -156,6 +156,7 @@ private:
     void orr_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void eor_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void mul_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
+    void umulh_reg(uint8_t dst, uint8_t src1, uint8_t src2);  // 64×64→128 高半（仅 64 位）
     void msub_reg(uint8_t dst, uint8_t src1, uint8_t src2, uint8_t acc, bool is_64 = true);
     void sdiv_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);
     void udiv_reg(uint8_t dst, uint8_t src1, uint8_t src2, bool is_64 = true);

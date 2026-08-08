@@ -1603,6 +1603,17 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
     case BPF_FP_UNORD_D: emit_unord(true);  return true;
     case BPF_FP_UNORD_F: emit_unord(false); return true;
 
+    // 整数宽乘取高半：r0 = (a*b)>>64，用 x86 mulq（RDX:RAX = RAX*RCX）。
+    // mulq 破坏 RDX(=BPF r5) 不需保护：softfp call 的 r1~r5 是 caller-saved
+    //（同 fadd/fsub 等；emit_inline_div 那种内联 ALU 才需保护）。
+    case BPF_FP_UMULH: {
+        mov_r64(X86::RAX, R_R1);                    // rax = a
+        mov_r64(X86::RCX, R_R2);                    // rcx = b
+        emit8(0x48); emit8(0xF7); emit8(0xE1);      // mul rcx：RDX:RAX = RAX*RCX
+        mov_r64(R_R0, X86::RDX);                    // hi(RDX) → r0
+        return true;
+    }
+
     default:
         // 未实现的 FP 编号（主要是 uint 目标的转换 D2USI/D2UDI/F2USI/F2UDI
         // 及对应的 int→fp 无符号源 USI2*/UDI2*，x86 无直接指令）交给通用 syscall。

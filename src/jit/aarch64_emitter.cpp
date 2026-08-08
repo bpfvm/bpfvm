@@ -120,6 +120,11 @@ void AArch64Emitter::mul_reg(uint8_t d, uint8_t n, uint8_t m, bool is_64) {
     uint32_t sf = is_64 ? 1u : 0u;
     emit_insn((sf << 31) | (0x1Bu << 24) | ((uint32_t)m << 16) | (0x1Fu << 10) | ((uint32_t)n << 5) | rd(d));
 }
+// UMULH：64×64→128 的高 64 位。Data Processing 3-source，bit[23:22]=11 区分于 MUL(=00)。
+void AArch64Emitter::umulh_reg(uint8_t d, uint8_t n, uint8_t m) {
+    emit_insn((1u << 31) | (0x1Bu << 24) | (0x3u << 22) | ((uint32_t)m << 16)
+              | (0x1Fu << 10) | ((uint32_t)n << 5) | rd(d));
+}
 void AArch64Emitter::msub_reg(uint8_t d, uint8_t n, uint8_t m, uint8_t a, bool is_64) {
     uint32_t sf = is_64 ? 1u : 0u;
     emit_insn((sf << 31) | (0x1Bu << 24) | ((uint32_t)m << 16) | (1u << 15)
@@ -1232,6 +1237,11 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
     // —— 无序判定 ——
     case BPF_FP_UNORD_D: emit_unord(true);  return true;
     case BPF_FP_UNORD_F: emit_unord(false); return true;
+
+    // 整数宽乘取高半：r0 = (a*b)>>64。aarch64 原生 UMULH 一条指令。
+    case BPF_FP_UMULH:
+        umulh_reg(R_R0, R_R1, R_R2);       // X9 = (X10 * X11) >> 64
+        return true;
 
     default:
         return false;

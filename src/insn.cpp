@@ -525,6 +525,10 @@ bool vm::do_softfp(uint32_t call) {
     case BPF_FP_FABS_F: r(0) = (uint64_t)f_out(std::fabs(f_in(a_bits))); return true;
     case BPF_FP_COPYSIGN_D: r(0) = d_out(std::copysign(d_in(a_bits), d_in(b_bits))); return true;
     case BPF_FP_COPYSIGN_F: r(0) = (uint64_t)f_out(std::copysign(f_in(a_bits), f_in(b_bits))); return true;
+    // 整数宽乘取高半：r0 = (a*b) >> 64。
+    case BPF_FP_UMULH:
+        r(0) = (uint64_t)(__uint128_t(a_bits) * b_bits >> 64);
+        return true;
     default:
         r(0) = -ENOSYS;
         return true;
