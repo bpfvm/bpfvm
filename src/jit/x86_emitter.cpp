@@ -691,7 +691,7 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
     // 不会：RAX 是 scratch，不在 caller-saved 列表中，push 不影响它
     mov_r64(X86::RSI, X86::RAX);                             // mov rsi, rax
     emit8(0xBA); emit32((uint32_t)access_size);              // mov edx, size
-    call_helper(is_write ? helpers_.mmu_w : helpers_.mmu);
+    call_helper(is_write ? helpers_->mmu_w : helpers_->mmu);
 
     // 恢复 caller-saved 的 BPF 寄存器
     restore_caller_saved();
@@ -1303,7 +1303,7 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
     // 调用 helper_do_syscall(vm*, call_id)
     mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
     emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
-    call_helper(helpers_.do_syscall);
+    call_helper(helpers_->do_syscall);
 
     // 检查返回值
     test_al_al();
@@ -1336,7 +1336,7 @@ void X86Emitter::emit_call_softfp_slow(const bpf_insn* insn, int current_index,
     // 调用 helper_do_softfp(vm*, call_id)
     mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
     emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
-    call_helper(helpers_.do_softfp);
+    call_helper(helpers_->do_softfp);
 
     // do_softfp 只写 r0、不改其他寄存器语义外的东西，但 reload 以保持一致与安全。
     reload_from_vm();
@@ -1696,7 +1696,7 @@ void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     size_t slot_arg_off = size();
     emit64(0);
     call_cache_offs.push_back(slot_arg_off);
-    call_helper(helpers_.resolve_and_cache);
+    call_helper(helpers_->resolve_and_cache);
     restore_caller_saved();
     test_rax_rax();
     size_t nc_jz = size();
@@ -1721,7 +1721,7 @@ void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     mov_r64(X86::RDI, X86::RBP);
     emit8(0x48); emit8(0xBE); emit64(ret_gpa);
     emit8(0x48); emit8(0xBA); emit64(callee_gpa);
-    call_helper(helpers_.call_bpf);
+    call_helper(helpers_->call_bpf);
     size_t slow_jmp = size();
     emit8(0xE9); emit32(0);
     patch_branch_uncond(slow_jmp, vm_exit_offset);
@@ -1768,7 +1768,7 @@ void X86Emitter::emit_call_indirect(const bpf_insn* insn,
 
     mov_r64(X86::RDI, X86::RBP);
     emit8(0x48); emit8(0xBE); emit64(ret_gpa);                // mov rsi, ret_gpa
-    call_helper(helpers_.call_indirect);
+    call_helper(helpers_->call_indirect);
     // helper_call_indirect 执行后总是需要退出 JIT（pc 已改变或 VM 被终止）
     // 直接跳 vm_exit（flush 已经做过了）
     size_t jmp_off = size();
@@ -1928,7 +1928,7 @@ size_t X86Emitter::emit_prologue() {
     // Safepoint at entry: 必须先 flush 所有寄存器（信号处理器可能读取）
     flush_to_vm();
     mov_r64(X86::RDI, X86::RBP);             // mov rdi, rbp
-    call_helper(helpers_.safepoint);
+    call_helper(helpers_->safepoint);
     test_eax_eax();
     // Safepoint 失败 → 直接跳 vm_exit（不走 flush_and_exit，因为 flush 已做过，
     // 而且信号处理器可能已修改 vm->reg[]，不能再用 x86 寄存器覆盖）
@@ -2012,7 +2012,7 @@ void X86Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) {
     emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
 
     mov_r64(X86::RDI, X86::RBP);
-    call_helper(helpers_.safepoint);
+    call_helper(helpers_->safepoint);
     test_eax_eax();
     size_t sp_jne = size();
     emit8(0x0F); emit8(0x85); emit32(0);     // JNE .vm_exit

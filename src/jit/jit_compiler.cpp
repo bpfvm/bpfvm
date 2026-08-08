@@ -44,12 +44,28 @@ JitCompiler<EmitterT>::JitCompiler() {
     const char* env = getenv("JIT_ENABLE");
     enabled_ = (env == nullptr || strcmp(env, "0") != 0);
     if (const char* e = getenv("JIT_THRESHOLD")) threshold_ = (uint32_t)atoi(e);
+    debug_enabled_ = getenv("BPF_DEBUG");
+
+    helpers_.safepoint        = (void*)&helper_safepoint;
+    helpers_.push_frame       = (void*)&helper_push_frame;
+    helpers_.pop_frame        = (void*)&helper_pop_frame;
+    helpers_.do_syscall       = (void*)&helper_do_syscall;
+    helpers_.do_softfp        = (void*)&helper_do_softfp;
+    helpers_.call_indirect    = (void*)&helper_call_indirect;
+    helpers_.call_bpf         = (void*)&helper_call_bpf;
+    helpers_.return_to_caller = (void*)&helper_return_to_caller;
+    helpers_.resolve_and_cache = (void*)&helper_resolve_and_cache;
+    helpers_.mmu              = (void*)&helper_mmu;
+    helpers_.mmu_w            = (void*)&helper_mmu_w;
 }
 
 template<typename EmitterT>
 JitCompiler<EmitterT>::~JitCompiler() {
-    for (auto& [pc, f] : functions_) {
-        if (f.code) munmap(f.code, f.code_size);
+    for (auto& [pc, entry] : entries_) {
+        if (entry.kind == JitEntryKind::Compiled && entry.code) {
+            munmap(entry.code, entry.code_size);
+            entry.code = nullptr;
+        }
     }
 }
 
@@ -177,36 +193,15 @@ void* JitCompiler<EmitterT>::helper_mmu_w(vm* v, uint64_t addr, uint64_t size) {
     return v->mmu_w_slow(addr, (size_t)size);
 }
 
-// ---------------------------------------------------------------------------
-// Helper table construction
-// ---------------------------------------------------------------------------
-
-template<typename EmitterT>
-HelperTable JitCompiler<EmitterT>::make_helper_table() const {
-    HelperTable h;
-    h.safepoint = (void*)&helper_safepoint;
-    h.push_frame = (void*)&helper_push_frame;
-    h.pop_frame = (void*)&helper_pop_frame;
-    h.do_syscall = (void*)&helper_do_syscall;
-    h.do_softfp = (void*)&helper_do_softfp;
-    h.call_indirect = (void*)&helper_call_indirect;
-    h.call_bpf = (void*)&helper_call_bpf;
-    h.return_to_caller = (void*)&helper_return_to_caller;
-    h.resolve_and_cache = (void*)&helper_resolve_and_cache;
-    h.mmu = (void*)&helper_mmu;
-    h.mmu_w = (void*)&helper_mmu_w;
-    return h;
-}
-
 // resolve_call — 由 helper_resolve_and_cache（cache miss 慢路径）调用，返回 callee 的
 //   entry_fast 入口；未编译返回 nullptr。
 
 template<typename EmitterT>
 void* JitCompiler<EmitterT>::resolve_call(vm* /*v*/, uint64_t callee_gpa) {
-    auto it = functions_.find(callee_gpa);
-    if (it == functions_.end()) return nullptr;
+    auto it = entries_.find(callee_gpa);
+    if (it == entries_.end()) return nullptr;
     auto& f = it->second;
-    if (!f.code || f.entry_fast_offset == 0) return nullptr;
+    if (f.kind != JitEntryKind::Compiled) return nullptr;
     return (char*)f.code + f.entry_fast_offset;
 }
 
@@ -226,7 +221,9 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
 
     std::vector<bool> reachable(seg_limit, false);
     back_edge_targets.assign(seg_limit, false);
-    std::vector<int> max_back_edge_src(seg_limit, -1);
+    // 回边稀疏记录：(target, src)。绝大多数 pc 不是回边 target
+    // 改为只在遇到回边时 push，BFS 后聚合。
+    std::vector<std::pair<int,int>> back_edges;
     int max_reached = -1;
 
     std::queue<int> q;
@@ -243,7 +240,7 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
         if (target >= 0 && target < seg_limit) {
             if (target <= i) {
                 back_edge_targets[target] = true;
-                if (i > max_back_edge_src[target]) max_back_edge_src[target] = i;
+                back_edges.emplace_back(target, i);
             }
             enqueue(target);
         }
@@ -311,11 +308,12 @@ std::vector<bool> JitCompiler<EmitterT>::discover_reachable(
     reachable.resize(func_size);
     back_edge_targets.resize(func_size);
 
-    // 计算每个回边目标的循环体大小
+    // 计算每个回边目标的循环体大小：同一 target 取最远 src（max 语义）
     loop_body_sizes.assign(func_size, 1);
-    for (int i = 0; i < func_size; i++) {
-        if (back_edge_targets[i] && max_back_edge_src[i] >= 0) {
-            loop_body_sizes[i] = max_back_edge_src[i] - i + 1;
+    for (auto [target, src] : back_edges) {
+        int body = src - target + 1;
+        if (body > (int)loop_body_sizes[target]) {
+            loop_body_sizes[target] = body;
         }
     }
 
@@ -471,30 +469,47 @@ void* JitCompiler<EmitterT>::finalize_code(EmitterT& e) {
 // ---------------------------------------------------------------------------
 
 template<typename EmitterT>
-JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
+JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     if (!enabled_) return nullptr;
     // GDB attach 期间（VM_DEBUG_ATTACHED）：跳过 JIT，强制走解释器——解释器每步检查断点/单步，
     if (v->get_flags() & vm::VM_DEBUG_ATTACHED) return nullptr;
-    auto it = functions_.find(gpa);
-    if (it != functions_.end()) return &it->second;
-    if (failed_.count(gpa)) {
-        return nullptr;
+
+    struct Timer {
+        bool enable;
+        uint64_t& acc;
+        std::chrono::high_resolution_clock::time_point start;
+        explicit Timer(bool enable_, uint64_t& a) : enable(enable_), acc(a) {
+            if (enable) start = std::chrono::high_resolution_clock::now();
+        }
+        ~Timer() {
+            if(!enable) return;
+            acc += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - start).count();
+        }
+    } timer(debug_enabled_, stats.compile_ns);
+
+    // 一次查找覆盖三类命中：已编译直接返回；failed 永久返回 nullptr；Counting 落到热点判定。
+    auto it = entries_.find(gpa);
+    if (it != entries_.end()) {
+        switch (it->second.kind) {
+        case JitEntryKind::Compiled: return &it->second;
+        case JitEntryKind::Failed:   return nullptr;
+        case JitEntryKind::Counting: break;  // 继续走热点判定
+        }
+    } else {
+        it = entries_.emplace(gpa, JitEntry{}).first;
     }
 
     // 热点检测：未达阈值的 pc 走解释器（返回 nullptr）。计数器在每次 compile()
     // 调用时递增——step() 单步与 JIT helper_call_bpf 都经过这里，所以循环回边
     // 目标会被反复计数，达到阈值即在循环头编译（OSR：prologue 从 vm->reg[] 加载
     // 解释器当前状态，JIT 接管剩余循环）。冷 pc 永不达阈值，始终走解释器。
-    if (threshold_ > 0) {
-        auto& cnt = call_counts_[gpa];
-        if (++cnt < threshold_) return nullptr;
+    if (threshold_ > 0 && ++it->second.count < threshold_) {
+        return nullptr;
     }
 
-    auto compile_start = std::chrono::high_resolution_clock::now();
-    auto record_compile_time = [&] {
-        stats.compile_ns += (uint64_t)std::chrono::duration_cast<
-            std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - compile_start).count();
-    };
+    // 记录失败：把当前 entry 标记为 Failed（下次直接命中返回 nullptr，不再重试/计数）。
+    auto mark_failed = [&] { it->second.kind = JitEntryKind::Failed; };
 
     // gpa 是 guest 入口地址；编译期需要 host 指针遍历指令，mmu 取一次（编译期无 CoW）
     const bpf_insn* entry_pc = (const bpf_insn*)v->mmu(gpa);
@@ -518,12 +533,17 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     std::vector<uint32_t> loop_body_sizes;
     int num_insns = 0;
     auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, loop_body_sizes, num_insns);
-    if (reachable.empty() || num_insns <= 0) { record_compile_time(); return nullptr; }
+    // reachable.empty()/num_insns<=0 ⟺ seg_limit<=0（gpa 距段尾不足一条指令）。
+    // gpa 相对段的位置不变、段大小不变，属结构性失败——缓存失败避免每次 step 重跑 BFS。
+    if (reachable.empty() || num_insns <= 0) {
+        mark_failed();
+        return nullptr;
+    }
 
-    // 跳转 target 预检（仅 threshold_==1 启用）：gpa 若是函数中间地址——单次执行的 pc
-    // 只在 threshold=1 下被编译——其相对入口的跳转 target 会越界，patch 阶段必失败。
+    // 跳转 target 预检（仅 threshold_<=1 启用）：gpa 若是函数中间地址——单次执行的 pc
+    // 只在 threshold<=1 下被编译——其相对入口的跳转 target 会越界，patch 阶段必失败。
     // 在昂贵的 emit 之前廉价扫描，越界即判失败，省掉无用的 emit。
-    for (int i = 0; threshold_ == 1 &&  i < num_insns; i++) {
+    for (int i = 0; threshold_ <= 1 && i < num_insns; i++) {
         if (!reachable[i]) continue;
         const bpf_insn* insn = entry_pc + i;
         uint8_t cls = insn->code & 0x07;
@@ -540,19 +560,18 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         }
         // patch 阶段要求 target ∈ [0, num_insns) 且该槽可达（被 emit）。
         if (target < 0 || target >= num_insns || !reachable[target]) {
-            failed_.insert(gpa);
-            record_compile_time();
+            mark_failed();
             return nullptr;
         }
     }
 
     // Set up emitter
-    bool insn_count_enabled = getenv("BPF_DEBUG") || v->options.insn_limit != 0;
-    bool budget_enabled = v->options.insn_limit != 0;
     EmitterT e;
     e.set_vm_offsets(off_reg_, off_pc_, off_flags_, off_tlb_, off_stack_limit_, off_scratch_);
-    e.set_budget(off_insn_count_, off_insn_limit_, insn_count_enabled, budget_enabled);
-    e.set_helpers(make_helper_table());
+    if(debug_enabled_ || v->options.insn_limit != 0) {
+        e.set_budget(off_insn_count_, off_insn_limit_, v->options.insn_limit != 0);
+    }
+    e.set_helpers(helpers_);
 
     // Emit code
     std::vector<JumpPlaceholder> placeholders;
@@ -577,20 +596,21 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
 
         if (!emit_instruction(e, entry_pc, entry_gpa, i,
                               placeholders, abort_patches, call_cache_offs, compiled_count)) {
-            failed_.insert(gpa);
-            record_compile_time();
+            mark_failed();
             return nullptr;
         }
     }
 
-    if (compiled_count == 0) { failed_.insert(gpa); record_compile_time(); return nullptr; }
+    if (compiled_count == 0) {
+        mark_failed();
+        return nullptr;
+    }
 
     // Patch jump placeholders
     for (auto& ph : placeholders) {
         if (ph.target_bpf_index < 0 || ph.target_bpf_index >= num_insns ||
             pc_offsets[ph.target_bpf_index] == UINT32_MAX) {
-            failed_.insert(gpa);
-            record_compile_time();
+            mark_failed();
             return nullptr;
         }
         size_t target = pc_offsets[ph.target_bpf_index];
@@ -605,8 +625,9 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         e.patch_branch_cond(ap.jump_offset, flush_and_exit_offset);
     }
 
-    // 建 JitFunction 条目（finalize 前建，以便 call_cache 落地、取稳定槽地址）。
-    auto& func = functions_[gpa];
+    // 复用当前 entry（编译开始前已 emplace，迭代器稳定），承载编译产物；call_cache
+    // 落地后取稳定槽地址 patch 进 JIT 代码。
+    auto& func = it->second;
     func.gpa = gpa;
     // 每个 call site 有 2 个占位（fast path 读 cache + slow_resolve 传 helper），二者在
     // call_cache_offs 中相邻成对（同一 emit_call_bpf 内连续 push），共用 1 个 cache 槽：
@@ -624,7 +645,10 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
 
     // Finalize
     void* code_mem = finalize_code(e);
-    if (!code_mem) { functions_.erase(gpa); record_compile_time(); return nullptr; }
+    if (!code_mem) {
+        mark_failed();
+        return nullptr;
+    }
 
     stats.jit_compiles++;
     stats.jit_compiled_insns += compiled_count;
@@ -633,7 +657,7 @@ JitFunction* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     func.code_size = (e.size() + 4095) & ~(size_t)4095;
     func.pc_offsets = std::move(pc_offsets);
     func.entry_fast_offset = e.get_entry_fast_offset();  // 由 emit_prologue 生成
-    record_compile_time();
+    func.kind = JitEntryKind::Compiled;
     return &func;
 }
 

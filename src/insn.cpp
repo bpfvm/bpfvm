@@ -23,7 +23,7 @@ using JitCompilerImpl = JitCompiler<AArch64Emitter>;
 #else
 class StubJitCompiler : public JitCompilerBase {
 public:
-    JitFunction* compile(vm*, uint64_t) override { return nullptr; }
+    JitEntry* compile(vm*, uint64_t) override { return nullptr; }
 };
 using JitCompilerImpl = StubJitCompiler;
 #endif

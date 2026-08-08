@@ -44,9 +44,18 @@ struct MemAccessContext {
 };
 
 // ---------------------------------------------------------------------------
-// JitFunction: one compiled BPF function
+// JitEntry: one compiled BPF function + 编译状态/热点计数。
 // ---------------------------------------------------------------------------
-struct JitFunction {
+enum class JitEntryKind : uint8_t {
+    Counting,   // 仅在计数（未编译、未判定失败）
+    Failed,     // 编译失败，永久返回 nullptr
+    Compiled,   // 已编译
+};
+
+struct JitEntry {
+    JitEntryKind kind = JitEntryKind::Counting;
+    uint32_t count = 0;              // 热点计数（编译成功后不再重置，不再被读取）
+
     void* code = nullptr;             // executable entry point
     int insn_count = 0;               // total BPF instructions compiled
     size_t code_size = 0;             // mmap'd allocation size
@@ -94,7 +103,7 @@ struct HelperTable {
 class JitCompilerBase {
 public:
     virtual ~JitCompilerBase() = default;
-    virtual JitFunction* compile(vm* v, uint64_t gpa) = 0;
+    virtual JitEntry* compile(vm* v, uint64_t gpa) = 0;
     virtual void clear() {}  // 失效所有已编译的 JIT 缓存（execve 替换地址空间后调用）
     // 查 callee：已编译返回其 entry_fast 入口，否则 nullptr。
     virtual void* resolve_call(vm* v, uint64_t callee_gpa) { (void)v; (void)callee_gpa; return nullptr; }

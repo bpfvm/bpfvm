@@ -587,7 +587,7 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     mov_reg(X1, X0, true);           // arg2 = guest addr
     mov_reg(X0, X28, true);          // arg1 = vm*
     mov_imm(X2, (uint64_t)access_size, true); // arg3 = size
-    call_helper(is_write ? helpers_.mmu_w : helpers_.mmu);
+    call_helper(is_write ? helpers_->mmu_w : helpers_->mmu);
     restore_caller_saved();
     cbz(X0, true);                   // null → .vm_exit (recorded as abort)
     ctx.abort_jumps.push_back(size() - 4);
@@ -1249,7 +1249,7 @@ void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t e
     // Call helper_do_syscall(vm*, call_id)
     mov_reg(X0, X28, true);
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
-    call_helper(helpers_.do_syscall);
+    call_helper(helpers_->do_syscall);
     // Check return (al != 0 means ok)
     cbz(X0, false);
     patch_branch_cond(size() - 4, vm_exit_offset);
@@ -1267,7 +1267,7 @@ void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64
     // Call helper_do_softfp(vm*, call_id)
     mov_reg(X0, X28, true);
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
-    call_helper(helpers_.do_softfp);
+    call_helper(helpers_->do_softfp);
     reload_from_vm();
 }
 
@@ -1352,7 +1352,7 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     size_t slot_arg_off = size();
     emit64(0);
     call_cache_offs.push_back(slot_arg_off);
-    call_helper(helpers_.resolve_and_cache);
+    call_helper(helpers_->resolve_and_cache);
     restore_caller_saved();
     size_t nc_cbz = size(); cbz(X0, true);  // CBZ X0, .not_compiled
     mov_reg(X16, X0, true);
@@ -1373,7 +1373,7 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     mov_reg(X0, X28, true);
     mov_imm(X1, ret_gpa, true);
     mov_imm(X2, callee_gpa, true);
-    call_helper(helpers_.call_bpf);
+    call_helper(helpers_->call_bpf);
     size_t slow_b = size(); b_uncond();
     patch_branch_uncond(slow_b, vm_exit_offset);
 
@@ -1413,7 +1413,7 @@ void AArch64Emitter::emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa) 
     mov_reg(X0, X28, true);                                       // X0 = vm*
     mov_imm(X1, ret_gpa, true);                                   // X1 = ret_gpa
     ldr_imm(X2, X28, (int32_t)(off_reg_ + insn->dst_reg * 8), true); // X2 = target
-    call_helper(helpers_.call_indirect);
+    call_helper(helpers_->call_indirect);
     size_t off = size(); b_uncond();
     patch_branch_uncond(off, vm_exit_offset);
 }
@@ -1532,7 +1532,7 @@ size_t AArch64Emitter::emit_prologue() {
     patch_branch_uncond(entry_jmp, size());
     flush_to_vm();
     mov_reg(X0, X28, true);
-    call_helper(helpers_.safepoint);
+    call_helper(helpers_->safepoint);
     // helper returns 0=ok, non-zero=exit. CBNZ W0 → vm_exit
     cbnz(X0, false);
     patch_branch_cond(size() - 4, vm_exit_offset);
@@ -1608,7 +1608,7 @@ void AArch64Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) 
     mov_imm(X2, insn_gpa, true);
     str_imm(X2, X28, (int32_t)off_pc_, true);
     mov_reg(X0, X28, true);
-    call_helper(helpers_.safepoint);
+    call_helper(helpers_->safepoint);
     // helper returns 0=ok, non-zero=exit
     cbnz(X0, false);
     patch_branch_cond(size() - 4, vm_exit_offset);
