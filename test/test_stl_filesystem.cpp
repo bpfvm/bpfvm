@@ -1,12 +1,13 @@
 // STL <filesystem> 测试：验证 std::filesystem 在 bpfvm 上正确工作。
 //
-// 机制（见 port_cplusplus.md「filesystem 支持」）：
+// 机制（见 README「C++ 支持 / filesystem」章节）：
 //   - libc++ <filesystem> 头 + libcxx.a 的 filesystem/*.o（path/operations/
 //     directory_iterator/directory_entry/filesystem_error/filesystem_clock/
 //     int128_builtins）。
-//   - 关键宏 -D_LIBCPP_HAS_NO_INT128：BPF 后端不支持 __int128 乘除（__multi3/
-//     __divti3），file_clock::rep 默认是 __int128_t；定义该宏让 rep 退化为
-//     long long，整条时间戳运算链不再触发后端拒绝。
+//   - __int128 已启用（不定义 _LIBCPP_HAS_NO_INT128）：file_clock::rep 是 __int128_t，
+//     时间戳运算产生的 mul/sdiv/udiv/srem/urem i128 由 BpfSoftFp pass 改写成虚拟指令
+//     （BPF_FP_MUL128 / BPF_FP_*DIV128 / *REM128），__muloti4 等 i128 返回值函数由
+//     BpfWideArgs 的 lowerI128Returns 降级为 sret。
 //   - VM 已实现全部所需文件系统 syscall（openat/statx/getdents64/mkdirat/
 //     unlinkat/symlinkat/linkat/renameat2/readlinkat/fchdir/getcwd/fchmodat/
 //     utimensat/faccessat/truncate/ftruncate），musl 包装完成。

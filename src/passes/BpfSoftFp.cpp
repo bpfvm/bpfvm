@@ -1,28 +1,25 @@
 //===- BpfSoftFp.cpp - 虚拟 FP 指令的编码 pass ----------------------------===//
 //
-// 虚拟 FP 指令的设计见 include/bpf_fp.h（BPF_FP_* 宏段注释）。本 pass
-// 负责编码阶段：在 IR 层把每个浮点运算指令替换成一次对 extern __ksym 函数
-// `__bpf_fp_<ID>` 的调用，绕过后端在 ISel 阶段对 fadd/fmul/... 的拒绝
-// （"A call to built-in function '__adddf3' is not supported"）。
-//
-// 语义目标：FP 走 src_reg=2 的"浮点专用通道"，与 syscall（src_reg=0）彻底分离。
-// VM 解释器/JIT 看到 src_reg=2 直接走 do_softfp / emit_call_softfp，不经过
-// syscall handler。字节码层一眼能区分 FP（call src_reg=2）与 syscall（src_reg=0）。
+// 虚拟 FP 指令的设计见 include/bpf_fp.h。本 pass 在 IR 层把每个浮点运算指令替换成
+// 一次对 extern __ksym 函数 `__bpf_fp_<ID>` 的调用，绕过后端在 ISel 阶段对
+// fadd/fmul/... 的拒绝（"A call to built-in function '__adddf3' is not supported"）。
+// FP 走 src_reg=2 通道（与 syscall 的 src_reg=0 分离），VM 解释器/JIT 直接走
+// do_softfp / emit_call_softfp。
 //
 // 编码链路（不在 pass 里直出 src_reg=2，交给 clang 后端 + linker 协同）：
-//   1. pass 把 fadd/... 改成 `call @__bpf_fp_<ID>(i64...)`（extern，section
-//      ".ksyms"）。符号名尾部 <ID> 直接编码 BPF_FP_*，无映射表。
-//   2. clang 后端把它当作普通未解析外部函数调用：按 calling convention 把参数
-//      放 r1/r2、结果放 r0，emit `call -1`（src_reg=1 占位）+ R_BPF_64_32 重定位
-//      （目标符号 = __bpf_fp_<ID>）。参数/结果的寄存器绑定由后端原生 call lowering
-//      保证（这是 InlineAsm 方案做不到的：InlineAsm 的 "r"/"=r" 不保证绑 r1/r2/r0，
-//      在寄存器压力下会错放，且 clobber 会触发 LiveVariables 崩溃，故弃用）。
-//   3. bpfvm-ld 在 R_BPF_64_32 看到 `__bpf_fp_` 符号：解析名字尾的 ID，改写 call
-//      的 src_reg=2 + imm=<ID>，且不报"未定义符号"（VM 按 src_reg=2 解释）。
+//   pass  →  extern long __bpf_fp_<ID>(i64...) (section ".ksyms")，符号名尾部 <ID>
+//            直接编码 BPF_FP_*，无映射表
+//   clang →  当普通未解析外部函数调用，按 calling convention 把参数放 r1/r2/...、结果
+//            放 r0，emit `call -1`（src_reg=1 占位）+ R_BPF_64_32 重定位
+//   linker→  在 R_BPF_64_32 看到 `__bpf_fp_` 符号 → 改写 call 的 src_reg=2 + imm=<ID>
+//   VM    →  src_reg=2 的 dispatch 直达 do_softfp
 //
-// 操作数按 IEEE754 位模式当 i64 传递（fp 参数先 bitcast 到 i64；结果 i64 再按
-// 需 bitcast/trunc 回目标类型）。覆盖：算术 / fneg / sqrt / 比较 /
-// fp<->int / fptrunc / fpext / fmuladd。
+// 寄存器绑定由后端原生 call lowering 保证（不用 InlineAsm：它的 "r"/"=r" 不保证绑
+// r1/r2/r0，寄存器压力下会错放，且 clobber 会触发 LiveVariables 崩溃）。
+//
+// 操作数按 IEEE754 位模式当 i64 传递（fp 参数先 bitcast 到 i64；结果 i64 再 bitcast/
+// trunc 回目标类型）。覆盖：算术 / fneg / sqrt / 比较 / fp<->int / fptrunc / fpext /
+// fmuladd / i128 乘除模 / i128 变量移位。
 //
 // 用法：clang -target bpf -fpass-plugin=libBpfSoftFp.so ...
 //
@@ -72,29 +69,8 @@ static Value *toI64Bits(IRBuilder<> &B, Value *V) {
     return V;  // 已是 i64 等价物
 }
 
-// 生成一条浮点虚拟指令：一次对 extern __ksym 函数的调用。
-//
-// 编码链路：
-//   pass  →  extern long __bpf_fp_<ID>(i64...) (section ".ksyms")
-//   clang →  `call -1`（src_reg=1，PC-relative 占位）+ R_BPF_64_32 重定位
-//            （目标符号 = `__bpf_fp_<ID>`）
-//   linker→  识别 `__bpf_fp_` 符号 → 改写 call 的 src_reg=2、imm=<ID>，
-//            且不报"未定义符号"（这些符号由 VM 在运行时按 src_reg=2 解释）
-//   VM    →  src_reg=2 的 dispatch 直达 do_softfp（与 syscall 彻底分离）
-//
-// 寄存器绑定（关键稳定性来源）：
-//   这是一次"普通外部函数调用"，clang BPF 后端按 calling convention 处理——
-//   参数自动落 r1/r2/...、结果回 r0。这是后端原生 call lowering 保证的，
-//   不依赖 InlineAsm 的约束赌博（InlineAsm 方案实测在寄存器压力下会把一元 op
-//   的输入错放到 r2，且 clobber 会触发 LiveVariables 崩溃，已弃用）。
-//
-// 符号名编码 ID（无映射表）：
-//   符号名 `__bpf_fp_<ID>` 直接携带 FP_ID，linker 解析名字尾部数字即得 ID，
-//   pass 造名 / linker 解名是单向数据流，无需两侧维护同步的查表。
-//
-// 操作数与结果统一按 i64 位模式传递（toI64Bits 入，按 RetTy 出）：
-//   fp 结果：i64 bitcast 回 float/double；
-//   int 结果（如 CMP 的 i32）：i64 trunc 回目标宽度。
+// 生成一条浮点虚拟指令：对 extern __bpf_fp_<ID> 的调用（链路见文件头）。
+// 操作数经 toI64Bits 转成 i64 位模式传入；结果 i64 按 RetTy 转 fp 或 trunc 回窄整数。
 static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
                                unsigned FpCallId,
                                ArrayRef<Value *> Args,
@@ -102,13 +78,12 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
     Type *I64Ty = Type::getInt64Ty(Ctx);
     Module &M = *B.GetInsertBlock()->getModule();
 
-    // 入参全部转成 i64 位模式。
     SmallVector<Value *, 4> I64Args;
     for (Value *A : Args)
         I64Args.push_back(toI64Bits(B, A));
 
-    // 构造 extern 函数声明：(i64)(i64, i64, ...)，符号名 __bpf_fp_<ID>，
-    // 放 .ksyms section（让 clang emit R_BPF_64_32 重定位，linker 据符号名识别）。
+    // extern __bpf_fp_<ID>(i64...) 放 .ksyms section：clang 据此 emit R_BPF_64_32
+    // 重定位，linker 据符号名识别并改写 src_reg=2。
     SmallVector<Type *, 4> ArgTys(I64Args.size(), I64Ty);
     FunctionType *FTy = FunctionType::get(I64Ty, ArgTys, false);
     std::string Name = "__bpf_fp_" + std::to_string(FpCallId);
@@ -116,14 +91,10 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
     Function *F = dyn_cast<Function>(FC.getCallee());
     if (F) {
         F->setLinkage(GlobalValue::ExternalLinkage);
-        // section 名与内核 libbpf 的 kfunc（extern __ksym）约定一致；
-        // clang 据此 emit R_BPF_64_32 重定位（src_reg=1 的未解析 call）。
         if (!F->hasSection())
             F->setSection(".ksyms");
     }
 
-    // 普通函数调用：clang 后端按 calling convention 把参数放 r1/r2、结果放 r0，
-    // 并 emit `call -1` + R_BPF_64_32（指向 __bpf_fp_<ID>）。
     Value *Call = B.CreateCall(FC, I64Args);
 
     // 结果 i64 → 目标类型。
@@ -138,7 +109,7 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
 }
 
 // 发射 BPF_FP_UMULH（softfp 通道），取 64×64→128 的高半。用于 mul i128 与
-// umul.with.overflow 的高位提取。
+// umul.with.overflow 的高位提取。单输出（只回 r0=hi），低半由调用方用原生 mul 另算。
 static Value *emitMul128Hi(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb) {
     Type *I64Ty = Type::getInt64Ty(Ctx);
     return emitDirectFpCall(B, Ctx, BPF_FP_UMULH, {A, Bb}, I64Ty);
@@ -194,10 +165,13 @@ static bool softenFunction(Function &F) {
         for (Instruction &I : make_early_inc_range(BB)) {
             IRBuilder<> B(&I);
 
-            // ---- mul i128：唯一 BPF 后端无法 lower 的 i128 运算（会变 __multi3，
-            // 而 i128 不能作 ABI 返回值）。操作数经 narrowToI64 归约成 i64（实际
-            // 操作数真值均 <2^64），用 lo=原生 mul i64 + hi=BPF_FP_UMULH 组装回 i128，
-            // 交后端 lower 后续 add/lshr/phi/icmp 等。
+            // ---- mul i128：后端 ISel 把它 lower 成内建 __multi3 调用，BPF 后端不支持
+            // 该内建（"__multi3 not supported"）。注意这与 i128 返回值无关——lowerI128Returns
+            // 改的是 IR 层用户函数的签名，管不到后端 ISel 自行生成的内建调用。操作数经
+            // narrowToI64 归约成 i64（实际操作数真值均 <2^64），用 lo=原生 mul i64 +
+            // hi=BPF_FP_UMULH 组装回 i128，交后端 lower 后续 add/lshr 等。
+            // UMULH 只回 r0（高半），低半由原生 mul 另算——避免双输出 InlineAsm "={r1}"
+            // 在 OpenSSL BN 密集乘法场景 RA 偶发丢 hi（验证）。
             if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
                 if (BO->getOpcode() == Instruction::Mul &&
                     BO->getType()->isIntegerTy(128)) {
@@ -212,6 +186,64 @@ static bool softenFunction(Function &F) {
                     Value *Prod = B.CreateOr(B.CreateShl(B.CreateZExt(Hi, I128Ty), BITS64),
                                              B.CreateZExt(Lo, I128Ty));
                     BO->replaceAllUsesWith(Prod);
+                    ToErase.push_back(BO);
+                    Changed = true;
+                    continue;
+                }
+            }
+
+            // ---- sdiv/udiv/srem/urem i128：后端 ISel lower 成内建 __divti3 等调用，
+            // BPF 后端不支持（同 mul i128 / __multi3 的理由）。把两个 i128 操作数各拆成
+            // (lo,hi)，调 i64 __bpf_fp_<ID>(ptr out_hi, i64 aLo, i64 aHi, i64 bLo, i64 bHi)
+            //（5 参占满 BPF r1-r5）：VM 低半回 r0、高半写入 out_hi 指向的 8 字节，caller
+            // 只 load 一次高半组装回 i128。不用双输出 InlineAsm（"={r1}" 在 OpenSSL BN
+            // 密集乘法场景 RA 偶发丢 hi）；除法频率极低（libc++ filesystem 时间换算），
+            // 高半的一次 load 可接受。JIT 无原生 lowering，回退解释器 do_softfp。
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                unsigned Op = BO->getOpcode();
+                unsigned FpId;
+                switch (Op) {
+                case Instruction::UDiv: FpId = BPF_FP_UDIV128; break;
+                case Instruction::SDiv: FpId = BPF_FP_SDIV128; break;
+                case Instruction::URem: FpId = BPF_FP_UREM128; break;
+                case Instruction::SRem: FpId = BPF_FP_SREM128; break;
+                default:                FpId = 0;              break;
+                }
+                if (FpId != 0 && BO->getType()->isIntegerTy(128)) {
+                    Type *I128Ty = Type::getInt128Ty(Ctx);
+                    Type *I64Ty = Type::getInt64Ty(Ctx);
+                    Type *PtrTy = PointerType::getUnqual(Ctx);
+                    Constant *BITS64 = ConstantInt::get(I64Ty, 64);
+                    // 拆 (lo,hi)：操作数已是 i128，后端尚未 lower；手动 trunc 取两半。
+                    auto split128 = [&](Value *V) -> std::pair<Value *, Value *> {
+                        Value *Lo = B.CreateTrunc(V, I64Ty);
+                        Value *Hi = B.CreateTrunc(B.CreateLShr(V, BITS64), I64Ty);
+                        return {Lo, Hi};
+                    };
+                    auto [aLo, aHi] = split128(BO->getOperand(0));
+                    auto [bLo, bHi] = split128(BO->getOperand(1));
+                    // alloca 8 字节存高半。BPF 要求 alloca 在入口块（BpfSoftFp 跑在
+                    // OptimizerLastEP，之后无 SROA，非入口 alloca 会被后端拒绝
+                    // "unsupported dynamic stack allocation"），故用临时 builder 插入口块。
+                    // 低半走 r0（正常返回值寄存器），只高半经 sret 指针——省一次 load。
+                    IRBuilder<> EntryB(&F.getEntryBlock(), F.getEntryBlock().getFirstInsertionPt());
+                    Value *HiSlot = EntryB.CreateAlloca(I64Ty, nullptr);
+                    // 构造 extern i64 __bpf_fp_<ID>(ptr out_hi, i64 aLo, i64 aHi, i64 bLo, i64 bHi)。
+                    // 返回 r0=低半，高半写入 out_hi 指向的 8 字节。
+                    FunctionType *FTy = FunctionType::get(I64Ty,
+                                                          {PtrTy, I64Ty, I64Ty, I64Ty, I64Ty}, false);
+                    std::string Name = "__bpf_fp_" + std::to_string(FpId);
+                    FunctionCallee FC = B.GetInsertBlock()->getModule()->getOrInsertFunction(Name, FTy);
+                    if (Function *F = dyn_cast<Function>(FC.getCallee())) {
+                        F->setLinkage(GlobalValue::ExternalLinkage);
+                        if (!F->hasSection())
+                            F->setSection(".ksyms");
+                    }
+                    Value *Lo = B.CreateCall(FC, {HiSlot, aLo, aHi, bLo, bHi});
+                    Value *Hi = B.CreateLoad(I64Ty, HiSlot);
+                    Value *Res = B.CreateOr(B.CreateShl(B.CreateZExt(Hi, I128Ty), BITS64),
+                                            B.CreateZExt(Lo, I128Ty));
+                    BO->replaceAllUsesWith(Res);
                     ToErase.push_back(BO);
                     Changed = true;
                     continue;
@@ -325,14 +357,9 @@ static bool softenFunction(Function &F) {
                     const char *sfx = suffix(Src);
                     if (!sfx) continue;
                     bool isDouble = (sfx[0] == 'd');
-                    // 窄整数目标（i1/i8/i16）统一走 i32 路径：先转 i32，再由
-                    // emitDirectFpCall 末尾的 trunc 收窄到原宽度。语义等价：
-                    //   (i8)(double)x == (i8)(int)(double)x
-                    // 与 SIToFP/UIToFP 分支处理窄整数源（256-268 行）对称。
-                    // 不走这条路会留给后端，BPF ISel 对 double→i8 等 lower
-                    // 成 __fixdfsi libcall 后拒绝（"A call to built-in function
-                    // '__fixdfsi' is not supported"），如 busybox awk.c 的
-                    // `char cc = getvar_i(arg)`（getvar_i 返回 double）。
+                    // 窄整数目标（i1/i8/i16）统一走 i32 路径（先转 i32，emitDirectFpCall
+                    // 末尾 trunc 收窄），否则后端 lower 成 __fixdfsi libcall 后拒绝。
+                    // 如 busybox awk.c 的 char cc = getvar_i(arg)。
                     unsigned dstBits = Dst->isIntegerTy() ? Dst->getIntegerBitWidth() : 0;
                     unsigned callId;
                     if (Op == Instruction::FPToSI) {
@@ -356,10 +383,8 @@ static bool softenFunction(Function &F) {
                     if (!sfx) continue;
                     bool isDouble = (sfx[0] == 'd');
 
-                    // 窄整数（i1/i8/i16）源：先扩展到 i32 再走 i32 路径。
-                    // 语义等价：(double)(unsigned char)x == (double)(unsigned int)x。
-                    // 否则后端 DAG legalise 会把 i1 提升、把 uitofp i32→double lower
-                    // 成 __floatunsidf libcall，BPF ISel 拒绝。
+                    // 窄整数源（i1/i8/i16）先扩展到 i32 再走 i32 路径，否则后端 lower
+                    // 成 __floatunsidf libcall 后拒绝。
                     Value *SrcVal = CI->getOperand(0);
                     if (Src->isIntegerTy()) {
                         unsigned bw = Src->getIntegerBitWidth();
@@ -443,10 +468,8 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
-                // fabs/copysign → VM 虚拟指令：musl 体是单条 bitwise and/or，会被
-                //   instcombine 折回同名 intrinsic（@llvm.fabs 等），走 libcall 会自递归
-                //   （fabs 调用自己），故保留在本 pass 走 BPF_FP_*。
-                // fabs：VM 虚拟指令（避免 libcall 自递归）
+                // fabs/copysign：musl 体是单条 bitwise，会被 instcombine 折回同名 intrinsic，
+                // 走 libcall 会自递归（fabs 调用自己），故保留在本 pass 走 BPF_FP_*。
                 if (II->getIntrinsicID() == Intrinsic::fabs) {
                     const char *sfx = suffix(Ty);
                     if (!sfx) continue;
@@ -457,7 +480,6 @@ static bool softenFunction(Function &F) {
                     Changed = true;
                     continue;
                 }
-                // copysign 是二元：VM 虚拟指令（避免 libcall 自递归）
                 if (II->getIntrinsicID() == Intrinsic::copysign) {
                     const char *sfx = suffix(Ty);
                     if (!sfx) continue;
@@ -617,32 +639,24 @@ public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
         if (F.isDeclaration())
             return PreservedAnalyses::all();
-        // 不要软化编译器自带的软浮点库函数（如 __adddf3/__floatsidf/__fixdfdi 等），
-        // 否则会在它们内部无限递归改写。这里用精确后缀判断：这些 runtime helper
-        // 的命名是 libgcc/compiler-rt 的固定集合，特征是「名字里含 sf/df 且以
-        // 数字 2/3 结尾」（如 __adddf3、__floatsidf、__extendsfdf2、__unorddf2）。
-        // 注意不能用 starts_with("__float") 之类——会误伤 musl 内部的
-        // __floatscan/__floatundisf 等同名前缀函数。
+        // 跳过编译器自带的软浮点库函数（__adddf3 等），否则在它们内部无限递归改写。
         if (isSoftFpRuntimeFunc(F.getName()))
             return PreservedAnalyses::all();
         return softenFunction(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
 
 private:
+    // libgcc/compiler-rt 软浮点 runtime 函数全集（sf=单精度，df=双精度，tf=quad，
+    // xf=80-bit）。精确匹配整名，不能用 starts_with("__float")——会误伤 musl 的
+    // __floatscan/__floatundisf 等同名前缀函数。
     static bool isSoftFpRuntimeFunc(StringRef Name) {
-        // libgcc / compiler-rt 软浮点 runtime 函数全集（sf=单精度，df=双精度，
-        // tf=long double/quad，xf=80-bit）。命名约定见 GCC manual「Statements that
-        // affect the runtime」与 LLVM lib/builtins。
         static const char *const SoftFpFuncs[] = {
-            // 算术
             "__addsf3", "__adddf3", "__addtf3", "__addxf3",
             "__subsf3", "__subdf3", "__subtf3", "__subxf3",
             "__mulsf3", "__muldf3", "__multf3", "__mulxf3",
             "__divsf3", "__divdf3", "__divtf3", "__divxf3",
-            // 一元
             "__negsf2", "__negdf2", "__negtf2", "__negxf2",
             "__sqrtf", "__sqrt", "__sqrttf2",
-            // fp -> int (fix)
             "__fixsfsi", "__fixsfdi", "__fixsfti",
             "__fixdfsi", "__fixdfdi", "__fixdfti",
             "__fixtfsi", "__fixtfdi", "__fixtfti",
@@ -651,7 +665,6 @@ private:
             "__fixunsdfsi", "__fixunsdfdi", "__fixunsdfti",
             "__fixunstfsi", "__fixunstfdi", "__fixunstfti",
             "__fixunsxfsi", "__fixunsxfdi", "__fixunsxfti",
-            // int -> fp (float)
             "__floatsisf", "__floatdisf", "__floattisf",
             "__floatsidf", "__floatdidf", "__floattidf",
             "__floatsitf", "__floatditf", "__floattitf",
@@ -660,18 +673,15 @@ private:
             "__floatunsidf", "__floatundidf", "__floatuntidf",
             "__floatunsitf", "__floatunditf", "__floatuntitf",
             "__floatunsixf", "__floatundixf", "__floatuntixf",
-            // 类型转换
             "__extendsfdf2", "__extendsftf2", "__extendsfxf2",
             "__truncdfsf2", "__trunctfsf2", "__truncxfsf2",
             "__trunctfdf2", "__truncxfdf2",
             "__extenddftf2", "__extenddfxf2",
-            // 比较
             "__eqsf2", "__nesf2", "__ltsf2", "__gtsf2", "__lesf2", "__gesf2",
             "__eqdf2", "__nedf2", "__ltdf2", "__gtdf2", "__ledf2", "__gedf2",
             "__eqtf2", "__netf2", "__lttf2", "__gttf2", "__letf2", "__getf2",
             "__eqxf2", "__nexf2", "__ltxf2", "__gtxf2", "__lexf2", "__gexf2",
             "__unordsf2", "__unorddf2", "__unordtf2", "__unordxf2",
-            // 杂项
             "__multi3",
         };
         for (const char *S : SoftFpFuncs)
@@ -687,20 +697,14 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "BpfSoftFp", LLVM_VERSION_STRING,
             [](PassBuilder &PB) {
-                // 运行时机很重要：必须在常量折叠 / instcombine 之后。
-                // 若跑在管道起始处，会把 max_int_length() 里 (bytes*8-1)*0.301+14
-                // 这种浮点常量表达式替换成运行时 call，使其不再可被前端折叠，
-                // 导致依赖它做 VLA 长度的代码（dash expand.c: char buf[len]）
-                // 变成真 VLA，被 BPF 后端拒绝（"unsupported dynamic stack allocation"）。
-                // 放到优化器末尾：此时该折叠的常量已折叠成 ConstantFP/常量，本 pass
-                // 只软化剩下的真运行时浮点指令。
+                // 必须在常量折叠/instcombine 之后：否则会把浮点常量表达式（如 VLA
+                // 长度计算）替换成运行时 call，使其不再可折叠，导致 VLA 退化成真
+                // 动态栈分配被后端拒绝。放到优化器末尾，只软化剩下的真运行时浮点指令。
                 auto addPass = [](ModulePassManager &MPM) {
                     FunctionPassManager FPM;
                     FPM.addPass(BpfSoftFpPass());
                     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
                 };
-                // 有优化的级别（-O1+）：走 optimizer 末尾。
-                // LLVM >= 21 给 OptimizerLastEPCallback 增加了 ThinOrFullLTOPhase 形参。
                 PB.registerOptimizerLastEPCallback(
 #if LLVM_VERSION_MAJOR >= 21
                     [addPass](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
@@ -709,8 +713,8 @@ llvmGetPassPluginInfo() {
 #endif
                         addPass(MPM);
                     });
-                // -O0：没有 optimizer 阶段，只能在管道起始跑。
-                // -O0 不做常量折叠，VLA 本身也不会退化，故无上述风险。
+                // -O0 没有 optimizer 阶段，在 PipelineStartEP 跑（-O0 不做常量折叠，
+                // 无上述风险）。
                 PB.registerPipelineStartEPCallback(
                     [addPass](ModulePassManager &MPM, OptimizationLevel OL) {
                         if (OL == OptimizationLevel::O0)

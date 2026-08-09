@@ -59,7 +59,6 @@ STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-b
     -D_GNU_SOURCE \
     -D_LIBCPP_HAS_THREAD_API_PTHREAD \
     -D_LIBCPP_HAS_MUSL_LIBC \
-    -D_LIBCPP_HAS_NO_INT128 \
     -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
     -D_LIBCPP_BUILDING_LIBRARY \
     -DLIBCXX_BUILDING_LIBCXXABI \
@@ -96,7 +95,7 @@ if [ -d "$LIBCXX_SRC" ]; then
 
     # ryu 浮点格式化算法（charconv.cpp 的浮点 to_chars 调用 __f2s_buffered_n /
     # __d2s_buffered_n / __d2fixed_buffered_n 等）。必须随 charconv 一起编译，否则
-    # 库带未定义引用。ryu 源依赖 -D_LIBCPP_HAS_NO_INT128 走 long long fallback（见下）。
+    # 库带未定义引用。
     for src in "$LIBCXX_SRC"/ryu/*.cpp; do
         b=$(basename "$src")
         clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/ryu_${b%.cpp}.o"
@@ -105,11 +104,6 @@ if [ -d "$LIBCXX_SRC" ]; then
     echo "   [OK] ryu (浮点 to_chars)"
 
     # filesystem 子系统（解锁 <filesystem>）。编译 $LIBCXX_SRC/filesystem/ 下全部 .cpp。
-    # 关键：必须配合 -D_LIBCPP_HAS_NO_INT128（见上 STL_CXX_FLAGS）——BPF 后端 i128 乘法
-    #   已由 BpfSoftFp 支持（BPF_FP_MUL128），但 i128 除法/取模（__divti3/__modti3）仍
-    #   不支持，而 file_clock::rep 默认是 __int128_t，operations.cpp 的 __last_write_time
-    #   会产生 __divti3。定义该宏让 rep 退化为 long long；int128_builtins.cpp 整体被 #if
-    #   包裹，定义后变空 TU（不产 __muloti4 符号，也无冲突）。
     for src in "$LIBCXX_SRC"/filesystem/*.cpp; do
         b=$(basename "$src")
         clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/fs_${b%.cpp}.o"

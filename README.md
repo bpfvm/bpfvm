@@ -64,7 +64,7 @@ sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，�
 
 ### 构建 OpenSSL 3.0（库 + CLI）
 
-`./scripts/build_root.sh openssl` 交叉编译 OpenSSL 3.0：产出 `root/lib/{libcrypto.a,libssl.a}`、`root/lib/{libcrypto.so,libssl.so}`、`root/include/openssl/` 头文件，以及 **`root/bin/openssl` CLI**（OpenSSL 自链的自包含静态 PIE，ssl/crypto/libc 全静态打入，无 DT_NEEDED，直接 `./build/bpfvm root/bin/openssl` 可跑）。Configure 经 `--config=cmake/openssl-bpf.conf` 注入 `bpf-unknown-none` 目标定义（`THIRTY_TWO_BIT` bignum 避开 `__int128`、`sys_id=BPFVM`、`thread_scheme=pthreads`），不改 OpenSSL 源码。
+`./scripts/build_root.sh openssl` 交叉编译 OpenSSL 3.0：产出 `root/lib/{libcrypto.a,libssl.a}`、`root/lib/{libcrypto.so,libssl.so}`、`root/include/openssl/` 头文件，以及 **`root/bin/openssl` CLI**（OpenSSL 自链的自包含静态 PIE，ssl/crypto/libc 全静态打入，无 DT_NEEDED，直接 `./build/bpfvm root/bin/openssl` 可跑）。Configure 经 `--config=cmake/openssl-bpf.conf` 注入 `bpf-unknown-none` 目标定义（`SIXTY_FOUR_BIT_LONG` bignum 启用 `__int128`（经 `BpfSoftFp` 软化）、`sys_id=BPFVM`、`thread_scheme=pthreads`），不改 OpenSSL 源码。
 
 ```bash
 ./scripts/build_root.sh openssl  # → root/lib/{libcrypto,libssl}.{a,so} + root/bin/openssl
@@ -341,7 +341,7 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 **全局构造/析构**：经 `bpfvm-ld` 的 `.init_array`/`.fini_array` 框架支持（见 `src/elf_linker.cpp` 与下文「全局构造/析构」）。有非平凡构造/析构的全局对象可用：构造在 `main` 之前运行（定义序），析构在 `exit` 时运行（逆序，经 `_GLOBAL__sub_I_*` 中注册的 `__cxa_atexit`）。由 `test/test_cpp_ctor.cpp` 验证。
 
 **构建集成**（见 `test/Makefile`）：
-- `test/test_cpp_*.cpp` 自动发现；`CXX_FLAGS` 镜像 C 的 `CC_FLAGS`（相同的 target/CPU/stack-size/isystem/pass-plugin 标志）加上 `-std=c++23 -nostdinc++ -fno-exceptions -frtti` 和 libc++ 绕过宏（`-D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC -D_LIBCPP_HAS_NO_INT128 ...`）。C++ pass 插件（`libBpfWideArgs.so`/`libBpfSoftFp.so`/`libBpfLibcallLower.so`/`libBpfEmutls.so`）随 C 的一起注入。
+- `test/test_cpp_*.cpp` 自动发现；`CXX_FLAGS` 镜像 C 的 `CC_FLAGS`（相同的 target/CPU/stack-size/isystem/pass-plugin 标志）加上 `-std=c++23 -nostdinc++ -fno-exceptions -frtti` 和 libc++ 绕过宏（`-D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC ...`）。C++ pass 插件（`libBpfWideArgs.so`/`libBpfSoftFp.so`/`libBpfLibcallLower.so`/`libBpfEmutls.so`）随 C 的一起注入。
 - C++ 测试链接 `libcxx.a`（静态 `.out`）或 `libcxx.so`（动态 `.linked`），两者均由 `scripts/build_root.sh` 的 `build_libcxx` 产出（`scripts/build_libcxx.sh` → `libcxx.a`；`bpfvm-ld -shared` → `libcxx.so`，`DT_NEEDED libc.so`）。C 测试保持无任何 libcxx 依赖。
 - C++ 测试经 `cmake/RunBpfProgram.cmake` 运行与 C 测试相同的 5 个 ctest 变体。
 - musl `libc.a` **不**提供 C++ ABI 符号（仅 C 式 `__cxa_atexit`/`__cxa_finalize`）；C++ 运行时——`operator new`/`delete`、libc++abi typeinfo vtable + `__dynamic_cast` + `__cxa_*`，以及 libc++ 库本身——来自 `libcxx.a`/`libcxx.so`。

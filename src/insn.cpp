@@ -529,6 +529,41 @@ bool vm::do_softfp(uint32_t call) {
     case BPF_FP_UMULH:
         r(0) = (uint64_t)(__uint128_t(a_bits) * b_bits >> 64);
         return true;
+    // 128 位整数除法/取模：入参 r1=out_hi(ptr) r2=aLo r3=aHi r4=bLo r5=bHi，
+    // 低半返回 r0，高半写入 r1 指向的 8 字节。用宿主 __int128 算；除零返回 0（LLVM
+    // 语义 sdiv/udiv X,0 是 poison，宿主 __int128/0 会 SIGFPE 崩溃 host，故显式拦截）。
+    // 有符号变体用 __int128（C 的 / 和 % 对有符号截断向零，与 LLVM sdiv/srem 一致）。
+    case BPF_FP_UDIV128: case BPF_FP_UREM128:
+    case BPF_FP_SDIV128: case BPF_FP_SREM128: {
+        uint64_t aLo = r(2), aHi = r(3), bLo = r(4), bHi = r(5);
+        uint64_t resLo, resHi;
+        if (bLo == 0 && bHi == 0) {     // 除零：返回 0
+            resLo = 0; resHi = 0;
+        } else if (op == BPF_FP_UDIV128 || op == BPF_FP_UREM128) {
+            __uint128_t a = ((__uint128_t)aHi << 64) | aLo;
+            __uint128_t b = ((__uint128_t)bHi << 64) | bLo;
+            __uint128_t res = (op == BPF_FP_UDIV128) ? a / b : a % b;
+            resLo = (uint64_t)res;
+            resHi = (uint64_t)(res >> 64);
+        } else {
+            // 有符号：高半需符号扩展，先转 int64_t 再扩到 __int128。
+            // 用 int64_t（stdint.h）而非 __int64_t（宿主内部 typedef，BPF 交叉
+            // 编译时未定义，insn.cpp 也编进 bpfvm.bpf）。
+            __int128 a = ((__int128)(int64_t)aHi << 64) | (__uint128_t)aLo;
+            __int128 b = ((__int128)(int64_t)bHi << 64) | (__uint128_t)bLo;
+            __int128 res = (op == BPF_FP_SDIV128) ? a / b : a % b;
+            resLo = (uint64_t)res;
+            resHi = (uint64_t)((__uint128_t)res >> 64);
+        }
+        // 高半写入 guest 内存（out_hi = r1），低半回 r0。
+        if (uint64_t *out = (uint64_t*)mmu_w(r(1), 8)) {
+            *out = resHi;
+        } else {
+            return false;
+        }
+        r(0) = resLo;
+        return true;
+    }
     default:
         r(0) = -ENOSYS;
         return true;

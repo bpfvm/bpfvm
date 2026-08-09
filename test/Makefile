@@ -100,7 +100,6 @@ CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
              -mllvm -bpf-stack-size=16384 -nostdinc \
              -fno-builtin -fno-math-errno -fno-exceptions -frtti \
              -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC \
-             -D_LIBCPP_HAS_NO_INT128 \
              $(if $(LIBCXX_INC),-isystem $(LIBCXX_INC)) \
              -isystem ../root/include/ -isystem ../include \
              -Dthread_local='__attribute__((annotate("emutls")))' \

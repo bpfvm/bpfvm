@@ -165,9 +165,10 @@ build_openssl() {
     #       !OPENSSL_NO_ASM 守卫（no-asm 只定义 OPENSSL_NO_ASM，不定义 OPENSSL_NO_INLINE_ASM）。
     #       这里 undef 它使 __int128 宏分支激活。仅影响预处理宏——asm 源文件列表由 build.info 的
     #       !$disabled{asm} 控制，与 CFLAGS 无关，故不会拉入 x86 asm。
-    # __SIZEOF_INT128__ 全局启用：BpfSoftFp pass 的 i128 标量替换把所有 i128 运算
-    # （mul/add/sub/phi/...，覆盖 bn 的 BN_UMULT_HIGH 与 curve448/curve25519 的域运算）
-    # 分解为 (lo,hi) 对，用原生 64 位 ALU 重写，不再触发 __multi3/__ashlti3 等。
+    # __SIZEOF_INT128__ 全局启用：__int128 的乘/除/模/变量移位由 BpfSoftFp pass 改写
+    # 成虚拟指令软化（BPF_FP_MUL128 / BPF_FP_*DIV128/*REM128 / 拆半移位，覆盖 bn 的
+    # BN_UMULT_HIGH 与 curve448/curve25519 域运算）；add/sub/phi 等其余 i128 运算由
+    # BPF 后端原生拆成 (lo,hi) i64 处理。故不再触发 __multi3/__ashlti3 等。
     local OPENSSL_CFLAGS="${COMMON_CFLAGS//-g/}"
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-fstack-size-section/} -Wno-error=int-conversion"
     OPENSSL_CFLAGS="${OPENSSL_CFLAGS//-bpf-stack-size=16384/-bpf-stack-size=131072}"
