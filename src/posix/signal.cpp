@@ -49,9 +49,9 @@ void PosixSyscall::notify_parent_sigchld() {
 
 void PosixSyscall::stop_process(int sig) {
     // 停止整个线程组（进程级 stop 语义）。三件事：
-    //   1) 设 tg 级停止状态（stopped/stop_sig），waitpid(WUNTRACED) 据此报告 WIFSTOPPED
-    //   2) 组内每个线程设 VM_STOPPED + wakeup(false)：safepoint 见 VM_STOPPED 即 cond_wait
-    //   3) 给父进程投一次 SIGCHLD（去重 stop_reported），让 dash 的 wait/sigsuspend 唤醒
+    //    - 设 tg 级停止状态（stopped/stop_sig），waitpid(WUNTRACED) 据此报告 WIFSTOPPED
+    //    - 组内每个线程设 VM_STOPPED + wakeup(false)：safepoint 见 VM_STOPPED 即 cond_wait
+    //    - 给父进程投一次 SIGCHLD（去重 stop_reported），让 dash 的 wait/sigsuspend 唤醒
     tg->stopped.store(true, std::memory_order_release);
     tg->stop_sig.store(sig, std::memory_order_release);
     std::vector<std::shared_ptr<vm>> to_wake;
@@ -659,7 +659,7 @@ int64_t PosixSyscall::do_signalfd4(vm* v) {
     }
 
     // —— 更新既有 signalfd 的 mask ——
-    // dynamic_cast 判定：非 SignalFd（普通文件/pipe/socket/ProcFile/ProcDir）→ Linux 返回 EINVAL。
+    // dynamic_cast 判定：非 SignalFd -> Linux 返回 EINVAL。
     auto h = ps->find_fd(fd);
     if(!h) {
         return -EBADF;

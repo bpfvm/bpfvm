@@ -10,7 +10,7 @@
 //     SIG_DFL     → 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
 //     已 catch    → handler 返回后被中断的系统调用返回 -1/EINTR
 // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
-// 非 DevFd（HostFd/SignalFd/ProcFile/ProcDir）第一行短路 → 对它们永远放行（无后台门控）。
+// 非 DevFd 第一行短路 -> 对它们永远放行（无后台门控）。
 std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read) {
     auto dfd = std::dynamic_pointer_cast<DevFd>(fd).get();
     GuestTty* tty = dfd ? dfd->guest_tty().get() : nullptr;
@@ -97,7 +97,7 @@ int64_t PosixSyscall::do_write(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    ssize_t rc = h->write(buf, count);  // HostFd::write / ProcFile/ProcDir::write(-EROFS)
+    ssize_t rc = h->write(buf, count);
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
     }
@@ -134,7 +134,7 @@ int64_t PosixSyscall::do_close(vm* v) {
     if(!h) {
         return -EBADF;
     }
-    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（ProcFile/ProcDir 的 on_close 为 no-op）。
+    // pty master fd 关闭且是最后一个 master 引用时触发 SIGHUP（其余 fd 的 on_close 为 no-op）。
     // on_close 在锁外（投 SIGHUP 不能在 fds_mutate 重试循环里）。
     // COW 下别的线程持有的旧快照仍能看到该 fd（host fd 延迟关闭，对齐 Linux file 引用计数语义）。
     h->on_close(this, v);
@@ -266,5 +266,5 @@ int64_t PosixSyscall::do_getdents64(vm* v) {
     if(buf == nullptr) {
         return -EFAULT;
     }
-    return h->getdents64(buf, count);  // HostFd 透传 / ProcDir 填充虚拟条目
+    return h->getdents64(buf, count);
 }

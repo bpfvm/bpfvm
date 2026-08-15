@@ -29,6 +29,8 @@ struct Session;
 struct GuestTty {
     std::atomic<uint64_t> fg_pgrp{0};
     Session* owner_ = nullptr;
+    int ptn = -1;              // host pts 编号（TIOCGPTN）；-1 = 未登记进 /dev/pts 注册表。
+                               // 创建时写一次、之后只读（最后一个 master fd 关闭时按它 erase）。
     GuestTty() = default;
 };
 
@@ -41,7 +43,7 @@ struct PtySide {};
 // Fd —— 多态 fd 基类。
 // 把"host fd 直通"与"/proc 虚拟文件"两种 fd 统一为同一接口，消除 syscall 入口的
 // is_proc() 判空分流：每个 do_* 只保留公共逻辑（指针翻译、EINTR、tty 门控），
-// I/O 动作通过虚方法下沉到 HostFd / ProcFile / ProcDir 各自实现。
+// I/O 动作通过虚方法下沉到 HostFd / ProcFile / VirtualDir 各自实现。
 //
 // 虚方法约定：接收已翻译的 host 指针（不碰 vm/mmu），返回 ssize_t：
 //   >=0 成功字节数（read/write 等），0 = EOF，<0 = 负 errno（如 -EINVAL/-EROFS/-EINTR）。
@@ -70,17 +72,17 @@ struct Fd {
     virtual int fchmod(mode_t mode) { (void)mode; return -EROFS; }
     virtual int futimens(const struct timespec times[2], int flags) { (void)times; (void)flags; return -EROFS; }
 
-    // dup/fork 复制：HostFd ::dup 得独立 host fd；ProcFile/ProcDir 复制快照得独立游标。
+    // dup/fork 复制：HostFd ::dup 得独立 host fd；ProcFile/VirtualDir 复制得独立副本。
     virtual std::shared_ptr<Fd> clone() const = 0;
 
-    // —— host fd 访问（仅 HostFd 有效；ProcFile/ProcDir 返回 -1）——
-    // socket/epoll/mmap/*at 系等纯 host fd 透传场景用此。ProcFile/ProcDir 返回 -1 → host syscall
-    // 自然失败（EBADF），行为与重构前一致。
+    // -- host fd 访问（仅 HostFd 有效；虚拟 fd 返回 -1）--
+    // socket/epoll/mmap/*at 系等纯 host fd 透传场景用此。虚拟 fd 返回 -1 -> host syscall
+    // 自然失败（EBADF）。
     virtual int host_fd() const { return -1; }
 
     // 销毁前副作用（所有 fd 关闭路径在 erase 前统一调）。默认 no-op。
     // DevFd override：pty master 末次关闭时向 ctty 前台组投 SIGHUP
-    // （对齐 Linux pty_close → tty_vhangup）。其余子类（HostFd/SignalFd/ProcFile/ProcDir）
+    // （对齐 Linux pty_close -> tty_vhangup）。其余子类（HostFd/SignalFd/ProcFile/VirtualDir）
     // 用默认 no-op。
     // 约束：不得在持有 fds 锁（fds_mutate 重试循环）时调用——SIGHUP 投递会重入 fd 表。
     // 调用方须先 find_fd 拿到 shared_ptr 快照、退出锁、再调本方法，最后才 erase。
@@ -125,7 +127,7 @@ struct HostFd: Fd {
 // master/slave 区分靠 master_token_ 有无（沿用 PtySide 计数模型，无 enum）：
 //   - pty master（/dev/ptmx）：构造时传 make_shared<PtySide>()，use_count()==1 时关闭触发 SIGHUP。
 //   - pty slave（/dev/pts/N）、/dev/tty 合成端、PTY 初始 stdio：不传 master_token_（slave 关不发 SIGHUP）。
-// master 与 slave 共享同一 GuestTty（经 ptmx_registry，与 HostFd 时代一致）。
+// master 与 slave 共享同一 GuestTty（经 ptmx_registry）。
 struct DevFd: HostFd {
     std::shared_ptr<GuestTty> tty_;                    // 非空 = pty 端（master/slave 共享）
     std::shared_ptr<PtySide> master_token_;            // 非空 = pty master（use_count 计 SIGHUP）
@@ -139,7 +141,7 @@ struct DevFd: HostFd {
     // 比对；TIOCSCTTY 的 session->ctty 绑定也用此 shared_ptr 直接赋值）。
     const std::shared_ptr<GuestTty>& guest_tty() const { return tty_; }
     // /dev/* 严格拦截（不 fallback 到 host openat）：仅调用方已知是 /dev/* 路径时才调本函数。
-    //   /dev/tty、/dev/ptmx、/dev/pts/N —— 合成 DevFd（pty 设备）。
+    //   /dev/tty、/dev/console、/dev/ptmx、/dev/pts/N -- 合成 DevFd（pty/tty 设备）。
     //   /dev/null、/dev/zero、/dev/urandom、/dev/random、/dev/full —— 委托 HostFd::open 开宿主
     //     真设备（不经 chroot 前缀：这些是 bpfvm 进程自身的设备，两模式行为一致）。
     //   其余 /dev/* —— err=-ENOENT（设备抽象封闭，不透传宿主 /dev 目录）。
@@ -188,12 +190,27 @@ struct SignalFd: HostFd {
     bool deliver(const SigEvent& ev);
 };
 
+// VirtualDir -- 虚拟目录 fd（无 host fd，fd=-1），/proc、/dev 等合成目录共用。
+// 持有 (name, d_type) 条目列表，getdents 按 idx 游标切片；lseek（SEEK_SET/SEEK_CUR）
+// 直接读写 idx--idx 即 getdents 写出的 d_off cookie，rewinddir/seekdir 可用。
+// mode 恒 S_IFDIR|0555、size 恒 0（只读虚拟目录）。clone 复制得独立游标。
+struct VirtualDir: Fd {
+    using Entry = std::pair<std::string, unsigned char>;  // name + d_type
+    std::vector<Entry> entries;
+    off_t idx = 0;            // getdents 游标（"."/.. 占 idx 0/1，真实条目从 idx 2 起）
+    VirtualDir(std::string path_, std::vector<Entry> e) { path = std::move(path_); entries = std::move(e); }
+    ssize_t getdents64(void* buf, size_t count) override;
+    off_t lseek(off_t off, int whence) override;
+    int fstatx(struct statx* stx, unsigned int mask, int flags) override;
+    std::shared_ptr<Fd> clone() const override;
+};
+
 // =====================================================================
 // Path —— 路径解析多态基类：把所有"按路径"操作统一到对象上。
 // do_openat/do_readlinkat/do_statx/do_unlinkat/... 先 ResolvePath(self,guest) 拿到对应子类，
 // 再调对应虚方法，不再各自重复 /dev|/proc|host 前缀分发。子类按路径前缀分流：
-//   /proc  → ProcPath（open 经 lookup→ProcFile/ProcDir；readlink/statx/access 经 lookup；修改类返 EROFS）
-//   /dev   → DevPath （open 经 DevFd::open；其余继承 HostPath 走 host）
+//   /proc  -> ProcPath（open 经 lookup->ProcFile/VirtualDir；readlink/statx/access 经 lookup；修改类 EROFS、link/rename EXDEV）
+//   /dev   -> DevPath （合成设备层：open/statx/access/readlink 查 dev_lookup；修改类 EROFS、link/rename EXDEV）
 //   其它   → HostPath（open 经 HostFd::open；readlink/statx/修改类调 host libc）
 // Path 不开 fd、不快照——这些是真正 open 时才做的事。持有：
 //   self  —— PosixSyscall*（ProcPath/DevPath 的 open 等要读进程状态，构造时存进成员）
@@ -207,7 +224,7 @@ struct Path {
     Path(PosixSyscall* s, std::string g);
     virtual ~Path() = default;
 
-    // open：返回已打开的 Fd（ProcFile/ProcDir/DevFd/HostFd），失败返 nullptr 且 errno 已设。
+    // open：返回已打开的 Fd（ProcFile/VirtualDir/DevFd/HostFd），失败返 nullptr 且 errno 已设。
     virtual std::shared_ptr<Fd> open(int flags, mode_t mode) = 0;
     // follow：返回 follow 符号链接后的 guest 路径（给 execve/execveat 用——它们需要真实
     //   可加载文件，而非 /proc 符号链接）。HostPath/DevPath 不穿透，返回自身 guest；
@@ -231,15 +248,21 @@ struct Path {
     virtual int truncate(off_t /*len*/) { return -EROFS; }
     virtual int utimens(const struct timespec /*times*/[2], int /*flags*/) { return -EROFS; }
 
-    // 双路径：本 path=old/src，other=new/dst。默认 -EROFS；HostPath override（任一是 /proc 即 EROFS）。
-    virtual int link(const Path& /*other*/, int /*flags*/) { return -EROFS; }
-    virtual int rename(const Path& /*other*/, unsigned int /*flags*/) { return -EROFS; }
+    // 双路径：本 path=old/src，other=new/dst。默认 -EXDEV（ProcPath 继承：/proc 与 host fs、
+    // /dev 互为独立文件系统，跨界 rename/link 同 Linux 跨挂载点判 EXDEV）；HostPath override。
+    virtual int link(const Path& /*other*/, int /*flags*/) { return -EXDEV; }
+    virtual int rename(const Path& /*other*/, unsigned int /*flags*/) { return -EXDEV; }
 };
 
 
 // 工厂：按 guest 前缀分类返回对应 Path 子类（/proc→ProcPath、/dev→DevPath、其它→HostPath）。
 // host 路径由 self->resolve_path(guest) 算好（含 chroot 前缀）传进 Path。
 std::shared_ptr<Path> ResolvePath(PosixSyscall* self, std::string guest);
+
+// 把 host pty（pts 编号 ptn + 其 GuestTty）登记进 /dev/pts 注册表（可列举、可 open），
+// 并记 ptn 进 GuestTty（最后一个 master fd 关闭时按它 erase，见 DevFd::on_close）。
+// guest open("/dev/ptmx") 与 PTY 模式初始控制终端的登记都走这里。
+void dev_ptmx_register(int ptn, std::shared_ptr<GuestTty> tty);
 
 // HostPath —— host 文件系统路径。open 经 HostFd::open；readlink/statx/access/修改类调 host libc。
 struct HostPath: Path {
@@ -258,17 +281,30 @@ struct HostPath: Path {
     int rename(const Path& other, unsigned int flags) override;              // ::renameat2
 };
 
-// DevPath —— /dev 路径。仅 open 被 DevFd::open 拦截（pty/tty/标准设备）；
-// readlink/statx/access/修改类全部继承 HostPath（与 PathStub 时代语义一致：/dev 交 host）。
+// DevPath -- /dev 合成设备层。按 guest 路径查 dev_lookup（不拼 chroot）：
+//   open -> 目录 VirtualDir；末段符号链接（/dev/std*、/dev/fd）follow target；其余 DevFd::open。
+//   statx/access/readlink -> 按节点类型查 host 绝对路径或合成。
+//   中间段符号链接（/dev/fd/N）经 dev_lookup 的 escape 转 ResolvePath 重解析（同 ProcPath）。
+//   修改类 -> -EROFS；link/rename 继承 HostPath（is_dev -> EXDEV）。
 struct DevPath: HostPath {
     using HostPath::HostPath;
-    std::shared_ptr<Fd> open(int flags, mode_t mode) override;  // DevFd::open(guest,...,self)
+    std::shared_ptr<Fd> open(int flags, mode_t mode) override;                 // DevFd::open + VirtualDir
+    ssize_t readlink(char* buf, size_t bufsiz) override;                       // 符号链接 target
+    int statx(struct statx* stx, unsigned int mask, int flags) override;       // HostChr 查 host / 合成
+    int access(int mode, int flags) override;                                  // HostChr 查 host / 存在即允许
+    int unlink(int /*flags*/) override { return -EROFS; }
+    int mkdir(mode_t /*mode*/) override { return -EROFS; }
+    int symlink(const std::string& /*target*/) override { return -EROFS; }
+    int chmod(mode_t /*mode*/, int /*flags*/) override { return -EROFS; }
+    int truncate(off_t /*len*/) override { return -EROFS; }
+    int utimens(const struct timespec /*times*/[2], int /*flags*/) override { return -EROFS; }
 };
 
-// ProcPath —— /proc 路径。open/readlink/statx/access 查虚拟节点；修改类继承基类 -EROFS。
+// ProcPath -- /proc 路径。open/readlink/statx/access 查虚拟节点；修改类继承基类
+// （link/rename -> EXDEV，其余 EROFS）。
 struct ProcPath: Path {
     using Path::Path;
-    std::shared_ptr<Fd> open(int flags, mode_t mode) override;               // lookup→ProcFile/ProcDir/穿透
+    std::shared_ptr<Fd> open(int flags, mode_t mode) override;               // lookup->ProcFile/VirtualDir/穿透
     std::string follow() override;                                           // 穿透 LinkGen（exe/cwd/root）
     ssize_t readlink(char* buf, size_t bufsiz) override;                     // lookup（跟随符号链接）
     int statx(struct statx* stx, unsigned int mask, int flags) override;     // lookup + 按 mode 填字段

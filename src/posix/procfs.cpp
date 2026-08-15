@@ -89,8 +89,6 @@ struct DirGen: IGen {
 struct ProcFile: Fd {
     off_t pos = 0;            // 读游标（read/readv 推进；pread/lseek 不随之）
     std::string data;         // 构造时的全量快照
-    // 构造即快照：调一次 gen.func() 冻结内容（与旧实现的 fd->data = node->generate() 等价，
-    // 只是挪进构造函数，使 ProcFile 一经构造即可独立 read）。
     ProcFile(std::string path_, FileGen g): data(g.func()) { path = std::move(path_); }
 
     ssize_t read(void* buf, size_t count) override;
@@ -171,105 +169,12 @@ int ProcFile::fstatx(struct statx* stx, unsigned int /*mask*/, int /*flags*/) {
 }
 
 
-// ProcDir —— 虚拟 /proc 目录（无 host fd，fd=-1）。
-// 快照式：构造时调 gen.func() 生成全量子项存进 entries，getdents 按 idx 切片。
-struct ProcDir: Fd {
-    using Entries = std::vector<std::pair<std::string, Gen>>;
-    off_t idx = 0;            // getdents 游标（"."/.. 占 idx 0/1，真实条目从 idx 2 起）
-    Entries entries;
-    ProcDir(std::string path_, DirGen g): entries(make_entries(std::move(g))) { path = std::move(path_); }
-    ssize_t getdents64(void* buf, size_t count) override;
-    int fstatx(struct statx* stx, unsigned int mask, int flags) override;
-    std::shared_ptr<Fd> clone() const override;
-private:
-    // 把 DirGen 返回的 map 转成 vector（保留插入序、可重复 read）。
-    static Entries make_entries(DirGen g) {
-        auto m = g.func();
-        return Entries(m.begin(), m.end());
-    }
-};
-
-// linux_dirent64 布局（host/guest UAPI 二进制兼容）：{u64 d_ino; s64 d_off;
-// u16 d_reclen; u8 d_type; char d_name[];}。d_off 是 telldir cookie——指向"本条目
-// 之后下一项的位置"。本虚拟目录用条目索引作 cookie，语义自洽：lseek 回到某 d_off
-// 即跳到对应条目继续列举（与用 idx 做游标一致），不依赖缓冲区内字节偏移。
-struct proc_linux_dirent64 {
-    uint64_t d_ino;
-    int64_t  d_off;
-    uint16_t d_reclen;
-    uint8_t  d_type;
-    char     d_name[];
-};
-
-// mode_t → d_type：ProcDir::entries 存的是 Gen（节点描述），其 mode() 决定 d_type。
+// Gen 节点描述 -> getdents 的 d_type（供 ProcPath::open 构造 VirtualDir 的 entries）。
 static unsigned char gen_dtype(const Gen& g) {
     mode_t m = g.mode();
     if(S_ISDIR(m))  return DT_DIR;
     if(S_ISLNK(m))  return DT_LNK;
     return DT_REG;
-}
-
-ssize_t ProcDir::getdents64(void* buf, size_t count) {
-    // 用 idx 作目录列举游标。idx 0/1 固定为 "." 和 ".."（与真实 getdents 一致，
-    // 部分 ls/find 实现依赖这两条），idx>=2 映射到 entries[idx-2]。
-    char* cbuf = (char*)buf;
-    size_t bufpos = 0;
-
-    // 内联辅助：往 cbuf+bufpos 写一条目录项，成功写入推进 bufpos 并返回 true，
-    // 缓冲区放不下返回 false（调用方停止，保留当前 idx 供下次继续）。
-    auto emit = [&](size_t cookie, const char* name, unsigned char dtype) -> bool {
-        size_t namelen = strlen(name);
-        size_t reclen = (24 + namelen + 1 + 7) & ~(size_t)7;
-        if(bufpos + reclen > count) return false;  // 缓冲区满，下次继续
-        auto* de = (proc_linux_dirent64*)(cbuf + bufpos);
-        de->d_ino = 1 + cookie;        // 虚拟 inode（与旧版一致，非 0 即可）
-        de->d_off = (off_t)(cookie + 1);  // telldir cookie = 下一项的索引
-        de->d_reclen = (uint16_t)reclen;
-        de->d_type = dtype;
-        memcpy(de->d_name, name, namelen);
-        de->d_name[namelen] = '\0';
-        bufpos += reclen;
-        return true;
-    };
-
-    // "." / ".."
-    if(idx == 0) {
-        if(!emit(0, ".", DT_DIR)) return (ssize_t)bufpos;
-        idx = 1;
-    }
-    if(idx == 1) {
-        if(!emit(1, "..", DT_DIR)) return (ssize_t)bufpos;
-        idx = 2;
-    }
-    // 真实条目
-    for(size_t i = (size_t)idx - 2; i < entries.size(); i++) {
-        size_t cookie = i + 2;
-        if(!emit(cookie, entries[i].first.c_str(), gen_dtype(entries[i].second))) {
-            idx = (off_t)cookie;  // 保留游标到本条目（下次重试）
-            return (ssize_t)bufpos;
-        }
-        idx = (off_t)(cookie + 1);
-    }
-    return (ssize_t)bufpos;      // 0 = EOF（全部读完）
-}
-
-std::shared_ptr<Fd> ProcDir::clone() const {
-    // 复制快照得独立 fd（idx 从 0 起，与 host dup 一致：两 fd 独立 seek 但内容相同）。
-    auto fd = std::make_shared<ProcDir>(*this);
-    fd->idx = 0;
-    return fd;
-}
-
-int ProcDir::fstatx(struct statx* stx, unsigned int /*mask*/, int /*flags*/) {
-    memset(stx, 0, sizeof(*stx));
-    stx->stx_mask = STATX_BASIC_STATS;
-    stx->stx_blksize = 4096;
-    stx->stx_nlink = 1;
-    stx->stx_uid = 0;
-    stx->stx_gid = 0;
-    stx->stx_mode = S_IFDIR | 0555;
-    stx->stx_size = 0;
-    return 0;
 }
 
 
@@ -592,22 +497,18 @@ static Gen lookup(PosixSyscall* self, const std::string& guest_abs, std::string&
 }
 
 // 把符号链接 target 按 POSIX 语义解析成绝对 guest 路径：相对 target 相对 link_path 的
-// 父目录，用 std::filesystem::lexically_normal 规范化（消解 . 和 ..）。
-// 注意 link_path 先 strip 尾斜杠——符号链接本质是文件（/proc/self 是链接，不是目录），
-// 但 path("/proc/self/").parent_path() 会得 "/proc/self"（把尾斜杠当目录语义），错。
+// 父目录（link_path 由 ResolvePath 保证无尾斜杠），用 lexically_normal 规范化（消解 . 和 ..）。
 // readlink 不用此函数（返回原始 target，与 readlink(2) 一致）。
 static std::string resolve_symlink(const std::string& link_path, const std::string& target) {
     if(target.empty()) return {};
     std::filesystem::path resolved = std::filesystem::path(target);
     if(resolved.is_relative()) {
-        std::string base = link_path;
-        while(base.size() > 1 && base.back() == '/') base.pop_back();  // 去尾斜杠
-        resolved = std::filesystem::path(base).parent_path() / target;
+        resolved = std::filesystem::path(link_path).parent_path() / target;
     }
     return resolved.lexically_normal().string();
 }
 
-// open：命中 lookup 即构造 ProcFile/ProcDir（快照式）。/proc 下查不到节点 → ENOENT（设备封闭）。
+// open：命中 lookup 即构造 ProcFile/VirtualDir（快照式）。/proc 下查不到节点 -> ENOENT（设备封闭）。
 std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     std::string escape;
     auto node = lookup(self, guest, escape);
@@ -625,16 +526,21 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
         errno = EROFS;
         return nullptr;
     }
-    // 末段符号链接 follow（O_NOFOLLOW 由 do_openat 提前判 ELOOP，能走到这说明要 follow）。
-    // target 经 resolve_symlink 规范成绝对 guest 路径后，经 ResolvePath 重解析（套 chroot +
-    // 按前缀分发：/proc→procfs、/dev→DevFd、其余→HostFd），其 open 返回真实 fd。
+    // 末段符号链接 follow：O_NOFOLLOW 自查判 ELOOP（do_openat 不看此 flag，虚拟符号链接
+    // 须自查；仅末段，escape 的中间段链接不受影响）。target 经 resolve_symlink 规范成
+    // 绝对 guest 路径后经 ResolvePath 重解析（套 chroot + 按前缀分发），返回真实 fd。
     if(auto link = node.as<LinkGen>()) {
+        if(flags & O_NOFOLLOW) { errno = ELOOP; return nullptr; }
         std::string target = resolve_symlink(guest, (*link)());
         if(target.empty()) { errno = ENOENT; return nullptr; }
         return ResolvePath(self, target)->open(flags, mode);
     }
     if(auto dir = node.as<DirGen>()) {
-        return std::make_shared<ProcDir>(guest, *dir);
+        std::vector<std::pair<std::string, unsigned char>> entries;
+        for(auto& [name, gen] : (*dir)()) {
+            entries.emplace_back(name, gen_dtype(gen));
+        }
+        return std::make_shared<VirtualDir>(guest, std::move(entries));
     }
     if(auto file = node.as<FileGen>()) {
         return std::make_shared<ProcFile>(guest, *file);

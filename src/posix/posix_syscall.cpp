@@ -55,6 +55,8 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
         tty->owner_ = session.get();
         tty->fg_pgrp.store(pgrp->pgid);
         session->ctty = tty;
+        // 控制终端登记进 /dev/pts 注册表（与真实 devpts 一致）。
+        dev_ptmx_register(pty->ptn(), tty);
         ps->fds_mutate([&](SharedState::FdMap& m){
             m.emplace(0, std::make_shared<DevFd>(dup(slave_fd), "", tty));
             m.emplace(1, std::make_shared<DevFd>(dup(slave_fd), "", tty));

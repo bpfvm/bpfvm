@@ -141,6 +141,8 @@ bool Pty::setup(bool enable_pty) {
         close(master);
         return false;
     }
+    // 取 pts 编号（失败保持 -1，仅影响 /dev/pts 列举，不致命）。
+    ioctl(master, TIOCGPTN, &ptn_);
     char* slave_name = ptsname(master);
     if(!slave_name) {
         close(master);

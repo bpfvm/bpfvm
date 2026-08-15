@@ -22,10 +22,10 @@ class SyscallHandler;
 
 // host 接入器 + 信号路由器。两类职责，统一由 pump 线程承载：
 //
-// 1) PTY 字节转发（enable_pty=true）：开一对 host pty（posix_openpt），host stdin/stdout
+//  - PTY 字节转发（enable_pty=true）：开一对 host pty（posix_openpt），host stdin/stdout
 //    经 pump 纯转发到 pty master；guest fd 0/1/2 用 pty slave 包裹。canonical/echo/termios
 //    全交 host 内核的 n_tty，bpfvm 不实现 ldisc。
-// 2) 宿主信号路由（两种模式都做）：SIGINT/SIGQUIT/SIGTSTP/SIGHUP/SIGTERM 经 main 进程级
+//  - 宿主信号路由（两种模式都做）：SIGINT/SIGQUIT/SIGTSTP/SIGHUP/SIGTERM 经 main 进程级
 //    block 后只排队到 signalfd，pump 线程读出后调 sys->host_signal()，在普通线程上下文
 //    完成 guest 侧路由（摆脱 async-signal-safe 约束）。
 //
@@ -37,6 +37,7 @@ class Pty {
     pthread_t pump_thread_ = 0;
     int master_fd_ = -1;             // pump 用的 host pty master（<0 = 非 PTY 模式）
     int slave_fd_ = -1;              // 给 guest fd 0/1/2 的 host pty slave
+    int ptn_ = -1;                   // 本 pty 的 pts 编号（TIOCGPTN），<0 = 非 PTY 模式
     bool tio_saved_ = false;         // 宿主 STDIN 原 termios 是否已保存（setup 时 raw 化）
     struct termios saved_tio_{};     // 宿主 STDIN 原 termios，~Pty 恢复
 
@@ -53,6 +54,9 @@ public:
 
     // 用于判断是否开了真 pty（master >= 0）。init(pid==1) 据此决定 fd 0/1/2 播种方式。
     int& master_fd() { return master_fd_; }
+
+    // pts 编号。init(pid==1) 据此把控制终端登记进 ptmx_registry（/dev/pts 可见可 open）。
+    int ptn() const { return ptn_; }
 
     // init(pid==1) 调用：取走 slave fd（只允许一次）。master 留给 pump。
     // 仅 master_fd >= 0 时有意义。返回 host slave fd。
