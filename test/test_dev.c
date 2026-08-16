@@ -4,8 +4,8 @@
  *   - 标准设备 I/O：/dev/null(写丢弃+读EOF)、/dev/zero(读全零)、/dev/urandom(读非全零)、
  *     /dev/full(写->ENOSPC)。
  *   - stat 一致性：stat("/dev/null") 成功且 S_ISCHR；fstat(opened fd) 同为字符设备。
- *   - std 符号链接：/dev/stdin 等指向 /proc/self/fd/N。bpfvm 的 procfs 未实现该目录，
- *     open follow 得 ENOENT；readlink/lstat(NOFOLLOW) 正常。host 变体 follow 成功。
+ *   - std 符号链接：/dev/stdin 等指向 /proc/self/fd/N。procfs 已实现 [pid]/fd 目录，
+ *     open follow 经 fd 链接重开目标 fd（与 host 一致）；readlink/lstat(NOFOLLOW) 正常。
  *   - readlink：/dev/stdin -> /proc/self/fd/0；/dev/null(非链接) -> EINVAL。
  *   - 目录列举：open("/dev")+getdents64 含 null/zero/ptmx/pts；stat("/dev") 是目录；
  *     lseek 回卷与按 d_off cookie 续读（rewinddir/seekdir 的底层机制）。
@@ -108,28 +108,31 @@ int main(void) {
     if(!S_ISCHR(st.st_mode)) return fail("fstat /dev/null not CHR", 0);
     close(fd);
 
-    /* -- std 符号链接：指向 /proc/self/fd/N。host 有该目录 -> open follow 成功；
-     * bpfvm 的 procfs 未实现 -> follow 得 ENOENT。两变体的 lstat(NOFOLLOW) 都是 S_IFLNK
-     * （/dev 层直接给 target，不依赖 procfs）。 */
-    const char* variant = getenv("BPF_TEST_VARIANT");
-    int is_bpf = !(variant && strcmp(variant, "host") == 0);
-
+    /* -- std 符号链接：指向 /proc/self/fd/N。procfs 已实现 [pid]/fd 目录 -> open follow
+     * 经 fd 链接重开目标 fd（与 host 一致）。例外：stdout 本身是 socket 时（输出被
+     * socket 捕获的运行环境），Linux 对 socket 的 /proc/self/fd 重开报 ENXIO，两变体
+     * 行为一致，此时期望失败。lstat(NOFOLLOW) 都是 S_IFLNK（/dev 层直接给 target）。 */
+    struct stat stio;
+    fstat(1, &stio);
+    int out_reopenable = !S_ISSOCK(stio.st_mode);
+    fstat(2, &stio);
+    int err_reopenable = !S_ISSOCK(stio.st_mode);
     fd = open("/dev/stdout", O_WRONLY);
-    if(is_bpf) {
-        if(fd != -1 || errno != ENOENT) return fail("open /dev/stdout (bpfvm expect ENOENT, procfs has no /proc/self/fd)", errno);
-    } else {
-        if(fd < 0) return fail("open /dev/stdout (host)", errno);
+    if(out_reopenable) {
+        if(fd < 0) return fail("open /dev/stdout", errno);
         const char* m = "DEV_STDOUT_OK\n";
         if(write(fd, m, strlen(m)) != (long)strlen(m)) return fail("write /dev/stdout", errno);
         close(fd);
+    } else {
+        if(fd != -1) return fail("open /dev/stdout should fail on socket stdout", 0);
     }
 
     fd = open("/dev/stderr", O_WRONLY);
-    if(is_bpf) {
-        if(fd != -1 || errno != ENOENT) return fail("open /dev/stderr (bpfvm expect ENOENT)", errno);
-    } else {
-        if(fd < 0) return fail("open /dev/stderr (host)", errno);
+    if(err_reopenable) {
+        if(fd < 0) return fail("open /dev/stderr", errno);
         close(fd);
+    } else {
+        if(fd != -1) return fail("open /dev/stderr should fail on socket stderr", 0);
     }
 
     int fd3 = open("/dev/null", O_RDWR);
@@ -137,14 +140,10 @@ int main(void) {
     char path[32];
     snprintf(path, sizeof(path), "/dev/fd/%d", fd3);
     int fddup = open(path, O_RDWR);
-    if(is_bpf) {
-        if(fddup != -1 || errno != ENOENT) return fail("open /dev/fd/N (bpfvm expect ENOENT)", errno);
-    } else {
-        if(fddup < 0) return fail("open /dev/fd/N (host)", errno);
-        if(fddup == fd3) return fail("open /dev/fd/N returned same fd (not a dup)", 0);
-        if(write(fddup, "x", 1) != 1) return fail("write /dev/fd/N dup", errno);
-        close(fddup);
-    }
+    if(fddup < 0) return fail("open /dev/fd/N", errno);
+    if(fddup == fd3) return fail("open /dev/fd/N returned same fd (not a dup)", 0);
+    if(write(fddup, "x", 1) != 1) return fail("write /dev/fd/N dup", errno);
+    close(fddup);
     /* lstat（NOFOLLOW）不 follow，两种变体都应得符号链接。 */
     struct stat lst;
     if(lstat("/dev/stdin", &lst) != 0) return fail("lstat /dev/stdin", errno);

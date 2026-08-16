@@ -65,6 +65,11 @@ std::vector<std::string> lib_search_dirs_from_envp(const std::map<std::string, s
 // 的 PT_INTERP（/lib/ld-bpf.so）在 rootfs 内可被定位。仅 bpfvm 运行时调用；bpfvm-ld 不调。
 void set_loader_root(const std::string& root);
 
+// 把宿主路径转回 guest 视角路径（剥掉 --root 前缀），用于诊断输出：chroot 模式下诊断
+// 信息会进入 guest 可见 stderr，不能泄漏 root 的宿主绝对路径（如 /home/.../root/bin/ls）。
+// 非 chroot 模式或非 root 前缀开头的路径（如宿主搜索到的 .so）原样返回。
+std::string guest_view(const std::string& host_path);
+
 // 主程序加载结果：除入口地址外，还带 auxv 启动所需的信息（musl/glibc 的
 // __init_tls 靠 AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 program headers 与 TLS）。
 // entry 为 0 表示加载失败；此时 err 给出失败原因（正 errno 值，如 ENOENT/EACCES/ENOEXEC），
@@ -93,7 +98,11 @@ struct ElfLoadInfo {
 // 加载 ELF：有 PT_INTERP 走 ldso 模式（只 mmap 主程序+ldso，依赖加载/重定位由 guest
 // ldso 完成）；否则静态路径（mmap 段，链接期已重定位）。为每个 PT_LOAD 段构造 memmap
 // 并通过 add 回调交给调用方（如 vm::addmem）。返回加载信息（entry 为 0 表失败）。
-ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add,
+// main_fd 为已打开的宿主 fd，借用语义——本函数不关闭它，生命周期归调用方（可安全传
+// VM fd 表内仍在使用的 fd，无须 dup）。加载过程中自行打开的 fd（ldso 等）仍由本函数
+// 关闭。path 不会被打开，仅作诊断输出与 memmap/ElfFile 的路径记录（guest 视角）——
+// 支持路径不可达但 fd 存活的场景（已删文件、经 /proc/self/fd/N 重开的 fd 等）。
+ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)> add,
                      const std::map<std::string, std::string>& envp);
 
 #endif // ELF_LOADER_H

@@ -1,14 +1,13 @@
 /* fexecve() 回归测试。
  *
  * musl 的 fexecve 先试 SYS_execveat(fd,"",argv,envp,AT_EMPTY_PATH)。VM 现已实现
- * AT_EMPTY_PATH：经 fd->path（打开时存的 guest 绝对路径）+ ResolvePath(...)->follow()
- * 穿透 /proc/self/exe 等 /proc 符号链接到真实可加载文件，加载 ELF 替换地址空间。不再依赖
- * /proc/self/fd，也不再返回 ENOSYS。
+ * AT_EMPTY_PATH：直取 fd 表项底层 host fd（dup 出独立 fd）加载 ELF，替换地址空间。
+ * 不走路径重解析，也不依赖 /proc/self/fd，更不会返回 ENOSYS。
  *
  * 两个用例：
  *   -  成功路径：fexecve 一个指向自身 ELF 的 fd（经 /proc/self/exe 取真实 ELF 路径）。
  *      re-exec 后的新映像由哨兵 env（FEXECVE_REEXEC=1）识别，打印 ok 并 exit 0。
- *      覆盖 AT_EMPTY_PATH 实现 + /proc/self/exe follow + 映像替换 + argv/envp 传递。
+ *      覆盖 AT_EMPTY_PATH 实现 + /proc/self/exe open + 映像替换 + argv/envp 传递。
  *   -  优雅降级：fexecve 一个目录 fd（open(".")），目录非 ELF，execveat 返 -ENOEXEC，
  *      fexecve 不替换映像、返 -1 且 errno 被设置。验证关键点：fexecve
  *      【不崩溃、不把 fd 当 path 读导致段错误】。旧行为（execveat 错配到 EXECVE handler）
@@ -40,9 +39,8 @@ int main(void) {
     }
 
     /* —— 用例 1：成功路径 —— */
-    /* /proc/self/exe 是 magic symlink -> 真实 ELF。ProcPath::open 会 follow 到真实 ELF
-     * 路径并 open，得到的 HostFd 的 path 字段即真实 guest 绝对路径——这正是 do_execveat
-     * 的 AT_EMPTY_PATH 分支所读的 fd->path。 */
+    /* /proc/self/exe 是 magic symlink -> 真实 ELF。open 经 ExeLinkGen 直连底层 exe fd
+     * 重开，得到的 HostFd 即 do_execveat 的 AT_EMPTY_PATH 分支直取的 fd 表项。 */
     int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         printf("FAIL: open /proc/self/exe: %s\n", strerror(errno));

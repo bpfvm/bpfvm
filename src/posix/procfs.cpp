@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <map>
+#include <typeinfo>
 
 // =====================================================================
 // make_comm — basename，截断到 15 字节（Linux TASK_COMM_LEN-1）
@@ -81,6 +82,50 @@ struct DirGen: IGen {
 
     mode_t mode() const override { return S_IFDIR; }
     std::map<std::string, Gen> operator()() { return func(); }
+};
+
+// fd 链接 target：有 host fd 的优先读 host 自身 /proc/self/fd/N 的链接 target
+// 无 host fd（ProcFile/VirtualDir 等虚拟 fd）或 host 无 /proc（readlink 失败）时
+// 回退记录的 guest 路径。
+static std::string fd_link_target(const std::shared_ptr<Fd>& f) {
+    if(!f) return {};
+    if(dynamic_cast<const SignalFd*>(f.get())) return "anon_inode:[signalfd]";
+    int hfd = f->host_fd();
+    if(hfd >= 0) {
+        char p[32];
+        snprintf(p, sizeof(p), "/proc/self/fd/%d", hfd);
+        char buf[256];
+        ssize_t n = ::readlink(p, buf, sizeof(buf) - 1);
+        if(n > 0) {
+            return guest_view(std::string(buf, (size_t)n));
+        }
+    }
+    return f->path;
+}
+
+// FdLinkGen —— /proc/[pid]/fd/N 条目：指向目标进程某个已打开 fd 的 magic symlink。
+// 额外持有目标 Fd 快照：open/statx 经它直连底层文件（reopen/fstatx），
+// fd 在 guest 侧 close 后本节点仍存活（对齐 Linux 持 struct file 引用的语义）。
+struct FdLinkGen: LinkGen {
+    std::shared_ptr<Fd> target;   // 目标进程的 fd 快照
+    FdLinkGen(std::shared_ptr<Fd> f)
+        : LinkGen([f] { return fd_link_target(f); }), target(std::move(f)) {}
+};
+
+// ExeLinkGen —— /proc/[pid]/exe 条目：指向目标进程可执行文件的 magic symlink。
+// 持有目标 vm 快照；调用时原子取 image 快照：持快照期间 fd 被钉住（不会与目标退出
+// 关 fd 竞争，对齐 Linux 魔法链接解析期间钉住 struct file），open/statx 直连该 fd，
+// exe 已删除/路径不可达仍可开。目标 run 已退出（image 清空，如僵尸）时报空串 ->
+// ENOENT，对齐 Linux 僵尸 exe_file 已释放的语义。
+struct ExeLinkGen: LinkGen {
+    std::shared_ptr<vm> target;   // 目标 task 快照
+    ExeLinkGen(std::shared_ptr<vm> t)
+        : LinkGen([t] {
+              if(!t || !t->image()) return std::string();
+              auto proc = PosixSyscall::sys(t.get());
+              return proc ? proc->ps->exe_path : std::string();
+          }),
+          target(std::move(t)) {}
 };
 
 // ProcFile —— 虚拟 /proc 文件（无 host fd，fd=-1）。
@@ -348,6 +393,22 @@ static std::string gen_pid_maps(uint64_t pid) {
 }
 
 
+// /proc/[pid]/fd 的内容：目标进程 fd 表快照（ps->fds 是 CLONE_FILES 共享的进程级
+// 状态，[pid] 与 [tid] 视角一致）。每个条目名即 fd 号，值是 FdLinkGen。map 按字典序
+// 输出（"10" 在 "2" 前），与真实 procfs 的数值序不同，但 getdents 消费方（ls/glob/
+// closeall 扫描）不依赖顺序。
+static std::map<std::string, Gen> gen_pid_fd_entries(uint64_t id) {
+    std::map<std::string, Gen> out;
+    auto task_vm = PosixSyscall::find_task(id);
+    if(!task_vm) return out;
+    auto proc = PosixSyscall::sys(task_vm.get());
+    if(!proc) return out;
+    for(const auto& [fdn, h] : *proc->ps->fds_snap()) {
+        out.emplace(std::to_string(fdn), FdLinkGen(h));
+    }
+    return out;
+}
+
 // 进程目录与线程目录**内容完全相同**的条目集（进程级共享数据：mm/fs/argv/envp/挂载）。
 // comm/stat/status 三者两目录语义不同（进程名/tgid vs 线程名/tid），但实现共用（gen_task_*），不在此共享。
 static std::map<std::string, Gen> proc_task_common_entries(pid_t id) {
@@ -358,16 +419,13 @@ static std::map<std::string, Gen> proc_task_common_entries(pid_t id) {
         {"cmdline", FileGen([id]{ return gen_pid_cmdline(id); })},
         {"environ", FileGen([id]{ return gen_pid_environ(id); })},
         {"maps",    FileGen([id]{ return gen_pid_maps(id); })},
+        {"fd",      DirGen([id]{ return gen_pid_fd_entries(id); })},
         {"cwd",     LinkGen([id]{
             auto task_vm = PosixSyscall::find_task(id);
             auto proc = PosixSyscall::sys(task_vm.get());
             return proc ? proc->ps->cwd : std::string();
         })},
-        {"exe",     LinkGen([id]{
-            auto task_vm = PosixSyscall::find_task(id);
-            auto proc = PosixSyscall::sys(task_vm.get());
-            return proc ? proc->ps->exe_path : std::string();
-        })},
+        {"exe",     ExeLinkGen(PosixSyscall::find_task(id))},
     };
 }
 
@@ -521,6 +579,71 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
         errno = ENOENT;   // /proc 下不存在的路径
         return nullptr;
     }
+    // /proc/[pid]/fd/N：magic symlink 直连目标 fd，open = 重开同一文件。
+    // signalfd 等 anon_inode fd Linux 不可重开（EACCES）
+    // 其余（DevFd 保 tty 身份、虚拟 fd 无 host fd）退回 clone():
+    // dup 语义：host fd 共享 offset，但保留类型身份——pty 的 TIOCGPGRP/TIOCSCTTY 语义不丢。
+    if(auto flink = node.as<FdLinkGen>()) {
+        if(flags & O_NOFOLLOW) {
+            errno = ELOOP;
+            return nullptr;
+        }
+        const Fd& tfd = *flink->target;   // 经引用取 typeid，避免 -Wpotentially-evaluated-expression
+        if(typeid(tfd) == typeid(HostFd)) {
+            char p[32];
+            snprintf(p, sizeof(p), "/proc/self/fd/%d", flink->target->host_fd());
+            int nfd = ::openat(AT_FDCWD, p, flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+            if(nfd >= 0) {
+                return std::make_shared<HostFd>(nfd, flink->target->path);
+            }
+            // 失败原因属"重开被拒"（如访问模式提权 EACCES）则如实上抛；仅 host 无
+            // /proc（ENOENT/ENOTDIR）时退回 clone。
+            if(errno != ENOENT && errno != ENOTDIR) return nullptr;
+        }
+        if(dynamic_cast<const SignalFd*>(flink->target.get())) {
+            errno = EACCES;
+            return nullptr;
+        }
+        auto nf = flink->target->clone();
+        if(!nf) return nullptr;   // errno 已由 clone 设（dup 失败 EMFILE 等）
+        // O_TRUNC 仅对可截断文件生效（Linux：pipe 等 FIFO 忽略之），失败 EINVAL/ESPIPE 放行。
+        if(flags & O_TRUNC) {
+            int rc = nf->ftruncate(0);
+            if(rc < 0 && rc != -EINVAL && rc != -ESPIPE) {
+                errno = -rc; 
+                return nullptr; 
+            }
+        }
+        return nf;
+    }
+    // /proc/[pid]/exe：重开目标 vm 持有的 exe fd（host /proc/self/fd/N 形式）
+    // host 无 /proc（ENOENT/ENOTDIR）时退回 open(exe_path)
+    // 僵尸（image 空）判定先于 ETXTBSY：Linux 链接解析失败（proc_pid_get_link）优先于
+    // writecount 检查。一次 image() 快照贯穿判活与取 fd：持快照期间 fd 被钉住，
+    // 不与目标 run() 退出释放引用竞争。
+    if(auto elink = node.as<ExeLinkGen>()) {
+        if(flags & O_NOFOLLOW) {
+            errno = ELOOP;
+            return nullptr;
+        }
+        auto img = elink->target ? elink->target->image() : nullptr;
+        if(!img) {
+            errno = ENOENT;
+            return nullptr;
+        }
+        if(flags & (O_WRONLY | O_RDWR)) {
+            errno = ETXTBSY;
+            return nullptr;
+        }
+        char p[32];
+        snprintf(p, sizeof(p), "/proc/self/fd/%d", img->fd);
+        int nfd = ::openat(AT_FDCWD, p, flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+        if(nfd < 0 && (errno == ENOENT || errno == ENOTDIR)) {
+            nfd = ::open(img->exe.c_str(), flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+        }
+        if(nfd < 0) return nullptr;   // errno 已由 openat/open 设
+        return std::make_shared<HostFd>(nfd, (*elink)());   // path = ps->exe_path（guest 视角）
+    }
     // /proc 整棵只读：任何写/截断访问一律 EROFS（与 Linux 只读 procfs 挂载一致）。
     if(flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND)) {
         errno = EROFS;
@@ -549,19 +672,6 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     return nullptr;
 }
 
-// follow：execve/execveat 用——返回 follow 后的真实可加载文件路径。
-// 中间段符号链接跳出 /proc -> 直接返回 escape（完整 host 路径）；
-// 末段符号链接 -> 返回 resolve_symlink 后的绝对 target；其余返回 guest 自身。
-std::string ProcPath::follow() {
-    std::string escape;
-    auto node = lookup(self, guest, escape);
-    if(!escape.empty()) return escape;
-    if(auto link = node.as<LinkGen>()) {
-        return resolve_symlink(guest, (*link)());
-    }
-    return guest;
-}
-
 ssize_t ProcPath::readlink(char* buf, size_t bufsiz) {
     std::string escape;
     auto node = lookup(self, guest, escape);
@@ -578,13 +688,13 @@ ssize_t ProcPath::readlink(char* buf, size_t bufsiz) {
     }
     // readlink(2) 返回原始 target（不做路径规范化，与内核一致）。
     std::string target = (*node.as<LinkGen>())();
-    if(target.empty()) return -ENOENT;  // 目标进程已退出或 exe_path 未设
+    if(target.empty()) return -ENOENT;  // 目标已失效（进程退出/僵尸）或 exe_path 未设
     size_t n = target.size() < bufsiz ? target.size() : bufsiz;
     memcpy(buf, target.data(), n);
     return (ssize_t)n;
 }
 
-int ProcPath::statx(struct statx* stx, unsigned int /*mask*/, int flags) {
+int ProcPath::statx(struct statx* stx, unsigned int mask, int flags) {
     std::string escape;
     auto node = lookup(self, guest, escape);
     // 中间段符号链接跳出 /proc（如 /proc/1/root/bin）：escape 是完整 host 路径，交给
@@ -596,6 +706,15 @@ int ProcPath::statx(struct statx* stx, unsigned int /*mask*/, int flags) {
         return -ENOENT;
     }
     if(!(flags & AT_SYMLINK_NOFOLLOW)) {
+        if(auto flink = node.as<FdLinkGen>()) {
+            return flink->target->fstatx(stx, mask, flags);
+        }
+        if(auto elink = node.as<ExeLinkGen>()) {
+            // 一次快照贯穿判活与取 fd：持快照期间 fd 被钉住（见 ProcPath::open）。
+            auto img = elink->target ? elink->target->image() : nullptr;
+            if(!img) return -ENOENT;
+            return statx_fd(img->fd, stx, mask);
+        }
         if(auto link = node.as<LinkGen>()) {
             std::string target = resolve_symlink(guest, (*link)());
             if(target.empty()) return -ENOENT;

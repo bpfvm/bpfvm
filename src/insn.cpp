@@ -216,11 +216,14 @@ std::shared_ptr<vm> vm::create() {
     return std::make_shared<vm>(Token{});
 }
 
-ElfLoadInfo vm::load_elf(const char* elf_file_path, const std::map<std::string, std::string>& envp) {
-    auto info = ::load_elf(elf_file_path, [this](memmap&& m) { addmem(std::move(m)); }, envp);
-    // 记录当前加载的镜像信息（entry/load_base/exe）。elf_file_path 是 host 视角路径
+ElfLoadInfo vm::load_elf(int fd, const char* elf_file_path, const std::map<std::string, std::string>& envp) {
+    auto info = ::load_elf(fd, elf_file_path, [this](memmap&& m) { addmem(std::move(m)); }, envp);
+    // fd 所有权交接见 elf_loader.h（借用）与 vmImage::fd（析构关）：成功构造 image 存入，
+    // 失败立即关（exec 流程的 fresh 不跑 run()，不关就泄漏）。
     if(info.entry != 0) {
-        vmImage = {info.entry, info.app_load_base, elf_file_path};
+        set_image(std::make_shared<vmImage>(info.entry, info.app_load_base, elf_file_path, fd));
+    } else {
+        close(fd);
     }
     return info;
 }
@@ -1428,6 +1431,9 @@ uint64_t vm::run() {
     }
     flags.fetch_or(VM_EXITED, std::memory_order_release);
     pthread_cond_broadcast(&wait_cv);
+    // 释放本 vm 的镜像引用：僵尸态发布（run 已退、vm 仍活）——ExeLinkGen 判空报
+    // ENOENT；共享该 image 的 fork 子 vm 不受影响（引用计数，对齐 exe_file）。
+    set_image(nullptr);
     return r(0);
 }
 
@@ -1435,8 +1441,10 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
     this->options = *options;
     insn_count = 0;
     interp_insns = 0;
+    uint64_t entry = 0;
+    if(auto img = image()) entry = img->entry;
     if(options->verbose) {
-        printf("entry: 0x%lx\n", (unsigned long)vmImage.entry);
+        printf("entry: 0x%lx\n", (unsigned long)entry);
     }
 
     // setup_stack 接收 map（key->value），内部拼成 "KEY=VALUE" 写入栈。
@@ -1444,7 +1452,7 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         return 0;
     }
     flags.fetch_and(~(VM_EXITED | VM_KILLED), std::memory_order_release);
-    pc_ = vmImage.entry;
+    pc_ = entry;
     if(!mmu(pc_)) {
         std::cerr << "[run] pc is null after mmu(entry)\n";
         return 0;

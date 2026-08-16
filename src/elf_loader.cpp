@@ -47,11 +47,7 @@ void set_loader_root(const std::string& root) {
     }
 }
 
-// 把宿主路径（load_elf 实际打开的、拼了 root 前缀的路径）转回 guest 视角路径，用于诊断输出。
-// chroot 模式下诊断信息会进入 guest 可见的 stderr，不能泄漏 root 的宿主绝对路径
-// （如 /home/user/.../root/bin/ls）——剥掉 g_loader_root 前缀后只显示 guest 看到的 /bin/ls。
-// 非 chroot 模式原样返回。非 root 前缀开头的路径（如宿主搜索到的 .so）也原样返回。
-static std::string guest_view(const std::string& host_path) {
+std::string guest_view(const std::string& host_path) {
     if (g_loader_root.empty()) return host_path;
     if (host_path == g_loader_root) return "/";
     const std::string prefix = g_loader_root + "/";
@@ -301,7 +297,8 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
         close(ldso_fd);
         return fail(ENOEXEC);
     }
-    // opened 存 fd（由 load_elf 的 defer_close 统一关闭）；首元素 = 占位（main fd 由 load_elf 关）。
+    // opened 存 loader 自己打开的 fd（ldso 等），由 load_elf 的 defer_close 统一关闭；
+    // main_fd 是调用方的，不入此表。
     opened.push_back({ldso_fd, ldso_fd});
 
     // 地址分配 + 段布局：主程序（elves[0]）+ ldso（elves[1]），都按 ET_DYN PIE 分配。
@@ -350,26 +347,20 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
     return ElfLoadInfo{entry, phdr_addr, main_ef.ehdr.e_phentsize, main_ef.ehdr.e_phnum, ldso_base, app_entry, load_base[0]};
 }
 
-ElfLoadInfo load_elf(const char* path, std::function<void(memmap&&)> add,
+// fd 入参：借用语义（声明处注释见 elf_loader.h）。
+ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)> add,
                      const std::map<std::string, std::string>& envp) {
     // 加载 ET_EXEC（静态，固定地址）或 ET_DYN（PIE 主程序 / .so，运行时分配地址）。
     // 运行时处理 .rela.dyn（数据/lddw 重定位）和 .rela.plt（GOT 槽）。
-    int main_fd = open(path, O_RDONLY);
-    if (main_fd < 0) {
-        std::cerr << "Failed to open: " << guest_view(path) << ": " << strerror(errno) << std::endl;
-        // 文件不存在/无权限等：传真实 errno（ENOENT/EACCES...），让 execve 报准。
-        return fail(errno);
-    }
     Elf64_Ehdr ehdr;
     const char* err_reason = nullptr;
     if (!read_ehdr(main_fd, ehdr, err_reason)) {
         std::cerr << "Failed to open ELF file: " << guest_view(path)
                   << " (" << err_reason << ")" << std::endl;
-        close(main_fd);
         return fail(ENOEXEC);
     }
-    // opened：存待关闭的 fd，Defer 统一关闭。
-    std::vector<std::pair<int, int>> opened = {{main_fd, main_fd}};
+    // opened：存本函数（含 ldso 路径）打开的待关闭 fd，Defer 统一关闭；main_fd 不在内。
+    std::vector<std::pair<int, int>> opened;
     Defer defer_close([&]() {
         for (auto& [_, fd] : opened) { if (fd >= 0) close(fd); }
     });

@@ -42,9 +42,12 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     if (dirfd == AT_FDCWD && (flags & AT_EMPTY_PATH)) {
         return -EINVAL;   // AT_EMPTY_PATH 需要有效 dirfd，不能是 AT_FDCWD
     }
-    // 常规路径：dirfd+path 解析 + 符号链接穿透 + chroot 前缀。
-    if(dirfd != AT_FDCWD && !ps->find_fd(dirfd)) {
-        return -EBADF;
+    std::shared_ptr<Fd> dirfd_entry;
+    if(dirfd != AT_FDCWD) {
+        dirfd_entry = ps->find_fd(dirfd);
+        if(!dirfd_entry) {
+            return -EBADF;
+        }
     }
 
     std::vector<std::string> argv_strings;
@@ -63,29 +66,39 @@ int64_t PosixSyscall::do_execveat(vm* v) {
             envp_map[e.substr(0, eq)] = e.substr(eq + 1);
         }
     }
-    std::string guest_abs;
+    // 打开可执行文件（符号链接穿透；/proc 魔法链接直连底层 fd，已删文件仍可加载）。
+    std::shared_ptr<Fd> exe_file;
     if(flags & AT_EMPTY_PATH) {
-        auto fd = ps->find_fd(dirfd);
-        if(!fd || fd->path.empty()) {
-            return -EBADF;
+        int hfd = dirfd_entry->host_fd();
+        if(hfd < 0) {
+            return -EACCES;   // 虚拟 fd（/proc 文件、合成目录）无底层文件，非可执行
         }
-        guest_abs = ResolvePath(this, guest_abs_path(fd->path))->follow();
+        int d = ::dup(hfd);
+        if(d < 0) {
+            return -errno;
+        }
+        exe_file = std::make_shared<HostFd>(d, dirfd_entry->path);
     } else {
-        // follow 符号链接后取真实 guest 路径（/proc/self/exe->/bin/busybox 等），再拼 chroot 前缀
-        guest_abs = ResolvePath(this, guest_abs_path(path, dirfd))->follow();
+        exe_file = ResolvePath(this, guest_abs_path(path, dirfd))->open(O_RDONLY, 0);
     }
+    auto exe = std::dynamic_pointer_cast<HostFd>(exe_file);
+    if(!exe) {
+        if(exe_file) errno = EACCES;   // 目录/虚拟节点（/proc 文件等）非可执行
+        return -errno;
+    }
+    std::string guest_abs = exe->path;
     std::string host_path = guest_abs;
     if(!ps->root.empty()) {
         host_path = std::filesystem::path(ps->root + guest_abs).lexically_normal().string();
     }
 
     // 加载 ELF 并替换整个 guest 地址空间为新程序。
-    //   host_path   —— 传给 load_elf 的宿主路径（已含 chroot 前缀）。
+    //   host_path   —— 记录用宿主路径（已含 chroot 前缀），记进 image()->exe。
     //   guest_abs   —— guest 视角 exe 路径（写进 ps->exe_path，/proc/self/exe 目标；派生 comm）。
     auto fresh = vm::create();
     options(fresh.get()).stack_limit = options(v).stack_limit;
     options(fresh.get()).raw_stack   = options(v).raw_stack;
-    ElfLoadInfo load_info = fresh->load_elf(host_path.c_str(), envp_map);
+    ElfLoadInfo load_info = fresh->load_elf(exe->release_fd(), host_path.c_str(), envp_map);
     if(load_info.entry == 0) {
         // load_elf 失败时 err 给出精确原因（ENOENT/EACCES/ENOEXEC...），未设置则回退 ENOEXEC。
         return load_info.err ? -load_info.err : -ENOEXEC;
@@ -136,7 +149,9 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
     comm_ = make_comm(guest_abs);
-    v->image() = fresh->image();
+    // exec 换镜像：整体替换为新 image（fresh 自己那份引用由其析构自动减）。旧 image
+    // 引用归零时关旧 fd（对齐 Linux exec 换 mm->exe_file）。
+    v->set_image(fresh->image());
     {
         std::lock_guard<std::mutex> lock(*maps_mutex(v));
         maps(v).swap(maps(fresh.get()));
@@ -186,7 +201,9 @@ int64_t PosixSyscall::do_clone(vm* v) {
 
     auto child = vm::create();
     options(child.get()) = options(v);
-    child->image() = v->image();
+    // 子 vm 共享父的 image 引用（对齐 fork 的 exe_file 引用计数 +1）：父子各自
+    // run() 退出时只减自己的引用，归零（都退出/都 exec 掉）才关 fd。
+    child->set_image(v->image());
     /* CLONE_THREAD 是新线程，不在任何信号处理上下文 -> signal_depth=0。
      * 非 CLONE_THREAD（如 fork / 裸 clone 新进程）继承父 signal_depth，
      * 与 fork 语义一致（fork 复制整个执行状态）。 */

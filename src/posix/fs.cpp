@@ -90,16 +90,28 @@ ssize_t HostFd::getdents64(void* buf, size_t count) {
     return rc;
 }
 
+// 裸 statx 的平台适配原语（Android bionic 无 statx wrapper，走 SYS_statx 直调），
+// 全文件唯一的 __ANDROID__ 守卫。参数序同 statx(2)。
+static int statx_raw(int dirfd, const char* path, int flags, unsigned int mask,
+                     struct statx* stx) {
+#if defined(__ANDROID__)
+    int rc = (int)::syscall(SYS_statx, dirfd, path, flags, mask, stx);
+#else
+    int rc = ::statx(dirfd, path, flags, mask, stx);
+#endif
+    return rc == -1 ? -errno : 0;
+}
+
+// statx 的 fd 形态（= fstat）：dirfd=fd + 空 path + AT_EMPTY_PATH。
+int statx_fd(int fd, struct statx* stx, unsigned int mask) {
+    return statx_raw(fd, "", AT_EMPTY_PATH, mask, stx);
+}
+
 int HostFd::fstatx(struct statx* stx, unsigned int mask, int /*flags*/) {
     // fstat 语义：始终 AT_EMPTY_PATH + 空 path，对 fd 自身的 inode 取属性（与内核
     // fstat(fd) == statx(fd,"",AT_EMPTY_PATH) 等价）。flags 参数（如 AT_SYMLINK_NOFOLLOW）
     // 对 fd 形式无意义——fd 已是 follow 后的结果，不可能是符号链接本身。
-#if defined(__ANDROID__)
-    int rc = (int)::syscall(SYS_statx, fd_, "", AT_EMPTY_PATH, mask, stx);
-#else
-    int rc = ::statx(fd_, "", AT_EMPTY_PATH, mask, stx);
-#endif
-    return rc == -1 ? -errno : 0;
+    return statx_fd(fd_, stx, mask);
 }
 
 int HostFd::ftruncate(off_t len) {
@@ -252,9 +264,17 @@ void DevFd::on_close(PosixSyscall* self, vm* v) {
     }
 }
 
+// 先经 HostFd::fstatx 填全字段（blksize/ino 等），再覆写 mode。ioctl 不受影响（按
+// dynamic_pointer_cast<SignalFd> 识别，与 fstat 形态无关）。
+int SignalFd::fstatx(struct statx* stx, unsigned int mask, int flags) {
+    int rc = HostFd::fstatx(stx, mask, flags);
+    if(rc == 0) stx->stx_mode = 0600;
+    return rc;
+}
+
+// fork 复制：为子新建独立 pipe（写端 O_NONBLOCK），mask 复制自父。子读端不能
+// 指向父同一 pipe——否则父子读到对方 pending 的信号，破坏 Linux task-pending 语义。
 std::shared_ptr<Fd> SignalFd::clone() const {
-    // fork 复制：为子新建独立 pipe（写端 O_NONBLOCK），mask 复制自父。子读端不能
-    // 指向父同一 pipe——否则父子读到对方 pending 的信号，破坏 Linux task-pending 语义。
     // cloexec 不复制（由调用方按需设置，与 dup 语义一致）。
     int p[2];
     if(pipe2(p, 0) < 0) {
@@ -343,8 +363,7 @@ static std::optional<DevInfo> dev_lookup(const std::string& guest_abs, std::stri
     }
 
     // /dev/fd 指向目录，走它取子项（/dev/fd/N，进程替换/按 fd 重开）是真实用法：按中间段
-    // 链接语义 follow，target+剩余段经 escape 交回调用方重解析（/dev/fd/3 ->
-    // /proc/self/fd/3，procfs 未实现则终点 ENOENT）。
+    // 链接语义 follow，target+剩余段经 escape 交回调用方重解析（/dev/fd/3 -> /proc/self/fd/3）。
     if(guest_abs.rfind("/dev/fd/", 0) == 0) {
         escape = dev_nodes.at("/dev/fd").link + guest_abs.substr(strlen("/dev/fd"));
         return std::nullopt;
@@ -513,12 +532,7 @@ ssize_t HostPath::readlink(char* buf, size_t bufsiz) {
 }
 
 int HostPath::statx(struct statx* stx, unsigned int mask, int flags) {
-#if defined(__ANDROID__)
-    int rc = (int)::syscall(SYS_statx, AT_FDCWD, host.c_str(), flags, mask, stx);
-#else
-    int rc = ::statx(AT_FDCWD, host.c_str(), flags, mask, stx);
-#endif
-    return rc == -1 ? -errno : 0;
+    return statx_raw(AT_FDCWD, host.c_str(), flags, mask, stx);
 }
 
 int HostPath::access(int mode, int flags) {
@@ -591,7 +605,7 @@ std::shared_ptr<Fd> DevPath::open(int flags, mode_t mode) {
         // O_NOFOLLOW：末段是符号链接，按 open(2) 判 ELOOP（do_openat 不看此 flag，
         // 虚拟符号链接须自查）。
         if(flags & O_NOFOLLOW) { errno = ELOOP; return nullptr; }
-        // follow target（/proc/self/fd[N]，经 ResolvePath 重解析；procfs 未实现该目录 -> ENOENT）。
+        // follow target（/proc/self/fd/N，经 ResolvePath 重解析）。
         return ResolvePath(self, info->link)->open(flags, mode);
     }
     // 其余（HostChr/未命中）交 DevFd::open。
@@ -626,12 +640,7 @@ int DevPath::statx(struct statx* stx, unsigned int mask, int flags) {
     if(!info) return -ENOENT;
     if(info->kind == DevInfo::HostChr) {
         // host 真实设备：绝对路径 stat（不拼 chroot），拿真实 rdev/dev/mode。
-#if defined(__ANDROID__)
-        int rc = (int)::syscall(SYS_statx, AT_FDCWD, guest.c_str(), flags, mask, stx);
-#else
-        int rc = ::statx(AT_FDCWD, guest.c_str(), flags, mask, stx);
-#endif
-        return rc == -1 ? -errno : 0;
+        return statx_raw(AT_FDCWD, guest.c_str(), flags, mask, stx);
     }
     if(info->kind == DevInfo::Dir) {
         // /dev、/dev/pts 合成目录。
@@ -654,7 +663,7 @@ int DevPath::statx(struct statx* stx, unsigned int mask, int flags) {
         stx->stx_size = info->link.size();
         return 0;
     }
-    // follow：重解析 target（procfs 未实现 /proc/self/fd -> ENOENT，与 open 一致）。
+    // follow：重解析 target（/proc/self/fd/N）。
     return ResolvePath(self, info->link)->statx(stx, mask, flags);
 }
 

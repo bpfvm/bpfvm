@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <unistd.h>
 #include <sys/mman.h>
 
 extern std::mutex log_mutex;
@@ -183,10 +184,19 @@ public:
 //   entry：程序入口
 //   load_base：主程序 PIE 加载基址。静态/ET_EXEC 为 0；
 //   exe：host 视角绝对路径（= load_elf 的入参）。
+//   fd：exe 的宿主 fd，由 ~vmImage 关闭（唯一关闭点）。对象经 shared_ptr 引用计数
+//       管理：vm 持有一份，fork 的子 vm 共享同一对象（对齐 Linux exe_file 引用计数），
+//       exec 整体替换新对象（旧 fd 随引用归零关闭）。发布后字段不可变，跨线程读经
+//       vm::image() 原子快照——持快照期间 fd 被钉住，不会被告方关闭（procfs 魔法链接
+//       直连依赖此保证）。路径已删/不可达时仍可从 fd 读内容。
 struct vmImage {
     uint64_t entry = 0;
     uint64_t load_base = 0;
     std::string exe;
+    int fd = -1;
+    vmImage(uint64_t entry_, uint64_t base_, std::string exe_, int fd_)
+        : entry(entry_), load_base(base_), exe(std::move(exe_)), fd(fd_) {}
+    ~vmImage() { if(fd >= 0) close(fd); }
 };
 
 struct vmOptions {
@@ -315,7 +325,7 @@ class vm: public std::enable_shared_from_this<vm> {
 private:
     TlbEntry tlb[TLB_SIZE]{};
     vmOptions options;
-    struct vmImage vmImage;
+    AtomicSharedPtr<const vmImage> image_;
     uint64_t pc_;
     uint64_t reg[11];
     std::shared_ptr<std::vector<memmap>> maps = std::make_shared<std::vector<memmap>>();
@@ -427,7 +437,9 @@ public:
     // clear_blocked=true：清 VM_BLOCKED，wait_for 返回 0（正常唤醒，如 futex_wake / IO 完成）。
     // clear_blocked=false：保留 VM_BLOCKED，仅 broadcast 让 waiter 重判信号 flag 而返回 -EINTR
     void wakeup(bool clear_blocked);
-    ElfLoadInfo load_elf(const char* elf_file_path, const std::map<std::string, std::string>& envp);
+    // fd 所有权交 vm：成功构造 vmImage 存入（fd 由 ~vmImage 关），失败立即 close。
+    // elf_file_path 仅作诊断与 image()->exe 记录，不会被打开。
+    ElfLoadInfo load_elf(int fd, const char* elf_file_path, const std::map<std::string, std::string>& envp);
     void addmem(memmap&& memmap);
     bool unmap(uint64_t addr);
     void flush_tlb();
@@ -441,8 +453,14 @@ public:
     std::shared_ptr<SyscallHandler> sys() {
         return options.sys;
     }
-    struct vmImage& image() {
-        return vmImage;
+    // 镜像快照：原子取当前引用（可能为空）。持快照期间对象存活、字段不变、fd 被钉住，
+    // 跨线程读安全。判空即僵尸态（run() 退出时清空，procfs ExeLinkGen 据此报 ENOENT）。
+    std::shared_ptr<const vmImage> image() const {
+        return image_.load();
+    }
+    // 整体替换镜像（exec 加载完成 / fork 共享父引用）。旧 image 引用归零时关旧 fd。
+    void set_image(std::shared_ptr<const vmImage> img) {
+        image_.store(std::move(img));
     }
 
     uint32_t get_flags() const { return flags.load(std::memory_order_acquire); }

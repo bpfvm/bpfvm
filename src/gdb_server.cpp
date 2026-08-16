@@ -441,7 +441,7 @@ std::function<void(vm*, uint32_t)> GdbServer::make_syscall_cb(bool is_entry) {
             auto it = tasks_.find(v->sys()->id());
             if(it != tasks_.end() && report_exec_events_) {
                 it->second.breakpoints.clear();  // 旧程序地址空间已失效
-                it->second.exec_path = v->image().exe;  // 宿主路径（GDB open 用）
+                it->second.exec_path = v->image()->exe;  // 宿主路径（GDB open 用）
                 v->set_flags(vm::VM_DEBUG_STOP);  // 停新程序首条指令（all-stop 协调要求）
                 return;  // debug_park：停住等 GDB continue
             }
@@ -911,7 +911,7 @@ void GdbServer::server_loop() {
         return;
     }
     std::fprintf(stderr, "[gdb] listening on 127.0.0.1:%u (entry=0x%lx)\n",
-                 port_, (unsigned long)main_vm->image().entry);
+                 port_, (unsigned long)main_vm->image()->entry);
 
     // 外层 accept 循环：每来一个 GDB 连接就是一次会话，会话结束（断开 / detach all）后 detach
     // 并回 accept 等下次连接——支持重复 attach。单线程 accept 串行化保证同时只服务一个会话
@@ -1041,7 +1041,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
             // +偏移重定位到运行时地址，否则 PIE 断点命中不了（文件内 main@0xbc728 vs
             // 运行时 0x401ce728）。静态/ET_EXEC 的 load_base 为 0。
             // 注意值是纯十六进制，不能带 0x 前缀（GDB 报 "Invalid hex digit"）。
-            uint64_t base = current_vm->image().load_base;
+            uint64_t base = current_vm->image()->load_base;
             char buf[64];
             std::snprintf(buf, sizeof(buf), "Text=%lx;Data=%lx;Bss=%lx",
                           (unsigned long)base, (unsigned long)base, (unsigned long)base);

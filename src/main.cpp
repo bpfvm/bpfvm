@@ -8,6 +8,7 @@
 #include <libgen.h>
 #include <getopt.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -153,7 +154,12 @@ int real_main(int argc, char** argv) {
     auto vm = vm::create();
     // load_elf 从 envp 解析 LD_LIBRARY_PATH 做库搜索；extra_envp 是 map（key->value），
     // load_elf 直接消费，无需展平。
-    ElfLoadInfo load_info = vm->load_elf(elf_path.c_str(), extra_envp);
+    int elf_fd = open(elf_path.c_str(), O_RDONLY);
+    if(elf_fd < 0) {
+        std::cerr << "Failed to open: " << guest_view(elf_path) << ": " << strerror(errno) << std::endl;
+        return 1;
+    }
+    ElfLoadInfo load_info = vm->load_elf(elf_fd, elf_path.c_str(), extra_envp);
     if(load_info.entry == 0) {
         return 1;
     }

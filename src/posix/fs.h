@@ -92,10 +92,13 @@ struct Fd {
 // HostFd —— host fd 直通（普通文件/pipe/socket）。
 // 各 I/O 虚方法直接调 host libc 同名函数。不含任何 tty/pty 语义（设备 fd 见 DevFd）。
 struct HostFd: Fd {
-    const int fd_;                                     // host fd（>=0）
+    int fd_;                                             // host fd（>=0；release_fd 后 -1）
     explicit HostFd(int fd, std::string path_ = {})
         : fd_(fd) { path = std::move(path_); }
     ~HostFd() override { if(fd_ >= 0) close(fd_); }
+
+    // 偷走 host fd：返回 fd_ 并置 -1，析构不再关闭。所有权转移给调用方（execve 加载用）。
+    int release_fd() { int f = fd_; fd_ = -1; return f; }
 
     ssize_t read(void* buf, size_t count) override;
     ssize_t write(const void* buf, size_t count) override;
@@ -183,6 +186,8 @@ struct SignalFd: HostFd {
     ssize_t writev(const struct iovec* iov, int iovcnt) override { (void)iov; (void)iovcnt; return -EINVAL; }
     ssize_t pread(void* buf, size_t count, off_t off) override { (void)buf; (void)count; (void)off; return -ESPIPE; }
     int ftruncate(off_t len) override { (void)len; return -EINVAL; }
+    // fstat 报 Linux 的 anon_inode 形态：mode 仅权限位 0600、无类型位（S_IFMT=0）。
+    int fstatx(struct statx* stx, unsigned int mask, int flags) override;
 
     // 投递：sig 在 mask 内则构造 signalfd_siginfo 写 pipe，返回 true（已消费）。
     // pipe 满（EAGAIN）/已关闭（EBADF）静默忽略，与 Linux signalfd 溢出语义一致。
@@ -226,11 +231,6 @@ struct Path {
 
     // open：返回已打开的 Fd（ProcFile/VirtualDir/DevFd/HostFd），失败返 nullptr 且 errno 已设。
     virtual std::shared_ptr<Fd> open(int flags, mode_t mode) = 0;
-    // follow：返回 follow 符号链接后的 guest 路径（给 execve/execveat 用——它们需要真实
-    //   可加载文件，而非 /proc 符号链接）。HostPath/DevPath 不穿透，返回自身 guest；
-    //   ProcPath override：命中 LinkGen（/proc/<pid>/{exe,cwd,root}）返回目标 guest 路径，
-    //   其余（文件/目录/符号链接跳出 /proc）返回 escape 或自身 guest。
-    virtual std::string follow() { return guest; }
     // readlink：把目标写入 buf（按 bufsiz 截断，不含 NUL，与 readlink(2) 一致）。
     //   返回写入字节数（>=0=成功）；<0=负 errno（ENOENT=目标进程已退出；EINVAL=非符号链接；...）。
     virtual ssize_t readlink(char* buf, size_t bufsiz) = 0;
@@ -258,6 +258,10 @@ struct Path {
 // 工厂：按 guest 前缀分类返回对应 Path 子类（/proc->ProcPath、/dev->DevPath、其它->HostPath）。
 // host 路径由 self->resolve_path(guest) 算好（含 chroot 前缀）传进 Path。
 std::shared_ptr<Path> ResolvePath(PosixSyscall* self, std::string guest);
+
+// 对裸 host fd 取属性（statx 的 fd 形态 = fstat；HostFd::fstatx 与 procfs 魔法链接
+// 直连 fd 的 statx 共用。Android 的 SYS_statx 直调差异收敛在实现内部）。
+int statx_fd(int fd, struct statx* stx, unsigned int mask);
 
 // 把 host pty（pts 编号 ptn + 其 GuestTty）登记进 /dev/pts 注册表（可列举、可 open），
 // 并记 ptn 进 GuestTty（最后一个 master fd 关闭时按它 erase，见 DevFd::on_close）。
@@ -305,7 +309,6 @@ struct DevPath: HostPath {
 struct ProcPath: Path {
     using Path::Path;
     std::shared_ptr<Fd> open(int flags, mode_t mode) override;               // lookup->ProcFile/VirtualDir/穿透
-    std::string follow() override;                                           // 穿透 LinkGen（exe/cwd/root）
     ssize_t readlink(char* buf, size_t bufsiz) override;                     // lookup（跟随符号链接）
     int statx(struct statx* stx, unsigned int mask, int flags) override;     // lookup + 按 mode 填字段
     int access(int mode, int flags) override;                                // lookup 存在性

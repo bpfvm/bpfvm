@@ -45,7 +45,7 @@
 // ── exec 跟踪 ──
 // 协商 exec-events+ 后，execveat 替换地址空间后该 vm 停下并上报 T05exec:<hex-host-path>，
 // GDB 据此重载符号、重插断点（新程序地址空间与旧断点无关，旧断点位置已失效）。路径用宿主视角
-// 绝对路径（v->image().exe，load_elf 设置）——GDB 在宿主机跑、用它 open 文件读符号，chroot 模式
+// 绝对路径（v->image()->exe，load_elf 设置）——GDB 在宿主机跑、用它 open 文件读符号，chroot 模式
 // 下宿主路径与 guest 视角路径不同。复用 syscall_return 钩子检测（execveat 成功即 r(0)==0 时），
 //
 // ── all-stop ──

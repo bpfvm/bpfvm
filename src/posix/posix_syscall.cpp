@@ -83,12 +83,14 @@ void PosixSyscall::init(const std::shared_ptr<vm>& v){
     }
     // /proc 进程标识：从 argv[0] 用 guest_abs_path 算 guest 视角 exe 绝对路径
     // 只有 pid 1 走到这里；fork 子进程经 ps 整体拷贝（exe_path）+ comm_ 拷贝继承。
-    if(ps->root.empty() || ps->root == "/") {
-        ps->exe_path = v->image().exe;
-    } else {
-        ps->exe_path = ( "/" / std::filesystem::relative(v->image().exe, ps->root)).string();
+    if(auto img = v->image()) {
+        if(ps->root.empty() || ps->root == "/") {
+            ps->exe_path = img->exe;
+        } else {
+            ps->exe_path = ( "/" / std::filesystem::relative(img->exe, ps->root)).string();
+        }
+        comm_ = make_comm(ps->exe_path);
     }
-    comm_ = make_comm(ps->exe_path);
 }
 
 void PosixSyscall::fini(const std::shared_ptr<vm>& v) {

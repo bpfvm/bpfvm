@@ -63,10 +63,11 @@ bool load_program_to_vm(std::shared_ptr<vm> ebpf_vm, const bpf_insn* instruction
     prog_mem.set_data(prog_data, sysconf(_SC_PAGESIZE));  // DataDeleter 用整页大小做 munmap
     prog_mem.flags = PF_R | PF_X | PF_W; // PF_W for free() by memmap destructor, PF_R | PF_X for execution
     ebpf_vm->addmem(std::move(prog_mem));
-    // 测试不经 load_elf，程序加载地址即入口。仅首次加载（entry 未设）时记入口；
+    // 测试不经 load_elf，程序加载地址即入口。仅首次加载（image 未设）时构造 image；
     // 多段加载（如主程序+helper）不覆盖入口——入口恒为主程序（首次）加载地址。
-    if(ebpf_vm->image().entry == 0) {
-        ebpf_vm->image().entry = paddr;
+    // fd=-1：手搓 vm 无 exe 文件，~vmImage 不关任何 fd。
+    if(!ebpf_vm->image()) {
+        ebpf_vm->set_image(std::make_shared<vmImage>(paddr, 0, "", -1));
     }
     return true;
 }
