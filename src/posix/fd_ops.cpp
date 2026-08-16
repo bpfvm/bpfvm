@@ -228,7 +228,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         if(g_pgid <= 0) {
             return -EINVAL;
         }
-        // 校验目标 pgrp 存在且同 session（Linux：不存在/跨 session→EPERM）。
+        // 校验目标 pgrp 存在且同 session（Linux：不存在/跨 session->EPERM）。
         bool found = false;
         {
             std::lock_guard<std::mutex> lock(pid_map_mutex);
@@ -277,7 +277,7 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
         } else if(request == FIONBIO || request == FIONREAD) {
             // FIONBIO/FIONREAD：旧式无 _IOC_DIR 编码的 ioctl，arg 指向 int。
             // FIONBIO 读取该 int（非阻塞标志），FIONREAD 写回该 int（可读字节数）。
-            // 与 _IOC_DIR 探测分支（psize=0 → arg 当裸值）不同，这两个必须翻译指针。
+            // 与 _IOC_DIR 探测分支（psize=0 -> arg 当裸值）不同，这两个必须翻译指针。
             write_back = (request == FIONREAD);
             psize = sizeof(int);
         } else {
@@ -309,11 +309,11 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
 
 int64_t PosixSyscall::do_poll(vm* v) {
     // guest/host 的 struct pollfd 布局一致（{int fd; short events; short revents;}），
-    // 故把 guest 数组当作 host 数组就地读写；唯一要做的是 guest fd → host fd 翻译。
+    // 故把 guest 数组当作 host 数组就地读写；唯一要做的是 guest fd -> host fd 翻译。
     nfds_t n = arg_size(v->r(2));
     int timeout = arg_s32(v->r(3));  // ms；负数=永久阻塞，0=非阻塞
 
-    // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE → EINVAL。bpfvm 无 rlimit 概念，
+    // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE -> EINVAL。bpfvm 无 rlimit 概念，
     // 给一个固定上限，避免 guest 传极大 n 导致下面的 vector(n) 全量构造时 bad_alloc/OOM。
     if(n > 1024) {
         return -EINVAL;
@@ -404,7 +404,7 @@ int64_t PosixSyscall::do_pselect6(vm* v) {
         const struct timespec* ts = (const struct timespec*)v->mmu(v->r(5), sizeof(struct timespec));
         if(!ts) return -EFAULT;
         if(ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;
-        // 上限钳制（tv_sec*1000 在 tv_sec≈INT_MAX/1000 处溢出 int）。永久阻塞用 -1。
+        // 上限钳制（tv_sec*1000 在 tv_sec~INT_MAX/1000 处溢出 int）。永久阻塞用 -1。
         if(ts->tv_sec > (int64_t)INT32_MAX / 1000) timeout_ms = INT32_MAX;
         else timeout_ms = (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
     }

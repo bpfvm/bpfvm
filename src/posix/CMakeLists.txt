@@ -11,8 +11,8 @@
 # 全局作用域，供顶层转发给 nesting 子项目（BPF-on-BPF 自举复用同一份列表）。
 #
 # 仍需沿用项目根的两组头搜索路径：
-#   - ${CMAKE_SOURCE_DIR}/src   → "posix_syscall.h" / "insn.h" 等项目头
-#   - ${CMAKE_SOURCE_DIR}       → "include/bpf_syscall.h" 等 BPF 侧头
+#   - ${CMAKE_SOURCE_DIR}/src   -> "posix_syscall.h" / "insn.h" 等项目头
+#   - ${CMAKE_SOURCE_DIR}       -> "include/bpf_syscall.h" 等 BPF 侧头
 set(_posix_sources
     posix_syscall.cpp
     signal_queue.cpp

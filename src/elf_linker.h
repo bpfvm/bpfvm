@@ -5,16 +5,16 @@
 //
 // 提供 3 套对外接口，共用同一套链接逻辑（Linker 类），对齐标准 ld 默认行为：
 //
-//   1. 静态链接（-static，自包含 ET_EXEC，固定地址）：
+//   -  静态链接（-static，自包含 ET_EXEC，固定地址）：
 //        link_bpf_object("foo.o", "foo.linked", {"libpdclib.a"})
 //      产物完全自包含，VM 加载时不需任何额外文件。
 //
-//   2. 构建动态库（-shared，标准 ELF .so，PIE）：
+//   -  构建动态库（-shared，标准 ELF .so，PIE）：
 //        link_bpf_shared("libfoo.a", "libfoo.so", "libfoo.so")
 //      产出 ET_DYN + PT_DYNAMIC/.dynsym/.dynstr/.hash/.rela.dyn，DT_SONAME 声明自身名。
 //      p_vaddr=0，可在任意地址加载；VM 加载时按 .rela.dyn 做运行时重定位。
 //
-//   3. 构建动态可执行（默认模式，PIE ET_DYN + DT_NEEDED）：
+//   -  构建动态可执行（默认模式，PIE ET_DYN + DT_NEEDED）：
 //        link_bpf_exe("foo.o", "foo.linked", {"libc.so", ...}, "_start")
 //      产出 ET_DYN + PT_DYNAMIC + DT_NEEDED（依赖的 soname 列表）。
 //      跨模块函数调用默认走 PLT/GOT（标准 ld 行为）；跨模块数据引用由 .rela.dyn 记录，

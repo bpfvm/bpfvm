@@ -3,8 +3,8 @@
  *
  * 触发链路(无 pass 时):
  *   (u128)x << K / >> K  (K 是运行时变量,非编译期常量)
- *   → IR: shl/lshr i128 by i8/i16/...
- *   → BPF 后端 lower 成 __ashlti3 / __lshrti3 调用 → ISel 拒绝。
+ *   -> IR: shl/lshr i128 by i8/i16/...
+ *   -> BPF 后端 lower 成 __ashlti3 / __lshrti3 调用 -> ISel 拒绝。
  *
  * BpfSoftFp pass 把 i128 变量移位拆成 (lo,hi) 两半,按 K<64 / K>=64 两分支
  * 用原生 64 位变量移位实现,再组装回 i128。

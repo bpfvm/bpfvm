@@ -245,16 +245,16 @@ int64_t PosixSyscall::do_recvfrom(vm* v) {
 //
 // SCM_RIGHTS（fd 传递）：
 // VM 只在边界翻译 fd 编号——cmsg 里 guest 塞的是 guest fd，host 内核认 host fd：
-//   sendmsg: guest cmsg 的 SCM_RIGHTS fd → 查 fd 表得 host fd → 写进 cmsg → host 内核
-//   recvmsg: host 内核在本进程安装 host fd → VM 分配 guest fd 登记进接收方 fd 表
-//            → 得 guest fd → 写回 guest cmsg
+//   sendmsg: guest cmsg 的 SCM_RIGHTS fd -> 查 fd 表得 host fd -> 写进 cmsg -> host 内核
+//   recvmsg: host 内核在本进程安装 host fd -> VM 分配 guest fd 登记进接收方 fd 表
+//            -> 得 guest fd -> 写回 guest cmsg
 //
 // FIXME: 目前只翻译 SCM_RIGHTS 的 fd，其余 cmsg 类型原样透传（如 SCM_TIMESTAMP 的
 // timeval/timespec 纯数据，host 直接读写 guest 的 control 缓冲区即可）。但以下需要类似
 // 边界翻译、尚未实现：
 //   - SCM_CREDENTIALS（ucred{pid,uid,gid}）：send 侧 guest pid 是 VM 内 guest 编号，host 内核
 //     不认；recv 侧 host 内核填的是 VM 进程的 host pid（恒定），guest 期望对端 guest pid。
-//     两侧都需 guest pid ↔ host pid 翻译。uid/gid 在无 user namespace 时一致，可不翻译。
+//     两侧都需 guest pid <-> host pid 翻译。uid/gid 在无 user namespace 时一致，可不翻译。
 //   - SO_PEERCRED（getsockopt 获取对端凭据）有同样的 pid 问题。
 
 // 把 guest 的 msghdr 翻译成 host msghdr。writable=true 时 iov/control/name 的缓冲区
@@ -332,7 +332,7 @@ int64_t PosixSyscall::do_sendmsg(vm* v) {
         cmsg_buf.resize(hmsg.msg_controllen);
         memcpy(cmsg_buf.data(), hmsg.msg_control, hmsg.msg_controllen);
         hmsg.msg_control = cmsg_buf.data();
-        // SCM_RIGHTS: guest fd → host fd（在本地副本上改）
+        // SCM_RIGHTS: guest fd -> host fd（在本地副本上改）
         for(struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hmsg); cmsg; cmsg = CMSG_NXTHDR(&hmsg, cmsg)) {
             if(cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
                 continue;
@@ -344,7 +344,7 @@ int64_t PosixSyscall::do_sendmsg(vm* v) {
                 if(!fd_h) {
                     return -EBADF;
                 }
-                fds[i] = fd_h->host_fd();   // guest fd → host fd
+                fds[i] = fd_h->host_fd();   // guest fd -> host fd
             }
         }
     }
@@ -383,7 +383,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
     gmsg->msg_flags = hmsg.msg_flags;
     gmsg->msg_namelen = hmsg.msg_namelen;
     gmsg->msg_controllen = hmsg.msg_controllen;
-    // SCM_RIGHTS: host fd → guest fd（host 内核已在本进程安装 host fd，登记进接收方 fd 表）。
+    // SCM_RIGHTS: host fd -> guest fd（host 内核已在本进程安装 host fd，登记进接收方 fd 表）。
     for(struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hmsg); cmsg; cmsg = CMSG_NXTHDR(&hmsg, cmsg)) {
         if(cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
             continue;
@@ -393,7 +393,7 @@ int64_t PosixSyscall::do_recvmsg(vm* v) {
         for(int i = 0; i < nfds; ++i) {
             int host_fd = fds[i];
             int new_guest = ps->fds_emplace(std::make_shared<HostFd>(host_fd));
-            fds[i] = new_guest;   // host fd → guest fd，写回 guest 的 cmsg 缓冲区
+            fds[i] = new_guest;   // host fd -> guest fd，写回 guest 的 cmsg 缓冲区
         }
     }
     return rc;

@@ -57,7 +57,7 @@ int main(void) {
     CHECK(n > 0 && strstr(buf, "proc"), "mounts");
     fprintf(stderr, "7:mounts\n");
 
-    /* /proc/mounts 是 magic symlink → self/mounts，故 /proc/self/mounts 也应可读。 */
+    /* /proc/mounts 是 magic symlink -> self/mounts，故 /proc/self/mounts 也应可读。 */
     n = read_file("/proc/self/mounts", buf, sizeof(buf));
     CHECK(n > 0 && strstr(buf, "proc"), "self mounts");
     fprintf(stderr, "7a:self mounts\n");
@@ -80,8 +80,8 @@ int main(void) {
     CHECK(ln > 0, "cwd link");
     fprintf(stderr, "10:cwd link\n");
 
-    /* readlink 穿透 /proc 到 host 符号链接：root→/，再读 /bin（Linux 上常是 → usr/bin 的
-       链接，Android 上 → /system/bin 的链接）。无 chroot 时 /proc/self/root/bin 即 host
+    /* readlink 穿透 /proc 到 host 符号链接：root->/，再读 /bin（Linux 上常是 -> usr/bin 的
+       链接，Android 上 -> /system/bin 的链接）。无 chroot 时 /proc/self/root/bin 即 host
        /bin，readlink 应返回其 target。选 /bin 而非 /lib：跨 Linux/Android 均为 symlink。 */
     ln = readlink("/proc/self/root/bin", linkbuf, sizeof(linkbuf));
     linkbuf[ln > 0 ? ln : 0] = '\0';
@@ -148,7 +148,7 @@ int main(void) {
     CHECK(lstat("/proc/self/", &st) == 0 && S_ISDIR(st.st_mode), "lstat self/ follows (trailing slash)");
     fprintf(stderr, "18c2:lstat self/ trailing slash\n");
 
-    /* follow-stat 真符号链接：stat（follow）解析为目标类型（exe→REG，cwd/root→DIR），
+    /* follow-stat 真符号链接：stat（follow）解析为目标类型（exe->REG，cwd/root->DIR），
        lstat（不 follow）报符号链接。与 Linux 内核一致。 */
     CHECK(stat("/proc/self/exe", &st) == 0 && S_ISREG(st.st_mode), "stat exe is reg");
     fprintf(stderr, "18d:stat exe\n");
@@ -172,7 +172,7 @@ int main(void) {
     fprintf(stderr, "18f:stat cwd\n");
     CHECK(stat("/proc/self/root", &st) == 0 && S_ISDIR(st.st_mode), "stat root is dir");
     fprintf(stderr, "18g:stat root\n");
-    /* /proc/self/root 跳出 /proc 后接续 host 路径段：root→/，再走 /bin，应 follow 到目录 */
+    /* /proc/self/root 跳出 /proc 后接续 host 路径段：root->/，再走 /bin，应 follow 到目录 */
     CHECK(stat("/proc/self/root/bin", &st) == 0 && S_ISDIR(st.st_mode), "stat root/bin escapes proc");
     fprintf(stderr, "18h:stat root/bin\n");
     /* 尾斜杠：/proc/1/ 与 /proc/1 等价；/proc/self/ 是符号链接+尾斜杠，应 follow 到 [tgid] 目录 */

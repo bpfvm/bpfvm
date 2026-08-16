@@ -1,7 +1,7 @@
 /* job-control 停止/恢复 + waitpid(WUNTRACED) 回归测试。
  *
- * 覆盖 SIGTSTP → 子进程停止 → 父进程经 SIGCHLD 唤醒 → waitpid(WUNTRACED) 报告
- * WIFSTOPPED / WSTOPSIG==SIGTSTP → kill(SIGCONT) 恢复 → 再 waitpid 报告退出 的完整链路。
+ * 覆盖 SIGTSTP -> 子进程停止 -> 父进程经 SIGCHLD 唤醒 -> waitpid(WUNTRACED) 报告
+ * WIFSTOPPED / WSTOPSIG==SIGTSTP -> kill(SIGCONT) 恢复 -> 再 waitpid 报告退出 的完整链路。
  * 这是 dash 等交互式 shell 实现 CTRL+Z / fg 的核心机制。
  *
  * 关键点：子进程的 SIGTSTP 是它自己 raise 的（模拟收到 tty 信号停止），父进程靠

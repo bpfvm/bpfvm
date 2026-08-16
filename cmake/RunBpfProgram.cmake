@@ -1,12 +1,12 @@
-# 每个用例内部串行跑多变体：静态/动态 × JIT 开/关 + host + bpfvm-on-bpfvm 嵌套。
+# 每个用例内部串行跑多变体：静态/动态 x JIT 开/关 + host + bpfvm-on-bpfvm 嵌套。
 # 不同用例之间由 ctest -j 并发。同用例的变体串行，不冲突文件。
 #
 # 参数：BPFVM / NAME / WORKDIR / ROOT（可选）/ BPFVM_BPF（可选）
-#   ROOT 非空 → chroot 模式：每个变体建临时 rootfs，prog 以 guest 路径（/<name>.<suffix>）
+#   ROOT 非空 -> chroot 模式：每个变体建临时 rootfs，prog 以 guest 路径（/<name>.<suffix>）
 #   启动（bpfvm --root <rootfs>）。root/lib 一并拷入（动态变体的 PT_INTERP 解析）。
 #   host 变体跳过（chroot 无宿主对照意义）。隔离正确性由 guest 程序自身断言
 #
-#   BPFVM_BPF 非空 → 额外跑 1 个嵌套变体（nest_static）：
+#   BPFVM_BPF 非空 -> 额外跑 1 个嵌套变体（nest_static）：
 #   host bpfvm 跑 bpfvm.bpf，内层 bpfvm 再跑 prog。内层 bpfvm 交叉编译到 BPF 目标，
 #   其 JIT 编译器在编译期被桩化（src/insn.cpp: StubJitCompiler，compile() 恒返回
 #   nullptr），故内层恒为纯解释器——嵌套变体无 jit/interp 之分，只按程序类型区分。
@@ -42,7 +42,7 @@ set(BPF_NEST_SKIP
 )
 
 # label|program_suffix|BPF_TEST_VARIANT|JIT_ENABLE|JIT_THRESHOLD|nest_flag  ("-" 占位空值)
-# 前 4 个走 bpfvm（静态/动态 × JIT/解释器）。
+# 前 4 个走 bpfvm（静态/动态 x JIT/解释器）。
 # JIT 变体设 JIT_THRESHOLD=1：每个 pc 命中一次即编译，最大化 JIT 覆盖（暴露冷代码
 # 路径里的 JIT 缺陷，而非只在热点循环上验证）。
 # 第 5 个 host 变体直接运行宿主 gcc 原生二进制（test/Makefile 的 *.host），
@@ -64,7 +64,7 @@ if(DEFINED ROOT AND NOT ROOT STREQUAL "")
     set(ROOT_LIB "${WORKDIR}/root/lib")
 endif()
 
-# 嵌套变体可用性：BPFVM_BPF 未定义/文件不存在 → 跳过（graceful，不影响普通变体）。
+# 嵌套变体可用性：BPFVM_BPF 未定义/文件不存在 -> 跳过（graceful，不影响普通变体）。
 set(NEST_AVAILABLE OFF)
 if(DEFINED BPFVM_BPF AND NOT BPFVM_BPF STREQUAL "" AND EXISTS "${BPFVM_BPF}")
     set(NEST_AVAILABLE ON)

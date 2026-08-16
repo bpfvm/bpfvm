@@ -151,7 +151,7 @@ int real_main(int argc, char** argv) {
     options->pty->setup(use_pty);
 
     auto vm = vm::create();
-    // load_elf 从 envp 解析 LD_LIBRARY_PATH 做库搜索；extra_envp 是 map（key→value），
+    // load_elf 从 envp 解析 LD_LIBRARY_PATH 做库搜索；extra_envp 是 map（key->value），
     // load_elf 直接消费，无需展平。
     ElfLoadInfo load_info = vm->load_elf(elf_path.c_str(), extra_envp);
     if(load_info.entry == 0) {

@@ -3,8 +3,8 @@
  *
  * 触发链路(无 pass 时):
  *   (u128)a / b, a % b, (__int128)a / b ...  (a, b 是运行时值)
- *   → IR: udiv/sdiv/urem/srem i128
- *   → BPF 后端 ISel lower 成 __udivti3 / __divti3 / __umodti3 / __modti3 调用
+ *   -> IR: udiv/sdiv/urem/srem i128
+ *   -> BPF 后端 ISel lower 成 __udivti3 / __divti3 / __umodti3 / __modti3 调用
  *     并在 ISel 阶段拒绝（IR pass 管不到 ISel 自行生成的 libcall）。
  *
  * BpfSoftFp pass 把两个 i128 操作数各拆成 (lo,hi)，调
@@ -101,7 +101,7 @@ int main(void) {
         CHECK(urem_lo(alo,ahi,blo,bhi), 0,            "urem cross lo");
         CHECK(urem_hi(alo,ahi,blo,bhi), 0,            "urem cross hi");
     }
-    /* === 无符号:小商(被除数 < 除数 → 商 0,余数=被除数)=== */
+    /* === 无符号:小商(被除数 < 除数 -> 商 0,余数=被除数)=== */
     {
         uint64_t alo = 5, ahi = 0;           /* a = 5 */
         uint64_t blo = 7, bhi = 0;           /* b = 7 */
@@ -154,7 +154,7 @@ int main(void) {
     }
     /* === 有符号:负被除数(符号影响结果;C 的 % 截断向零)== */
     {
-        /* a = -100, b = 7 → 商 -14, 余 -2 (截断向零) */
+        /* a = -100, b = 7 -> 商 -14, 余 -2 (截断向零) */
         __int128 a = -100, b = 7;
         uint64_t alo = (uint64_t)a, ahi = (uint64_t)((unsigned __int128)a >> 64);
         uint64_t blo = (uint64_t)b, bhi = (uint64_t)((unsigned __int128)b >> 64);
@@ -165,7 +165,7 @@ int main(void) {
     }
     /* === 有符号:负除数 == */
     {
-        /* a = 100, b = -7 → 商 -14, 余 2 (截断向零) */
+        /* a = 100, b = -7 -> 商 -14, 余 2 (截断向零) */
         __int128 a = 100, b = -7;
         uint64_t alo = (uint64_t)a, ahi = (uint64_t)((unsigned __int128)a >> 64);
         uint64_t blo = (uint64_t)b, bhi = (uint64_t)((unsigned __int128)b >> 64);
@@ -174,7 +174,7 @@ int main(void) {
     }
     /* === 有符号:两负(商正,余负)== */
     {
-        /* a = -100, b = -7 → 商 14, 余 -2 */
+        /* a = -100, b = -7 -> 商 14, 余 -2 */
         __int128 a = -100, b = -7;
         uint64_t alo = (uint64_t)a, ahi = (uint64_t)((unsigned __int128)a >> 64);
         uint64_t blo = (uint64_t)b, bhi = (uint64_t)((unsigned __int128)b >> 64);
@@ -183,7 +183,7 @@ int main(void) {
     }
     /* === 有符号:大数跨半(商 > 2^63 但 < 2^64,正数)== */
     {
-        /* a = 2^127, b = 2 → 商 = 2^126 */
+        /* a = 2^127, b = 2 -> 商 = 2^126 */
         unsigned __int128 a = ((unsigned __int128)1) << 127;
         __int128 b = 2;
         uint64_t alo = (uint64_t)a, ahi = (uint64_t)(a >> 64);

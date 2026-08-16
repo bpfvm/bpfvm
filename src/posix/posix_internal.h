@@ -53,7 +53,7 @@ namespace bpf{
 void futex_child_tid_clear(ThreadGroup* tg, int* ctid, uint64_t tid_address);
 
 // —— procfs 虚拟文件系统（实现在 procfs.cpp）——
-// open/readlink/statx 三类"按路径"操作经 ResolvePath→Path 虚方法统一入口（按 /proc|/dev|host 前缀分发），
+// open/readlink/statx 三类"按路径"操作经 ResolvePath->Path 虚方法统一入口（按 /proc|/dev|host 前缀分发），
 // lookup 与节点类型（FileGen/DirGen/LinkGen/NoneGen，经 Gen 包装）都是 procfs.cpp 的内部细节。
 // 经 PosixSyscall 的 public 进程标识字段（pid/ppid/tg/...）与 *_of 静态转发读 vm 内部。
 // comm = basename(path) 截断 15 字节（Linux TASK_COMM_LEN-1）。do_execveat / init 共用。

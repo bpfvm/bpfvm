@@ -4,7 +4,7 @@
 
 /* 软件浮点运行时验证（JIT 原生 SSE 短路 + 解释器 syscall shim 共用此用例）。
    用 volatile 阻止常量折叠，强制浮点运算在 VM 运行时执行（经 BpfSoftFp pass
-   把运算直接编成 caller 里的 BPF_FP_* call → VM do_softfp / JIT SSE 执行）。
+   把运算直接编成 caller 里的 BPF_FP_* call -> VM do_softfp / JIT SSE 执行）。
 
    返回 0 表示全部通过，非 0 表示失败。所有结果以整数形式打印（避开 printf %f
    的 PDCLib 打印器，独立验证算术正确性）。 */
@@ -80,10 +80,10 @@ int main(void) {
     /* 负数算术 */
     volatile double na = -1.5;
     volatile double nb = 2.0;
-    if ((int)(na + nb) != 0) { printf("FAIL neg_add\n"); fails++; }      /* 0.5 → 0 */
-    if ((int)(na - nb) != -3) { printf("FAIL neg_sub\n"); fails++; }     /* -3.5 → -3 */
+    if ((int)(na + nb) != 0) { printf("FAIL neg_add\n"); fails++; }      /* 0.5 -> 0 */
+    if ((int)(na - nb) != -3) { printf("FAIL neg_sub\n"); fails++; }     /* -3.5 -> -3 */
     if ((int)(na * nb) != -3) { printf("FAIL neg_mul\n"); fails++; }     /* -3.0 */
-    if ((int)(na / nb) != 0) { printf("FAIL neg_div\n"); fails++; }      /* -0.75 → 0 */
+    if ((int)(na / nb) != 0) { printf("FAIL neg_div\n"); fails++; }      /* -0.75 -> 0 */
     /* 截断方向：负数向 0 截断（不是向下取整）*/
     if ((int)(double)(-7) != -7) { printf("FAIL neg_trunc\n"); fails++; }
     if ((long)(double)(-1234567890123LL) != -1234567890123LL) { printf("FAIL neg_d2di\n"); fails++; }
@@ -102,7 +102,7 @@ int main(void) {
         volatile double sq = 16.0;
         if ((int)__builtin_sqrt(sq) != 4) { printf("FAIL sqrt_d\n"); fails++; }
         volatile double sq2 = 2.0;
-        /* sqrt(2)≈1.4142，截断到 int 是 1 */
+        /* sqrt(2)~1.4142，截断到 int 是 1 */
         if ((int)__builtin_sqrt(sq2) != 1) { printf("FAIL sqrt_d_irr\n"); fails++; }
     }
     {
@@ -124,7 +124,7 @@ int main(void) {
         volatile float fx = -3.7f;
         volatile float fy = 2.5f;
 
-        /* —— floor/ceil/trunc/round：intrinsic→libcall + libcall 直穿，均经 musl —— */
+        /* —— floor/ceil/trunc/round：intrinsic->libcall + libcall 直穿，均经 musl —— */
         if ((int)__builtin_floor(dx) != -4) { printf("FAIL floor_d_intrinsic\n"); fails++; }
         if ((int)__builtin_ceil(dx) != -3) { printf("FAIL ceil_d_intrinsic\n"); fails++; }
         if ((int)__builtin_trunc(dx) != -3) { printf("FAIL trunc_d_intrinsic\n"); fails++; }
@@ -154,7 +154,7 @@ int main(void) {
 
         /* —— IEEE754 边界：符号位精确性（double 位模式按位验，避开截断丢符号）——
            这是 inline 位运算与硬件 fabs/copysign 最容易分叉的点：必须正确传递
-           ±0.0 的符号位、保留 NaN payload。通过 union 读 64 位位模式查最高位。 */
+           +/-0.0 的符号位、保留 NaN payload。通过 union 读 64 位位模式查最高位。 */
         volatile double posz = 0.0, negz = -0.0;
         union { double d; uint64_t i; } u;
         /* fabs(-0.0) = +0.0：符号位清零 */
@@ -163,7 +163,7 @@ int main(void) {
         /* copysign(+0.0, -1.0) = -0.0：符号位置位（验证 y 的符号传到 x=0） */
         u.d = copysign(posz, dx);
         if (!(u.i & 0x8000000000000000ULL)) { printf("FAIL copysign_neg0_sign\n"); fails++; }
-        /* copysign(-3.7, NaN) = +3.7：NaN 当作正号（符号位 0）→ 结果正 */
+        /* copysign(-3.7, NaN) = +3.7：NaN 当作正号（符号位 0）-> 结果正 */
         {
             volatile double nan_v = __builtin_nan("");
             u.d = copysign(dx, nan_v);
@@ -171,9 +171,9 @@ int main(void) {
         }
     }
 
-    /* 无符号整型 ↔ 浮点转换。这是 x86 与 aarch64 行为最容易分叉的一组：
+    /* 无符号整型 <-> 浮点转换。这是 x86 与 aarch64 行为最容易分叉的一组：
        aarch64 有原生 FCVTZU/UCVTF 全部原生处理，x86 无直接指令（缺 unsigned
-       fp↔int 转换，需 AVX-512）走 do_softfp 回退。两端必须语义一致。 */
+       fp<->int 转换，需 AVX-512）走 do_softfp 回退。两端必须语义一致。 */
     {
         /* unsigned int/long -> double/float（值 > INT_MAX 才能区分有/无符号解释）*/
         volatile unsigned u32 = 4000000000u;          /* > INT_MAX(2147483647) */
@@ -182,7 +182,7 @@ int main(void) {
         }
         volatile unsigned long u64 = 18446744073709551615ULL;  /* UINT64_MAX */
         {
-            double d = (double)u64;                   /* ≈ 1.8e19 */
+            double d = (double)u64;                   /* ~ 1.8e19 */
             if (!(d > 1.8e19)) { printf("FAIL udi2d\n"); fails++; }
         }
         volatile unsigned u32f = 4294967295u;

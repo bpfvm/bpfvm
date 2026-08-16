@@ -3,14 +3,14 @@
    依赖拓扑（动态版）：
      test_dyn_data.linked
         └─ (DT_NEEDED) libgot.so
-              └─ (DT_NEEDED) libc.so     ← libgot 内部调用 strlen
+              └─ (DT_NEEDED) libc.so     <- libgot 内部调用 strlen
 
    验证：
    - got_counter（STT_OBJECT, libgot 导出）：主程序 .rela.dyn 运行时 patch
    - got_add（STT_FUNC, libgot 导出）：主程序经 PLT/GOT 调用
    - got_hash（STT_FUNC, libgot 导出，内部调 libc strlen）：链式 PLT/GOT
-     · loader 必须递归加载 libgot 的 DT_NEEDED（libc.so），否则 strlen 解析失败
-     · libgot 自身也走 PLT 调用 libc，验证 .so 内部 PLT 桩在运行期可解析
+     - loader 必须递归加载 libgot 的 DT_NEEDED（libc.so），否则 strlen 解析失败
+     - libgot 自身也走 PLT 调用 libc，验证 .so 内部 PLT 桩在运行期可解析
    - .so 可在任意地址加载（PIE，p_vaddr=0）
 
    静态版（.out）把 libgot.a + libpdclib.a 直接链入，构建期 patch，应当通过。 */

@@ -135,8 +135,8 @@ int64_t PosixSyscall::do_mmap(vm* v) {
     } else {
         // 非 fixed：guest 地址「接在上一个映射尾部」分配。必须把「算地址 + 插入」
         // 放进同一把锁，否则多线程并发 mmap 时各自读到同一个 ml.back()、算出同一个
-        // next，释放锁后各自 insert → 多个 memmap 分配到重叠的 guest 地址（绑定不同
-        // host 内存、TLB 互相覆盖、munmap 后 host 指针失效 → SIGSEGV）。
+        // next，释放锁后各自 insert -> 多个 memmap 分配到重叠的 guest 地址（绑定不同
+        // host 内存、TLB 互相覆盖、munmap 后 host 指针失效 -> SIGSEGV）。
         // addmem 内部会自行加锁，因此这里直接操作 maps（与 addmem 的有序插入逻辑一致），
         // 不重复走 addmem。
         //
@@ -233,7 +233,7 @@ int64_t PosixSyscall::do_mprotect(vm* v) {
                 }
             }
             // 用「构造新 vector」式替换，避免 vector insert/erase 的迭代器失效
-            // 顺序：left（若有）→ mid → right（若有），保持 paddr 升序（尾部分配器
+            // 顺序：left（若有）-> mid -> right（若有），保持 paddr 升序（尾部分配器
             // ml.back() 依赖有序，否则 mmap 地址碰撞）。
             std::vector<memmap> rebuilt;
             rebuilt.reserve(ml.size() + 2);

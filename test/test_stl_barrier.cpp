@@ -5,15 +5,15 @@
 // （"unsupported atomic operation, please use 32/64 bit version"）。现已由
 // BpfWideArgs.cpp 的 BpfAtomicLowerPass（子字节 CAS 循环展开，照搬 LLVM
 // AtomicExpandPass）解锁，barrier.cpp 已纳入 libcxx.a。本测试端到端验证：
-//   1) #include <barrier> 能链接（__construct/__arrive/__destroy_barrier_algorithm_base
+//   -  #include <barrier> 能链接（__construct/__arrive/__destroy_barrier_algorithm_base
 //      三个非内联符号在 libcxx.a 中）；
-//   2) std::barrier::arrive/arrive_and_wait/arrive_and_drop 的同步语义正确。
+//   -  std::barrier::arrive/arrive_and_wait/arrive_and_drop 的同步语义正确。
 //
 // host 变体用 clang++ 编宿主 glibc，作为对照基线。
 //
-// 注意：①刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store（C++ <atomic>
+// 注意：(1)刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store（C++ <atomic>
 // 的 load/store 会撞 BPF 后端，见 BpfAtomicLowerPass 的 D1 注释），改用 mutex
-// 保护普通 int；②所有同步靠 barrier.arrive_and_wait / join 显式定序，不依赖时序，
+// 保护普通 int；(2)所有同步靠 barrier.arrive_and_wait / join 显式定序，不依赖时序，
 // 保证 host 与 BPF（单核解释/JIT）行为一致。
 
 #include <barrier>
@@ -94,7 +94,7 @@ int main() {
         { std::lock_guard<std::mutex> lk(m); ++counter; }
         sync.arrive_and_drop();
         for (auto &t : ts) t.join();
-        // counter = (N-1 worker × ROUNDS 轮) + 主 1 次
+        // counter = (N-1 worker * ROUNDS 轮) + 主 1 次
         long expect = (long)(N - 1) * ROUNDS + 1;
         if (counter != expect) {
             printf("FAIL arrive_and_drop: counter=%ld (expect %ld)\n", counter, expect);

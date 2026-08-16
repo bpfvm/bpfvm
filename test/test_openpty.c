@@ -1,16 +1,16 @@
 /* posix_openpt/openpty 路径回归（tmux 等终端复用器的最小用例）。
  *
  * 覆盖 guest 通过 open("/dev/ptmx") + ioctl(TIOCSPTLCK/TIOCGPTN) + open("/dev/pts/N")
- * 创建 pty 并 master↔slave 互通：这正是 tmux 给每个 pane 开 pty 的调用序列。
+ * 创建 pty 并 master<->slave 互通：这正是 tmux 给每个 pane 开 pty 的调用序列。
  * bpfvm 在 do_openat 拦截 /dev/ptmx 与 /dev/pts/N，合成 host pty（ldisc 全交 host 内核）。
  *
  * 直接用低层调用（不经 libc 的 openpty 包装），以显式覆盖拦截点：
- *   1. open("/dev/ptmx", O_RDWR)            → master fd
- *   2. unlockpt(master)  = ioctl(TIOCSPTLCK,&zero)
- *   3. ptsname(master)   = ioctl(TIOCGPTN,&n) + 拼路径
- *   4. open("/dev/pts/N",O_RDWR|O_NOCTTY)    → slave fd
- *   5. write(master) / read(slave) 验证字节互通
- *   6. slave 是 tty：isatty(slave)==1, tcgetattr 成功
+ *   -  open("/dev/ptmx", O_RDWR)            -> master fd
+ *   -  unlockpt(master)  = ioctl(TIOCSPTLCK,&zero)
+ *   -  ptsname(master)   = ioctl(TIOCGPTN,&n) + 拼路径
+ *   -  open("/dev/pts/N",O_RDWR|O_NOCTTY)    -> slave fd
+ *   -  write(master) / read(slave) 验证字节互通
+ *   -  slave 是 tty：isatty(slave)==1, tcgetattr 成功
  */
 #include <stdio.h>
 #include <stdlib.h>

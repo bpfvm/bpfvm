@@ -203,7 +203,7 @@ int main(void) {
      * 步骤：tag=0,long=100 ; tag=1,ptr="x"(地址未知，但累加后与单独取一致)
      * 这里改用可预测的值：long 用具体数值，ptr 用 NULL(0) */
     {
-        /* mixed(2, 0, 100L, 1, (const char*)0) → acc = 100 + 0 = 100 */
+        /* mixed(2, 0, 100L, 1, (const char*)0) -> acc = 100 + 0 = 100 */
         uintptr_t r = mixed(2, 0, 100L, 1, (const char *)0);
         CHECK(r == 100);
     }
@@ -243,7 +243,7 @@ int main(void) {
     /* 栈膨胀回归：在单个 main 内产生 NUM_ROWS（256）个变参调用点。
      * 旧版 pass 下这里会因每调用点独立 alloca 触发 BPF "stack limit exceeded"，
      * 根本编译不出 .out；新版共用一块缓冲区，能编译且每次结果正确。
-     * 若任一调用点结果不符（共享缓冲区被污染），pack_test 返回 1 → exit(1)。 */
+     * 若任一调用点结果不符（共享缓冲区被污染），pack_test 返回 1 -> exit(1)。 */
     ROW(1);   ROW(2);   ROW(3);   ROW(4);   ROW(5);   ROW(6);   ROW(7);   ROW(8);
     ROW(9);   ROW(10);  ROW(11);  ROW(12);  ROW(13);  ROW(14);  ROW(15);  ROW(16);
     ROW(17);  ROW(18);  ROW(19);  ROW(20);  ROW(21);  ROW(22);  ROW(23);  ROW(24);

@@ -1,7 +1,7 @@
 #include "posix_internal.h"
 
 // 从 guest 地址空间读出一个 NUL 结尾字符串（最多 max_len 字节）。
-// 与下面的 resolve_path 同属「guest 内存 ↔ 字符串」工具，故放在本文件。
+// 与下面的 resolve_path 同属「guest 内存 <-> 字符串」工具，故放在本文件。
 bool PosixSyscall::read_c_string(vm* v, uint64_t addr, std::string& out, size_t max_len) {
     out.clear();
     if(addr == 0) {
@@ -287,8 +287,8 @@ int64_t PosixSyscall::do_utimensat(vm* v) {
         times_ptr = pts;
     }
 
-    // path=NULL → 纯 fd 形式（内核：utimensat(fd,NULL,...) == futimens(fd)）
-    // dirfd 顶部已校验有效；AT_FDCWD 时无 fd 可作用 → EFAULT（utimensat 语义）。
+    // path=NULL -> 纯 fd 形式（内核：utimensat(fd,NULL,...) == futimens(fd)）
+    // dirfd 顶部已校验有效；AT_FDCWD 时无 fd 可作用 -> EFAULT（utimensat 语义）。
     if(!has_path) {
         if(dirfd == AT_FDCWD) return -EFAULT;
         auto h = ps->find_fd(dirfd);

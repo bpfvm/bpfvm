@@ -1,7 +1,7 @@
 // Tree-walking interpreter on bpfvm — bootstrap probe step 1.
 //
-// 目标：在 bpfvm 上用 C++ 实现一个完整的小语言解释器（词法 → 递归下降 parser
-// → AST → 求值），验证编译器前端内核在 BPF 上能跑通，并暴露 C++/libc++/VM 侧
+// 目标：在 bpfvm 上用 C++ 实现一个完整的小语言解释器（词法 -> 递归下降 parser
+// -> AST -> 求值），验证编译器前端内核在 BPF 上能跑通，并暴露 C++/libc++/VM 侧
 // 的剩余缺口。这是朝"自举"目标走的第一步：环境若能解释一个有变量/算术/控制流
 // 的小语言，就具备写更大编译器的 C++ 基础。
 //
@@ -305,7 +305,7 @@ int main() {
     check("a = -3 + 5;",               "a", 2);    // 一元负
     check("x = 7; y = 2; z = x % y;",  "z", 1);    // 模
     check("x = 5; if x > 3 { x = 10; } else { x = 0; }", "x", 10);  // if true
-    check("x = 1; if x > 3 { x = 10; } else { x = 0; }", "x", 0);   // if false → else
+    check("x = 1; if x > 3 { x = 10; } else { x = 0; }", "x", 0);   // if false -> else
     check("i = 1; s = 0; while i <= 10 { s = s + i; i = i + 1; }", "s", 55);  // 1..10 求和
     check("n = 5; f = 1; while n > 1 { f = f * n; n = n - 1; }", "f", 120);   // 5! 阶乘
     check("a = 0; b = 0; while a < 5 { b = b + a * a; a = a + 1; }", "b", 30); // 0+1+4+9+16

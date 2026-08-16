@@ -35,7 +35,7 @@ int main(void)
         perror("epoll_ctl ADD sv"); return 1;
     }
 
-    /* —— 用例 2：两 fd 都应就绪（pipe 无数据 → 仅 EPOLLOUT 的 sv 就绪；先写 pipe 让它也 IN）—— */
+    /* —— 用例 2：两 fd 都应就绪（pipe 无数据 -> 仅 EPOLLOUT 的 sv 就绪；先写 pipe 让它也 IN）—— */
     char c = 'x';
     if (write(pfd[1], &c, 1) != 1) { perror("write pipe"); return 1; }
 
@@ -46,7 +46,7 @@ int main(void)
         fprintf(stderr, "FAIL: epoll_wait returned %d events, expected 2\n", n);
         return 1;
     }
-    /* 校验两个 token 都返回了（顺序无关）。这是验证 16B↔12B 布局拷贝正确的关键。 */
+    /* 校验两个 token 都返回了（顺序无关）。这是验证 16B<->12B 布局拷贝正确的关键。 */
     int got1 = 0, got2 = 0;
     for (int i = 0; i < n; ++i) {
         if (out[i].data.u64 == 0xAAAA1111BBBB2222ULL) got1 = 1;
@@ -68,7 +68,7 @@ int main(void)
         return 1;
     }
 
-    /* —— 用例 4：MOD 把 sv 改成 EPOLLIN，未写入 → 不就绪 → wait 超时返回 0 —— */
+    /* —— 用例 4：MOD 把 sv 改成 EPOLLIN，未写入 -> 不就绪 -> wait 超时返回 0 —— */
     ev.events = EPOLLIN;
     ev.data.u64 = 0xEEEE5555FFFF6666ULL;
     if (epoll_ctl(ep, EPOLL_CTL_MOD, sv[0], &ev) < 0) {
@@ -80,7 +80,7 @@ int main(void)
         return 1;
     }
 
-    /* —— 用例 5：往 sv[1] 写入 → sv[0] EPOLLIN 就绪，且 token 是 MOD 后的新值 —— */
+    /* —— 用例 5：往 sv[1] 写入 -> sv[0] EPOLLIN 就绪，且 token 是 MOD 后的新值 —— */
     if (write(sv[1], &c, 1) != 1) { perror("write sv"); return 1; }
     n = epoll_wait(ep, out, 4, 1000);
     if (n != 1 || out[0].data.u64 != 0xEEEE5555FFFF6666ULL

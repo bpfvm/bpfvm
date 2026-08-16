@@ -73,7 +73,7 @@ struct ThreadGroup {
         });
     }
     // 唤醒所有等待者并清空列表。摘取列表在锁内、wakeup 在锁外：wakeup 取 vm::wait_mutex，
-    // 锁序 mtx → wait_mutex 与 stop_process 既有约定一致；锁外 broadcast 避免长广播持锁。
+    // 锁序 mtx -> wait_mutex 与 stop_process 既有约定一致；锁外 broadcast 避免长广播持锁。
     void wake_waiters() {
         std::vector<std::weak_ptr<vm>> to_wake;
         {
@@ -141,7 +141,7 @@ class PosixSyscall: public SyscallHandler{
         std::array<signal_action, NSIG> signal_actions{};
         // chroot 根目录（宿主绝对路径，无尾斜杠）。空 = 不 chroot。
         // 随 fork/clone 自动传播（与 cwd 同级）。ps->cwd 存 guest 视角路径，
-        // resolve_path 负责 cwd → 宿主路径时拼上此 root。
+        // resolve_path 负责 cwd -> 宿主路径时拼上此 root。
         std::string root;
         // guest 程序路径（/proc/[pid]/exe symlink 目标，guest 视角绝对路径）。
         // 进程级（mm_struct::exe_file）：do_execveat 成功后更新；main.cpp 初次加载时补写。
@@ -225,13 +225,13 @@ class PosixSyscall: public SyscallHandler{
     // 停止整个线程组（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）：设 tg 级停止状态 + 组内每线程
     // VM_STOPPED + 给父进程投一次 SIGCHLD（去重）。stop 是进程级，整组一致
     void stop_process(int sig);
-    // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
+    // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm -> sys()->queue_signal。
     // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
     void notify_parent_sigchld();
 
 public:
     const uint64_t pid;          // task id（== tid）。gettid 返回此值。
-    // 程序名（/proc/[pid]/comm，basename(exe)，≤15 字节，Linux TASK_COMM_LEN-1）。
+    // 程序名（/proc/[pid]/comm，basename(exe)，<=15 字节，Linux TASK_COMM_LEN-1）。
     std::string comm_;
     // —— 进程标识（procfs 自由函数直接读，字段 public 不加 getter 包装）——
     std::shared_ptr<SharedState> ps;
@@ -288,7 +288,7 @@ public:
     std::optional<int64_t> tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read);
 
     // 向控制终端的前台进程组（tty->fg_pgrp）投递 tty 信号。tty==nullptr 时退化为按
-    // 调用者 session 选目标组。host_signal（宿主→guest 路由）与 do_close 的 pty master
+    // 调用者 session 选目标组。host_signal（宿主->guest 路由）与 do_close 的 pty master
     // 关闭发 SIGHUP（对齐 Linux tty_vhangup 语义）共用此路径。
     void deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig);
 

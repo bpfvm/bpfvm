@@ -23,7 +23,7 @@ static int run_case(int kind, int setup, int sig){
          * 否则可忽略信号那组子进程会因超时正常退出，被误判为"提前退出"。
          * 父侧 usleep(50ms)+观察 100ms=150ms，故 1s 裕量充足（原 2s 裕量过大）。
          * 注意：不能在进入阻塞前用 pipe 同步通知父进程——SIGUSR1(caught) 这组要求
-         * 信号在子进程已处于阻塞调用期间到达，而通知→真正进入阻塞之间有指令窗口，
+         * 信号在子进程已处于阻塞调用期间到达，而通知->真正进入阻塞之间有指令窗口，
          * 信号提前到达会被 handler 消化掉而不打断后续阻塞调用，造成误判。 */
         if(kind==0){ struct timespec ts={1,0},rem={0}; nanosleep(&ts,&rem); _exit(0); }
         if(kind==1){ close(fd[1]); char buf[16]; read(fd[0],buf,sizeof buf); _exit(0); }
@@ -45,22 +45,22 @@ static int run_case(int kind, int setup, int sig){
 }
 int main(void){
     setvbuf(stdout, NULL, _IONBF, 0);
-    /* 1. 可忽略信号不应中断（修复目标）*/
+    /* -  可忽略信号不应中断（修复目标）*/
     int ign_ok = 1;
     for(int k=0;k<3;k++) if(run_case(k, 0, SIGCONT)) ign_ok = 0;
     printf("SIGCONT (default Cont) ignored, not interrupting: %s\n", ign_ok?"PASS":"FAIL");
 
-    /* 2. 默认 Ign 的 SIGCHLD 不应中断 */
+    /* -  默认 Ign 的 SIGCHLD 不应中断 */
     int chld_ok = 1;
     for(int k=0;k<3;k++) if(run_case(k, 0, SIGCHLD)) chld_ok = 0;
     printf("SIGCHLD (default Ign) ignored, not interrupting: %s\n", chld_ok?"PASS":"FAIL");
 
-    /* 3. 已 catch 的 SIGUSR1 必须中断 */
+    /* -  已 catch 的 SIGUSR1 必须中断 */
     int catch_ok = 1;
     for(int k=0;k<3;k++) if(!run_case(k, 1, SIGUSR1)) catch_ok = 0;
     printf("SIGUSR1 (caught) interrupts: %s\n", catch_ok?"PASS":"FAIL");
 
-    /* 4. 默认 Term 的 SIGTERM 必须中断（终止进程）*/
+    /* -  默认 Term 的 SIGTERM 必须中断（终止进程）*/
     int term_ok = 1;
     for(int k=0;k<3;k++) if(!run_case(k, 0, SIGTERM)) term_ok = 0;
     printf("SIGTERM (default Term) interrupts: %s\n", term_ok?"PASS":"FAIL");

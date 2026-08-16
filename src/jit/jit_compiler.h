@@ -58,7 +58,7 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     { e.size() } -> std::same_as<size_t>;
     { e.data() } -> std::convertible_to<uint8_t*>;
     // emulate fp instruction (BPF_FP_*) in JIT (x86 SSE/FP) natively, or fall
-    // back to helper_do_softfp (e.g. x86 unsigned fp↔int conversion lacks AVX-512).
+    // back to helper_do_softfp (e.g. x86 unsigned fp<->int conversion lacks AVX-512).
     { e.emit_call_softfp(insn) } -> std::same_as<bool>;
     e.emit_call_softfp_slow(insn, idx, gpa);
 

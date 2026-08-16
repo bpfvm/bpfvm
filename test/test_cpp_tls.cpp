@@ -86,8 +86,8 @@ int main() {
     }
 
     // (1c) 取地址 &var：
-    //   get_counter_addr() 返回 counter 副本指针 → 经它写入应改 counter
-    //   via_call_arg() 把 &init_val 传入外部函数 → 应读到模板初值 42
+    //   get_counter_addr() 返回 counter 副本指针 -> 经它写入应改 counter
+    //   via_call_arg() 把 &init_val 传入外部函数 -> 应读到模板初值 42
     counter = 11;
     int *cp = get_counter_addr();
     *cp = 22;   // 经指针写，counter 应变 22

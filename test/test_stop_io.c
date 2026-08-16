@@ -1,5 +1,5 @@
 /* 验证阻塞中的 read 被 SIGTSTP+SIGCONT 快速连续后仍正确阻塞（新模型：STOP 不踢 host syscall）。
- * 父进程 stop→立即 cont（不给子进程 CPU），子进程的 read 应从未被 EINTR 打断，
+ * 父进程 stop->立即 cont（不给子进程 CPU），子进程的 read 应从未被 EINTR 打断，
  * 继续等数据。这验证了"STOP 不踢 host syscall，CONT 先到则无事发生过"。
  *
  * 对照：旧模型下 stop+cont 快速连续会误返回 EINTR（VM_STOPPED 被 CONT 清，
@@ -58,7 +58,7 @@ int main(void) {
         close(fd[1]);
         return 1;
     }
-    /* 子仍阻塞 → 正确。写数据让它完成。 */
+    /* 子仍阻塞 -> 正确。写数据让它完成。 */
     write(fd[1], "x", 1);
     close(fd[1]);
     waitpid(pid, &st, 0);

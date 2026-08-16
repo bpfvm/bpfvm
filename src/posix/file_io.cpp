@@ -5,10 +5,10 @@
 //   读：无条件产生 SIGTTIN（TOSTOP 不影响读）。
 //   写：仅当 termios c_lflag & TOSTOP 才产生 SIGTTOU；默认 TOSTOP=0，写照常进行。
 //   信号 disposition：
-//     SIG_IGN + 写 → 信号忽略，I/O 照常完成（写返回写入字节数）。
-//     SIG_IGN + 读 → Linux 返回 -EIO（忽略读的 SIGTTIN 视作非法后台读）。
-//     SIG_DFL     → 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
-//     已 catch    → handler 返回后被中断的系统调用返回 -1/EINTR
+//     SIG_IGN + 写 -> 信号忽略，I/O 照常完成（写返回写入字节数）。
+//     SIG_IGN + 读 -> Linux 返回 -EIO（忽略读的 SIGTTIN 视作非法后台读）。
+//     SIG_DFL     -> 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
+//     已 catch    -> handler 返回后被中断的系统调用返回 -1/EINTR
 // 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
 // 非 DevFd 第一行短路 -> 对它们永远放行（无后台门控）。
 std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read) {
@@ -30,8 +30,8 @@ std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<F
     const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
     if(handler_is_ignored(act.handler)) {
         // SIG_IGN：信号被忽略。
-        //   写 → I/O 照常完成（放行，do_write 真正 write）。
-        //   读 → Linux 返回 -EIO（后台读被忽略视为非法）。
+        //   写 -> I/O 照常完成（放行，do_write 真正 write）。
+        //   读 -> Linux 返回 -EIO（后台读被忽略视为非法）。
         if(is_read) {
             return -EIO;
         }

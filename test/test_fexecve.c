@@ -6,10 +6,10 @@
  * /proc/self/fd，也不再返回 ENOSYS。
  *
  * 两个用例：
- *   1) 成功路径：fexecve 一个指向自身 ELF 的 fd（经 /proc/self/exe 取真实 ELF 路径）。
+ *   -  成功路径：fexecve 一个指向自身 ELF 的 fd（经 /proc/self/exe 取真实 ELF 路径）。
  *      re-exec 后的新映像由哨兵 env（FEXECVE_REEXEC=1）识别，打印 ok 并 exit 0。
  *      覆盖 AT_EMPTY_PATH 实现 + /proc/self/exe follow + 映像替换 + argv/envp 传递。
- *   2) 优雅降级：fexecve 一个目录 fd（open(".")），目录非 ELF，execveat 返 -ENOEXEC，
+ *   -  优雅降级：fexecve 一个目录 fd（open(".")），目录非 ELF，execveat 返 -ENOEXEC，
  *      fexecve 不替换映像、返 -1 且 errno 被设置。验证关键点：fexecve
  *      【不崩溃、不把 fd 当 path 读导致段错误】。旧行为（execveat 错配到 EXECVE handler）
  *      会把 fd 当 path 读，导致段错误或乱 exec。
@@ -40,7 +40,7 @@ int main(void) {
     }
 
     /* —— 用例 1：成功路径 —— */
-    /* /proc/self/exe 是 magic symlink → 真实 ELF。ProcPath::open 会 follow 到真实 ELF
+    /* /proc/self/exe 是 magic symlink -> 真实 ELF。ProcPath::open 会 follow 到真实 ELF
      * 路径并 open，得到的 HostFd 的 path 字段即真实 guest 绝对路径——这正是 do_execveat
      * 的 AT_EMPTY_PATH 分支所读的 fd->path。 */
     int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
@@ -69,8 +69,8 @@ int main(void) {
            r, strerror(errno));
     close(fd);
 
-    /* —— 用例 2：优雅降级（目录 fd → ENOEXEC）—— */
-    /* open 一个目录 fd，目录非 ELF，load_elf 失败 → execveat 返 -ENOEXEC。
+    /* —— 用例 2：优雅降级（目录 fd -> ENOEXEC）—— */
+    /* open 一个目录 fd，目录非 ELF，load_elf 失败 -> execveat 返 -ENOEXEC。
      * 验证关键点：不崩溃、不把 fd 当 path 读导致段错误。 */
     int dfd = open(".", O_RDONLY);
     if (dfd < 0) {

@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 /* ===================================================================
- * 1. Fibonacci（第 70 项，用 uint64_t 防溢出）
+ * -  Fibonacci（第 70 项，用 uint64_t 防溢出）
  * 覆盖：寄存器间 ADD、MOV、循环回边、条件跳转
  * =================================================================== */
 static uint64_t fib(int n) {
@@ -25,7 +25,7 @@ static uint64_t fib(int n) {
 }
 
 /* ===================================================================
- * 2. 累加 + 位运算混合
+ * -  累加 + 位运算混合
  * 覆盖：ADD/SUB/XOR/AND/OR/LSH/RSH，立即数和寄存器两种形式
  * =================================================================== */
 static uint64_t bitops_loop(int n) {
@@ -42,7 +42,7 @@ static uint64_t bitops_loop(int n) {
 }
 
 /* ===================================================================
- * 3. 32-bit 算术密集循环
+ * -  32-bit 算术密集循环
  * 覆盖：ALU32 指令（add32, sub32, mul32, lsh32, rsh32）
  * =================================================================== */
 static uint32_t alu32_loop(int n) {
@@ -58,7 +58,7 @@ static uint32_t alu32_loop(int n) {
 }
 
 /* ===================================================================
- * 4. 多寄存器同时活跃（r0-r9 全部使用）
+ * -  多寄存器同时活跃（r0-r9 全部使用）
  * 覆盖：寄存器分配压力，测试 callee-saved / caller-saved 映射
  * =================================================================== */
 static uint64_t multi_reg(int n) {
@@ -78,7 +78,7 @@ static uint64_t multi_reg(int n) {
 }
 
 /* ===================================================================
- * 5. DIV/MOD 密集（走 helper call，测试 spill/restore 开销）
+ * -  DIV/MOD 密集（走 helper call，测试 spill/restore 开销）
  * =================================================================== */
 static uint64_t divmod_loop(int n) {
     uint64_t acc = 1000000;
@@ -91,7 +91,7 @@ static uint64_t divmod_loop(int n) {
 }
 
 /* ===================================================================
- * 6. Collatz 猜想迭代（条件跳转密集）
+ * -  Collatz 猜想迭代（条件跳转密集）
  * 覆盖：大量条件分支 + ALU 混合
  * =================================================================== */
 static uint64_t collatz_total_steps(uint64_t start, uint64_t count) {
@@ -110,7 +110,7 @@ static uint64_t collatz_total_steps(uint64_t start, uint64_t count) {
 }
 
 /* ===================================================================
- * 7. 数组遍历求和 + 位运算（内存访问 + ALU 混合）
+ * -  数组遍历求和 + 位运算（内存访问 + ALU 混合）
  * 覆盖：LDX/STX + ALU 交织，测试寄存器映射在内存访问路径的效果
  * =================================================================== */
 static uint64_t array_compute(void) {
@@ -144,7 +144,7 @@ static uint64_t array_compute(void) {
 int main(void) {
     int ok = 1;
 
-    /* 1. Fibonacci */
+    /* -  Fibonacci */
     {
         uint64_t r = fib(70);
         /* fib(70) = 190392490709135 */
@@ -152,42 +152,42 @@ int main(void) {
         ok &= (r == 190392490709135ULL);
     }
 
-    /* 2. Bitops (10M 次迭代) */
+    /* -  Bitops (10M 次迭代) */
     {
         uint64_t r = bitops_loop(10000000);
         printf("bitops(10M) = %lu\n", r);
         ok &= (r == 2393173702422460ULL);
     }
 
-    /* 3. ALU32 (5M 次迭代) */
+    /* -  ALU32 (5M 次迭代) */
     {
         uint32_t r = alu32_loop(5000000);
         printf("alu32(5M) = %u\n", r);
         ok &= (r == 3655653932U);
     }
 
-    /* 4. Multi-register (10M 次迭代) */
+    /* -  Multi-register (10M 次迭代) */
     {
         uint64_t r = multi_reg(10000000);
         printf("multi_reg(10M) = %lu\n", r);
         ok &= (r == 18360034627886528466ULL);
     }
 
-    /* 5. Divmod (1M 次迭代) */
+    /* -  Divmod (1M 次迭代) */
     {
         uint64_t r = divmod_loop(1000000);
         printf("divmod(1M) = %lu\n", r);
         ok &= (r == 500000ULL);
     }
 
-    /* 6. Collatz (从 2 开始的 10000 个数) */
+    /* -  Collatz (从 2 开始的 10000 个数) */
     {
         uint64_t r = collatz_total_steps(2, 10000);
         printf("collatz(2..10001) = %lu\n", r);
         ok &= (r == 849845ULL);
     }
 
-    /* 7. Array compute (256 元素 x 100K 轮) */
+    /* -  Array compute (256 元素 x 100K 轮) */
     {
         uint64_t r = array_compute();
         printf("array_compute = %lu\n", r);

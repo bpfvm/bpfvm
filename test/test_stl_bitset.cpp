@@ -2,7 +2,7 @@
 //
 // 解锁背景：<bitset> 的 count/find_first 等内部调 std::__count 的 __bit_iterator
 // 特化版，其参数是 [2 x i64] 聚合（__bit_iterator = {ptr, unsigned}）。两个 bit_
-// iterator + value + proj = 6 个 BPF 寄存器 > 上限 5 → "too many arguments"。
+// iterator + value + proj = 6 个 BPF 寄存器 > 上限 5 -> "too many arguments"。
 // BpfWideArgs 的 lowerAggregateParams 把小聚合成值参数直接归一成裸 ptr（恒占 1
 // 寄存器），解锁 bitset 全部操作。
 //

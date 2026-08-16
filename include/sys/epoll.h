@@ -4,7 +4,7 @@
 // BPF arch 的 epoll uapi（与 Linux uapi 同级定位）。
 //
 // 仅放 BPF 特有类型：epoll_event 在 BPF arch 下是「非 packed 16B」布局（events 4B
-// + 4B padding + data 8B），与 host x86_64（packed 12B）不同 → 这正是要单独定义、
+// + 4B padding + data 8B），与 host x86_64（packed 12B）不同 -> 这正是要单独定义、
 // 且 VM 在 epoll_ctl/wait 时必须逐元素转换布局的根本原因。epoll_data_t 一并定义，
 // 让 epoll_event 完全由本头自洽（host 与 musl 的 epoll_data_t 都是 8B 同布局 union，
 // 但为了 uapi 自洽、避免对 host 头的隐式依赖，这里显式定义）。

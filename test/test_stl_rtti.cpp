@@ -1,10 +1,10 @@
 // STL <typeinfo> + dynamic_cast 测试：验证 C++ RTTI 在 bpfvm 上正确工作。
 //
 // 解锁背景（详见 port_cplusplus.md「RTTI 支持」决策记录）：
-//   ①链接器修 SHT_REL embedded addend bug——typeinfo 第一槽是「vtable+16 指针」，
+//   (1)链接器修 SHT_REL embedded addend bug——typeinfo 第一槽是「vtable+16 指针」，
 //     引用 UND 符号 _ZTVN10__cxxabiv1*（定义在 libc++abi），embedded addend=+16 必须
-//     读出，否则 typeinfo vtable 指针少 16 → dynamic_cast/typeid 崩。
-//   ②libcxx.a 编入 libc++abi 的 6 个 typeinfo 源文件（private_typeinfo 等），
+//     读出，否则 typeinfo vtable 指针少 16 -> dynamic_cast/typeid 崩。
+//   (2)libcxx.a 编入 libc++abi 的 6 个 typeinfo 源文件（private_typeinfo 等），
 //     提供 __cxxabiv1 全部 typeinfo vtable + 76 个基本 typeinfo 对象 + __dynamic_cast
 //     全实现 + __cxa_bad_typeid。
 // 异常仍禁用（-fno-exceptions），故不测 throw/catch；typeid 与 dynamic_cast 的指针
@@ -61,7 +61,7 @@ int main() {
         Base* bp = &d;
         const std::type_info& dyn_ti = typeid(*bp);  // 动态：实际是 Derived
         const std::type_info& sta_ti = typeid(Derived); // 静态
-        // Itanium ABI 约定同一类型 RTTI 唯一 → 动态==静态（指针相等）。
+        // Itanium ABI 约定同一类型 RTTI 唯一 -> 动态==静态（指针相等）。
         if (&dyn_ti != &sta_ti) {
             printf("FAIL (2) dynamic typeid != static: %s vs %s\n",
                    dyn_ti.name(), sta_ti.name());
@@ -166,7 +166,7 @@ int main() {
     {
         Derived d1, d2;
         Base *b1 = &d1, *b2 = &d2;
-        // 两个不同对象的动态类型都是 Derived → typeid 应指向同一个 type_info 对象。
+        // 两个不同对象的动态类型都是 Derived -> typeid 应指向同一个 type_info 对象。
         if (&typeid(*b1) != &typeid(*b2)) {
             printf("FAIL (11) typeid identity across objects\n");
             ++failures;

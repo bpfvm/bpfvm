@@ -7,7 +7,7 @@
  *   - tcsetattr 切 ICANON/ECHO off（验证 TCSETS）并读回验证
  *   - TIOCGWINSZ 读出非 0 行列
  *   - TIOCGPGRP == 自身 pgrp（验证前台组初始化）
- *   - 深层路径：fork→子 setsid()+TIOCSCTTY 建新会话并绑 ctty，再 tcsetpgrp/tcgetpgrp
+ *   - 深层路径：fork->子 setsid()+TIOCSCTTY 建新会话并绑 ctty，再 tcsetpgrp/tcgetpgrp
  *     往返，覆盖 session/ctty/前台组语义
  *
  * 运行：bpfvm --pty test_pty.out / bpfvm test_pty.out   均可。
@@ -122,7 +122,7 @@ static int leader_main(void) {
         return 1;
     }
 
-    /* 深层路径：fork→孙 setsid() 建新会话，再对同一 slave 做 TIOCSCTTY 抢夺。
+    /* 深层路径：fork->孙 setsid() 建新会话，再对同一 slave 做 TIOCSCTTY 抢夺。
      * POSIX：孙 setsid 后新 session 无 ctty；继承的 slave fd 仍是 leader session 的
      * ctty（同一 pty slave），非 force 抢应失败 EPERM（一个 tty 同时只属一个 session）；
      * force=1 抢夺应成功。验证多 session 的 ctty 占用语义。 */
@@ -137,7 +137,7 @@ static int leader_main(void) {
             printf("child setsid failed errno=%d\n", errno);
             _exit(1);
         }
-        /* 非 force 抢：slave 已是 leader session 的 ctty → EPERM */
+        /* 非 force 抢：slave 已是 leader session 的 ctty -> EPERM */
         if(ioctl(slave, TIOCSCTTY, 0) == 0) {
             printf("child TIOCSCTTY(non-force) unexpectedly succeeded\n");
             _exit(1);
@@ -180,7 +180,7 @@ static int leader_main(void) {
         return 1;
     }
 
-    /* 先报告成功再关 master：close(master) 对齐 Linux pty_close → tty_vhangup，向该
+    /* 先报告成功再关 master：close(master) 对齐 Linux pty_close -> tty_vhangup，向该
      * ctty 前台组（leader 自身）投 SIGHUP，默认动作终止 leader。故 printf 必须在
      * close(master) 之前完成，否则被 SIGHUP 打断跑不到。close(slave) 不触发 SIGHUP。 */
     printf("pty ok row=%d col=%d pgrp=%d\n", ws.ws_row, ws.ws_col, pgrp);
@@ -208,7 +208,7 @@ int main(void) {
     }
     /* leader 正常退出：返回其退出码。
      * leader 被 SIGHUP 杀：也算成功。因为 leader_main 在 close(master) 前已 printf 完
-     * 成功信息并 return 0，随后的 close(master) 对齐 Linux pty_close → 向 ctty 前台组
+     * 成功信息并 return 0，随后的 close(master) 对齐 Linux pty_close -> 向 ctty 前台组
      * 投 SIGHUP，leader 自身正是前台组，故被 SIGHUP 终止——这是预期的 Linux 语义，
      * 不是断言失败（断言失败会先 _exit 非 0，走 WIFEXITED 分支返回非 0）。 */
     if(WIFEXITED(status)) return WEXITSTATUS(status);

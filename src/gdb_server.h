@@ -18,8 +18,8 @@
 // safepoint，无法支持任意 pc 的断点/单步）；step() 取指后调 DebugHooks::breakpoint 钩子（void）
 // 判定是否落实停止。钩子命中条件即 set VM_DEBUG_STOP（GDB 请求停的主信号），step() 见 flag 即
 // debug_park。两种命中来源：
-//   • TaskEntry::breakpoints 命中当前 pc（软断点）→ set STOP；
-//   • TaskEntry::stepping 为真（单步/step-over 的一次性放行请求）→ 消费 stepping + set STOP。
+//   - TaskEntry::breakpoints 命中当前 pc（软断点）-> set STOP；
+//   - TaskEntry::stepping 为真（单步/step-over 的一次性放行请求）-> 消费 stepping + set STOP。
 // debug_park 是纯消费者：只 cond_wait 等 GDB continue 清 VM_DEBUG_STOP + wakeup 放行，不自己
 // set flag（消费者不生产）。
 //   即时停（Ctrl-C / attach / all-stop 协调 / fork / exec / syscall catch / 断点命中）由 GDB
@@ -122,10 +122,10 @@ private:
         vm* fork_child = nullptr;                               // 待上报 fork 事件（子 vm*，nullptr=无）
         std::pair<uint32_t, bool> syscall_event = {0, false};   // 待上报 syscall 事件（{0,false}=无）
     };
-    // pid → TaskEntry。GdbServer 自维护，不依赖 syscall 层 pid_map——pid_map 条目会被 guest 父
+    // pid -> TaskEntry。GdbServer 自维护，不依赖 syscall 层 pid_map——pid_map 条目会被 guest 父
     // 进程 waitpid 回收，但被 trace 的 vm 退出后 GdbServer 仍需读其 r(0)/tgid 发退出回复，故自己
     // 持引用（对齐 ptrace）。
-    //   登记：register_task（start 时 pid=1）/ on_create_vm（fork·clone 子）/ vAttach。
+    //   登记：register_task（start 时 pid=1）/ on_create_vm（fork/clone 子）/ vAttach。
     //   移除：send_exit_reply 上报退出后 / detach_vm。
     // 并发：on_create_vm 在父 vm 线程写、wait_any_stopped 等在 GDB 线程读，tasks_mutex_ 统一保护。
     mutable std::mutex tasks_mutex_;
@@ -141,8 +141,8 @@ private:
     //   with_task(v,fn)：锁内对单个 vm 的 entry 执行 fn。
     // fn 内可读写 TaskEntry 字段、调 vm 的不阻塞方法（get/set/clear_flags 原子；wakeup 持 vm
     // 自己的锁；host_signal 是 pthread_kill，都不持 tasks_mutex_，锁内调安全）。**fn 内禁止**：
-    //   1) 阻塞操作（send_packet / wait_stopped / recv 等）——需收集目标后锁外做；
-    //   2) 重锁 tasks_mutex_ 的函数（find_task / has_breakpoint / mark_stepping / register_task
+    //   -  阻塞操作（send_packet / wait_stopped / recv 等）——需收集目标后锁外做；
+    //   -  重锁 tasks_mutex_ 的函数（find_task / has_breakpoint / mark_stepping / register_task
     //      等薄封装及 for_each_task/with_task 自身）——非递归锁，重锁会死锁。
     // 不变量：对某 vm 写状态字段前必须先 register（调用方保证）。
     void for_each_task(std::function<void(TaskEntry&)> fn);

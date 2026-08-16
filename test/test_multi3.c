@@ -1,10 +1,10 @@
 /*
  * test_multi3.c — 验证 __builtin_mul_overflow(uint64_t, uint64_t, uint64_t*)
- *   (64×64→128 宽乘高位)支持。
+ *   (64x64->128 宽乘高位)支持。
  *
  * 触发链路(无 pass 时):
- *   __builtin_mul_overflow → @llvm.umul.with.overflow.i64
- *   → BPF 后端 lower 成 __multi3 调用 → BPF ISel 拒绝("__multi3 not supported")
+ *   __builtin_mul_overflow -> @llvm.umul.with.overflow.i64
+ *   -> BPF 后端 lower 成 __multi3 调用 -> BPF ISel 拒绝("__multi3 not supported")
  *
  * BpfSoftFp pass 在 IR 层把 umul.with.overflow 展开成
  * 原生 mul i64(低位) + BPF_FP_UMULH(高位,走 softfp 通道),消除 __multi3 调用。
@@ -71,8 +71,8 @@ int main(void) {
     CHECK_MUL(1ULL << 32, 1ULL << 32,
               0, 1, "(2^32)^2");
     /* (2^32-1)^2 = 0xFFFFFFFE00000001:恰好 64 位,不溢出
-       (PLAN.md 草案曾误标"乘积 1 溢出 1",那是 32×32→64 的视角;
-       64×64→128 视角下高位 = 0,不溢出) */
+       (PLAN.md 草案曾误标"乘积 1 溢出 1",那是 32x32->64 的视角;
+       64x64->128 视角下高位 = 0,不溢出) */
     CHECK_MUL(0xFFFFFFFFULL, 0xFFFFFFFFULL,
               0xFFFFFFFE00000001ULL, 0, "(2^32-1)^2");
     /* (2^32-1)*2^32 平方:c = (2^32-1)*2^32, c*c = (2^32-1)^2 * 2^64

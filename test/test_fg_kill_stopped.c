@@ -14,7 +14,7 @@
  * 注：这是 dash `fg` 不生效的次要因素；主因（SIGTTOU+SIG_IGN 死循环）见
  * test_bg_write_tty.c。本用例独立验证信号投递时序。
  *
- * 流程：子进程 raise(SIGTSTP) 停 → 父 SIGTERM(挂起)+SIGCONT(唤醒) → 轮询 waitpid，
+ * 流程：子进程 raise(SIGTSTP) 停 -> 父 SIGTERM(挂起)+SIGCONT(唤醒) -> 轮询 waitpid，
  * 期望 5 秒内被 SIGTERM 杀；回归（JIT 模式）时子进程卡在 nanosleep，5 秒超时。
  */
 #include <stdio.h>

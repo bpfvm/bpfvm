@@ -7,7 +7,7 @@ int64_t PosixSyscall::do_setpgid(vm* v) {
         return -EINVAL;
     }
 
-    // 解析目标 task：pid_arg==0 → 自身；否则必须是自身或子进程。
+    // 解析目标 task：pid_arg==0 -> 自身；否则必须是自身或子进程。
     std::shared_ptr<vm> target_vm;
     PosixSyscall* target = nullptr;
     if(pid_arg == 0) {
@@ -40,7 +40,7 @@ int64_t PosixSyscall::do_setpgid(vm* v) {
         return 0;
     }
 
-    // 解析新 pgid：pgrp_arg==0 → 目标自身 pid（新建组）
+    // 解析新 pgid：pgrp_arg==0 -> 目标自身 pid（新建组）
     uint64_t new_pgid = (pgrp_arg == 0) ? target->pid : static_cast<uint64_t>(pgrp_arg);
 
     // 若 new_pgid != 目标 pid，必须存在同 session 的进程以该 pid 为 pgid leader
@@ -81,7 +81,7 @@ int64_t PosixSyscall::do_getpgrp(vm*) {
 }
 
 int64_t PosixSyscall::do_setsid(vm*) {
-    // 已是进程组 leader → EPERM
+    // 已是进程组 leader -> EPERM
     if(pgrp->pgid == pid) {
         return -EPERM;
     }

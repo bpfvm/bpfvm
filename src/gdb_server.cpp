@@ -36,7 +36,7 @@ GdbServer::~GdbServer() {
     //
     // 注意：不能用 `if(!running_.exchange(false)) return;` 提前返回——server_loop 的 LoopExitGuard
     // 在退出时会把 running_ 置 false（如 GDB 断开后自然退出），此时析构再走 exchange 返回 false 会
-    // 直接 return，跳过下面的 thread_.join()，导致 std::thread 析构时仍 joinable → std::terminate
+    // 直接 return，跳过下面的 thread_.join()，导致 std::thread 析构时仍 joinable -> std::terminate
     // （kill 场景必现崩溃）。是否要 join 只取决于 thread_.joinable()，与 running_ 的值无关。
     running_ = false;
     if(listen_fd_ >= 0) {
@@ -46,7 +46,7 @@ GdbServer::~GdbServer() {
     }
     if(thread_.joinable()) {
         // 轮询等待 server_loop 自然退出（GDB 断开或 vm 退出），最多 ~6 秒。
-        // running_ 已 false，server 应在 ≤0.2s（一个 recv 超时周期）内退出；超时则
+        // running_ 已 false，server 应在 <=0.2s（一个 recv 超时周期）内退出；超时则
         // 强制关 client fd 让阻塞中的 recv 返回后再 join。
         for(int i = 0; i < 60 && !loop_done_.load(std::memory_order_acquire); i++) {
             timespec ts{0, 100000000};  // 0.1s
@@ -245,7 +245,7 @@ void GdbServer::register_task(std::shared_ptr<vm> v,
     // C++ 里函数实参的求值顺序未排序（unsequenced），若写成
     //   tasks_.insert_or_assign(v->sys()->id(), TaskEntry{std::move(v), ...});
     // 编译器可能先执行 TaskEntry{std::move(v)}（把 v 移空），再求值 v->sys()，
-    // 解引用已移空的 shared_ptr → SIGSEGV（gcc 14 实测就是这么排的）。
+    // 解引用已移空的 shared_ptr -> SIGSEGV（gcc 14 实测就是这么排的）。
     uint64_t pid = v->sys()->id();
     std::lock_guard<std::mutex> lock(tasks_mutex_);
     tasks_.insert_or_assign(pid, TaskEntry{std::move(v), std::move(bps), {}});
@@ -282,7 +282,7 @@ std::string GdbServer::encode_tid(vm* v) {
 // 解析 RSP 线程 id 字符串为 vm（内部 find_task 查表）。
 //   裸 hex（"1"/"2a"）：按裸 pid 处理。
 //   pPID.TID（"p1.1"）：multiprocess 格式，取 TID 段作为 pid。
-//   "0"/"-1"/"p0.0"/"p-1.-1"：RSP 特殊值（任意/所有）→ pid 0；pid 0 或查表不到均返回 nullptr。
+//   "0"/"-1"/"p0.0"/"p-1.-1"：RSP 特殊值（任意/所有）-> pid 0；pid 0 或查表不到均返回 nullptr。
 std::shared_ptr<vm> GdbServer::decode_tid(const std::string& s, bool search_pid_map) {
     uint64_t pid = 0;
     if(!s.empty()) {
@@ -407,7 +407,7 @@ void GdbServer::on_create_vm(vm* parent, vm* child, bool is_thread) {
     child->set_flags(vm::VM_DEBUG_ATTACHED);
     bool want_fork_event = (!is_thread && report_fork_events_);
 
-    // 一次锁内完成：register 子 → set VM_DEBUG_STOP(子 停首条) → [fork-events: 写父 fork_child +
+    // 一次锁内完成：register 子 -> set VM_DEBUG_STOP(子 停首条) -> [fork-events: 写父 fork_child +
     // set VM_DEBUG_STOP(父 停)]。子停首条是 all-stop 正确性要求：派生的子必须立即停下纳入协调，
     // 否则会在父命中断点时自由跑完，破坏 all-stop。
     std::lock_guard<std::mutex> lk(tasks_mutex_);
@@ -694,7 +694,7 @@ void GdbServer::wait_any_stopped(std::shared_ptr<vm>& out_hit_vm, vm* preferred,
 std::string GdbServer::handle_vcont(const std::string& pkt) {
     self_replied_ = true;
     // 切分 ';'：首段是 "vCont"，其后每段一个 action。
-    // 例：vCont;c:1;s:2  → ["vCont", "c:1", "s:2"]
+    // 例：vCont;c:1;s:2  -> ["vCont", "c:1", "s:2"]
     std::vector<std::string> actions;
     size_t start = 0;
     for(;;) {
@@ -726,7 +726,7 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         const std::string& a = actions[i];
         if(a.empty()) continue;
         char act = a[0];
-        // 归一化：C<c> → c（带信号继续），S<c> → s（带信号单步）。信号当前不投递。
+        // 归一化：C<c> -> c（带信号继续），S<c> -> s（带信号单步）。信号当前不投递。
         char norm;
         if(act == 'c' || act == 'C') norm = 'c';
         else if(act == 's' || act == 'S') norm = 's';
@@ -734,9 +734,9 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         else continue;  // 未知 action 跳过
 
         // 解析可选 :tid。tid 形如 pid / pPID.TID / pPID.-1 / pPID.0 / -1 / 0。
-        //   pPID.TID    → 单线程（has_tid=true, target=该 tid 的 vm*）
-        //   pPID.-1/0   → 该 PID 的所有线程（scope=该 pid 的 vm*，has_tid=false）
-        //   -1/0/p-1.-1 → 所有线程（全局 default，has_tid=false, scope=nullptr）
+        //   pPID.TID    -> 单线程（has_tid=true, target=该 tid 的 vm*）
+        //   pPID.-1/0   -> 该 PID 的所有线程（scope=该 pid 的 vm*，has_tid=false）
+        //   -1/0/p-1.-1 -> 所有线程（全局 default，has_tid=false, scope=nullptr）
         // wire pid 经 find_task 桥成 vm*；桥不到（已退出/detach）存 nullptr，后续 set_action 跳过。
         auto colon = a.find(':');
         bool has_tid = false;
@@ -778,10 +778,10 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
 
     // 三阶段执行（三阶段都用 for_each_task；step-over 的 wait_stopped 阻塞需锁外，在 fn 里
     // 收集目标后锁外逐个做）：
-    //   1. 决定每个 attached vm 的最终动作（显式单线程 > 进程作用域 pPID.-1 > 全局 default）。
-    //   2. 对 c 动作且 pc 命中断点的 vm 串行 step-over（必须越过，否则放行后首条 step 又命中
+    //   -  决定每个 attached vm 的最终动作（显式单线程 > 进程作用域 pPID.-1 > 全局 default）。
+    //   -  对 c 动作且 pc 命中断点的 vm 串行 step-over（必须越过，否则放行后首条 step 又命中
     //      同一断点死循环）。s/t 不需越步。
-    //   3. 按动作统一放行，wait_any_stopped 仅观察本次释放的 vm 停下。
+    //   -  按动作统一放行，wait_any_stopped 仅观察本次释放的 vm 停下。
     // 跳过非 VM_DEBUG_ATTACHED 的 vm（已 detach 的停止/退出绝不上报，否则 GDB 对已移除
     // inferior 取状态会 internal-error）。
     auto is_attached = [](vm* v) { return (v->get_flags() & vm::VM_DEBUG_ATTACHED) != 0; };
@@ -791,10 +791,10 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
     for(auto& pa : parsed) if(pa.has_tid && pa.target) explicit_targets.insert(pa.target);
 
     // ── 第一阶段：决定每个 attached vm 的最终动作。
-    //   vCont;c           → 所有线程 'c'（全局 default）
-    //   vCont;c:p1.-1     → inferior 1 的线程 'c'（进程作用域）
-    //   vCont;c:p1.1      → 线程 1 'c'（显式单线程）
-    //   vCont;c:p1.-1;t:p1.1 → 线程 1 't'，inferior 1 其余线程 'c'（显式优先于作用域）
+    //   vCont;c           -> 所有线程 'c'（全局 default）
+    //   vCont;c:p1.-1     -> inferior 1 的线程 'c'（进程作用域）
+    //   vCont;c:p1.1      -> 线程 1 'c'（显式单线程）
+    //   vCont;c:p1.-1;t:p1.1 -> 线程 1 't'，inferior 1 其余线程 'c'（显式优先于作用域）
     std::unordered_map<vm*, char> action_of;
     auto set_action = [&](vm* v, char act) {
         if(!v) return;  // 桥不到的 vm 跳过（已退出/detach）
@@ -1083,11 +1083,11 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
                     if(semi == std::string::npos) break;
                     pos = semi + 1;
                 }
-                cfg->sysnos = set;  // shared_ptr<T> → shared_ptr<const T> 隐式转换
+                cfg->sysnos = set;  // shared_ptr<T> -> shared_ptr<const T> 隐式转换
             } else {
                 return "E01";  // 格式错误（如 "1abc"）
             }
-            syscall_catch_.store(std::move(cfg));  // shared_ptr<T> → shared_ptr<const T>
+            syscall_catch_.store(std::move(cfg));  // shared_ptr<T> -> shared_ptr<const T>
             return "OK";
         }
         return "";
@@ -1110,7 +1110,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
         if(pkt.size() < 2) return "E01";
         std::string t = pkt.substr(2);
         if(auto v = decode_tid(t)) { current_vm = v; return "OK"; }
-        current_vm = main_vm;  // tid==0 / 查表失败 → 回退主 vm（current_vm 恒非空）
+        current_vm = main_vm;  // tid==0 / 查表失败 -> 回退主 vm（current_vm 恒非空）
         return "OK";
     }
     case 'g': {
@@ -1209,7 +1209,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
         // all-stop：当前 vm 先越过断点并放行（resume_continue 读 v->pc()/设 flags，必须在
         // v 被放行前完成——否则 v 解释器线程并发写 pc_ 构成数据竞争），再放行其余 vm。
         // continue 不能只等当前 vm（旧 resume 路径的 bug：若另一 vm 先命中断点而当前 vm
-        // 无断点长循环，wait_stopped(current) 永不返回 → all-stop 失效）。改由 wait_any_stopped
+        // 无断点长循环，wait_stopped(current) 永不返回 -> all-stop 失效）。改由 wait_any_stopped
         // 统一协调：放行所有 vm 后等任一命中并传播 stop 到其余 vm。
         resume_continue(v.get());
         continue_all_vms();

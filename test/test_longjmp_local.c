@@ -15,7 +15,7 @@
 
 static sigjmp_buf top_buf;
 
-/* 模拟 ash 的深层调用：read_line_input → ... → raise_exception → siglongjmp */
+/* 模拟 ash 的深层调用：read_line_input -> ... -> raise_exception -> siglongjmp */
 static void deep_call_then_longjmp(void) {
     /* 中间做一些调用，产生多层栈帧（模拟 ash 的 read_line_input 调用深度） */
     volatile int marker = 0xABCD;

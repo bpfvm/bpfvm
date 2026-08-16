@@ -441,7 +441,7 @@ static DirGen proc_root(PosixSyscall* self) {
 static Gen lookup(PosixSyscall* self, const std::string& guest_abs, std::string& escape) {
     auto to_segs = [](const std::string& p) {
         std::vector<std::string> v;
-        // 调用方保证路径是 /proc 开头。砍掉 "/proc" 前缀（substr(5)：/proc→""，/proc/x→"/x"），
+        // 调用方保证路径是 /proc 开头。砍掉 "/proc" 前缀（substr(5)：/proc->""，/proc/x->"/x"），
         for(const auto& part : std::filesystem::path(p.substr(5)).relative_path()) {
             if(!part.empty()) v.push_back(part.string());
         }
@@ -512,7 +512,7 @@ static std::string resolve_symlink(const std::string& link_path, const std::stri
 std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     std::string escape;
     auto node = lookup(self, guest, escape);
-    // 中间段符号链接跳出 /proc（如 /proc/1/root/bin）→ escape 是 target+剩余段的完整 host 路径，
+    // 中间段符号链接跳出 /proc（如 /proc/1/root/bin）-> escape 是 target+剩余段的完整 host 路径，
     // 经 ResolvePath 重解析（套 chroot + 按前缀分发）走完剩余部分。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->open(flags, mode);
@@ -550,8 +550,8 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
 }
 
 // follow：execve/execveat 用——返回 follow 后的真实可加载文件路径。
-// 中间段符号链接跳出 /proc → 直接返回 escape（完整 host 路径）；
-// 末段符号链接 → 返回 resolve_symlink 后的绝对 target；其余返回 guest 自身。
+// 中间段符号链接跳出 /proc -> 直接返回 escape（完整 host 路径）；
+// 末段符号链接 -> 返回 resolve_symlink 后的绝对 target；其余返回 guest 自身。
 std::string ProcPath::follow() {
     std::string escape;
     auto node = lookup(self, guest, escape);
@@ -565,7 +565,7 @@ std::string ProcPath::follow() {
 ssize_t ProcPath::readlink(char* buf, size_t bufsiz) {
     std::string escape;
     auto node = lookup(self, guest, escape);
-    // 中间段符号链接跳出 /proc（如 /proc/self/root/lib：root→/，再读 /lib 链接）→ escape 是
+    // 中间段符号链接跳出 /proc（如 /proc/self/root/lib：root->/，再读 /lib 链接）-> escape 是
     // 完整 host 路径，交给 ResolvePath 的 readlink 读真实符号链接（套 chroot + 按前缀分发）。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->readlink(buf, bufsiz);
@@ -628,7 +628,7 @@ int ProcPath::statx(struct statx* stx, unsigned int /*mask*/, int flags) {
 int ProcPath::access(int mode, int flags) {
     std::string escape;
     auto node = lookup(self, guest, escape);
-    // 中间段符号链接跳出 /proc → escape 是完整 host 路径，交给 ResolvePath 的 access
+    // 中间段符号链接跳出 /proc -> escape 是完整 host 路径，交给 ResolvePath 的 access
     // （套 chroot + 按前缀分发）测真实文件可访问性。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->access(mode, flags);

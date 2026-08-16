@@ -176,7 +176,7 @@ struct SignalFd: HostFd {
     std::shared_ptr<Fd> clone() const override;   // fork：独立新 pipe
 
     // —— 拦截对 signalfd 无意义的操作（对齐 Linux 行为，防止污染内部 pipe）——
-    // 实测 Linux：write/writev/ftruncate → EINVAL；pwrite/pread → ESPIPE；
+    // 实测 Linux：write/writev/ftruncate -> EINVAL；pwrite/pread -> ESPIPE；
     // lseek 在 signalfd 上 rc=0（no-op），保留 HostFd 透传即可（无需 override）。
     ssize_t write(const void* buf, size_t count) override { (void)buf; (void)count; return -EINVAL; }
     ssize_t pwrite(const void* buf, size_t count, off_t off) override { (void)buf; (void)count; (void)off; return -ESPIPE; }
@@ -211,7 +211,7 @@ struct VirtualDir: Fd {
 // 再调对应虚方法，不再各自重复 /dev|/proc|host 前缀分发。子类按路径前缀分流：
 //   /proc  -> ProcPath（open 经 lookup->ProcFile/VirtualDir；readlink/statx/access 经 lookup；修改类 EROFS、link/rename EXDEV）
 //   /dev   -> DevPath （合成设备层：open/statx/access/readlink 查 dev_lookup；修改类 EROFS、link/rename EXDEV）
-//   其它   → HostPath（open 经 HostFd::open；readlink/statx/修改类调 host libc）
+//   其它   -> HostPath（open 经 HostFd::open；readlink/statx/修改类调 host libc）
 // Path 不开 fd、不快照——这些是真正 open 时才做的事。持有：
 //   self  —— PosixSyscall*（ProcPath/DevPath 的 open 等要读进程状态，构造时存进成员）
 //   guest —— guest 视角绝对路径（/proc、/dev 匹配 + 存进 Fd::path 用）
@@ -255,7 +255,7 @@ struct Path {
 };
 
 
-// 工厂：按 guest 前缀分类返回对应 Path 子类（/proc→ProcPath、/dev→DevPath、其它→HostPath）。
+// 工厂：按 guest 前缀分类返回对应 Path 子类（/proc->ProcPath、/dev->DevPath、其它->HostPath）。
 // host 路径由 self->resolve_path(guest) 算好（含 chroot 前缀）传进 Path。
 std::shared_ptr<Path> ResolvePath(PosixSyscall* self, std::string guest);
 
@@ -273,7 +273,7 @@ struct HostPath: Path {
     int access(int mode, int flags) override;                                // ::faccessat(host)
     int unlink(int flags) override;                                          // ::unlinkat(host)
     int mkdir(mode_t mode) override;                                         // ::mkdir(host)
-    int symlink(const std::string& target) override;                         // ::symlinkat(target→host)
+    int symlink(const std::string& target) override;                         // ::symlinkat(target->host)
     int chmod(mode_t mode, int flags) override;                              // ::fchmodat(host)
     int truncate(off_t len) override;                                        // ::truncate(host)
     int utimens(const struct timespec times[2], int flags) override;         // ::utimensat(host)

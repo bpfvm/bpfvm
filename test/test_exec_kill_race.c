@@ -3,7 +3,7 @@
  * 触发点（src/posix/signal.cpp do_kill）：
  *   do_kill(pid>0, SIGKILL) 原本只给目标 pid 的 leader 线程投递 SIGKILL，不给
  *   同组 sibling 线程投递——违反 Linux 语义（kill(pid,SIGKILL) 杀整个线程组）。
- *   leader 退出时 sibling 仍活 → 不是 last 线程 → tg->exited 不设 → 父进程
+ *   leader 退出时 sibling 仍活 -> 不是 last 线程 -> tg->exited 不设 -> 父进程
  *   waitpid 永久阻塞。修复：do_kill 对 SIGKILL 遍历 tg->threads 逐个投递，
  *   与 do_execveat / do_exit_group 一致。
  *
@@ -13,12 +13,12 @@
  *   主进程收到就绪立即 kill(A, sig)，试图命中 exec/多线程窗口
  *   主进程 waitpid(A)（带超时兜底防卡死），判定退出信号
  *
- * 修复前（SIGKILL）：worker 不被杀 → tg->exited 不设 → waitpid 超时。
+ * 修复前（SIGKILL）：worker 不被杀 -> tg->exited 不设 -> waitpid 超时。
  * 修复后：全组被 SIGKILL，正常回收，WTERMSIG==sig。
  *
  * 用法：test_exec_kill_race [iters] [workers] [sig]
  *   iters    迭代轮数（默认 20）
- *   workers  每轮起的 worker 线程数（默认 1，≤8）
+ *   workers  每轮起的 worker 线程数（默认 1，<=8）
  *   sig      杀 A 用的信号号（默认 9=SIGKILL；10=SIGUSR1 测普通信号路径）
  * 参数经 guest argv 传入（bpfvm 不透传 host 环境变量）。host 与 bpfvm 同一约定。
  */

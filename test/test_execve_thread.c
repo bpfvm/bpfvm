@@ -3,17 +3,17 @@
 // 验证 bpfvm 的 do_execveat 是否正确杀掉线程组内其它线程。
 //
 // 流程：
-//   1. fork 出子进程（fork 只复制调用线程，子进程是单线程）。
-//   2. 子进程 pthread_create 一个 worker 线程，worker 跑一个长时间忙循环，
+//   -  fork 出子进程（fork 只复制调用线程，子进程是单线程）。
+//   -  子进程 pthread_create 一个 worker 线程，worker 跑一个长时间忙循环，
 //      持续写全局变量 worker_alive=1。
-//   3. 子进程主线程稍后 execve 另一个程序（test_arg.out）。
-//   4. 按 POSIX/Linux 语义：exec 会终止 worker（线程组只剩调用 exec 的线程）。
+//   -  子进程主线程稍后 execve 另一个程序（test_arg.out）。
+//   -  按 POSIX/Linux 语义：exec 会终止 worker（线程组只剩调用 exec 的线程）。
 //      worker 不应在新地址空间里继续执行。
 //
 // 验证点（父进程通过子进程的退出码 + 输出判断）：
 //   - 若 exec 正确杀线程：子进程 exec 成功，test_arg 正常输出参数并 exit 0x22(34)。
 //   - 若 exec 未杀线程（bug）：worker 在被换掉的新地址空间里按旧 pc/旧栈继续跑，
-//     很快崩溃（段错误等），子进程非正常退出，退出码 ≠ 34，且不会有 test_arg 的输出。
+//     很快崩溃（段错误等），子进程非正常退出，退出码 != 34，且不会有 test_arg 的输出。
 //
 // 被 exec 的目标 test_arg 是 BPF_TEST_HELPERS（不在 CTest 独立注册），由本测试驱动。
 //
@@ -94,7 +94,7 @@ int main(void) {
         return 2;
     }
     int code = WEXITSTATUS(status);
-    /* test_arg 返回 0x22(34)。若 exec 未杀 worker 导致崩溃，code ≠ 34。 */
+    /* test_arg 返回 0x22(34)。若 exec 未杀 worker 导致崩溃，code != 34。 */
     if (code != 0x22) {
         printf("parent: child exit code=%d (expected 0x22=34, exec may not have killed worker)\n", code);
         return 3;

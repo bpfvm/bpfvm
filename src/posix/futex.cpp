@@ -88,7 +88,7 @@ int PosixSyscall::futex_wait(vm* v, ThreadGroup* tg, uint64_t addr, uint32_t val
 
     {
         // 注册 + *p 检查原子（持 g_futex_mutex），经典 futex 正确性论证成立：要么 *p 已变
-        // （musl 在 wake 前改值）→ EAGAIN；要么注册后 wake 必命中本等待者（waker 在同一把
+        // （musl 在 wake 前改值）-> EAGAIN；要么注册后 wake 必命中本等待者（waker 在同一把
         // 锁下遍历 waiters 列表）。置 VM_BLOCKED 与注册同在锁内，外部 waker 才看得到。
         std::lock_guard<std::mutex> flk(g_futex_mutex);
         if(*p != val) return -EAGAIN;

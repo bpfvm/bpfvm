@@ -2,9 +2,9 @@
  * 验证 siglongjmp 回跳后，调用者能正常进行后续的函数调用与返回。
  *
  * 模拟 ash Ctrl+C 场景：
- *   ash_main: setjmp → state=4 → cmdloop() ──┐
- *     cmdloop 深层 longjmp 回 ash_main        │ 进程不退出
- *   ash_main: longjmp 返回 → 调 post_fn() ────┘
+ *   ash_main: setjmp -> state=4 -> cmdloop() ──┐
+ *     cmdloop 深层 longjmp 回 ash_main          │ 进程不退出
+ *   ash_main: longjmp 返回 -> 调 post_fn() ─────┘
  *     post_fn 必须正确返回到 ash_main（而非返回到别处）
  *
  * 若 VM siglongjmp 破坏了调用者的帧头，post_fn 的 return 会跳到错误地址，

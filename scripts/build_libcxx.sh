@@ -2,10 +2,10 @@
 # 构建 BPF target 的 C++ runtime（libcxx.a）。
 #
 # 由两部分组成：
-#   1. libc++ 源文件（-frtti，LIBCXX_BUILDING_LIBCXXABI）：algorithm/string/vector/
+#   -  libc++ 源文件（-frtti，LIBCXX_BUILDING_LIBCXXABI）：algorithm/string/vector/
 #      regex/iostream/thread/filesystem 等 + exception.cpp（走官方 exception_libcxxabi.ipp，
 #      用 cxa_noexception.cpp 的 __cxa_* 实现 exception_ptr/uncaught_exceptions）。
-#   2. libc++abi 源文件（-frtti）：private_typeinfo（RTTI/dynamic_cast 全实现）、
+#   -  libc++abi 源文件（-frtti）：private_typeinfo（RTTI/dynamic_cast 全实现）、
 #      cxa_noexception（-fno-exceptions 下的 __cxa_uncaught_exceptions 等）、
 #      cxa_virtual（__cxa_pure_virtual）、cxa_handlers/cxa_default_handlers
 #      （terminate/new_handler）、cxa_vector/cxa_demangle/fallback_malloc/abort_message、
@@ -46,13 +46,13 @@ for p in $(ls -d /tmp/llvm-toolchain-*/libcxx/src /usr/local/llvm-*/src/libcxx /
 done
 # LIBCXX_BUILDING_LIBCXXABI：让 libc++ 源知道 ABI 库是 libc++abi（与下面编译的
 #   libc++abi 源配对）。影响 3 个 libc++ 源：
-#   exception.cpp  → 走 exception_libcxxabi.ipp + exception_pointer_cxxabi.ipp，
+#   exception.cpp  -> 走 exception_libcxxabi.ipp + exception_pointer_cxxabi.ipp，
 #     自动用 cxa_noexception.cpp 提供的 __cxa_uncaught_exceptions /
 #     __cxa_increment/decrement_exception_refcount / __cxa_current_primary_exception /
 #     __cxa_rethrow_primary_exception 实现 std::exception_ptr / uncaught_exceptions /
 #     nested_exception。
-#   new_handler.cpp → set/get_new_handler 交给 libc++abi cxa_default_handlers.cpp。
-#   typeinfo.cpp → ~type_info 交给 libc++abi stdlib_typeinfo.cpp。
+#   new_handler.cpp -> set/get_new_handler 交给 libc++abi cxa_default_handlers.cpp。
+#   typeinfo.cpp -> ~type_info 交给 libc++abi stdlib_typeinfo.cpp。
 STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-builtin -fno-math-errno \
     -mllvm -bpf-stack-size=16384 \
     -nostdinc \

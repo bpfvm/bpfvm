@@ -7,11 +7,11 @@
  * sigsetjmp/siglongjmp 回归测试，聚焦信号掩码保存/恢复语义。
  *
  * 覆盖三点：
- *   1. sigsetjmp(env, 1) 在 setjmp 点保存当前掩码；之后 block 一个信号再
+ *   -  sigsetjmp(env, 1) 在 setjmp 点保存当前掩码；之后 block 一个信号再
  *      siglongjmp 回去，掩码必须恢复到 setjmp 时（被 block 的信号重新可投递）。
- *   2. sigsetjmp(env, 0) 不保存掩码；siglongjmp 后掩码保持 siglongjmp 调用时的
+ *   -  sigsetjmp(env, 0) 不保存掩码；siglongjmp 后掩码保持 siglongjmp 调用时的
  *      状态（仍被 block）。
- *   3. setjmp/longjmp 基本回跳仍正确（防止改动引入回归）。
+ *   -  setjmp/longjmp 基本回跳仍正确（防止改动引入回归）。
  *
  * BPF 上 setjmp == sigsetjmp(env, 1)（总是保存掩码），故 case 3 等价于 case 1。
  * 掩码查询用 sigprocmask(SIG_BLOCK, NULL, &set) 读当前掩码，检查目标位是否置位。

@@ -36,8 +36,8 @@ struct AbortPatchInfo {
 // Context for inline TLB memory access
 // ---------------------------------------------------------------------------
 struct MemAccessContext {
-    std::vector<size_t> miss_jumps;   // TLB miss Jcc offsets → .slow
-    std::vector<size_t> abort_jumps;  // null-pointer Jcc offsets → .vm_exit
+    std::vector<size_t> miss_jumps;   // TLB miss Jcc offsets -> .slow
+    std::vector<size_t> abort_jumps;  // null-pointer Jcc offsets -> .vm_exit
     size_t slow_start = 0;            // offset of .slow label
     size_t done_offset = 0;           // offset of .done label (after load/store code)
     size_t done_jmp = 0;              // offset of JMP .done (fast path) — needs patching
@@ -60,10 +60,10 @@ struct JitEntry {
     int insn_count = 0;               // total BPF instructions compiled
     size_t code_size = 0;             // mmap'd allocation size
     uint64_t gpa = 0;                  // first BPF instruction (guest address)
-    std::vector<uint32_t> pc_offsets; // BPF index → code offset
+    std::vector<uint32_t> pc_offsets; // BPF index -> code offset
     // 跨函数直跳第二入口（跳过 entry safepoint），offset from code。
     size_t entry_fast_offset = 0;
-    // inline cache：每个 BPF→BPF call 站点一槽，缓存 callee 的 entry_fast 入口（0=未缓存）。
+    // inline cache：每个 BPF->BPF call 站点一槽，缓存 callee 的 entry_fast 入口（0=未缓存）。
     // compile() 在 e.data()（RW）patch 占位为 &call_cache[idx]，再固化 RX，无运行时 patch。
     std::vector<uint64_t> call_cache;
 };

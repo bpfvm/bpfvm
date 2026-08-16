@@ -18,7 +18,7 @@ make_ld_wrapper
 
 # 屏蔽系统 bpf-gcc，让 clang fallback 到 host gcc：
 # bpf-gcc 的 *link spec 不透传 -static 给 ld（upstream binutils-bpf 缺陷），静态模式下产出
-# 会是 PIE 而非 ET_EXEC。在 wrapper 目录放 bpf-gcc → host gcc 软链并前置到 PATH，clang 查
+# 会是 PIE 而非 ET_EXEC。在 wrapper 目录放 bpf-gcc -> host gcc 软链并前置到 PATH，clang 查
 # bpf-gcc 时优先命中它（host gcc 正确透传 -static）。系统 bpf-gcc 不动，仅影响本构建。
 if [ -n "${LD_WRAPPER_DIR}" ] && [ -x /usr/bin/gcc ]; then
     ln -sf /usr/bin/gcc "${LD_WRAPPER_DIR}/bpf-gcc"
@@ -124,7 +124,7 @@ configure
 
 # === 移植补丁：ash Ctrl+C 退出 bug（LLVM BPF 后端 miscompile workaround）===
 # 给 popstackmark 加 noinline 阻断内联，绕过后端 bug。根因/机制/upstream issue
-# 详见 AGENTS.md §5 "Known LLVM BPF backend bugs"。
+# 详见 AGENTS.md 第 5 节 "Known LLVM BPF backend bugs"。
 # 幂等：已是 noinline 则跳过（perl s/// 不匹配已改过的行）。
 if ! perl -0777 -ne 'exit 0 if /static void __attribute__\(\(noinline\)\)\npopstackmark/; exit 1' "${BB_DIR}/shell/ash.c"; then
     echo "=== Patching ash.c: popstackmark -> noinline (Ctrl+C bug fix) ==="

@@ -7,7 +7,7 @@
 /*
  * struct stat 布局：对齐 musl 的 bits/stat.h（x86_64 kernel 风格）。
  * 字段顺序、padding、末尾 __unused 都与 musl 一致——PDCLib 的 fstatat 封装
- *（statx→stat 转换）写入此布局，guest 程序读取，偏移必须严丝合缝。
+ *（statx->stat 转换）写入此布局，guest 程序读取，偏移必须严丝合缝。
  * 关键差异点（相对早期布局）：st_nlink 在 st_mode 之前；st_gid 后有 __pad0；
  * 末尾有 __unused[3]。注释里的偏移供核对。
  */

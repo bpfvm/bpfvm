@@ -1,5 +1,5 @@
 /*
- * #4 探测（pthread 接口版，间接驱动 musl futex → VM 的 g_futex_table）。
+ * #4 探测（pthread 接口版，间接驱动 musl futex -> VM 的 g_futex_table）。
  *
  * 大量 cond 变量并发 signal/wait：每个 cond 内部对应不同 futex 地址，
  * 持续触发 g_futex_table 的 try_emplace（哈希表增长/rehash）。
@@ -35,8 +35,8 @@ static void *stress(void *arg) {
     while (!stop) {
         for (int i = 0; i < 8; i++) {
             pthread_mutex_lock(&m[i]);
-            pthread_cond_signal(&c[i]);   /* 唤醒（即便没人等）→ futex_wake */
-            /* 短暂 wait（几乎立即被自己后续或超时唤醒）→ futex_wait */
+            pthread_cond_signal(&c[i]);   /* 唤醒（即便没人等）-> futex_wake */
+            /* 短暂 wait（几乎立即被自己后续或超时唤醒）-> futex_wait */
             struct timespec ts = {0, 1000};
             pthread_cond_timedwait(&c[i], &m[i], &ts);
             pthread_mutex_unlock(&m[i]);

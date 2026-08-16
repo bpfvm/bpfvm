@@ -70,7 +70,7 @@ void AArch64Emitter::mov_imm(uint8_t dst, uint64_t val, bool is_64) {
                 }
             }
         }
-        if (first) emit_insn(base | rd(dst)); // all 0xFFFF → MOVN #0
+        if (first) emit_insn(base | rd(dst)); // all 0xFFFF -> MOVN #0
     } else {
         for (int i = 0; i < N; i++) {
             if (p[i]) {
@@ -78,7 +78,7 @@ void AArch64Emitter::mov_imm(uint8_t dst, uint64_t val, bool is_64) {
                 else movk(dst, p[i], i * 16, is_64);
             }
         }
-        if (first) movz(dst, 0, 0, is_64); // all zero → MOVZ #0
+        if (first) movz(dst, 0, 0, is_64); // all zero -> MOVZ #0
     }
 }
 
@@ -120,7 +120,7 @@ void AArch64Emitter::mul_reg(uint8_t d, uint8_t n, uint8_t m, bool is_64) {
     uint32_t sf = is_64 ? 1u : 0u;
     emit_insn((sf << 31) | (0x1Bu << 24) | ((uint32_t)m << 16) | (0x1Fu << 10) | ((uint32_t)n << 5) | rd(d));
 }
-// UMULH：64×64→128 的高 64 位。Data Processing 3-source，bit[23:22]=11 区分于 MUL(=00)。
+// UMULH：64x64->128 的高 64 位。Data Processing 3-source，bit[23:22]=11 区分于 MUL(=00)。
 void AArch64Emitter::umulh_reg(uint8_t d, uint8_t n, uint8_t m) {
     emit_insn((1u << 31) | (0x1Bu << 24) | (0x3u << 22) | ((uint32_t)m << 16)
               | (0x1Fu << 10) | ((uint32_t)n << 5) | rd(d));
@@ -348,13 +348,13 @@ void AArch64Emitter::dmb() { emit_insn(0xD5033BBFu); }
 // ftype: single=00 / double=01（嵌在 base 里，故分两套 base）。
 // ---------------------------------------------------------------------------
 
-// FMOV Dx, Xn（GPR→FPR 位搬运，64 位）/ FMOV Sd, Wn（32 位）
+// FMOV Dx, Xn（GPR->FPR 位搬运，64 位）/ FMOV Sd, Wn（32 位）
 //   FMOV Dx,Xn : 9E670000 | (Rn<<5) | Rd
 //   FMOV Sd,Wn : 1E270000 | (Rn<<5) | Rd
 void AArch64Emitter::fmov_v_from_x(uint8_t vd, uint8_t rn, bool is_double) {
     emit_insn((is_double ? 0x9E670000u : 0x1E270000u) | ((uint32_t)rn << 5) | rd(vd));
 }
-// FMOV Xd, Dn / FMOV Wd, Sn（FPR→GPR 位搬运）
+// FMOV Xd, Dn / FMOV Wd, Sn（FPR->GPR 位搬运）
 //   FMOV Xd,Dn : 9E660000 | (Rn<<5) | Rd
 //   FMOV Wd,Sn : 1E260000 | (Rn<<5) | Rd
 void AArch64Emitter::fmov_x_from_v(uint8_t d, uint8_t vn, bool is_double) {
@@ -395,7 +395,7 @@ void AArch64Emitter::fp_cvt_sd(uint8_t d, uint8_t n, bool to_double) {
     emit_insn((to_double ? 0x1E22C000u : 0x1E624000u) | ((uint32_t)n << 5) | rd(d));
 }
 
-// SCVTF（有符号整型→FP）。sf 位决定整型源是 64 还是 32 位。
+// SCVTF（有符号整型->FP）。sf 位决定整型源是 64 还是 32 位。
 //   double: 9E620000(64src)/1E620000(32src) | (Rn<<5) | Rd
 //   single: 9E220000(64src)/1E220000(32src) | (Rn<<5) | Rd
 void AArch64Emitter::scvtf(uint8_t d, uint8_t n, bool is_double, bool src64) {
@@ -404,7 +404,7 @@ void AArch64Emitter::scvtf(uint8_t d, uint8_t n, bool is_double, bool src64) {
     emit_insn(base | ((uint32_t)n << 5) | rd(d));
 }
 
-// UCVTF（无符号整型→FP）。
+// UCVTF（无符号整型->FP）。
 //   double: 9E630000(64src)/1E630000(32src) | (Rn<<5) | Rd
 //   single: 9E230000(64src)/1E230000(32src) | (Rn<<5) | Rd
 void AArch64Emitter::ucvtf(uint8_t d, uint8_t n, bool is_double, bool src64) {
@@ -413,7 +413,7 @@ void AArch64Emitter::ucvtf(uint8_t d, uint8_t n, bool is_double, bool src64) {
     emit_insn(base | ((uint32_t)n << 5) | rd(d));
 }
 
-// FCVTZS（FP→有符号整型，向 0 截断）。sf 位决定整型目标是 64 还是 32 位。
+// FCVTZS（FP->有符号整型，向 0 截断）。sf 位决定整型目标是 64 还是 32 位。
 //   double: 9E780000(64dst)/1E780000(32dst) | (Rn<<5) | Rd
 //   single: 9E380000(64dst)/1E380000(32dst) | (Rn<<5) | Rd
 void AArch64Emitter::fcvtzs(uint8_t d, uint8_t n, bool is_double, bool dst64) {
@@ -422,7 +422,7 @@ void AArch64Emitter::fcvtzs(uint8_t d, uint8_t n, bool is_double, bool dst64) {
     emit_insn(base | ((uint32_t)n << 5) | rd(d));
 }
 
-// FCVTZU（FP→无符号整型，向 0 截断）。
+// FCVTZU（FP->无符号整型，向 0 截断）。
 //   double: 9E790000(64dst)/1E790000(32dst) | (Rn<<5) | Rd
 //   single: 9E390000(64dst)/1E390000(32dst) | (Rn<<5) | Rd
 void AArch64Emitter::fcvtzu(uint8_t d, uint8_t n, bool is_double, bool dst64) {
@@ -553,14 +553,14 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     ldr_imm(X1, X15, off_gb, true);
     cmp_reg(X0, X1, true);
     ctx.miss_jumps.push_back(size());
-    emit_insn(0x54000000u | ARMCond::CC); // B.cc (addr < base → slow)
+    emit_insn(0x54000000u | ARMCond::CC); // B.cc (addr < base -> slow)
 
     // Bounds check 2: addr + size <= guest_end
     add_imm(X2, X0, access_size, true);
     ldr_imm(X1, X15, off_ge, true);
     cmp_reg(X2, X1, true);
     ctx.miss_jumps.push_back(size());
-    emit_insn(0x54000000u | ARMCond::HI); // B.hi (end > guest_end → slow)
+    emit_insn(0x54000000u | ARMCond::HI); // B.hi (end > guest_end -> slow)
 
     if (is_write) {
         // flags & PF_W
@@ -568,7 +568,7 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
         mov_imm(X2, 2, false);            // PF_W = 0x2
         tst_reg(X1, X2, false);
         ctx.miss_jumps.push_back(size());
-        emit_insn(0x54000000u | ARMCond::EQ); // B.eq → slow
+        emit_insn(0x54000000u | ARMCond::EQ); // B.eq -> slow
 
         // !cow
         ldrb(X1, X15, off_cw);
@@ -594,7 +594,7 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     mov_imm(X2, (uint64_t)access_size, true); // arg3 = size
     call_helper(is_write ? helpers_->mmu_w : helpers_->mmu);
     restore_caller_saved();
-    cbz(X0, true);                   // null → .vm_exit (recorded as abort)
+    cbz(X0, true);                   // null -> .vm_exit (recorded as abort)
     ctx.abort_jumps.push_back(size() - 4);
 
     // .done
@@ -916,7 +916,7 @@ bool AArch64Emitter::emit_stx_atomic(const bpf_insn* insn,
         emit_insn(stlxr_base | ((uint32_t)X15 << 16) | ((uint32_t)X2 << 5) | rd(X1));
         cbnz(X15, false);
         patch_branch_cond(size() - 4, loop_start);
-        // Old value → src_reg
+        // Old value -> src_reg
         store_bpf(insn->src_reg, X3, true);
         break;
     }
@@ -938,7 +938,7 @@ bool AArch64Emitter::emit_stx_atomic(const bpf_insn* insn,
         patch_branch_cond(size() - 4, loop_start);
         // skip:
         patch_branch_cond(ne_jcc, size());
-        // Current value → BPF r0
+        // Current value -> BPF r0
         store_bpf(0, X0, true);
         break;
     }
@@ -1023,7 +1023,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
     // 下面 switch 未命中的 case 返回 false，由 dispatcher 走 emit_call_softfp_slow
     // 回退到 do_softfp。
 
-    // BPF 寄存器 → AArch64 寄存器（与 BPF_REG_MAP 一致）。
+    // BPF 寄存器 -> AArch64 寄存器（与 BPF_REG_MAP 一致）。
     const uint8_t R_R0 = ARM::X9;    // 结果
     const uint8_t R_R1 = ARM::X10;   // 操作数 a
     const uint8_t R_R2 = ARM::X11;   // 操作数 b
@@ -1047,29 +1047,29 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
     };
 
     // 比较：GCC 软浮点 ABI 返回 int 三态（<0/=0/>0）。完全无分支：
-    //   FCMP a,b 设 NZCV：a<b → LT；a==b → EQ；a>b → GT；无序(NaN) → CV=01。
+    //   FCMP a,b 设 NZCV：a<b -> LT；a==b -> EQ；a>b -> GT；无序(NaN) -> CV=01。
     //   序列：先默认 0，再 CSET GT 覆盖成 1（a>b），最后 CSEL LT 用 -1 覆盖（a<b）。
     //   注：三态 CMP 的 NaN 返回值不再单独决定比较谓词——NaN 信息由独立的
     //   UNORD（emit_unord）携带，BpfSoftFp pass 用 CMP+UNORD 还原每个谓词，
-    //   故 AArch64（NaN→-1）与 x86（NaN→0）的差异已无影响。
-    //     FCMP NZCV 真值：a<b → N=1,C=0,V=0；a==b → N=0,Z=1,C=1；
-    //                      a>b → N=0,C=1,V=0；无序 → N=0,Z=0,C=1,V=1
+    //   故 AArch64（NaN->-1）与 x86（NaN->0）的差异已无影响。
+    //     FCMP NZCV 真值：a<b -> N=1,C=0,V=0；a==b -> N=0,Z=1,C=1；
+    //                      a>b -> N=0,C=1,V=0；无序 -> N=0,Z=0,C=1,V=1
     auto emit_cmp = [&](bool is_double) {
         fmov_v_from_x(V_A, R_R1, true);
         fmov_v_from_x(V_B, R_R2, true);
         fcmp(V_A, V_B, is_double);
         mov_imm(R_R0, 0, false);                 // W9 = 0（默认：相等）
-        cset(R_R0, ARMCond::GT);                 // a>b → W9 = 1
+        cset(R_R0, ARMCond::GT);                 // a>b -> W9 = 1
         mov_imm(X0, (uint64_t)(int64_t)-1, true);// X0 = -1
-        csel(R_R0, X0, R_R0, ARMCond::LT, true); // a<b → X9 = -1，否则保持
+        csel(R_R0, X0, R_R0, ARMCond::LT, true); // a<b -> X9 = -1，否则保持
     };
-    // 无序判定（__unordXX2）：任一操作数为 NaN → r0=1，否则 r0=0。
+    // 无序判定（__unordXX2）：任一操作数为 NaN -> r0=1，否则 r0=0。
     // FCMP 在无序（NaN）时置 V=1，VS 条件恰好成立——一行 CSET VS 即得结果。
     auto emit_unord = [&](bool is_double) {
         fmov_v_from_x(V_A, R_R1, true);
         fmov_v_from_x(V_B, R_R2, true);
         fcmp(V_A, V_B, is_double);
-        cset(R_R0, ARMCond::VS);                 // VS=1(无序) → W9 = 1
+        cset(R_R0, ARMCond::VS);                 // VS=1(无序) -> W9 = 1
     };
 
     switch (imm) {
@@ -1145,7 +1145,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         return true;
     }
 
-    // —— double → 有符号整型（FCVTZS 向 0 截断）——
+    // —— double -> 有符号整型（FCVTZS 向 0 截断）——
     case BPF_FP_D2SI:   // -> int32
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, true, false);   // 32 位结果，W 写零扩展进 X9
@@ -1154,7 +1154,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, true, true);
         return true;
-    // —— float → 有符号整型 ——
+    // —— float -> 有符号整型 ——
     case BPF_FP_F2SI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, false, false);
@@ -1163,7 +1163,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzs(R_R0, V_A, false, true);
         return true;
-    // —— double/float → 无符号整型（FCVTZU；x86 无此能力）——
+    // —— double/float -> 无符号整型（FCVTZU；x86 无此能力）——
     case BPF_FP_D2USI:
         fmov_v_from_x(V_A, R_R1, true);
         fcvtzu(R_R0, V_A, true, false);
@@ -1181,16 +1181,16 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         fcvtzu(R_R0, V_A, false, true);
         return true;
 
-    // —— 有符号整型 → double ——
-    case BPF_FP_DI2D:   // int64 → double
+    // —— 有符号整型 -> double ——
+    case BPF_FP_DI2D:   // int64 -> double
         scvtf(V_A, R_R1, true, true);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_FP_SI2D:   // int32 → double（源按 W 解释，SCVTF 用 32 位源）
+    case BPF_FP_SI2D:   // int32 -> double（源按 W 解释，SCVTF 用 32 位源）
         scvtf(V_A, R_R1, true, false);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    // —— 有符号整型 → float ——
+    // —— 有符号整型 -> float ——
     case BPF_FP_DI2F:
         scvtf(V_A, R_R1, false, true);
         fmov_x_from_v(R_R0, V_A, false);
@@ -1199,7 +1199,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         scvtf(V_A, R_R1, false, false);
         fmov_x_from_v(R_R0, V_A, false);
         return true;
-    // —— 无符号整型 → double（UCVTF）——
+    // —— 无符号整型 -> double（UCVTF）——
     case BPF_FP_UDI2D:
         ucvtf(V_A, R_R1, true, true);
         fmov_x_from_v(R_R0, V_A, true);
@@ -1208,7 +1208,7 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         ucvtf(V_A, R_R1, true, false);
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    // —— 无符号整型 → float ——
+    // —— 无符号整型 -> float ——
     case BPF_FP_UDI2F:
         ucvtf(V_A, R_R1, false, true);
         fmov_x_from_v(R_R0, V_A, false);
@@ -1219,14 +1219,14 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
         return true;
 
     // —— 单/双精度互转 ——
-    case BPF_FP_EXTEND:  // float → double
+    case BPF_FP_EXTEND:  // float -> double
         fmov_v_from_x(V_A, R_R1, true);   // 8 字节搬进 V0（低 32 位是 float）
-        fp_cvt_sd(V_A, V_A, true);        // S→D 扩展
+        fp_cvt_sd(V_A, V_A, true);        // S->D 扩展
         fmov_x_from_v(R_R0, V_A, true);
         return true;
-    case BPF_FP_TRUNC:   // double → float
+    case BPF_FP_TRUNC:   // double -> float
         fmov_v_from_x(V_A, R_R1, true);
-        fp_cvt_sd(V_A, V_A, false);       // D→S 截断
+        fp_cvt_sd(V_A, V_A, false);       // D->S 截断
         fmov_x_from_v(R_R0, V_A, false);  // 取低 32 位零扩展
         return true;
 
@@ -1285,17 +1285,17 @@ void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64
 // CALL BPF-to-BPF (src_reg==1)
 //
 // fast path（flags==0、callee 已缓存）零 C 调用、零 flush/reload：
-//   flags-check → 内联 push_frame → inline cache → 命中 blr X16 进 entry_fast
-//   → callee 经 vm_exit ret 回 .cont（只 reload r10 + flag-check + pc-check）。
+//   flags-check -> 内联 push_frame -> inline cache -> 命中 blr X16 进 entry_fast
+//   -> callee 经 vm_exit ret 回 .cont（只 reload r10 + flag-check + pc-check）。
 //   r0=X9（vm_exit 不 ldp X9）、r6-r9/X28（callee-saved 由 ldp 还原）、r1-r5 失效，故无 reload。
 //   inline cache 槽用 ldr Xn,[pc,#8] + b .+12 跳过 8 字节内联数据（aarch64 不能像 x86 用
 //   mov reg,imm64 占位：ldr-literal 后 PC 会落入数据，须 b 跳过）。
 //
-// .slow_resolve（cache miss）：spill r0-r5 护参 → helper_resolve_and_cache（查 callee、
-//   命中填槽）→ restore → blr X16。
-// .not_compiled：未编译 → flush + vm_exit 回 step() 编译 callee。
-// .slow：flags≠0 → helper_call_bpf（push_frame+设 pc）→ vm_exit。
-// .overflow：栈溢出 → VM_KILLED（LDAXR/STLXR 原子 or）→ vm_exit。
+// .slow_resolve（cache miss）：spill r0-r5 护参 -> helper_resolve_and_cache（查 callee、
+//   命中填槽）-> restore -> blr X16。
+// .not_compiled：未编译 -> flush + vm_exit 回 step() 编译 callee。
+// .slow：flags!=0 -> helper_call_bpf（push_frame+设 pc）-> vm_exit。
+// .overflow：栈溢出 -> VM_KILLED（LDAXR/STLXR 原子 or）-> vm_exit。
 // ---------------------------------------------------------------------------
 
 void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
@@ -1303,12 +1303,12 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
                                   std::vector<size_t>& call_cache_offs) {
     size_t flags_cbnz = 0;  // CBNZ .slow 的 patch offset
 
-    // 1. 调用点 safepoint：flags≠0 走 .slow
+    // -  调用点 safepoint：flags!=0 走 .slow
     ldr_imm(X0, X28, (int32_t)off_flags_, false);  // W0 = flags (32-bit load)
     flags_cbnz = size(); cbnz(X0, false);           // CBNZ W0, .slow
     // entry_fast 信任 aarch64 寄存器（见 entry_fast 注释），故 fast path 无 flush。
 
-    // 2. 内联 push_frame（仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)）
+    // -  内联 push_frame（仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)）
     // 2a. 读 cur_frame[0]（caller 帧头 total_len 在低 32 位）
     auto rctx = begin_mem_access(X23, 0, 8, /*is_write=*/false);  // X0 = cur_frame host
     ldr_imm(X1, X0, 0, true);                // X1 = cur_frame[0]
@@ -1336,9 +1336,9 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     str_imm(X23, X28, (int32_t)(off_reg_ + 10 * 8), true);  // vm->reg[10] = frame_base
     finish_mem_access(wctx, abort_patches, bpf_index);
 
-    // 3. inline cache：ldr X0,[pc,#8] 取内联数据(slot_addr)；b .+12 跳过 8 字节数据；
-    //    ldr X0,[X0] 取缓存 target；cbz → .slow_resolve。数据由 compile() patch 成 &call_cache[idx]。
-    emit_insn(0x58000040u);               // ldr X0, [pc, #8]   (LDR literal, imm19=2 → +8)
+    // -  inline cache：ldr X0,[pc,#8] 取内联数据(slot_addr)；b .+12 跳过 8 字节数据；
+    //    ldr X0,[X0] 取缓存 target；cbz -> .slow_resolve。数据由 compile() patch 成 &call_cache[idx]。
+    emit_insn(0x58000040u);               // ldr X0, [pc, #8]   (LDR literal, imm19=2 -> +8)
     emit_insn(0x14000003u);               // b .+12            (跳过 8 字节数据)
     size_t slot_data_off = size();
     emit64(0);                            // 8 字节 slot_addr 占位
@@ -1346,12 +1346,12 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     ldr_imm(X0, X0, 0, true);             // ldr X0, [X0]  (cached target)
     size_t cache_cbz = size(); cbz(X0, true);  // CBZ X0, .slow_resolve
 
-    // 4. cache 命中：blr X16 进 entry_fast。X28 已是 vm*，无需 mov X0,X28。
+    // -  cache 命中：blr X16 进 entry_fast。X28 已是 vm*，无需 mov X0,X28。
     mov_reg(X16, X0, true);               // X16 = callee entry_fast
     blr(X16);
-    size_t after_call_b = size(); b_uncond();   // → .cont
+    size_t after_call_b = size(); b_uncond();   // -> .cont
 
-    // 5. .slow_resolve（cache miss）：spill r0-r5 护参 → helper_resolve_and_cache 填槽 → restore → blr
+    // -  .slow_resolve（cache miss）：spill r0-r5 护参 -> helper_resolve_and_cache 填槽 -> restore -> blr
     size_t slow_resolve = size();
     patch_branch_cond(cache_cbz, slow_resolve);
     spill_caller_saved();
@@ -1367,16 +1367,16 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     size_t nc_cbz = size(); cbz(X0, true);  // CBZ X0, .not_compiled
     mov_reg(X16, X0, true);
     blr(X16);
-    size_t sr_b = size(); b_uncond();          // → .cont
+    size_t sr_b = size(); b_uncond();          // -> .cont
 
-    // 6. .not_compiled：未编译。step 经正常入口从 vm->reg[] load r0-r9，故须 flush（r10 已写）。
+    // -  .not_compiled：未编译。step 经正常入口从 vm->reg[] load r0-r9，故须 flush（r10 已写）。
     size_t not_compiled = size();
     patch_branch_cond(nc_cbz, not_compiled);
     flush_to_vm();
     size_t nc_b = size(); b_uncond();
     patch_branch_uncond(nc_b, vm_exit_offset);
 
-    // 7. .slow：flags≠0 → helper_call_bpf（push_frame+设 pc）→ vm_exit
+    // -  .slow：flags!=0 -> helper_call_bpf（push_frame+设 pc）-> vm_exit
     size_t slow = size();
     patch_branch_cond(flags_cbnz, slow);
     flush_to_vm();
@@ -1387,7 +1387,7 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     size_t slow_b = size(); b_uncond();
     patch_branch_uncond(slow_b, vm_exit_offset);
 
-    // 8. .overflow：栈溢出 → 原子 or VM_KILLED → vm_exit
+    // -  .overflow：栈溢出 -> 原子 or VM_KILLED -> vm_exit
     size_t overflow = size();
     patch_branch_cond(overflow_b, overflow);
     mov_imm(X0, (uint64_t)vm::VM_KILLED, false);   // W0 = VM_KILLED(4)
@@ -1401,7 +1401,7 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     size_t ov_b = size(); b_uncond();
     patch_branch_uncond(ov_b, vm_exit_offset);
 
-    // 9. .cont：callee 经 vm_exit ret 返回。无 reload——r0=X9、r6-r9/X28 由 ldp 还原。
+    // -  .cont：callee 经 vm_exit ret 返回。无 reload——r0=X9、r6-r9/X28 由 ldp 还原。
     //    唯 r10 须 reload（ldp 还原 callee 入口 r10=frame_base，caller 需 old_sp，emit_exit
     //    已写 vm->reg[10]）。flag-check 捕 VM_JIT_ABORT/信号；pc-check 兜底非正常返回。
     size_t cont_target = size();
@@ -1429,7 +1429,7 @@ void AArch64Emitter::emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa) 
 }
 
 void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
-    // 1. 内联 pop_frame：读 frame[0..12]（104B，覆盖普通 64B + 信号 128B 的 r0..r5）。
+    // -  内联 pop_frame：读 frame[0..12]（104B，覆盖普通 64B + 信号 128B 的 r0..r5）。
     //   r6..r9 必从帧取（BPF 后端对未用 r6..r9 的函数不 spill/reload，x86 值不可信）。
     //   信号帧在 frame[7..12] 存被中断处 caller-saved r0..r5，须一并恢复。
     auto ctx = begin_mem_access(X23, 0, 104, /*is_write=*/false);  // X0 = frame host
@@ -1439,11 +1439,11 @@ void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int b
     str_imm(X0, X28, (int32_t)off_scratch_, true);  // 暂存 frame host
     finish_mem_access(ctx, abort_patches, bpf_index);
 
-    // 2. 栈底检查：ret_addr==0 → 哨兵帧（程序退出），置 VM_EXITED。
+    // -  栈底检查：ret_addr==0 -> 哨兵帧（程序退出），置 VM_EXITED。
     cbz(X1, true);                         // CBZ X1, .stack_bottom
     size_t stack_bottom_jcc = size() - 4;
 
-    // 3. 正常返回：vm->pc_=ret_addr；vm->reg[0]=r0(X9)；r6..r9/10 从帧取写 vm->reg[]。
+    // -  正常返回：vm->pc_=ret_addr；vm->reg[0]=r0(X9)；r6..r9/10 从帧取写 vm->reg[]。
     str_imm(X1, X28, (int32_t)off_pc_, true);              // vm->pc_ = ret_addr
     str_imm(X9, X28, (int32_t)(off_reg_ + 0 * 8), true);   // vm->reg[0] = r0（信号帧下方覆盖）
     ldr_imm(X0, X28, (int32_t)off_scratch_, true);          // X0 = frame host
@@ -1453,7 +1453,7 @@ void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int b
     ldr_imm(X1, X0, 0x30, true); str_imm(X1, X28, (int32_t)(off_reg_ + 9 * 8), true);  // r9
     str_imm(X2, X28, (int32_t)(off_reg_ + 10 * 8), true);  // vm->reg[10] = old_sp
 
-    // 4. 信号帧：r0..r5 从 frame[7..12](@0x38..0x60) 覆盖写 vm->reg[0..5]。
+    // -  信号帧：r0..r5 从 frame[7..12](@0x38..0x60) 覆盖写 vm->reg[0..5]。
     //    is_signal = frame[0] bit32。普通帧（bit32=0）跳过。
     lsr_imm(X15, X15, 32, true);
     cbz(X15, true);
@@ -1470,7 +1470,7 @@ void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int b
     size_t exit_jmp = size(); b_uncond();
     patch_branch_uncond(exit_jmp, vm_exit_offset);
 
-    // 5. .stack_bottom：flush r0(退出码) + 原子 or VM_EXITED + vm_exit
+    // -  .stack_bottom：flush r0(退出码) + 原子 or VM_EXITED + vm_exit
     size_t stack_bottom = size();
     patch_branch_cond(stack_bottom_jcc, stack_bottom);
     str_imm(X9, X28, (int32_t)(off_reg_ + 0 * 8), true);   // vm->reg[0] = 退出码
@@ -1543,7 +1543,7 @@ size_t AArch64Emitter::emit_prologue() {
     flush_to_vm();
     mov_reg(X0, X28, true);
     call_helper(helpers_->safepoint);
-    // helper returns 0=ok, non-zero=exit. CBNZ W0 → vm_exit
+    // helper returns 0=ok, non-zero=exit. CBNZ W0 -> vm_exit
     cbnz(X0, false);
     patch_branch_cond(size() - 4, vm_exit_offset);
     reload_caller_saved();

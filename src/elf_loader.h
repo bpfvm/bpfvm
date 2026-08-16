@@ -3,7 +3,7 @@
 //
 // ld_main（构建期 -l 解析）和 VM（运行期加载 ELF）共用。
 //
-// 搜索顺序：命令行 -L 目录 → LD_LIBRARY_PATH → 内置默认（lib, .；chroot --root 模式额外补搜 root/lib64, root/lib, root）
+// 搜索顺序：命令行 -L 目录 -> LD_LIBRARY_PATH -> 内置默认（lib, .；chroot --root 模式额外补搜 root/lib64, root/lib, root）
 //
 // load_elf 通过 std::function 回调把映射好的 memmap 交给调用方，
 //
@@ -54,14 +54,14 @@ struct memmap {
 // name 若是绝对路径或当前目录可直接访问的文件，原样返回。找不到返回空串。
 std::string find_library(const std::vector<std::string>& extra_dirs, const std::string& name);
 
-// 从 envp（key→value）里解析 LD_LIBRARY_PATH，按 ':' 拆成目录列表。
+// 从 envp（key->value）里解析 LD_LIBRARY_PATH，按 ':' 拆成目录列表。
 // elf_loader 不再读宿主 getenv；调用方（VM 运行时）传入 guest 的 envp（-e 注入或
 // execve 的 envp），由本函数取出影响库搜索的变量。当前仅 LD_LIBRARY_PATH，便于
 // 将来扩展（LD_PRELOAD 等）。
 std::vector<std::string> lib_search_dirs_from_envp(const std::map<std::string, std::string>& envp);
 
 // 设定运行期 loader 的 chroot 根目录（--root）。非空时 find_library 的默认搜索路径
-// 与 load_elf_ldso 的 ldso 查找会在 root 内（root/lib、root/lib64 …）补搜，使动态主程序
+// 与 load_elf_ldso 的 ldso 查找会在 root 内（root/lib、root/lib64 ...）补搜，使动态主程序
 // 的 PT_INTERP（/lib/ld-bpf.so）在 rootfs 内可被定位。仅 bpfvm 运行时调用；bpfvm-ld 不调。
 void set_loader_root(const std::string& root);
 

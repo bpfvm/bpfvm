@@ -4,8 +4,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # 公共 env（ROOT_DIR / COMMON_CFLAGS / pass 探测 / make_ld_wrapper 等）见 scripts/env.sh。
 # 本脚本所有产物（musl/libcxx 库 + 头 + 各可执行）统一装到 root/：
-#   root/include：musl C 头（bits/、sys/…）。
-#   root/lib：libc.a/libm.a/…、dlstart.lo/dynlink.lo、libc.so→ld-bpf.so、libcxx.a/libcxx.so、libcrypto/libssl.{a,so}。
+#   root/include：musl C 头（bits/、sys/...）。
+#   root/lib：libc.a/libm.a/...、dlstart.lo/dynlink.lo、libc.so->ld-bpf.so、libcxx.a/libcxx.so、libcrypto/libssl.{a,so}。
 #   root/bin：dash/sbase/busybox/openssl。
 #
 # 用法：
@@ -31,9 +31,9 @@ build_musl() {
 # 只构建一份二进制——libc.a + ldso objects，SONAME=libc.so，入口 _dlstart。
 #   - root/lib/ld-bpf.so：这份二进制本体。链接时（-l:libc.so）读它的 dynsym（libc 符号
 #     超集）+ DT_SONAME=libc.so，故链接进主程序/libcxx.so 的 DT_NEEDED 仍记 libc.so。
-#     * PT_INTERP=/lib/ld-bpf.so → VM loader find_library("ld-bpf.so") 命中，加载它，
+#     * PT_INTERP=/lib/ld-bpf.so -> VM loader find_library("ld-bpf.so") 命中，加载它，
 #       入口 = load_base + e_entry（e_entry 指向 _dlstart，由 -e _dlstart 设定）。
-#     * DT_NEEDED libc.so → ldso 的 load_library 命中 is_self，直接复用已映射的 ldso。
+#     * DT_NEEDED libc.so -> ldso 的 load_library 命中 is_self，直接复用已映射的 ldso。
 #   - root/lib/libc.so：相对 symlink 指向 ld-bpf.so（同名二进制，供 -l:libc.so 命名）。
 #   - 静态程序把 libc.a 直接链进去，不经过 .so，不受影响。
 build_libc_bpfso() {
@@ -46,10 +46,10 @@ build_libc_bpfso() {
         "${ROOT_DIR}/root/lib/dynlink.lo" \
         -o "${ROOT_DIR}/root/lib/ld-bpf.so"
     ln -sf ld-bpf.so "${ROOT_DIR}/root/lib/libc.so"
-    # 子库的 .so 软链 → libc.so：musl 把 m/rt/pthread/dl/... 全合并进 libc，
-    # 静态侧已在 musl/build.sh 建 lib<sub>.a→libc.a；动态侧补 lib<sub>.so→libc.so，
+    # 子库的 .so 软链 -> libc.so：musl 把 m/rt/pthread/dl/... 全合并进 libc，
+    # 静态侧已在 musl/build.sh 建 lib<sub>.a->libc.a；动态侧补 lib<sub>.so->libc.so，
     # 否则 -lm/-lrt/-lpthread/-ldl 等在 -L root/lib 找不到 .so 会漏到 host
-    # /usr/lib 的同名 linker script（非 ELF）→ bpfvm-ld 加载失败。
+    # /usr/lib 的同名 linker script（非 ELF）-> bpfvm-ld 加载失败。
     for sub in m rt pthread crypt util xnet resolv dl; do
         ln -sf libc.so "${ROOT_DIR}/root/lib/lib${sub}.so"
     done
@@ -158,7 +158,7 @@ build_openssl() {
     echo "=== Configuring OpenSSL (bpf-unknown-none) ==="
     # OpenSSL 专属 CFLAGS 调整（在 COMMON_CFLAGS 基础上）：
     #   去 -g / -fstack-size-section：clang BPF + -g 对部分外部函数声明 ICE（详见 AGENTS.md #213714）。
-    #   -Wno-error=int-conversion：o_str.c 的 strerror_r(int)→char* 赋值（仅错误路径）。
+    #   -Wno-error=int-conversion：o_str.c 的 strerror_r(int)->char* 赋值（仅错误路径）。
     #   -bpf-stack-size=131072：apps 大函数（s_client/s_server/s_speed）单帧 >16KB；
     #     curve25519/curve448 域运算也需大栈（SIXTY_FOUR_BIT_LONG 下展开更大）。
     #   -UOPENSSL_NO_ASM：SIXTY_FOUR_BIT_LONG 下 BN_UMULT_HIGH/LOHI 需过 bn_local.h:362 的
@@ -224,7 +224,7 @@ build_openssl() {
     fi
     echo "libcrypto.a / libssl.a / 头文件安装完成"
 
-    # 合成 .so（依赖链 libssl.so → libcrypto.so → libc.so，需 libc.so 已存在）。
+    # 合成 .so（依赖链 libssl.so -> libcrypto.so -> libc.so，需 libc.so 已存在）。
     echo "=== 合成 libcrypto.so / libssl.so (bpfvm-ld -shared) ==="
     "${BPFVM_LD}" -shared --soname libcrypto.so \
         "${PREFIX}/lib/libcrypto.a" \

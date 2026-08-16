@@ -1,13 +1,13 @@
 // --root chroot 隔离测试。全部断言在 guest 内自证（无需宿主侧校验）：
-//   1. getcwd() == "/"（进入 chroot 后从根开始）。
-//   2. /marker.txt 可写可读，内容一致（guest 视角绝对路径正常工作）。
-//   3. argv[0] 反映 guest 命名空间（以 '/' 开头）。
-//   4. 目录 "/" 可列出 marker.txt。
-//   5. "/../../../etc/passwd" 无法逃逸：chroot 生效时它规范化为 guest /etc/passwd
-//      （rootfs 内不存在）→ open 失败；若 chroot 失效则逃逸到宿主 /etc/passwd → open
+//   -  getcwd() == "/"（进入 chroot 后从根开始）。
+//   -  /marker.txt 可写可读，内容一致（guest 视角绝对路径正常工作）。
+//   -  argv[0] 反映 guest 命名空间（以 '/' 开头）。
+//   -  目录 "/" 可列出 marker.txt。
+//   -  "/../../../etc/passwd" 无法逃逸：chroot 生效时它规范化为 guest /etc/passwd
+//      （rootfs 内不存在）-> open 失败；若 chroot 失效则逃逸到宿主 /etc/passwd -> open
 //      成功，本项失败。这是隔离的充分自证：guest 自己就能发现逃逸。
 //
-// 全部通过 → exit 0；任一失败 → exit 非 0（打印 FAIL 行）。
+// 全部通过 -> exit 0；任一失败 -> exit 非 0（打印 FAIL 行）。
 
 #include <stdio.h>
 #include <string.h>

@@ -77,7 +77,7 @@ GlobalVariable *buildEmutlsControl(Module &M, GlobalVariable *GV) {
     const uint64_t Size = M.getDataLayout().getTypeAllocSize(ElemTy);
     const uint64_t Align = M.getDataLayout().getPrefTypeAlign(ElemTy).value();
 
-    // value 指针：零初始化 → null；非零 → 新建模板全局 __emutls_t.<name>。
+    // value 指针：零初始化 -> null；非零 -> 新建模板全局 __emutls_t.<name>。
     Constant *ValueInit = ConstantPointerNull::get(cast<PointerType>(Ptr));
     Constant *GVInit = GV->getInitializer();
     bool isZeroInit = GVInit->isNullValue();

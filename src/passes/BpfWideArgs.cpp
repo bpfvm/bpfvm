@@ -272,7 +272,7 @@ void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
 // 调用前可作输入，调用后被返回覆盖）。用 side-effect 内联 asm input "r" + clobber
 // r1..r9：后端只有 r0 不在 clobber 列表里且能承接 input，RA 别无选择把第 6 参落到
 // r0；clobber r1..r5 让后端自动 spill/reload 原 5 实参。然后重建 5 参 call。完全
-// 在 IR 层完成，无需改后端。≤5 参的 syscall 调用不进本函数（后端本就支持）。
+// 在 IR 层完成，无需改后端。<=5 参的 syscall 调用不进本函数（后端本就支持）。
 static void rewriteCallSiteSyscall6(CallBase *CB, Value *Callee) {
     IRBuilder<> B(CB);
     LLVMContext &Ctx = CB->getContext();
@@ -372,7 +372,7 @@ static void collectIndirectCallSites(Module &M, const DataLayout &DL,
                         report_fatal_error("BPF syscall with > 6 arguments");
                     }
                     if (nargs < 6)
-                        continue;   // ≤5 参的 syscall 形式调用原本就合法，无需改写
+                        continue;   // <=5 参的 syscall 形式调用原本就合法，无需改写
                     // 恰好 6 参：走 syscall 路径
                     Function *Caller = CB->getFunction();
                     byCaller[Caller].push_back(
@@ -455,9 +455,9 @@ bool stripSret(Module &M) {
 
 // i128 及更大标量返回值会让后端 LowerReturn 崩（只有单个 64 位返回寄存器 r0）。
 // clang 不对标量做 sret lowering，故 stripSret 救不了。这里主动改造成 sret 风格：
-//   i128 f(args)  →  void f(ptr %agg.result, args)
-//   callee: ret i128 %v  →  store %v, %agg.result; ret void
-//   caller: x = call i128 f(args)  →  alloca; call void f(ptr, args); load
+//   i128 f(args)  ->  void f(ptr %agg.result, args)
+//   callee: ret i128 %v  ->  store %v, %agg.result; ret void
+//   caller: x = call i128 f(args)  ->  alloca; call void f(ptr, args); load
 // 必须跑在 lowerAggregateParams 之前，让它接管残留的 i128 参数。
 
 // softfp 通道 VM helper（src_reg=2）由 BpfSoftFp 管辖，不由本 pass 改写。
@@ -515,7 +515,7 @@ bool lowerI128Returns(Module &M) {
     if (jobs.empty())
         return false;
 
-    // 搬函数体，改写所有 ret T %v → store + ret void。
+    // 搬函数体，改写所有 ret T %v -> store + ret void。
     for (auto &j : jobs) {
         Function *F = j.OldF;
         Function *NewF = j.NewF;
@@ -614,10 +614,10 @@ bool lowerI128Returns(Module &M) {
 //     其不写，保守保留）。
 //   - 小聚合成值参数（std::pair={i64,i64}、i128 等）：clang 直接用聚合值类型作参数
 //     类型，后端按构成展开成多寄存器，多个这样的参数会撑爆 5 寄存器上限（"too many
-//     arguments"）。重建签名（值类型→ptr）+ 搬函数体 + 入口 load + call site alloca/store。
+//     arguments"）。重建签名（值类型->ptr）+ 搬函数体 + 入口 load + call site alloca/store。
 
 // 后端 LowerFormalArguments 会展开成 >1 寄存器的类型：聚合（按构成，哪怕 8B 的
-// {i32,i32} 也算 2 个）、i128 及更大标量（>8B）。排除指针、≤64 位标量、向量。
+// {i32,i32} 也算 2 个）、i128 及更大标量（>8B）。排除指针、<=64 位标量、向量。
 static bool needsLowering(Type *T, const DataLayout &DL) {
     if (T->isPointerTy())
         return false;
@@ -631,7 +631,7 @@ static bool needsLowering(Type *T, const DataLayout &DL) {
 // 把 callee 的聚合值参数（如 [2 x i64]）的 use 重写成通过指针参数访问，模拟 x86
 // invisible-reference ABI：让指针参数直接代表值的存储位置（指向 caller 源对象）。
 // clang 的典型模式是先 `store %arg, ptr %local` 把值拷贝到本地再 move/copy；若简单
-// load 出值替换 %arg，move 作用于 load 副本，无法置空 caller 源对象 → 引用计数错乱
+// load 出值替换 %arg，move 作用于 load 副本，无法置空 caller 源对象 -> 引用计数错乱
 //（见 eliminateByvalScalarTemporaries 的 #207686 注释）。
 //
 // 对 `store %arg, ptr %dst`：消除该 store，把 %dst 的所有 use 重定向到 %newarg
@@ -730,7 +730,7 @@ bool lowerAggregateParams(Module &M) {
         }
     }
 
-    // 重建签名（小聚合成值参数 → 裸 ptr）。Function 不能就地改类型，先收集再统一处理。
+    // 重建签名（小聚合成值参数 -> 裸 ptr）。Function 不能就地改类型，先收集再统一处理。
     struct Job { Function *OldF; Function *NewF; SmallVector<unsigned, 4> agIdxs; };
     SmallVector<Job, 16> jobs;
     for (Function &F : M) {
@@ -838,7 +838,7 @@ bool lowerAggregateParams(Module &M) {
         }
     }
 
-    // RAUW 残余 use（取地址等非 call use）→ NewF，删旧函数。
+    // RAUW 残余 use（取地址等非 call use）-> NewF，删旧函数。
     for (auto &j : jobs)
         j.OldF->replaceAllUsesWith(j.NewF);
     for (auto &j : jobs)
@@ -851,7 +851,7 @@ bool lowerAggregateParams(Module &M) {
 // by-value 非平凡析构参数（unique_ptr 8B / shared_ptr 16B 等）的 double-free 修复
 //（上游 LLVM #207686）。
 //
-// BPF 后端把 ≤16B 的非平凡析构 by-value 参数直接降级成 i64/[2 x i64] 按值传递，而不
+// BPF 后端把 <=16B 的非平凡析构 by-value 参数直接降级成 i64/[2 x i64] 按值传递，而不
 // 走 Itanium C++ ABI 的 invisible-reference。lowerAggregateParams 把 callee 签名改
 // 成 ptr 后，caller 侧的 IR 模式是：
 //   %tmp = alloca T                          ; 备份临时
@@ -859,7 +859,7 @@ bool lowerAggregateParams(Module &M) {
 //   %v  = load T, ptr %tmp                   ; 取出值
 //   store %v, ptr __agg_arg                  ; 转存给 callee 的 alloca
 //   call @callee(ptr __agg_arg)              ; callee move 出去后置空它自己的 ptr
-//   call ~T(ptr %tmp)                        ; ★ 析构 %tmp——值仍是原指针→double-free
+//   call ~T(ptr %tmp)                        ; * 析构 %tmp——值仍是原指针->double-free
 // %tmp 是多余的"中转"备份：内容已交给 callee，析构它就再次释放已被 move 走的资源。
 //
 // 修复：在 dtor 前插 store zeroinitializer, %tmp，清零让析构 noop。所有 load 都在
@@ -868,7 +868,7 @@ bool lowerAggregateParams(Module &M) {
 // 识别 %tmp 是"备份临时"而非普通局部对象（两条路径任一满足）：
 //   - 存在 move-construct（mangling 含 C1/C2 + OS_<num>_）：从另一同类型对象 move
 //     出来的备份。加 benign-use 守卫（isBenignTmpUse）排除有 move-ctor 但非备份的。
-//   - size ≤ 8 + hasLoad + dtor：兜底 -O1 已把 move-construct inline 成 store、无 call
+//   - size <= 8 + hasLoad + dtor：兜底 -O1 已把 move-construct inline 成 store、无 call
 //     形式可识别的场景（unique_ptr 8B；16B shared_ptr 备份临时在 -O1 后被整体消除）。
 
 // 判断 call 是否是对 %tmp 的 move-construct：
@@ -970,7 +970,7 @@ bool eliminateByvalScalarTemporaries(Module &M) {
 
                 // 两条识别路径（详见函数头注释）：
                 //   pathA：存在 call T::T(ptr %tmp, ptr %src) move-construct。
-                //   pathB：size ≤ 8（兜底 -O1 已 inline 掉 move-ctor 的场景）。
+                //   pathB：size <= 8（兜底 -O1 已 inline 掉 move-ctor 的场景）。
                 // 两条都要求 hasLoad（备份临时的值必被读出交给 callee）。
                 bool hasMoveCtor = false;
                 for (User *U : tmp->users()) {
@@ -1038,7 +1038,7 @@ bool eliminateByvalScalarTemporaries(Module &M) {
 // 里 IsVarArg 检查直接 fail）。本路径把变参函数改写成定参，让后端见不到变参。
 //
 // ABI（clang 原生 void* 裸指针语义）：
-//   callee：R f(T0..Tn, ...) → R f(T0..Tn, ptr __va_base)
+//   callee：R f(T0..Tn, ...) -> R f(T0..Tn, ptr __va_base)
 //          __va_base 指向 caller 构建的 vararg 内存区（第一个 vararg 的地址）。
 //          函数体内 va_list（即 alloca ptr）经 va_start 后存 __va_base。
 //   caller：每个 call site 在入口 alloca 一段内存，按变参实参类型布局填值，
@@ -1152,7 +1152,7 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
 static Function *rewriteVarArgFunction(Function &F) {
     Module &M = *F.getParent();
 
-    // 1. 构造新参数类型表：原具名参数原样 + 末尾一个 ptr（__va_base）。
+    // -  构造新参数类型表：原具名参数原样 + 末尾一个 ptr（__va_base）。
     SmallVector<Type *, 8> newArgTys;
     for (unsigned i = 0; i < F.arg_size(); ++i)
         newArgTys.push_back(F.getFunctionType()->getParamType(i));
@@ -1160,7 +1160,7 @@ static Function *rewriteVarArgFunction(Function &F) {
 
     FunctionType *newFTy = FunctionType::get(F.getReturnType(), newArgTys, false);
 
-    // 2. 创建新函数（临时名，最后 takeName 拿回原名）。
+    // -  创建新函数（临时名，最后 takeName 拿回原名）。
     Function *NewF = Function::Create(
         newFTy, F.getLinkage(), F.getAddressSpace(),
         "__bpf_va_tmp_" + F.getName(), &M);
@@ -1178,11 +1178,11 @@ static Function *rewriteVarArgFunction(Function &F) {
         return NewF;
     }
 
-    // 3. 搬迁函数体。
+    // -  搬迁函数体。
     NewF->splice(NewF->end(), &F);
     NewF->takeName(&F);
 
-    // 4. 把旧具名参数映射到新参数（前 N 个一一对应）。
+    // -  把旧具名参数映射到新参数（前 N 个一一对应）。
     //    新增的末尾参数 __va_base 留给 lowerVaIntrinsics 用。
     unsigned oldIdx = 0;
     for (Argument &OldArg : F.args()) {
@@ -1190,7 +1190,7 @@ static Function *rewriteVarArgFunction(Function &F) {
         ++oldIdx;
     }
 
-    // 5. lower 体内所有 va intrinsic，用末尾参数作 __va_base。
+    // -  lower 体内所有 va intrinsic，用末尾参数作 __va_base。
     Value *VaBase = NewF->getArg(NewF->arg_size() - 1);
     lowerVaIntrinsics(*NewF, VaBase);
 
@@ -1210,7 +1210,7 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
         changed |= lowerI128Returns(M);
         changed |= lowerAggregateParams(M);
 
-        // 改写 callee 签名与函数体（>5 参数 + 变参两条互斥路径），得到 {旧F→新F}。
+        // 改写 callee 签名与函数体（>5 参数 + 变参两条互斥路径），得到 {旧F->新F}。
         // 调用点改写推迟到下一阶段统一处理（让混合 caller 共用单块缓冲区）。
         struct ToRewrite { Function *F; Function *NewF; };
         SmallVector<ToRewrite, 16> work;
@@ -1309,10 +1309,10 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
 //
 // clang 把 VLA 编码为三件套，映射到 alloca(inc) syscall（inc 带符号：>0 扩展、
 // =0 读当前下界、<0 收缩；返回调整后的下界 = 新块起始地址）：
-//   动态 alloca Ty, %n（或固定大小但非入口块的）→ alloca(((n*sizeof)+15)&~15)
+//   动态 alloca Ty, %n（或固定大小但非入口块的）-> alloca(((n*sizeof)+15)&~15)
 //     字节数向上对齐 16，保证相邻块间隔 16、每块起始相对 r10 偏移 16 对齐。
-//   @llvm.stacksave → alloca(0)：返回当前下界作退出时回退的 token。
-//   @llvm.stackrestore(tok) → alloca(tok - alloca(0))：当前下界与 token 的差
+//   @llvm.stacksave -> alloca(0)：返回当前下界作退出时回退的 token。
+//   @llvm.stackrestore(tok) -> alloca(tok - alloca(0))：当前下界与 token 的差
 //     作收缩量（负值）。clang 在 VLA 块每个退出点都放了 stackrestore，逐个替换。
 //
 // 跑在 OptimizerLastEP：必须在 SROA/instcombine 之后（让固定 alloca 先被消除，
@@ -1339,11 +1339,11 @@ static Value *emitVlaSyscall(IRBuilder<> &B, LLVMContext &Ctx, uint64_t CallId,
     Type *EffRetTy = RetTy->isPointerTy() ? I64Ty : RetTy;
     FunctionType *FTy = FunctionType::get(EffRetTy, ArgTys, false);
 
-    // inttoptr(const CallId) 当作函数指针直接调用 → 后端 emit `call <imm>`。
+    // inttoptr(const CallId) 当作函数指针直接调用 -> 后端 emit `call <imm>`。
     Value *FnPtr = B.CreateIntToPtr(ConstantInt::get(I64Ty, CallId), PtrTy);
     Value *Call = B.CreateCall(FTy, FnPtr, I64Args);
 
-    // 指针类型结果：i64 → ptr（inttoptr）。整数窄类型：trunc。
+    // 指针类型结果：i64 -> ptr（inttoptr）。整数窄类型：trunc。
     if(RetTy->isPointerTy())
         return B.CreateIntToPtr(Call, RetTy);
     if(RetTy->isIntegerTy() && RetTy->getIntegerBitWidth() < 64)
@@ -1372,7 +1372,7 @@ static bool rewriteVla(Function &F) {
             bool isStaticInEntry = (&BB == Entry) && !isDynamicSize;
             if(isStaticInEntry) continue;
 
-            // 总字节数 = 元素数 × 元素大小，向上对齐 16（相邻块间隔 16，起始相对
+            // 总字节数 = 元素数 * 元素大小，向上对齐 16（相邻块间隔 16，起始相对
             // r10 偏移 16 对齐）。
             IRBuilder<> B(AI);
             Type *ElemTy = AI->getAllocatedType();
@@ -1401,8 +1401,8 @@ static bool rewriteVla(Function &F) {
         }
     }
 
-    // stacksave/stackrestore。stacksave → alloca(0) 返回当前下界作 token；
-    // stackrestore(tok) → alloca(tok - alloca(0))：栈向低地址生长，下界 = r10 -
+    // stacksave/stackrestore。stacksave -> alloca(0) 返回当前下界作 token；
+    // stackrestore(tok) -> alloca(tok - alloca(0))：栈向低地址生长，下界 = r10 -
     // total_len，stacksave 时 tok 较高（total_len 小），此时 cur 较低（期间做过
     // alloca），inc = cur - tok = save_total - cur_total < 0，收缩回 tok。
     // clang 在 VLA 块每个退出点都放了 stackrestore，逐个替换即可。
@@ -1466,12 +1466,12 @@ public:
 // atomic load/store 降级（解锁 iostream/locale 等的 static guard、OpenSSL threads）。
 // eBPF ISA 只有 RMW 类原子指令，没有独立的 plain atomic load/store（LLVM 21 才补
 // BPF_LOAD_ACQ/BPF_STORE_REL，本项目用 LLVM 19）。三类处理：
-//   - LoadInst/StoreInst 的 atomic 形式 → 普通非原子 load/store。
-//   - i8/i16 的 AtomicRMW/CmpXchg → 展开成对包含它的对齐 i32 槽的子字节 CAS 循环
+//   - LoadInst/StoreInst 的 atomic 形式 -> 普通非原子 load/store。
+//   - i8/i16 的 AtomicRMW/CmpXchg -> 展开成对包含它的对齐 i32 槽的子字节 CAS 循环
 //    （后端只支持 i32/i64；照搬 LLVM expandPartwordAtomicRMW/CmpXchg）。解锁
 //     atomic<bool>/char/short。子字节展开先于 load/store 降级，否则它插入的普通
 //     load 会被再降级。
-//   - atomic_thread_fence → 直接删（BPF 无 fence 指令；单线程顺序执行下是空操作）。
+//   - atomic_thread_fence -> 直接删（BPF 无 fence 指令；单线程顺序执行下是空操作）。
 //   i32/i64 的 RMW/cmpxchg 不动（后端原生支持）。
 // 降级 plain atomic load 正确性依据：VM 单线程，guard 的 slow path __cxa_guard_acquire
 // 本就是非原子实现（_LIBCPP_HAS_NO_THREADS），fast-path 那处原子是孤立的。
@@ -1513,7 +1513,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
         PartwordMaskValues PMV;
         const DataLayout &DL = I->getModule()->getDataLayout();
         LLVMContext &Ctx = I->getContext();
-        unsigned ValueSize = DL.getTypeStoreSize(ValueType);  // i8→1, i16→2
+        unsigned ValueSize = DL.getTypeStoreSize(ValueType);  // i8->1, i16->2
         PMV.WordType = Type::getInt32Ty(Ctx);
         PMV.AlignedAddrAlignment = Align(MinWordSize);
 
@@ -1549,7 +1549,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
         return Builder.CreateTrunc(Shift, ValueType, "extracted");
     }
 
-    // D2a: i8/i16 cmpxchg → i32 子字节 CAS loop（照搬 expandPartwordCmpXchg）。
+    // D2a: i8/i16 cmpxchg -> i32 子字节 CAS loop（照搬 expandPartwordCmpXchg）。
     // IR 序列见 llvm/lib/CodeGen/AtomicExpandPass.cpp:1015 注释。
     static bool expandPartwordCmpXchg(AtomicCmpXchgInst *CI) {
         Value *Addr = CI->getPointerOperand();
@@ -1634,7 +1634,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
         }
     }
 
-    // D2b: i8/i16 atomicrmw → i32 子字节 CAS loop（照搬 expandPartwordAtomicRMW）。
+    // D2b: i8/i16 atomicrmw -> i32 子字节 CAS loop（照搬 expandPartwordAtomicRMW）。
     // Or/Xor/And 直接 widen 成 i32 原子位运算（周边位为 0/1 不影响结果；And 需把
     //   非目标字节置 1 避免清掉）。Add/Sub/Nand 在移位后的位上算再 mask 回目标字节。
     //   Min/Max/UMin/UMax extract 出窄值原宽算再 insert 回宽槽。
@@ -1765,13 +1765,13 @@ public:
                        RMW->getType()->getIntegerBitWidth() < 32)
                         NarrowRMWs.push_back(RMW);
                 } else if(isa<FenceInst>(&I)) {
-                    // D3: atomic_thread_fence → 删除（见下文 D3 段）。
+                    // D3: atomic_thread_fence -> 删除（见下文 D3 段）。
                     Fences.push_back(cast<FenceInst>(&I));
                 }
             }
         }
 
-        // D3: atomic_thread_fence（任意 ordering）→ 直接删除。
+        // D3: atomic_thread_fence（任意 ordering）-> 直接删除。
         // BPF 后端无 fence 指令（eBPF ISA 只有 RMW 原子 lock_xadd/xchg/cmpxchg，无独立
         // 内存屏障），ISel 对 AtomicFence 节点报 "Cannot select"。本 VM 单线程顺序执行
         // guest 指令，RMW 原子本身已带全屏障语义，跨线程同步靠 futex（do_futex 的
@@ -1793,7 +1793,7 @@ public:
             Changed = true;
         }
 
-        // D1: load atomic T, ptr <order>, align A  →  load T, ptr, align A
+        // D1: load atomic T, ptr <order>, align A  ->  load T, ptr, align A
         // 直接构造普通 LoadInst（IRBuilder 的 CreateLoad 无带 Align 的重载），
         // 复制对齐/volatile/调试元数据，order 设为 NotAtomic，插在原指令前再替换。
         for(LoadInst *LI : Loads) {
@@ -1808,7 +1808,7 @@ public:
             Changed = true;
         }
 
-        // D1: store atomic T v, ptr <order>, align A  →  store T v, ptr, align A
+        // D1: store atomic T v, ptr <order>, align A  ->  store T v, ptr, align A
         for(StoreInst *SI : Stores) {
             StoreInst *New = new StoreInst(SI->getValueOperand(), SI->getPointerOperand(),
                                             SI->isVolatile(), SI->getAlign(),

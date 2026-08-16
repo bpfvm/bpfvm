@@ -260,10 +260,10 @@ std::shared_ptr<Fd> SignalFd::clone() const {
     if(pipe2(p, 0) < 0) {
         return nullptr;
     }
-    // 写端设 O_NONBLOCK：信号风暴时 pipe 满 → EAGAIN → 静默丢，绝不阻塞 VM 线程。
+    // 写端设 O_NONBLOCK：信号风暴时 pipe 满 -> EAGAIN -> 静默丢，绝不阻塞 VM 线程。
     int wf = fcntl(p[1], F_GETFL);
     if(wf >= 0) fcntl(p[1], F_SETFL, wf | O_NONBLOCK);
-    // 父读端带 O_NONBLOCK（SFD_NONBLOCK 创建）→ 子读端也继承。
+    // 父读端带 O_NONBLOCK（SFD_NONBLOCK 创建）-> 子读端也继承。
     int rf = fcntl(fd_, F_GETFL);
     if(rf >= 0 && (rf & O_NONBLOCK)) {
         int nrf = fcntl(p[0], F_GETFL);
@@ -384,9 +384,9 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
     // 影响（root 内通常没有 /dev）。
     // —— /dev/tty：guest job-control（dash setjobctl）打开它拿控制终端做 tcgetpgrp/tcsetpgrp。
     // 真 /dev/tty 在 host 侧是 bpfvm 自身的 ctty（非 guest pty slave），Fd::tty() 为空，
-    // 后续 TIOCGPGRP 会因 tty 字段不匹配 session->ctty 而 ENOTTY → dash 报 "can't access tty;
+    // 后续 TIOCGPGRP 会因 tty 字段不匹配 session->ctty 而 ENOTTY -> dash 报 "can't access tty;
     // job control turned off"。故拦截：本会话有 ctty 时，复用一个已绑同一 ctty 的 fd（dup 它
-    // 的 host fd，携带同一 GuestTty），使该 fd 就是 ctty 端。无 ctty → ENXIO（与
+    // 的 host fd，携带同一 GuestTty），使该 fd 就是 ctty 端。无 ctty -> ENXIO（与
     // Linux 无 ctty 进程开 /dev/tty 的行为一致）。/dev/console 同此逻辑（musl syslog、
     // busybox init 用；bpfvm 无独立系统控制台，复用 ctty）。
     if(guest_abs == "/dev/tty" || guest_abs == "/dev/console") {

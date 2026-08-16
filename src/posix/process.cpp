@@ -25,7 +25,7 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
             }
         }
     }
-    v->set_flags(vm::VM_EXITED);  // 调用线程退出 → fini
+    v->set_flags(vm::VM_EXITED);  // 调用线程退出 -> fini
     return code;
 }
 
@@ -71,7 +71,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
         }
         guest_abs = ResolvePath(this, guest_abs_path(fd->path))->follow();
     } else {
-        // follow 符号链接后取真实 guest 路径（/proc/self/exe→/bin/busybox 等），再拼 chroot 前缀
+        // follow 符号链接后取真实 guest 路径（/proc/self/exe->/bin/busybox 等），再拼 chroot 前缀
         guest_abs = ResolvePath(this, guest_abs_path(path, dirfd))->follow();
     }
     std::string host_path = guest_abs;
@@ -117,7 +117,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     while(true) {
         {
             std::lock_guard<std::mutex> lk(tg->mtx);
-            // 判定与注册同在 tg->mtx 内：与 sibling 的「fetch_sub → wake_waiters(持 mtx
+            // 判定与注册同在 tg->mtx 内：与 sibling 的「fetch_sub -> wake_waiters(持 mtx
             // swap 列表)」互斥——见 >1 必有尚未退出的 sibling、其 fini 会 wake 我们；
             if(tg->live_threads.load(std::memory_order_acquire) <= 1) break;
             tg->waiters.push_back(v->shared_from_this());
@@ -187,7 +187,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
     auto child = vm::create();
     options(child.get()) = options(v);
     child->image() = v->image();
-    /* CLONE_THREAD 是新线程，不在任何信号处理上下文 → signal_depth=0。
+    /* CLONE_THREAD 是新线程，不在任何信号处理上下文 -> signal_depth=0。
      * 非 CLONE_THREAD（如 fork / 裸 clone 新进程）继承父 signal_depth，
      * 与 fork 语义一致（fork 复制整个执行状态）。 */
     signal_depth(child.get()) = is_thread ? 0 : signal_depth(v);
@@ -296,7 +296,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
     /* CLONE_SETTLS：新线程用调用者提供的 tls。
      * 否则（非 CLONE_THREAD，如 fork / 裸 clone 新进程）继承父 tp：子进程是父
      * 地址空间的副本（CoW），struct pthread 仍在同样的虚拟地址，TP 指向它依然
-     * 有效。若不继承，子进程 tp_=0 → __pthread_self() 返回 NULL → musl 后续写
+     * 有效。若不继承，子进程 tp_=0 -> __pthread_self() 返回 NULL -> musl 后续写
      * self->tid（偏移 0x30）会 invalid write at 0x30 崩溃。 */
     if(flags & CLONE_SETTLS) {
         tp(child.get()) = newtls;
@@ -322,8 +322,8 @@ int64_t PosixSyscall::do_clone(vm* v) {
     /* 启动 host 线程：先给 child 置 VM_STOPPED，让 worker 进入 run() 后立即在首个
      * safepoint 阻塞（不执行任何访存/syscall），父线程随后再登记 pid_map / tg->threads
      * 并放行。
-     * 子线程进 run() → init()(pid!=1 直接 return) → step() JIT 冷 pc 返回 nullptr →
-     * flags 检查命中 VM_STOPPED → safepoint 在 wait_cv 阻塞 */
+     * 子线程进 run() -> init()(pid!=1 直接 return) -> step() JIT 冷 pc 返回 nullptr ->
+     * flags 检查命中 VM_STOPPED -> safepoint 在 wait_cv 阻塞 */
     child->set_flags(vm::VM_STOPPED);
 
     pthread_attr_t attr;
@@ -424,9 +424,9 @@ std::vector<uint64_t> PosixSyscall::list_pids() {
 // 由两个 handler 把各自的 syscall 参数归一化后传入。options 含 WNOHANG/WUNTRACED/WNOWAIT。
 int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options, wait_event& out) {
     // 收集候选子进程。Linux 语义：
-    //   P_PID  (id > 0) → 指定 task（必须是自身子进程的线程组 leader）
-    //   P_PGID (id >=0) → 进程组 id 里任意子进程（wait4 的 pid==0 表示调用者进程组）
-    //   P_ALL         → 任意子进程
+    //   P_PID  (id > 0) -> 指定 task（必须是自身子进程的线程组 leader）
+    //   P_PGID (id >=0) -> 进程组 id 里任意子进程（wait4 的 pid==0 表示调用者进程组）
+    //   P_ALL         -> 任意子进程
     // 只有 leader（pid == tg->tgid）可被 wait；非 leader 线程退出不产生可 wait 状态。
     // wait4 的 pid==0 映射为 P_PGID + 调用者 pgid，已由 do_wait4 转好。
     auto match_child = [&](const std::shared_ptr<vm>& task_vm) -> bool {
@@ -450,7 +450,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
 
     // 原子选+回收一个有事件的子进程。持 pid_map_mutex：选 + erase/CAS 同锁，故并发 wait
     // 同一子进程时只有首个进入者成功（erase 必返回 1；stop CAS 只成一次），余者不再从
-    // pid_map 见到该子进程（已 erase）或 stop_reported 已被清（CAS 失败）→ 跳过。
+    // pid_map 见到该子进程（已 erase）或 stop_reported 已被清（CAS 失败）-> 跳过。
     // exited 优先于 stopped：被 SIGKILL 的已停止进程，fini 设 tg->exited 但不清 tg->stopped
     // 返回 1=已回收并填好 out；0=有匹配子进程但无可报告事件；-1=无匹配子进程(ECHILD)。
     auto claim_one = [&]() -> int {
@@ -477,7 +477,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
             if(s->tg->stopped.load(std::memory_order_acquire) &&
                s->tg->stop_reported.load(std::memory_order_acquire)) {
                 // 停止事件。WNOWAIT 只读不消费：与 exited 分支不 erase 对称，保留 stop_reported
-                // 使随后再 wait 仍能报告同一次停止。非 WNOWAIT 才 CAS true→false 抢占报告权
+                // 使随后再 wait 仍能报告同一次停止。非 WNOWAIT 才 CAS true->false 抢占报告权
                 // （进程仍存活，不 erase）；并发 wait 时 CAS 只成一次，余者跳过找下一个。
                 if(options & WNOWAIT) {
                     out.child = child_vm;
@@ -505,7 +505,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
     if(r == 1) return 0;
     if(r == -1) return -ECHILD;  // 无匹配子进程
 
-    // r == 0：有子进程但无事件。非阻塞 → 返空 child；否则阻塞等事件。
+    // r == 0：有子进程但无事件。非阻塞 -> 返空 child；否则阻塞等事件。
     if(options & WNOHANG) {
         return 0;  // out.child 保持空，handler 据此返回 0
     }
@@ -531,7 +531,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
         }
         // 先置 VM_BLOCKED 再注册：wakeup(true) 靠清 VM_BLOCKED 让 wait_for 立即返回，
         // 必须保证 waker 能在"我置位后"看到我的注册——置位在注册前，注册-检查又在
-        // 同一把子 tg->mtx 下与 fini 的"置 exited→wake_waiters(swap)"互斥，故不丢唤醒。
+        // 同一把子 tg->mtx 下与 fini 的"置 exited->wake_waiters(swap)"互斥，故不丢唤醒。
         v->set_flags(vm::VM_BLOCKED);
         bool has_event = false;
         for(const auto& candidate : kids) {
@@ -547,7 +547,7 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
             }
         }
         if(!has_event) {
-            // 阻塞直至子进程唤醒（wake_waiters→wakeup(true)）或被信号打断（-EINTR）；
+            // 阻塞直至子进程唤醒（wake_waiters->wakeup(true)）或被信号打断（-EINTR）；
             // 无显式超时，依赖 wait_for 内部 1s 滚动兜底防 spurious 遗漏。
             v->wait_for(nullptr);
         }
@@ -594,10 +594,10 @@ int64_t PosixSyscall::do_wait4(vm* v) {
     }
 
     // wait4 的 pid 编码归一化为 (idtype, id)：
-    //   pid > 0  → P_PID
-    //   pid == 0 → P_PGID（调用者进程组）
-    //   pid == -1→ P_ALL
-    //   pid < -1 → P_PGID（进程组 -pid）
+    //   pid > 0  -> P_PID
+    //   pid == 0 -> P_PGID（调用者进程组）
+    //   pid == -1-> P_ALL
+    //   pid < -1 -> P_PGID（进程组 -pid）
     int idtype;
     int64_t id;
     if(target_pid > 0) {
@@ -690,8 +690,8 @@ int64_t PosixSyscall::do_waitid(vm* v) {
         // si_status 语义与 wait4 的 int status 不同：对 SIGCHLD 事件，waitid 的
         // si_status 存的是【原始值】（CLD_EXITED=退出码、CLD_KILLED/CLD_DUMPED=信号号、
         // CLD_STOPPED=停止信号号），不是 wait4 的 (code<<8|sig) 状态字——不能用
-        // WEXITSTATUS/WTERMSIG 解码 si_status（实测 Linux：_exit(42)→si_status=42，
-        // SIGKILL→si_status=9）。局部变量加 out_ 前缀避开 glibc <signal.h> 宏。
+        // WEXITSTATUS/WTERMSIG 解码 si_status（实测 Linux：_exit(42)->si_status=42，
+        // SIGKILL->si_status=9）。局部变量加 out_ 前缀避开 glibc <signal.h> 宏。
         int out_signo = 17 /*SIGCHLD*/;
         int out_code;
         int out_status;
@@ -745,7 +745,7 @@ int64_t PosixSyscall::do_gettid(vm*) {
 }
 
 int64_t PosixSyscall::do_set_tls(vm* v) {
-    // 设置 thread pointer（musl __init_tp → __set_thread_area 在启动时调用）。
+    // 设置 thread pointer（musl __init_tp -> __set_thread_area 在启动时调用）。
     // BPF 无 TLS 寄存器，用一个 VM 字段 tp_ 模拟；guest 侧 __get_tp() 经
     // BPF_SYS_GET_TLS 读回同一值。
     // 必须返回 0（成功），否则 musl __init_tls.c:149 会 a_crash()。

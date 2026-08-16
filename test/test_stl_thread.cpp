@@ -4,13 +4,13 @@
 //   - libc++ 的 pthread 后端（__thread/support/pthread.h，inline 头）包装 musl pthread_*；
 //   - libcxx.a 提供 std::thread/mutex/condition_variable/future 的非内联成员
 //     （thread.cpp/mutex.cpp/condition_variable.cpp/future.cpp + 两个 _destructor.cpp）；
-//   - pthread_key 析构器在 guest 线程退出时由 musl __pthread_exit→__pthread_tsd_run_dtors
+//   - pthread_key 析构器在 guest 线程退出时由 musl __pthread_exit->__pthread_tsd_run_dtors
 //     触发，故 std::async/notify_all_at_thread_exit 的清理语义有效。
 //
 // host 变体用 g++ 编宿主 glibc，作为对照基线。
 //
-// 注意：①刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store，C++ <atomic> 的
-// load/store 会撞 BPF 后端，改用 mutex 保护普通 int；②所有同步靠 join/wait 显式定序，
+// 注意：(1)刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store，C++ <atomic> 的
+// load/store 会撞 BPF 后端，改用 mutex 保护普通 int；(2)所有同步靠 join/wait 显式定序，
 // 不依赖时序，保证 host 与 BPF（单核解释/JIT）行为一致。
 
 #include <thread>
@@ -44,7 +44,7 @@ int main() {
         }
     }
 
-    // (2) std::mutex + lock_guard：互斥保护的共享计数（4 线程 × 10000）。
+    // (2) std::mutex + lock_guard：互斥保护的共享计数（4 线程 * 10000）。
     {
         std::mutex m;
         long x = 0;

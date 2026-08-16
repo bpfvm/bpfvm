@@ -36,9 +36,9 @@ string(REPLACE ";" "|" _posix_sources_arg  "${BPFVM_POSIX_SOURCES}")
 # 链接配置。
 #
 # configure 期检测依赖（clang++ + libc++ 头 + root/lib 动态库）。工作流：
-#   1. 首次 cmake+make 建 host 工具链（bpfvm/bpfvm-ld/4 个 pass .so）
-#   2. ./scripts/build_root.sh 产出 root/lib/{libc.so,libcxx.so}
-#   3. 重新 cmake+make → 自动构建 build/bpfvm.bpf
+#   -  首次 cmake+make 建 host 工具链（bpfvm/bpfvm-ld/4 个 pass .so）
+#   -  ./scripts/build_root.sh 产出 root/lib/{libc.so,libcxx.so}
+#   -  重新 cmake+make -> 自动构建 build/bpfvm.bpf
 # 依赖缺失则跳过（不报错）。
 option(BPFVM_BUILD_BPF "Build bpfvm.bpf (BPF-on-BPF self-host) when deps are met" ON)
 if(BPFVM_BUILD_BPF)
@@ -140,7 +140,7 @@ if(BUILD_TESTING)
     # bpfvm-on-bpfvm 嵌套变体：host bpfvm 跑 build/bpfvm.bpf，内层 bpfvm 再跑测试程序。
     # 默认开启；bpfvm.bpf 没构建/依赖缺失时脚本运行期优雅跳过嵌套变体，不影响普通变体。
     # 注意：bpfvm.bpf 交叉编译到 BPF 目标，src/insn.cpp 的 JIT 编译器按宿主编译目标
-    # 架构在编译期选择，BPF 目标既非 __x86_64__ 也非 __aarch64__ → StubJitCompiler
+    # 架构在编译期选择，BPF 目标既非 __x86_64__ 也非 __aarch64__ -> StubJitCompiler
     # （compile() 恒返回 nullptr），故内层 bpfvm 是纯解释器，JIT_ENABLE 对它无效，
     # 嵌套变体只按程序类型（static/dynamic）区分，无 jit/interp 之分。
     option(BPFVM_TEST_NESTED "Run bpfvm-on-bpfvm nested variants in ctest" ON)
@@ -148,7 +148,7 @@ if(BUILD_TESTING)
         set(BPFVM_BPF_PATH "${CMAKE_BINARY_DIR}/bpfvm.bpf")
     endif()
 
-    # 每个用例一个 ctest 条目，内部串行跑多变体（静态/动态 × JIT 开/关 + host + 嵌套）。
+    # 每个用例一个 ctest 条目，内部串行跑多变体（静态/动态 x JIT 开/关 + host + 嵌套）。
     # 不同用例之间由 ctest -j 并发；同用例变体串行，不冲突文件。
     # ROOT 参数非空时走 chroot 模式（建临时 rootfs + --root 启动 + marker 落位校验）。
     function(add_bpf_program_test name)

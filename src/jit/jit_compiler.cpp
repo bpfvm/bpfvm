@@ -400,7 +400,7 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
                 compiled_count++;
             } else if (insn->src_reg == 2) {
                 // 浮点专用通道：先 JIT 原生（emit_call_softfp），未命中（如 x86 的
-                // uint fp↔int 转换）走 emit_call_softfp_slow 回退到 helper_do_softfp。
+                // uint fp<->int 转换）走 emit_call_softfp_slow 回退到 helper_do_softfp。
                 if (e.emit_call_softfp(insn)) {
                     compiled_count++;
                 } else {
@@ -533,7 +533,7 @@ JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     std::vector<uint32_t> loop_body_sizes;
     int num_insns = 0;
     auto reachable = discover_reachable(entry_pc, seg_limit, back_edge_targets, loop_body_sizes, num_insns);
-    // reachable.empty()/num_insns<=0 ⟺ seg_limit<=0（gpa 距段尾不足一条指令）。
+    // reachable.empty()/num_insns<=0 <=> seg_limit<=0（gpa 距段尾不足一条指令）。
     // gpa 相对段的位置不变、段大小不变，属结构性失败——缓存失败避免每次 step 重跑 BFS。
     if (reachable.empty() || num_insns <= 0) {
         mark_failed();
@@ -558,7 +558,7 @@ JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         } else {
             target = i + 1 + insn->off;
         }
-        // patch 阶段要求 target ∈ [0, num_insns) 且该槽可达（被 emit）。
+        // patch 阶段要求 target in [0, num_insns) 且该槽可达（被 emit）。
         if (target < 0 || target >= num_insns || !reachable[target]) {
             mark_failed();
             return nullptr;
@@ -631,7 +631,7 @@ JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
     func.gpa = gpa;
     // 每个 call site 有 2 个占位（fast path 读 cache + slow_resolve 传 helper），二者在
     // call_cache_offs 中相邻成对（同一 emit_call_bpf 内连续 push），共用 1 个 cache 槽：
-    // 占位 2k/2k+1 → slot k。
+    // 占位 2k/2k+1 -> slot k。
     size_t n_slots = (call_cache_offs.size() + 1) / 2;
     func.call_cache.assign(n_slots, 0);
 

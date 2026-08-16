@@ -1,8 +1,8 @@
 //
 // bpf_fp.h — 虚拟浮点指令编号（src_reg=2）
 //
-//   编码：BpfSoftFp pass（把浮点 IR 改成对 extern __ksym __bpf_fp_<ID> 的调用）→
-//         bpfvm-ld（识别符号、改写 src_reg=2、imm=<ID>）→
+//   编码：BpfSoftFp pass（把浮点 IR 改成对 extern __ksym __bpf_fp_<ID> 的调用）->
+//         bpfvm-ld（识别符号、改写 src_reg=2、imm=<ID>）->
 //   执行：do_softfp（解释器 / JIT 回退）、emit_call_softfp（JIT 原生）。
 //
 

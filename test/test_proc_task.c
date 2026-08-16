@@ -2,12 +2,12 @@
  * /proc/[pid]/task 子目录 + thread-self 符号链接穿透测试。
  *
  * 覆盖点（本次 procfs 重构新增的能力）：
- *   1. /proc/[pid]/task 目录可列举，单线程进程至少能看到 leader（自己的 tid）。
- *   2. 多线程时 task 目录列出每个 tid，数量与创建的线程一致。
- *   3. /proc/thread-self 是相对符号链接（"<tgid>/task/<tid>"），readlink 返回原始相对
+ *   -  /proc/[pid]/task 目录可列举，单线程进程至少能看到 leader（自己的 tid）。
+ *   -  多线程时 task 目录列出每个 tid，数量与创建的线程一致。
+ *   -  /proc/thread-self 是相对符号链接（"<tgid>/task/<tid>"），readlink 返回原始相对
  *      target；stat（follow）穿透到 /proc/[tgid]/task/[tid] 目录。
- *   4. /proc/[pid]/task/[tid]/comm 可读，内容是该线程的 comm。
- *   5. getdents 的 "." 和 ".." 条目存在。
+ *   -  /proc/[pid]/task/[tid]/comm 可读，内容是该线程的 comm。
+ *   -  getdents 的 "." 和 ".." 条目存在。
  *
  * 通过标准：打印 ok 并退出码 0。
  */
@@ -64,11 +64,11 @@ int main(void) {
     pid_t pid = getpid();
     pid_t tid = gettid();
 
-    /* 1. 单线程：task 至少有自己（leader） */
+    /* -  单线程：task 至少有自己（leader） */
     int n1 = count_tasks(pid, tid);
     CHECK(n1 >= 1, "single-thread task count");
 
-    /* 2. thread-self readlink 返回原始相对 target（"<tgid>/task/<tid>"） */
+    /* -  thread-self readlink 返回原始相对 target（"<tgid>/task/<tid>"） */
     char linkbuf[256];
     ssize_t ln = readlink("/proc/thread-self", linkbuf, sizeof(linkbuf) - 1);
     CHECK(ln > 0, "readlink thread-self");
@@ -77,13 +77,13 @@ int main(void) {
     snprintf(expect, sizeof(expect), "%d/task/%d", (int)pid, (int)tid);
     CHECK(strcmp(linkbuf, expect) == 0, "thread-self target is relative <tgid>/task/<tid>");
 
-    /* 3. stat(thread-self) follow 穿透后是目录 */
+    /* -  stat(thread-self) follow 穿透后是目录 */
     struct stat st;
     CHECK(stat("/proc/thread-self", &st) == 0 && S_ISDIR(st.st_mode), "stat thread-self is dir");
     /* lstat 不穿透：是符号链接 */
     CHECK(lstat("/proc/thread-self", &st) == 0 && S_ISLNK(st.st_mode), "lstat thread-self is link");
 
-    /* 4. 起一个线程，task 计数应增加 */
+    /* -  起一个线程，task 计数应增加 */
     pthread_t t;
     CHECK(pthread_create(&t, NULL, worker, NULL) == 0, "pthread_create");
     /* 等子线程真正起来 */
@@ -92,7 +92,7 @@ int main(void) {
     int n2 = count_tasks(pid, tid);
     CHECK(n2 == n1 + 1, "task count increased by 1 after thread create");
 
-    /* 5. 枚举 task，读每个 [tid]/comm 应非空 */
+    /* -  枚举 task，读每个 [tid]/comm 应非空 */
     {
         char base[64];
         snprintf(base, sizeof(base), "/proc/%d/task", (int)pid);
@@ -134,7 +134,7 @@ int main(void) {
         CHECK(read_comm_ok == n2, "read comm for every tid");
     }
 
-    /* 6. task/[tid] 不应再嵌套 task 子目录（真实 Linux：只有 tgid 目录才有 task） */
+    /* -  task/[tid] 不应再嵌套 task 子目录（真实 Linux：只有 tgid 目录才有 task） */
     {
         char no_task[128];
         snprintf(no_task, sizeof(no_task), "/proc/%d/task/%d/task", (int)pid, (int)tid);

@@ -1,4 +1,4 @@
-//===- BpfLibcallLower.cpp - intrinsic → libcall 改写 --------------------===//
+//===- BpfLibcallLower.cpp - intrinsic -> libcall 改写 --------------------===//
 //
 // BPF 后端在 ISel 阶段拒绝一批 LLVM intrinsic，报 "A call to built-in
 // function 'memcpy' is not supported" 等。-fno-builtin 只阻止"把 libc 调用
@@ -10,11 +10,11 @@
 // 本 pass 在 IR 层把这些 intrinsic 替换成对 musl 提供的普通函数的 call（BPF
 // 后端正常选 call 指令）。统一处理两类"后端拒收、但 libc/libm 有纯 C 实现"的
 // intrinsic：
-//   内存：@llvm.memcpy/memmove/memset → call memcpy/memmove/memset
-//   数学：@llvm.floor/ceil/trunc/round → call floor/ceil/trunc/round（+f）
+//   内存：@llvm.memcpy/memmove/memset -> call memcpy/memmove/memset
+//   数学：@llvm.floor/ceil/trunc/round -> call floor/ceil/trunc/round（+f）
 //         （musl src/math/*.c 纯 C 实现，后端能编译；源码直接调 floor() 本就是
 //          合法普通 call，后端能选 call，无需本 pass 介入
-//   控制：@llvm.trap → call abort（libc++ new.cpp 等会调 abort() 被 builtin 化）
+//   控制：@llvm.trap -> call abort（libc++ new.cpp 等会调 abort() 被 builtin 化）
 //
 // 时机：registerOptimizerLastEPCallback（-O1+）/ registerPipelineStartEPCallback
 // （-O0 兜底）。必须在 CodeGen 之前（ISel 才会拒绝 intrinsic），但尽量晚跑让
@@ -126,11 +126,11 @@ struct BpfLibcallLowerPass : public PassInfoMixin<BpfLibcallLowerPass> {
                 if (Len->getType() != I64) Len = B.CreateZExtOrTrunc(Len, I64);
                 B.CreateCall(FC, {Dst, Val, Len});
             } else if (ID == Intrinsic::trap) {
-                // @llvm.trap → call abort()（libc++ new.cpp 等会调 abort() 被 builtin 化）。
+                // @llvm.trap -> call abort()（libc++ new.cpp 等会调 abort() 被 builtin 化）。
                 FunctionCallee FC = get_callee("abort", AbortTy);
                 B.CreateCall(FC);
             } else {
-                // floor/ceil/trunc/round：单参 (T)->T 数学 intrinsic → musl libm call。
+                // floor/ceil/trunc/round：单参 (T)->T 数学 intrinsic -> musl libm call。
                 // 与上面 void 返回的 memcpy/memset/trap 不同，这些有返回值使用者，
                 // 必须 replaceAllUsesWith 再删除。
                 const char *name = nullptr;

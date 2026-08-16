@@ -2,14 +2,14 @@
  * test_i128_ret.c — 验证【返回 __int128 的函数】支持（caller + callee）。
  *
  * 触发链路(无 pass 时):
- *   __int128 foo(...) { ...; return val; }   →  IR: ret i128
- *   → BPF 后端 LowerReturn 只支持单 64 位返回寄存器 r0 →
+ *   __int128 foo(...) { ...; return val; }   ->  IR: ret i128
+ *   -> BPF 后端 LowerReturn 只支持单 64 位返回寄存器 r0 ->
  *     fatal error: "unable to allocate function return" 崩溃。
  *
  * BpfWideArgs pass 的 lowerI128Returns 把 i128 返回值降级成 sret 风格:
- *   i128 foo(args)  →  void foo(ptr %agg.result, args)
- *   callee: ret i128 %v  →  store %v, %agg.result; ret void
- *   caller: x = call i128 foo(args)  →  alloca; call void foo(ptr, args); load
+ *   i128 foo(args)  ->  void foo(ptr %agg.result, args)
+ *   callee: ret i128 %v  ->  store %v, %agg.result; ret void
+ *   caller: x = call i128 foo(args)  ->  alloca; call void foo(ptr, args); load
  *
  * mul128 不走这条路径:它由 BpfSoftFp 改写成单输出 BPF_FP_UMULH（只回 r0=高半，
  * 低半由调用方用原生 mul i64 另算），针对的是【i128 乘法指令】；本 pass 针对的是

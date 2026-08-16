@@ -1,16 +1,16 @@
 // test_signalfd.c — 验证 bpfvm 的 signalfd 语义。
 //
 // 覆盖：
-//   1. 阻塞 SIGUSR1 + signalfd 读，fork 子进程 kill 父，阻塞 read 返回 128 字节、
+//   -  阻塞 SIGUSR1 + signalfd 读，fork 子进程 kill 父，阻塞 read 返回 128 字节、
 //      ssi_signo == SIGUSR1，ssi_pid == 子进程 pid，ssi_code == SI_USER（验证 siginfo 透传）。
-//   2. 多信号排队：连续两次 kill 后两次 read 各得一个 siginfo。
-//   3. SFD_NONBLOCK + 空队列 → read 返回 -1/EAGAIN。
-//   4. poll(signalfd)：信号到达前 timeout=0 返回 0；信号入队后返回 POLLIN。
-//   5. 更新 mask：signalfd(fd, ...) 用既有 fd 重新设置监听集合。
-//   6. fork 后子进程的 signalfd 独立（读子进程自己的信号，与父互不干扰）。
-//   7. 非法操作（write/pwrite/pread/writev/ftruncate）被拦截，返回与 Linux 一致的 errno。
-//   8. close 后资源清理：50 次 signalfd()/close 循环后 fd 号能回收（防 host fd / fd 表泄漏）。
-//   9. SIGCHLD：fork 子进程分别正常退出/被信号杀，父 signalfd 读到 ssi_code ==
+//   -  多信号排队：连续两次 kill 后两次 read 各得一个 siginfo。
+//   -  SFD_NONBLOCK + 空队列 -> read 返回 -1/EAGAIN。
+//   -  poll(signalfd)：信号到达前 timeout=0 返回 0；信号入队后返回 POLLIN。
+//   -  更新 mask：signalfd(fd, ...) 用既有 fd 重新设置监听集合。
+//   -  fork 后子进程的 signalfd 独立（读子进程自己的信号，与父互不干扰）。
+//   -  非法操作（write/pwrite/pread/writev/ftruncate）被拦截，返回与 Linux 一致的 errno。
+//   -  close 后资源清理：50 次 signalfd()/close 循环后 fd 号能回收（防 host fd / fd 表泄漏）。
+//   -  SIGCHLD：fork 子进程分别正常退出/被信号杀，父 signalfd 读到 ssi_code ==
 //      CLD_EXITED/CLD_KILLED，ssi_status == 退出码/信号号（验证 SIGCHLD siginfo 语义）。
 // 全部断言通过返回 0。
 
@@ -103,7 +103,7 @@ int main(void) {
         return fail("case2 read2", "expected SIGUSR2");
     }
 
-    /* —— 用例 3：SFD_NONBLOCK + 空队列 → EAGAIN —— */
+    /* —— 用例 3：SFD_NONBLOCK + 空队列 -> EAGAIN —— */
     sigemptyset(&mask);
     sigaddset(&mask, SIGUSR2);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) return fail("case3 block", "sigprocmask");
@@ -153,7 +153,7 @@ int main(void) {
 
     /* —— 用例 6：fork 后子进程的 signalfd 独立 ——
      * 父 sfd 仍监听 SIGUSR2。fork 出子进程，子继承 sfd（dup 出的独立 fd）和注册条目。
-     * 子给自己发 SIGUSR2 → 应能从自己的 sfd 读到；父给自己发 SIGUSR2 也应能从父 sfd 读到。
+     * 子给自己发 SIGUSR2 -> 应能从自己的 sfd 读到；父给自己发 SIGUSR2 也应能从父 sfd 读到。
      * 双方互不干扰。*/
     sigemptyset(&mask);  /* 父 mask 用变量，子进程独立用 */
     pid_t c6 = fork();
@@ -245,9 +245,9 @@ int main(void) {
      *
      * 【串行化 fork/read/reap】SIGCHLD 是标准信号会合并：若两个子都在父第一次 read
      * 前退出（负载下父被调度延迟即触发），两次 exit 只 pending 一个 SIGCHLD，
-     * 第二次 read 会永久阻塞→卡死；且 A/B 谁先退出不确定，固定顺序假设也会偶发失败。
-     * 故一次只 outstanding 一个子：fork A → read A 的 SIGCHLD → waitpid 回收 A →
-     * 再 fork B → read B 的 SIGCHLD → 回收 B。任一时刻只有一个未回收子，SIGCHLD 不
+     * 第二次 read 会永久阻塞->卡死；且 A/B 谁先退出不确定，固定顺序假设也会偶发失败。
+     * 故一次只 outstanding 一个子：fork A -> read A 的 SIGCHLD -> waitpid 回收 A ->
+     * 再 fork B -> read B 的 SIGCHLD -> 回收 B。任一时刻只有一个未回收子，SIGCHLD 不
      * 合并、顺序确定。read 在前、waitpid 在后只回收已 zombie 的子（SIGCHLD 已被
      * signalfd 消费，waitpid 不与 signalfd 争抢）。*/
     sigemptyset(&mask);

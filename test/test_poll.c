@@ -12,7 +12,7 @@
 #include <sys/wait.h>
 #include <string.h>
 
-/* 用例 7：SIGUSR1 handler，空操作即可（无 SA_RESTART → poll 不重启，返回 EINTR） */
+/* 用例 7：SIGUSR1 handler，空操作即可（无 SA_RESTART -> poll 不重启，返回 EINTR） */
 static void on_usr1(int sig) {
     (void)sig;
 }
@@ -86,7 +86,7 @@ int main(void)
         return 1;
     }
 
-    /* —— 用例 4：负 timeout(永久阻塞) + 非法 fd → POLLNVAL 应立即返回，不得挂死 —— */
+    /* —— 用例 4：负 timeout(永久阻塞) + 非法 fd -> POLLNVAL 应立即返回，不得挂死 —— */
     struct pollfd pfd_nval_block = {
         .fd = 998,  /* 非法 fd */
         .events = POLLIN,
@@ -134,7 +134,7 @@ int main(void)
      * 这是 poll 设计的重点路径：queue_signal 的 pthread_kill(SIGUSR1) 把宿主 poll
      * 踢出 EINTR，do_poll 翻译成 -EINTR 返回，随后 safepoint 投递信号给 handler。 */
     struct sigaction sa = {0};
-    sa.sa_handler = on_usr1;    /* 空 handler，安装即可（无 SA_RESTART → poll 不重启） */
+    sa.sa_handler = on_usr1;    /* 空 handler，安装即可（无 SA_RESTART -> poll 不重启） */
     if (sigaction(SIGUSR1, &sa, NULL) != 0) {
         perror("sigaction");
         return 1;

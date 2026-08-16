@@ -8,7 +8,7 @@
  * 匹配执行——leader 先退出时也不能漏 reparent。
  *
  * 当前预期：撞预存的 CoW UAF（fork+跨进程并发写缺页，G 写 .data 段触发深拷贝时读到已
- * munmap 的页 → 段错误）。该 bug 与 reparent 改动无关，待单独修复；修好后本测试应通过。
+ * munmap 的页 -> 段错误）。该 bug 与 reparent 改动无关，待单独修复；修好后本测试应通过。
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -8,9 +8,9 @@
  *
  * 场景构造：父进程阻塞 read 一个空管道。一个 signaler 子进程延时给父进程发
  * SIGUSR1，随后向管道写一字节。
- *   - SA_RESTART：父进程 read 被信号打断 → handler 返回 → 自动重启 read → 读到
+ *   - SA_RESTART：父进程 read 被信号打断 -> handler 返回 -> 自动重启 read -> 读到
  *     signaler 写入的字节，返回 1（不是 -EINTR）。
- *   - 无 SA_RESTART：父进程 read 被信号打断 → 返回 -1/EINTR。
+ *   - 无 SA_RESTART：父进程 read 被信号打断 -> 返回 -1/EINTR。
  *
  * 两个分支都符合预期才 exit(0)。用 fork 子进程而非 alarm，避免与测试框架的
  * 信号设施冲突，且时序可控。

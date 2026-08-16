@@ -7,12 +7,12 @@
 // do_softfp / emit_call_softfp。
 //
 // 编码链路（不在 pass 里直出 src_reg=2，交给 clang 后端 + linker 协同）：
-//   pass  →  extern long __bpf_fp_<ID>(i64...) (section ".ksyms")，符号名尾部 <ID>
+//   pass  ->  extern long __bpf_fp_<ID>(i64...) (section ".ksyms")，符号名尾部 <ID>
 //            直接编码 BPF_FP_*，无映射表
-//   clang →  当普通未解析外部函数调用，按 calling convention 把参数放 r1/r2/...、结果
+//   clang ->  当普通未解析外部函数调用，按 calling convention 把参数放 r1/r2/...、结果
 //            放 r0，emit `call -1`（src_reg=1 占位）+ R_BPF_64_32 重定位
-//   linker→  在 R_BPF_64_32 看到 `__bpf_fp_` 符号 → 改写 call 的 src_reg=2 + imm=<ID>
-//   VM    →  src_reg=2 的 dispatch 直达 do_softfp
+//   linker->  在 R_BPF_64_32 看到 `__bpf_fp_` 符号 -> 改写 call 的 src_reg=2 + imm=<ID>
+//   VM    ->  src_reg=2 的 dispatch 直达 do_softfp
 //
 // 寄存器绑定由后端原生 call lowering 保证（不用 InlineAsm：它的 "r"/"=r" 不保证绑
 // r1/r2/r0，寄存器压力下会错放，且 clobber 会触发 LiveVariables 崩溃）。
@@ -97,9 +97,9 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
 
     Value *Call = B.CreateCall(FC, I64Args);
 
-    // 结果 i64 → 目标类型。
+    // 结果 i64 -> 目标类型。
     if (RetTy->isFloatTy())
-        // float 位模式在低 32 位：i64 trunc → i32，再 bitcast 回 float。
+        // float 位模式在低 32 位：i64 trunc -> i32，再 bitcast 回 float。
         return B.CreateBitCast(B.CreateTrunc(Call, Type::getInt32Ty(Ctx)), RetTy);
     if (RetTy->isDoubleTy())
         return B.CreateBitCast(Call, RetTy);
@@ -108,7 +108,7 @@ static Value *emitDirectFpCall(IRBuilder<> &B, LLVMContext &Ctx,
     return Call;  // 已是 i64
 }
 
-// 发射 BPF_FP_UMULH（softfp 通道），取 64×64→128 的高半。用于 mul i128 与
+// 发射 BPF_FP_UMULH（softfp 通道），取 64x64->128 的高半。用于 mul i128 与
 // umul.with.overflow 的高位提取。单输出（只回 r0=hi），低半由调用方用原生 mul 另算。
 static Value *emitMul128Hi(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb) {
     Type *I64Ty = Type::getInt64Ty(Ctx);
@@ -117,22 +117,22 @@ static Value *emitMul128Hi(IRBuilder<> &B, LLVMContext &Ctx, Value *A, Value *Bb
 
 // 把 mul i128 的操作数归约成 i64。前提：操作数真值 <2^64（mul i128 在实际代码中
 // 的来源——zext i64、i64 范围常量、掩码后的值——均满足）。各形态处理：
-//   - zext i64→i128             → 原 i64
-//   - and i128 X, (2^k-1), k≤64  → trunc X to i64（掩码保证值 <2^k，trunc 不丢信息）
-//   - i128 常量 ≤2^64-1         → trunc to i64
-//   - 其它                       → trunc to i64（前提不成立时丢精度）
+//   - zext i64->i128             -> 原 i64
+//   - and i128 X, (2^k-1), k<=64  -> trunc X to i64（掩码保证值 <2^k，trunc 不丢信息）
+//   - i128 常量 <=2^64-1         -> trunc to i64
+//   - 其它                       -> trunc to i64（前提不成立时丢精度）
 static Value *narrowToI64(IRBuilder<> &B, Value *V) {
     Type *I64Ty = Type::getInt64Ty(B.getContext());
-    // zext i64→i128：直接取原值。
+    // zext i64->i128：直接取原值。
     if (auto *ZE = dyn_cast<ZExtInst>(V)) {
         if (ZE->getSrcTy()->isIntegerTy(64) && ZE->getDestTy()->isIntegerTy(128))
             return ZE->getOperand(0);
     }
-    // and i128 X, (2^k-1)：掩码使值 <2^k≤2^64，trunc X 即正确低半。
+    // and i128 X, (2^k-1)：掩码使值 <2^k<=2^64，trunc X 即正确低半。
     if (auto *BO = dyn_cast<BinaryOperator>(V)) {
         if (BO->getOpcode() == Instruction::And && BO->getType()->isIntegerTy(128)) {
             if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-                APInt Cp1 = C->getValue() + 1;          // C 是 2^k-1 ⟺ C+1 是 2 的幂
+                APInt Cp1 = C->getValue() + 1;          // C 是 2^k-1 <=> C+1 是 2 的幂
                 if (Cp1.isPowerOf2() && Cp1.getActiveBits() <= 64) {
                     // (and X, 2^k-1) 取低 k 位。trunc 到 i64 后须【保留掩码】，
                     // 否则 X 的 bit k..63 脏数据会污染 mul 操作数。
@@ -142,7 +142,7 @@ static Value *narrowToI64(IRBuilder<> &B, Value *V) {
             }
         }
     }
-    // i128 常量（≤2^64-1）：trunc 取低半。
+    // i128 常量（<=2^64-1）：trunc 取低半。
     if (auto *C = dyn_cast<ConstantInt>(V)) {
         if (C->getValue().getActiveBits() <= 64)
             return ConstantInt::get(I64Ty, C->getValue().trunc(64));
@@ -271,7 +271,7 @@ static bool softenFunction(Function &F) {
                     // 交叉项里的 (64-K) 在 K==0 时等于 64，lshr/shl i64 by 64 是 poison
                     //（BPF 硬件把移位量按 6 位掩码，实测退成 >>0/<<0，把本应为 0 的交叉项
                     // 变成完整操作数）。拆成两个永不超过 63 的移位：x<>(64-K)，
-                    // 因 63-K ∈ [0,63] 恒为合法移位量，且两步合起来 == 移位 (64-K)
+                    // 因 63-K in [0,63] 恒为合法移位量，且两步合起来 == 移位 (64-K)
                     //（=64 时结果为 0，与数学语义一致）。
                     Constant *BITS63 = ConstantInt::get(I64Ty, 63);
                     Constant *ONE    = ConstantInt::get(I64Ty, 1);
@@ -347,7 +347,7 @@ static bool softenFunction(Function &F) {
                 continue;
             }
 
-            // ---- fp → int ----
+            // ---- fp -> int ----
             if (auto *CI = dyn_cast<CastInst>(&I)) {
                 Type *Dst = CI->getType();
                 Type *Src = CI->getOperand(0)->getType();
@@ -493,7 +493,7 @@ static bool softenFunction(Function &F) {
                 }
                 // umul.with.overflow（__builtin_mul_overflow 的 IR 形态）：用
                 // Lo = 原生 BPF_MUL 截断 + Hi = BPF_FP_UMULH 展开，按 {i64,i1}
-                // 语义重写 extractvalue：index 0→Lo，index 1→Ov(=Hi!=0)。
+                // 语义重写 extractvalue：index 0->Lo，index 1->Ov(=Hi!=0)。
                 // 注意：II->getType() 是 {i64,i1} struct，不能用 suffix(Ty) 判断
                 // （会返回 nullptr 漏过），必须用 operand 类型判断。只处理 i64 重载；
                 // i32 等窄类型 BPF 原生支持，留给后端。
@@ -521,7 +521,7 @@ static bool softenFunction(Function &F) {
                 }
             }
 
-            // ---- sqrt/fabs/copysign libcall 拦截 → VM 虚拟指令 ----
+            // ---- sqrt/fabs/copysign libcall 拦截 -> VM 虚拟指令 ----
             // （源码直接调 sqrt()/fabsf()，或 libc++ 头里的 sqrt）。
             if (auto *CI = dyn_cast<CallInst>(&I)) {
                 Function *Callee = CI->getCalledFunction();
@@ -552,7 +552,7 @@ static bool softenFunction(Function &F) {
 
             // ---- 比较：fcmp ----
             // 三态 CMP（<0/=0/>0）丢失了 NaN 信息：无法区分"相等(==0)"与"NaN 无法
-            // 比较(也落到 ==0)"。故配合独立的 UNORD（任一 NaN→1，否则→0）精确还原
+            // 比较(也落到 ==0)"。故配合独立的 UNORD（任一 NaN->1，否则->0）精确还原
             // 每个 IEEE754 谓词：有序谓词 && !uno，无序谓词 || uno。
             if (auto *FCmp = dyn_cast<FCmpInst>(&I)) {
                 Type *Ty = FCmp->getOperand(0)->getType();
@@ -584,7 +584,7 @@ static bool softenFunction(Function &F) {
                 default: break;   // 六组二元比较在下面统一处理
                 }
                 if (!Result) {
-                    // Cmp 三态 → 有序比较结果；Uno → 是否无序(NaN)。
+                    // Cmp 三态 -> 有序比较结果；Uno -> 是否无序(NaN)。
                     Value *Cmp   = EmitCmp();
                     Value *Uno   = EmitUnord();
                     Value *isUno = B.CreateICmpNE(Uno, Zero);       // 无序

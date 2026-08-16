@@ -9,16 +9,16 @@
  * 关键：为真正走到 BPF_SYS_ALLOCA 动态路径，本测试通过 volatile 取 VLA 大小
  * （编译期对优化器不透明），迫使 BpfVlaPass 生成 syscall 调用而非折叠成静态
  * alloca。这样同时覆盖：
- *   - 动态路径（编译期未知大小 → BPF_SYS_ALLOCA syscall）；
- *   - 静态折叠路径（编译期已知大小 → 入口块固定 alloca，由 BPF 后端处理）。
+ *   - 动态路径（编译期未知大小 -> BPF_SYS_ALLOCA syscall）；
+ *   - 静态折叠路径（编译期已知大小 -> 入口块固定 alloca，由 BPF 后端处理）。
  *
  * 覆盖：
- *   1. 基本 VLA 求和（int buf[n]）。
- *   2. VLA 在嵌套调用中：被调函数独立分配，返回后调用者再分配不重叠。
- *   3. 多次 VLA 在同一函数里：累计分配，地址不重叠。
- *   4. VLA 跨函数调用传递指针。
- *   5. 回收：循环里反复调用含 VLA 的函数，验证不爆栈（alloca 区随返回回收）。
- *   6. long long VLA（元素 8 字节，验证 size 计算）。
+ *   -  基本 VLA 求和（int buf[n]）。
+ *   -  VLA 在嵌套调用中：被调函数独立分配，返回后调用者再分配不重叠。
+ *   -  多次 VLA 在同一函数里：累计分配，地址不重叠。
+ *   -  VLA 跨函数调用传递指针。
+ *   -  回收：循环里反复调用含 VLA 的函数，验证不爆栈（alloca 区随返回回收）。
+ *   -  long long VLA（元素 8 字节，验证 size 计算）。
  *
  * 全部通过 exit(0)，否则 exit(1)。
  */
@@ -28,7 +28,7 @@
 /* volatile 阻止优化器把 VLA 大小折叠成常量，迫使走 BPF_SYS_ALLOCA 动态路径。 */
 static volatile int g_seed = 50;
 
-/* 1. 基本 VLA 求和：n 编译期未知 → 走 BPF_SYS_ALLOCA */
+/* -  基本 VLA 求和：n 编译期未知 -> 走 BPF_SYS_ALLOCA */
 static int vla_sum(int n) {
     int buf[n];
     for (int i = 0; i < n; i++) buf[i] = i * i;
@@ -37,7 +37,7 @@ static int vla_sum(int n) {
     return s;
 }
 
-/* 2. 嵌套：被调函数用 VLA */
+/* -  嵌套：被调函数用 VLA */
 static int vla_inner(int n) {
     int tmp[n];
     for (int i = 0; i < n; i++) tmp[i] = n - i;
@@ -55,7 +55,7 @@ static int vla_nested_call(int n) {
     return sum == n * (n - 1) / 2 ? got + sum : -1;
 }
 
-/* 3. 同一函数多次 VLA：累计分配，地址不重叠 */
+/* -  同一函数多次 VLA：累计分配，地址不重叠 */
 static int vla_multi(int n) {
     int a[n];
     int b[n];
@@ -66,7 +66,7 @@ static int vla_multi(int n) {
     return s;
 }
 
-/* 4. VLA 指针跨函数传递 */
+/* -  VLA 指针跨函数传递 */
 static int fill_and_sum(int *p, int n) {
     for (int i = 0; i < n; i++) p[i] = i + 1;
     int s = 0;
@@ -74,14 +74,14 @@ static int fill_and_sum(int *p, int n) {
     return s;
 }
 
-/* 5. 回收：每次调用都分配，循环 N 次不爆栈 */
+/* -  回收：每次调用都分配，循环 N 次不爆栈 */
 static int vla_recycle_one(int n) {
     char buf[n];
     memset(buf, 0xAB, n);
     return (unsigned char)buf[0] + (unsigned char)buf[n - 1];
 }
 
-/* 6. long long VLA（元素 8 字节，验证 size 计算） */
+/* -  long long VLA（元素 8 字节，验证 size 计算） */
 static long long vla_ll(long long n) {
     long long buf[n];
     for (long long i = 0; i < n; i++) buf[i] = i;
@@ -91,12 +91,12 @@ static long long vla_ll(long long n) {
 }
 
 int main(void) {
-    /* volatile 读取 → 编译期未知，迫使 VLA 走 BPF_SYS_ALLOCA 动态路径。 */
+    /* volatile 读取 -> 编译期未知，迫使 VLA 走 BPF_SYS_ALLOCA 动态路径。 */
     int base = g_seed;
     if(base < 4) base = 4;
     int ok = 1;
 
-    /* 1. 基本 VLA：sum_{i=0}^{n-1} i^2 */
+    /* -  基本 VLA：sum_{i=0}^{n-1} i^2 */
     {
         int n = base;
         int r = vla_sum(n);
@@ -106,7 +106,7 @@ int main(void) {
         ok &= (r == expect);
     }
 
-    /* 2. 嵌套调用 */
+    /* -  嵌套调用 */
     {
         int n = base;
         int r = vla_nested_call(n);
@@ -115,7 +115,7 @@ int main(void) {
         ok &= (r == expect);
     }
 
-    /* 3. 同函数多次 VLA */
+    /* -  同函数多次 VLA */
     {
         int n = base;
         int r = vla_multi(n);
@@ -125,7 +125,7 @@ int main(void) {
         ok &= (r == expect);
     }
 
-    /* 4. VLA 指针跨函数 */
+    /* -  VLA 指针跨函数 */
     {
         int n = base;
         int buf[n];
@@ -135,7 +135,7 @@ int main(void) {
         ok &= (r == expect);
     }
 
-    /* 5. 回收：循环多次，每次分配；若不回收会很快吃满栈 */
+    /* -  回收：循环多次，每次分配；若不回收会很快吃满栈 */
     {
         int total = 0;
         for (int k = 0; k < 2000; k++) {
@@ -146,7 +146,7 @@ int main(void) {
         ok &= (total == per * 2000);
     }
 
-    /* 6. long long VLA */
+    /* -  long long VLA */
     {
         long long n = base;
         long long r = vla_ll(n);

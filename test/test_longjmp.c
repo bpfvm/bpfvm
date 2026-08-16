@@ -7,10 +7,10 @@
  * setjmp/longjmp 回归测试。
  *
  * 这里覆盖 longjmp 的全部关键语义，每条都对应一个历史 bug 的表现面：
- *   1. longjmp 让 setjmp「第二次返回」，返回值 == 传入的 val；
- *   2. val==0 时归一化为 1（ISO C 要求）；
- *   3. 嵌套 setjmp（多层 jmp_buf）按 LIFO 正确回溯；
- *   4. longjmp 之后不 fall-through（控制流确实跳走，而非继续往下）。
+ *   -  longjmp 让 setjmp「第二次返回」，返回值 == 传入的 val；
+ *   -  val==0 时归一化为 1（ISO C 要求）；
+ *   -  嵌套 setjmp（多层 jmp_buf）按 LIFO 正确回溯；
+ *   -  longjmp 之后不 fall-through（控制流确实跳走，而非继续往下）。
  *
  * 任何一个语义被破坏都返回非 0；全过返回 0。早期 bug 里 longjmp 会
  * 把 setjmp 的「第二次返回值」弄成 0、甚至直接 fall-through，这些

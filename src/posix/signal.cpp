@@ -7,7 +7,7 @@ void PosixSyscall::notify_parent_sigchld() {
     // （fini 的 exited 置位 / stop_process 的 stopped 置位），调用方已在调用前设好状态
     tg->wake_waiters();
 
-    // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm → sys()->queue_signal。
+    // 给父进程投 SIGCHLD。find_task(ppid) 取父 vm -> sys()->queue_signal。
     // 父进程可能：已退出（find_task 返 nullptr）、是 EmptySyscall
     // （测试，sys() 返 nullptr）、或正常 PosixSyscall。前两者降级 no-op。
     // ppid 进程级（在 tg）：从 tg->ppid 取本进程的父 pid。
@@ -183,7 +183,7 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
         if(!pushed) {
             return;   // 队列满：丢弃信号，不处理
         }
-        // wakeup 在队列锁外：锁序约定 pending_signals.mtx() → vm::wait_mutex，
+        // wakeup 在队列锁外：锁序约定 pending_signals.mtx() -> vm::wait_mutex，
         // wakeup 内部拿 wait_mutex，持锁调用会反序。
         // wakeup(false)：vm 可能正阻塞在 futex 上，而 SIGUSR1 无法可靠打断
         // pthread_cond_wait（glibc 内部重试 EINTR），靠 broadcast 唤醒。
@@ -199,7 +199,7 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
 bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     // 实时信号统一模型：队列 + 掩码过滤。从 pending_signals 逐个 pop，被 sigmask 阻塞
     // 的信号暂存到 deferred（函数末尾回挂队列，保持 FIFO），找到第一个未阻塞的即投递。
-    // 队列空 / 全部被阻塞 → 收尾：阻塞信号留在队里，VM_SIGNAL_PENDING 保留，待
+    // 队列空 / 全部被阻塞 -> 收尾：阻塞信号留在队里，VM_SIGNAL_PENDING 保留，待
     // sigprocmask 解锁后 safepoint 重扫时投出。
     //
     // signalfd 分流：被阻塞的信号若被某 signalfd 监听，则送进 pipe、不入 deferred
@@ -320,10 +320,10 @@ int64_t PosixSyscall::do_kill(vm* v) {
     }
 
     // 收集目标 task 列表。Linux 语义：
-    //   pid > 0  → 指定 task
-    //   pid == 0 → 调用者进程组所有 task（含自身）
-    //   pid == -1→ 除 pid 1 外所有 task（含自身）
-    //   pid < -1 → 进程组 -pid 所有 task
+    //   pid > 0  -> 指定 task
+    //   pid == 0 -> 调用者进程组所有 task（含自身）
+    //   pid == -1-> 除 pid 1 外所有 task（含自身）
+    //   pid < -1 -> 进程组 -pid 所有 task
     std::vector<std::shared_ptr<vm>> targets;
     auto pick = [&](const std::shared_ptr<vm>& task_vm) {
         targets.push_back(task_vm);
@@ -474,7 +474,7 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
 }
 
 int64_t PosixSyscall::do_sigprocmask(vm* v) {
-    // rt_sigprocmask(how, set, old, sigsetsize)。how ∈ {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}。
+    // rt_sigprocmask(how, set, old, sigsetsize)。how in {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}。
     // sigset_t 在 bpf/musl 是 128 位（16 字节，2 个 unsigned long）；guest 指针指向 16 字节
     // 区域，本 host 仅用低 8 字节（信号 1..63），高 8 字节恒 0（NSIG=32）。
     // 信号 sig 占 bit (sig-1)（Linux 内核/musl sigset_t ABI；bit 0 不用）。
@@ -504,7 +504,7 @@ int64_t PosixSyscall::do_sigprocmask(vm* v) {
             return -EFAULT;
         }
         uint64_t bits = *set_ptr;
-        // 仅保留有效位（bit (sig-1), sig ∈ [1, NSIG-1]）；SIGKILL/SIGSTOP 不可阻塞。
+        // 仅保留有效位（bit (sig-1), sig in [1, NSIG-1]）；SIGKILL/SIGSTOP 不可阻塞。
         constexpr uint64_t valid = (NSIG < 64) ? ((1ULL << (NSIG - 1)) - 1) : ~0ULL;
         bits &= valid;
         bits &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
@@ -626,14 +626,14 @@ int64_t PosixSyscall::do_signalfd4(vm* v) {
     if(fd < 0) {
         // —— 创建新 signalfd ——
         // pipe2 用 O_CLOEXEC（若请求）让两端的 host fd 都带 CLOEXEC；写端额外设
-        // O_NONBLOCK：信号风暴时 pipe 满 → EAGAIN → 静默丢，绝不阻塞 VM 线程。
+        // O_NONBLOCK：信号风暴时 pipe 满 -> EAGAIN -> 静默丢，绝不阻塞 VM 线程。
         int p[2];
         int pipe_flags = (flags & SFD_CLOEXEC) ? O_CLOEXEC : 0;
         if(pipe2(p, pipe_flags) < 0) {
             return -errno;
         }
         // 写端设 O_NONBLOCK。读端保持阻塞（让 guest 的 read() 能阻塞，符合 signalfd 语义）；
-        // SFD_NONBLOCK 仅作用在 guest 视角的读端行为上 → 通过 O_NONBLOCK 体现。
+        // SFD_NONBLOCK 仅作用在 guest 视角的读端行为上 -> 通过 O_NONBLOCK 体现。
         int fcntl_flags = fcntl(p[1], F_GETFL);
         if(fcntl_flags >= 0) {
             fcntl(p[1], F_SETFL, fcntl_flags | O_NONBLOCK);

@@ -4,8 +4,8 @@
 // {ptr,ptr}）的 invisible-reference 改写（见 README.md 函数调用约定突破一节）。改写前的缺陷：
 // clang 对 by-value 非平凡聚合生成 [2 x i64] 值参数，pass 在 caller 侧只做按位
 // store 到临时 alloca、callee 侧 load 出值——move 构造作用于 load 副本，无法
-// 置空 caller 的源临时，caller 析构源时多减一次引用计数 → 计数比实际少 1 →
-// caller 持有的 shared_ptr 在 callee 析构副本后变悬空 → 解引用 UAF。
+// 置空 caller 的源临时，caller 析构源时多减一次引用计数 -> 计数比实际少 1 ->
+// caller 持有的 shared_ptr 在 callee 析构副本后变悬空 -> 解引用 UAF。
 //
 // 触发路径（与 bpfvm 自身 PosixSyscall::do_clone 的 make_shared<PosixSyscall>
 // 完全同构）：make_shared<Holder>(sp) 内部 placement-new 构造 Holder，构造函数

@@ -148,7 +148,7 @@ void PosixSyscall::fini(const std::shared_ptr<vm>& v) {
 
     // 标记整组 exited 并唤醒 waitpid。tg->exit_code 由 do_exit/do_exit_group 用 CAS
     // 首次写入，被 VM_KILLED 的线程不走 do_exit 故不碰；此处仅在仍为 -1（整组无人正常
-    // 退出，且不是经 do_kill→do_exit(128+sig) 被信号杀）时兜底置 137，正常路径不命中。
+    // 退出，且不是经 do_kill->do_exit(128+sig) 被信号杀）时兜底置 137，正常路径不命中。
     int expected = -1;
     tg->exit_code.compare_exchange_strong(expected, 128 + 9, std::memory_order_acq_rel);
     tg->exited.store(true, std::memory_order_release);

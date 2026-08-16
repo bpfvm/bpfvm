@@ -1,6 +1,6 @@
 // test_socket_tcp.c — 验证 bpfvm 的 BSD socket API（TCP）。
-// 场景：父进程 socket→bind(127.0.0.1:0)→listen→accept4；
-//       子进程 connect→send→recv（echo 回环）。
+// 场景：父进程 socket->bind(127.0.0.1:0)->listen->accept4；
+//       子进程 connect->send->recv（echo 回环）。
 // 覆盖：socket/bind/listen/accept4/connect/sendto(=send)/recvfrom(=recv)/
 //       setsockopt(SO_REUSEADDR)/getsockname（取端口）/shutdown。
 // 全部断言通过返回 0。

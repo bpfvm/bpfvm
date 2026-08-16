@@ -2,8 +2,8 @@
 //
 // BpfAtomicLowerPass 把 i8/i16 的 cmpxchg/rmw 展开成对包含它的对齐 i32 槽的子字节
 // CAS 循环。最容易出错的两点：
-//   1) 相邻字节被破坏（越界写）——验证原子字段前后的普通字段值不变。
-//   2) CAS 语义正确——compare_exchange 的成功/失败、旧值返回正确。
+//   -  相邻字节被破坏（越界写）——验证原子字段前后的普通字段值不变。
+//   -  CAS 语义正确——compare_exchange 的成功/失败、旧值返回正确。
 //
 // 用 __atomic_* 内建（与 std::atomic 生成相同 IR：i8 cmpxchg/rmw）。
 #include <stdio.h>

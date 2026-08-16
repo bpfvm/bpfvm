@@ -6,11 +6,11 @@
 // VM 端的加载（含 DT_NEEDED 动态加载）统一在 elf_loader.cpp 的 load_elf 处理。
 //
 // 流程：
-//   1. 加载主 .o：解析所有 section、符号、重定位。
-//   2. 依赖来自命令行 -l archive（由 ld_main 解析为完整路径），全展开。
-//   3. 聚合所有 GLOBAL 符号到全局符号表。
-//   4. 应用所有重定位（R_BPF_64_64 / R_BPF_64_ABS64 / R_BPF_64_32 / R_BPF_64_NODYLD32）。
-//   5. 找入口（_start / main），写出 ET_EXEC。
+//   -  加载主 .o：解析所有 section、符号、重定位。
+//   -  依赖来自命令行 -l archive（由 ld_main 解析为完整路径），全展开。
+//   -  聚合所有 GLOBAL 符号到全局符号表。
+//   -  应用所有重定位（R_BPF_64_64 / R_BPF_64_ABS64 / R_BPF_64_32 / R_BPF_64_NODYLD32）。
+//   -  找入口（_start / main），写出 ET_EXEC。
 //
 // 简化：
 //   - archive 全加载（不做按需提取）
@@ -70,7 +70,7 @@ struct LoadedSection {
 // 符号
 struct LoadedSym {
     std::string name;
-    size_t sec_idx = SIZE_MAX;  // 所属 section 在 LoadedObject::sections 的下标；UND → SIZE_MAX
+    size_t sec_idx = SIZE_MAX;  // 所属 section 在 LoadedObject::sections 的下标；UND -> SIZE_MAX
     uint64_t value = 0;         // section 内偏移
     uint64_t size = 0;
     int binding = 0;
@@ -100,7 +100,7 @@ struct DebugSec {
     size_t extra_idx = SIZE_MAX; // 写出时在 extras[] 里的位置
     // 本 obj 的该段在合并后的同名输出段中的字节起始偏移（collect_debug_sections 填）。
     // 多 .o 链接时同名 .debug_* 段按输入顺序拼接成一个输出段；contrib_off 标出本 .o
-    // 贡献区的起点。debug→debug 重定位（debug_abbrev_offset / DW_AT_str_offsets_base /
+    // 贡献区的起点。debug->debug 重定位（debug_abbrev_offset / DW_AT_str_offsets_base /
     // DW_AT_addr_base / DW_AT_stmt_list 等）必须用 contrib_off + sym.value 定位本 .o 的
     // contribution，否则跨 .o 的 CU 全部错位（gdb 报 "Could not find abbrev" /
     // "DW_FORM_addrx outside .debug_addr"）。
@@ -123,7 +123,7 @@ struct LoadedObject {
     std::unordered_map<size_t, size_t> dbg_sec_local_idx;
     // clang -fstack-size-section 产出的 .stack_sizes 段原始字节（keep_debug 时搬运）。
     // 用于链接期修复 DW_OP_fbreg 偏移（见 fix_fbreg_offsets）。每条记录 =
-    // [8字节 ABS64 重定位 → 函数 .text 地址][ULEB128 stacksize]，重定位在 obj.relocations 里。
+    // [8字节 ABS64 重定位 -> 函数 .text 地址][ULEB128 stacksize]，重定位在 obj.relocations 里。
     std::vector<uint8_t> stack_sizes_data;
     size_t stack_sizes_sec_idx = SIZE_MAX;  // .stack_sizes 在 obj.sections 的下标（reloc 查找用）
 };
@@ -184,7 +184,7 @@ struct ShstrtabOut {
     std::vector<Elf64_Word> extra_name_offs;  // 与 extras 一一对应
 };
 
-// ELF section type → 是否需要加载到 VM
+// ELF section type -> 是否需要加载到 VM
 // SHT_INIT_ARRAY/SHT_FINI_ARRAY 是全局构造/析构函数指针表，必须加载（进 SEG_DATA），
 // 否则 musl 的 __libc_start_init 循环（[__init_array_start, __init_array_end)）拿不到
 // ctor 列表，全局 C++ 对象不会构造。
@@ -195,11 +195,11 @@ bool is_loadable_section(Elf64_Word type) {
 
 // 标准 ld 的 orphan section 边界符号前缀
 // __start_<name>（首，8 字符）/ __stop_<name>（尾，7 字符）。如 section "__lcxx_override"
-// → __start___lcxx_override（三 _: 前缀尾 1 + section 头 2）。
+// -> __start___lcxx_override（三 _: 前缀尾 1 + section 头 2）。
 constexpr const char* kSectionStartPrefix = "__start_";  // 8 字符
 constexpr const char* kSectionStopPrefix  = "__stop_";   // 7 字符
 
-// 正向：符号名 → {is_start, section_name}；未命中返回 nullopt。
+// 正向：符号名 -> {is_start, section_name}；未命中返回 nullopt。
 std::optional<std::pair<bool, std::string>> parse_section_boundary_sym(const std::string& sym) {
     std::string_view sv(sym);
     std::string_view sp(kSectionStartPrefix);
@@ -211,12 +211,12 @@ std::optional<std::pair<bool, std::string>> parse_section_boundary_sym(const std
     return std::nullopt;
 }
 
-// 反向：section 名 + is_start → 符号名。
+// 反向：section 名 + is_start -> 符号名。
 std::string make_section_boundary_sym(const std::string& sec, bool is_start) {
     return std::string(is_start ? kSectionStartPrefix : kSectionStopPrefix) + sec;
 }
 
-// 按 section 属性分流到输出段：可写（含 .bss）→ data；可执行 → text；只读 → rodata。
+// 按 section 属性分流到输出段：可写（含 .bss）-> data；可执行 -> text；只读 -> rodata。
 // 可写优先于可执行：W^X 要求代码不可写，即便异常地同时带 EXECINSTR|WRITE 也归 data。
 SegClass classify_section(bool executable, bool writable) {
     if (writable) return SEG_DATA;
@@ -418,9 +418,9 @@ private:
     std::vector<std::string> dep_paths_;// DYNAMIC_EXE: .so 文件路径列表
     // === 运行时 GOT/PLT 合成状态（DYNAMIC_EXE 默认对所有 UND 函数启用）===
     struct GotPltLoc { size_t obj_idx; size_t offset; };
-    std::unordered_map<std::string, GotPltLoc> got_slots_;   // sym → GOT 槽（合成 .got 内偏移）
-    std::unordered_map<std::string, GotPltLoc> plt_entries_; // sym → PLT 桩（合成 .plt 内偏移）
-    std::unordered_map<std::string, uint64_t> plt_addr_;     // sym → 桩 guest_addr（layout 后回填）
+    std::unordered_map<std::string, GotPltLoc> got_slots_;   // sym -> GOT 槽（合成 .got 内偏移）
+    std::unordered_map<std::string, GotPltLoc> plt_entries_; // sym -> PLT 桩（合成 .plt 内偏移）
+    std::unordered_map<std::string, uint64_t> plt_addr_;     // sym -> 桩 guest_addr（layout 后回填）
     bool got_enabled_ = false;
     size_t got_obj_idx_ = SIZE_MAX;  // 合成 .got.plt 的 obj idx（DT_PLTGOT 指向它）
     size_t plt_obj_idx_ = SIZE_MAX;  // 合成 .plt 的 obj idx（运行时按 section 名定位）
@@ -432,29 +432,29 @@ private:
     bool keep_symtab_ = true; // 默认输出静态 .symtab/.strtab（-s/--strip-all 关闭，对齐 ld）
 
     // === -r (RELOCATABLE) 专用状态 ===
-    // (obj_idx, sec_idx) → 该输入段在合并输出段中的字节贡献起点
+    // (obj_idx, sec_idx) -> 该输入段在合并输出段中的字节贡献起点
     std::map<std::pair<size_t,size_t>, size_t> rel_contrib_off_;
-    // (obj_idx, sec_idx) → 该输入段对应的输出 section 在 extras_ 里的下标
+    // (obj_idx, sec_idx) -> 该输入段对应的输出 section 在 extras_ 里的下标
     std::map<std::pair<size_t,size_t>, size_t> rel_sec_out_index_;
-    // (obj_idx, sym_idx) → 该输入符号在输出 .symtab 中的索引（供重定位 r_info 重索引）
+    // (obj_idx, sym_idx) -> 该输入符号在输出 .symtab 中的索引（供重定位 r_info 重索引）
     std::map<std::pair<size_t,size_t>, size_t> rel_sym_out_index_;
-    // 仍 UND 的符号名 → 输出 symtab 索引（UND 条目无 obj/si，按名查）
+    // 仍 UND 的符号名 -> 输出 symtab 索引（UND 条目无 obj/si，按名查）
     std::unordered_map<std::string, size_t> rel_und_name_index_;
 
-    // 函数 guest 地址 → 栈大小（来自 .stack_sizes，build_stack_size_map 填充）。
+    // 函数 guest 地址 -> 栈大小（来自 .stack_sizes，build_stack_size_map 填充）。
     // 供 fix_fbreg_offsets 修正 DW_OP_fbreg 偏移（clang BPF 后端把栈变量偏移算错为
     // +(stacksize-N)，正确应为 -N；linker 用此表把 +N 改成 +N-stacksize）。
     std::unordered_map<uint64_t, uint64_t> stack_sizes_;
 
-    // loclistx 索引 → 所属函数栈大小（fix_fbreg_offsets 扫 .debug_info 时填）。
+    // loclistx 索引 -> 所属函数栈大小（fix_fbreg_offsets 扫 .debug_info 时填）。
     // .debug_loclists 里的 DW_OP_breg10 偏移有同 fbreg 一样的 bug（应为 -N 算成 +N），
     // fix_loclists_breg10 用此表按 loclist 所属函数修正。
     // 键 = loclists_base(合并段内绝对偏移) + loclistx 索引；与 fix_loclists_breg10 里
     // 的 loclists_base + i 一致（注意：用【旧】base，即重建前的贡献区起点 +12）。
     std::unordered_map<uint64_t, uint64_t> loclist_ss_;
 
-    // loclists_base 旧值 → 新值（fix_loclists_breg10 重建 .debug_loclists 后填）。
-    // 贡献区按真实长度重建（不再 padding），后续贡献区起点会位移 → 其 loclists_base 改变，
+    // loclists_base 旧值 -> 新值（fix_loclists_breg10 重建 .debug_loclists 后填）。
+    // 贡献区按真实长度重建（不再 padding），后续贡献区起点会位移 -> 其 loclists_base 改变，
     // remap_loclists_base 据此定长改写 .debug_info 里的 DW_AT_loclists_base(sec_offset)。
     std::unordered_map<uint64_t, uint64_t> loclists_base_remap_;
 
@@ -486,7 +486,7 @@ private:
     InitFiniArray init_array_;
     InitFiniArray fini_array_;
 
-    // 合成全局符号（name → guest vaddr）：__init_array_start/end、__fini_array_*、
+    // 合成全局符号（name -> guest vaddr）：__init_array_start/end、__fini_array_*、
     // __dso_handle 等。resolve_symbol 先查这里；build_static/dynamic_symtab 会遍历
     // 它们 emit 到符号表。与 globals_（必须指向真实 obj symbol）不同，这里存的是
     // linker 凭空合成的定义。
@@ -553,7 +553,7 @@ public:
         return InputKind::REL;
     }
 
-    // 按文件实际内容加载：ar 归档→全展开、ET_REL→目标、ET_DYN→动态符号+DT_NEEDED。
+    // 按文件实际内容加载：ar 归档->全展开、ET_REL->目标、ET_DYN->动态符号+DT_NEEDED。
     bool load_input(const std::string& in) {
         switch (classify_input(in)) {
             case InputKind::NOT_FOUND:
@@ -598,7 +598,7 @@ public:
             }
         } else if (mode_ == Mode::SHARED_LIB) {
             // 加载依赖 .so 作为符号提供者（UND 符号由 loader 运行时解析，
-            // 这里加载只为读 DT_SONAME → needed_，从而输出 DT_NEEDED）。
+            // 这里加载只为读 DT_SONAME -> needed_，从而输出 DT_NEEDED）。
             for (const auto& dep : dep_paths_) {
                 if (!load_bpfso_symbols(dep)) {
                     std::cerr << "[elf_linker] failed to load dep: " << dep << "\n";
@@ -614,9 +614,9 @@ public:
             }
         } else if (mode_ == Mode::DYNAMIC_EXE) {
             // 动态主程序：依赖按文件实际内容分流——
-            //   ar 归档 → 静态拉入成员（符号进 globals_，内部相对 call 解析）；
-            //   ET_REL → 当作附加对象静态链入；
-            //   ET_DYN/ET_EXEC → 动态依赖（只读 dynsym + DT_NEEDED，跨模块调用走 PLT/GOT）。
+            //   ar 归档 -> 静态拉入成员（符号进 globals_，内部相对 call 解析）；
+            //   ET_REL -> 当作附加对象静态链入；
+            //   ET_DYN/ET_EXEC -> 动态依赖（只读 dynsym + DT_NEEDED，跨模块调用走 PLT/GOT）。
             for (const auto& dep : dep_paths_) {
                 switch (classify_input(dep)) {
                     case InputKind::NOT_FOUND:
@@ -697,7 +697,7 @@ public:
         // DYNAMIC_EXE: entry 符号（_start）通常在 .so，主程序通过 PLT/GOT 调用；
         //   entry_ 指向主程序 PLT 里 _start 的桩（相对主程序基址的偏移，PIE）。
         if (mode_ != Mode::SHARED_LIB) {
-            // 1. 主程序内的全局符号（STATIC_EXE 的 _start，或 DYNAMIC_EXE 主程序自带入口）
+            // -  主程序内的全局符号（STATIC_EXE 的 _start，或 DYNAMIC_EXE 主程序自带入口）
             auto it = globals_.find(entry_name_);
             if (it != globals_.end()) {
                 const auto& obj = objects_[it->second.obj_idx];
@@ -708,7 +708,7 @@ public:
                           << " @ 0x" << std::hex << entry_ << std::dec
                           << " from " << obj.source << "\n";
             } else if (mode_ == Mode::DYNAMIC_EXE) {
-                // 2. DYNAMIC_EXE：_start 在 .so，走 PLT/GOT，entry 指向 PLT 桩
+                // -  DYNAMIC_EXE：_start 在 .so，走 PLT/GOT，entry 指向 PLT 桩
                 auto pit = plt_addr_.find(entry_name_);
                 if (pit != plt_addr_.end()) {
                     entry_ = pit->second;
@@ -751,10 +751,10 @@ public:
     // 独立 .init_array，与标准 ld 不同——是有意简化）。
     void layout_segments() {
         for (int c = 0; c < 3; c++) segs_[c] = SegInfo{};
-        // 分桶（保持 object/section 出现顺序 → 段内顺序稳定）。
+        // 分桶（保持 object/section 出现顺序 -> 段内顺序稳定）。
         // SEG_DATA 特殊处理：把所有 .init_array/.fini_array section 挑出来排在段尾，
         // 保证它们各自连续（musl 的 [__init_array_start, __init_array_end) 循环假设
-        // 是连续的函数指针数组，被 .data 穿插会读到非函数指针 → crash）。
+        // 是连续的函数指针数组，被 .data 穿插会读到非函数指针 -> crash）。
         std::vector<std::pair<size_t,size_t>> data_init, data_fini;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t si = 1; si < objects_[oi].sections.size(); si++) {
@@ -872,7 +872,7 @@ public:
     // 放进 __lcxx_override section，其可覆盖检测宏 __is_function_overridden 引用
     // __start___lcxx_override/__stop___lcxx_override 即走此机制。
     void collect_section_boundary_refs() {
-        // 先建 name→存在 的 section 名集合（loadable section）。
+        // 先建 name->存在 的 section 名集合（loadable section）。
         std::set<std::string> sec_names;
         for (const auto& obj : objects_) {
             for (const auto& ls : obj.sections) {
@@ -886,7 +886,7 @@ public:
                 if (!parsed) continue;
                 const std::string& sec = parsed->second;
                 // section 存在才合成（对齐 ld：无对应 section 时 __start_/__stop_ 不合成，
-                // 留作 weak UND→0 或报 undefined）。
+                // 留作 weak UND->0 或报 undefined）。
                 if (sec_names.count(sec)) synthetic_globals_[sym.name] = 1;
             }
         }
@@ -906,7 +906,7 @@ public:
         }
         if (wanted.empty()) return;
         // 按 section 名算合并后的边界。
-        std::unordered_map<std::string, std::pair<uint64_t,uint64_t>> bounds; // name → {min_addr, max_end}
+        std::unordered_map<std::string, std::pair<uint64_t,uint64_t>> bounds; // name -> {min_addr, max_end}
         for (const auto& obj : objects_) {
             for (const auto& ls : obj.sections) {
                 if (!ls.loadable || ls.name.empty()) continue;
@@ -933,7 +933,7 @@ public:
     // ======================================================================
 
     bool run_relocatable(const std::vector<std::string>& inputs) {
-        // 1. 加载输入（仅 ET_REL + ar 归档；classify_input 会把 .so/ET_DYN 也分流，
+        // -  加载输入（仅 ET_REL + ar 归档；classify_input 会把 .so/ET_DYN 也分流，
         //    但 partial link 不接受共享库——遇到 ET_DYN 输入直接报错）
         for (const auto& in : inputs) {
             auto kind = classify_input(in);
@@ -950,18 +950,18 @@ public:
         for (const auto& a : explicit_archives_) {
             load_archive_file(a);
         }
-        // 2. register_globals：建立 globals_（强覆盖弱），供 symtab 去重 + UND 判定
+        // -  register_globals：建立 globals_（强覆盖弱），供 symtab 去重 + UND 判定
         for (size_t i = 0; i < objects_.size(); i++) {
             register_globals(i);
         }
-        // 3. partial link 允许未解析符号——不调 check_undefined_symbols
+        // -  partial link 允许未解析符号——不调 check_undefined_symbols
         return true;
     }
 
     // 合并所有输入对象的 loadable 段（按完整段名）到 extras，并填 rel_contrib_off_/
     // rel_sec_out_index_。同名段顺序拼接，.bss(NOBITS) 只累加 size 不写数据。
     void merge_rel_sections(std::vector<SecBuf>& extras) {
-        // name → (extras 下标, 当前累计字节)
+        // name -> (extras 下标, 当前累计字节)
         std::unordered_map<std::string, std::pair<size_t, size_t>> merged;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t si = 1; si < objects_[oi].sections.size(); si++) {
@@ -1017,7 +1017,7 @@ public:
     // SHT_PROGBITS），按名拼接保留原始字节，供后续 final-link 消费。keep_debug_ 关闭时跳过。
     void merge_rel_debug_sections(std::vector<SecBuf>& extras) {
         if (!keep_debug_) return;
-        // name → (extras 下标, 累计字节)
+        // name -> (extras 下标, 累计字节)
         std::unordered_map<std::string, std::pair<size_t, size_t>> merged;
         auto append = [&](size_t oi, size_t sec_idx, const std::string& name,
                           Elf64_Xword align, const std::vector<uint8_t>& data) {
@@ -1125,7 +1125,7 @@ public:
             sym_count++;
         };
 
-        // 1. 本地符号（STB_LOCAL）：所有类型，含 STT_SECTION/STT_FILE。
+        // -  本地符号（STB_LOCAL）：所有类型，含 STT_SECTION/STT_FILE。
         //    同名段合并后，每个输入对象的 STT_SECTION 符号须各自保留——它们被本对象的
         //    重定位引用（r_info 指向本 obj 的 section 符号），合并段后 shndx 改指合并段，
         //    value 改指贡献区起点。
@@ -1138,7 +1138,7 @@ public:
         }
         symtab.info = (Elf64_Word)sym_count;  // sh_info = 第一个 non-local 的索引
 
-        // 2. global/weak 符号：每个名字输出一条（取 globals_ 的胜出定义，保留其 binding）；
+        // -  global/weak 符号：每个名字输出一条（取 globals_ 的胜出定义，保留其 binding）；
         //    同时为所有引用过但无定义的 UND 名字输出 SHN_UNDEF 条目。
         // 先输出有定义的 global/weak
         for (const auto& kv : globals_) {
@@ -1183,7 +1183,7 @@ public:
     // .rela.text（目标段 index 相同）。r_offset 重定位到合并段内（contrib_off + r.offset），
     // r_info 重索引到输出 symtab，addend 原样保留。不跳过任何重定位类型（含 call type 10）。
     void build_rel_relocations(std::vector<SecBuf>& extras, size_t symtab_idx) {
-        // 输出目标段 index → (extras 下标, 段名)
+        // 输出目标段 index -> (extras 下标, 段名)
         std::map<size_t, size_t> outsec_to_rela;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (const auto& r : objects_[oi].relocations) {
@@ -1240,7 +1240,7 @@ public:
         }
     }
 
-    // -r 文件布局：ehdr → extras 数据(顺序，按 addralign 对齐) → shdr 表
+    // -r 文件布局：ehdr -> extras 数据(顺序，按 addralign 对齐) -> shdr 表
     struct RelLayout {
         std::vector<uint64_t> extra_offs;  // 每个 extra 的文件 offset
         uint64_t sh_off = 0;               // shdr 表 offset
@@ -1249,18 +1249,18 @@ public:
     };
 
     bool write_rel_impl(FILE* f) {
-        // 1. 合并 loadable 段 + （keep_debug 时）DWARF/.stack_sizes 段
+        // -  合并 loadable 段 + （keep_debug 时）DWARF/.stack_sizes 段
         std::vector<SecBuf> extras;
         merge_rel_sections(extras);
         merge_rel_debug_sections(extras);
 
-        // 2. symtab + strtab
+        // -  symtab + strtab
         auto [symtab_idx, strtab_idx] = build_rel_symtab(extras);
 
-        // 3. 重定位段
+        // -  重定位段
         build_rel_relocations(extras, symtab_idx);
 
-        // 4. .shstrtab（收集所有 extra 名字）
+        // -  .shstrtab（收集所有 extra 名字）
         SecBuf shstrtab;
         shstrtab.name = ".shstrtab";
         shstrtab.type = SHT_STRTAB;
@@ -1279,7 +1279,7 @@ public:
         extras.push_back(std::move(shstrtab));
         name_offs.push_back(shstrtab_name_off);  // 与 extras 对齐，shstrtab 自身名字占一位
 
-        // 5. 计算文件布局
+        // -  计算文件布局
         RelLayout L;
         uint64_t off = sizeof(Elf64_Ehdr);  // 无 phdr
         L.extra_offs.resize(extras.size());
@@ -1298,7 +1298,7 @@ public:
         L.shnum = (Elf64_Half)(extras.size() + 1);  // +1: NULL shdr
         L.shstrndx = (Elf64_Half)shstrtab_idx + 1;  // +1: NULL shdr 占 index 0
 
-        // 6. 写 Ehdr
+        // -  写 Ehdr
         Elf64_Ehdr eh = {};
         eh.e_ident[0] = 0x7f; eh.e_ident[1] = 'E'; eh.e_ident[2] = 'L'; eh.e_ident[3] = 'F';
         eh.e_ident[4] = ELFCLASS64; eh.e_ident[5] = ELFDATA2LSB; eh.e_ident[6] = EV_CURRENT;
@@ -1318,7 +1318,7 @@ public:
         eh.e_shstrndx = L.shstrndx;
         if (fwrite(&eh, sizeof(eh), 1, f) != 1) return false;
 
-        // 7. 写 extras 数据（NOBITS 跳过）
+        // -  写 extras 数据（NOBITS 跳过）
         for (size_t i = 0; i < extras.size(); i++) {
             if (extras[i].type == SHT_NOBITS) continue;
             if (fseek(f, (long)L.extra_offs[i], SEEK_SET) != 0) return false;
@@ -1327,7 +1327,7 @@ public:
             }
         }
 
-        // 8. 写 shdr 表：NULL + 每个 extra 一条
+        // -  写 shdr 表：NULL + 每个 extra 一条
         if (fseek(f, (long)L.sh_off, SEEK_SET) != 0) return false;
         Elf64_Shdr null_sh = {};
         if (fwrite(&null_sh, sizeof(null_sh), 1, f) != 1) return false;
@@ -1379,7 +1379,7 @@ public:
     }
 
 private:
-    // .so 提供的符号表（DYNAMIC_EXE 模式用）：symbol name → 已固定地址
+    // .so 提供的符号表（DYNAMIC_EXE 模式用）：symbol name -> 已固定地址
     std::unordered_map<std::string, uint64_t> bpfso_symbols_;
     // 从文件加载一个 ET_REL .o
     size_t load_rel_file(const std::string& path) {
@@ -1616,7 +1616,7 @@ private:
                     // 真实的 embedded addend，对 UND 符号也一样（clang 在这里写的是真偏移，非占位）。
                     // 典型：C++ RTTI 的 typeinfo 第一槽是「vtable+16 指针」，引用 UND 符号
                     // _ZTVN10__cxxabiv1*（定义在 libc++abi），embedded addend = +16 必须读出，
-                    // 否则 typeinfo 的 vtable 指针少 16 → 落到 offset-to-top/typeinfo 槽 →
+                    // 否则 typeinfo 的 vtable 指针少 16 -> 落到 offset-to-top/typeinfo 槽 ->
                     // dynamic_cast/typeid 崩。
                     // call 重定位（type 10）：clang 对未解析调用写 imm=-1 占位符（非真实 addend），
                     // 故 UND 符号时 addend 保持 0；已定义符号的 call 也走相对偏移（addend 用不上）。
@@ -1738,7 +1738,7 @@ private:
                 const auto& sym = obj.symbols[r.sym_idx];
                 if (sym.defined) continue;                       // 本对象内定义
                 if (sym.name.empty()) continue;
-                if (sym.binding == STB_WEAK) continue;           // weak 未定义 → 解析为 0
+                if (sym.binding == STB_WEAK) continue;           // weak 未定义 -> 解析为 0
                 if (globals_.count(sym.name)) continue;          // .o/.a 提供（resolve_symbol 可解析）
                 if (synthetic_globals_.count(sym.name)) continue;// 合成符号（__init_array_start 等）
                 if (bpfso_symbols_.count(sym.name)) continue;    // .so 提供（运行时解析）
@@ -1804,7 +1804,7 @@ private:
     //     DWARF 的 section 间引用是「目标段内偏移」语义（如 .debug_info 的 DW_AT_abbrev
     //     指向 .debug_abbrev 段内偏移），不是文件内偏移。addend 已编码段内目标位置。
     //   - 符号指向 VM-loadable 段（.text/.rodata/.data）：值 = 运行时 guest 地址（STATIC
-    //     下即最终地址；debug→loadable 引用，如 .debug_addr/.debug_ranges 指向代码/数据）。
+    //     下即最终地址；debug->loadable 引用，如 .debug_addr/.debug_ranges 指向代码/数据）。
     // 返回 nullopt 表示无法解析。
     std::optional<uint64_t> resolve_debug_value(size_t obj_idx, size_t sym_idx) const {
         const auto& sym = objects_[obj_idx].symbols[sym_idx];
@@ -1838,7 +1838,7 @@ private:
         return sec.guest_addr + def_sym.value;
     }
 
-    // 加载 .so 文件，提取其 symtab 中所有 GLOBAL 符号 → 地址映射
+    // 加载 .so 文件，提取其 symtab 中所有 GLOBAL 符号 -> 地址映射
     // 不加载内容到 pool_，只读符号信息
     bool load_bpfso_symbols(const std::string& path) {
         std::vector<uint8_t> data;
@@ -1926,10 +1926,10 @@ private:
     //   SHARED_LIB:  ELF header + PT_LOAD + .bpf_soname + .symtab + .strtab + .shstrtab + section headers
     //   DYNAMIC_EXE: ELF header + PT_LOAD + .dynamic + section headers
     // ===== write_elf_impl：把 pool + extras 写成 ELF 文件 =====
-    // 流程：构建 extras → 计算布局 → 回填动态段 vaddr → 写 header/phdr/payload/shdr。
+    // 流程：构建 extras -> 计算布局 -> 回填动态段 vaddr -> 写 header/phdr/payload/shdr。
     // 各阶段拆到 build_*/compute_*/backfill_*/write_* helper，本函数仅编排。
     bool write_elf_impl(FILE* f) {
-        // 1. section index 布局：NULL(0) → .text → .plt? → .rodata → .data → .got.plt? → .bss? → extras
+        // -  section index 布局：NULL(0) -> .text -> .plt? -> .rodata -> .data -> .got.plt? -> .bss? -> extras
         Elf64_Half seg_shndx[3] = {0,0,0};
         Elf64_Half bss_shndx = 0;
         bool has_bss = segs_[SEG_DATA].used && segs_[SEG_DATA].memsz > segs_[SEG_DATA].filesz;
@@ -1950,10 +1950,10 @@ private:
         }
         Elf64_Half extras_base = next_sh;  // 第一个 extra 的 section index
 
-        // 2. 构建 extras（按 mode_ 条件追加）
+        // -  构建 extras（按 mode_ 条件追加）
         std::vector<SecBuf> extras;
         // 2a. DWARF 调试段（最先 push：在 extras 区前部，便于 shstrtab 自动注册名字）。
-        //     .debug_addr/.debug_ranges 等含运行时地址的重定位走 debug→loadable 分支，
+        //     .debug_addr/.debug_ranges 等含运行时地址的重定位走 debug->loadable 分支，
         //     返回 guest_addr。STATIC_EXE 下 guest_addr 即最终地址；PIE 模式下 guest_addr
         //     是文件内偏移（基址 0），运行时由 VM 加载基址后，GDB 经 qOffsets/RSP 获得真实
         //     地址——但 GDB 对 PIE remote target 默认按文件内偏移匹配，二者需一致，故 PIE
@@ -1964,7 +1964,7 @@ private:
             // 合成 .debug_frame（clang BPF 不生成 CFI；GDB bt 靠它回溯栈）。
             // 在 collect_debug_sections 之后：它已跳过输入的空 .debug_frame，这里补合成版。
             synthesize_debug_frame(extras);
-            // 建 函数地址→栈大小 表（来自 -fstack-size-section 的 .stack_sizes），供
+            // 建 函数地址->栈大小 表（来自 -fstack-size-section 的 .stack_sizes），供
             // fix_fbreg_offsets 修正 DW_OP_fbreg。不依赖 extras，只读 obj.stack_sizes_data。
             build_stack_size_map();
         }
@@ -1987,36 +1987,36 @@ private:
         // 2c. DWARF 重定位 patch + 偏移修正：必须在 compute_file_layout 之前完成，
         //     因为 fix_fbreg_offsets / fix_loclists_breg10 可能改变 .debug_info /
         //     .debug_loclists 长度（SLEB128 变长重写），若在布局后才改，后续段的文件偏移
-        //     会与变化后的尺寸不一致 → 段重叠/破坏。resolve_debug_value 用的是 guest 地址
+        //     会与变化后的尺寸不一致 -> 段重叠/破坏。resolve_debug_value 用的是 guest 地址
         //     （layout_segments 已设），不依赖文件布局，故提前到此处安全。
         if (emit_debug) {
             apply_debug_relocations(extras);
             // 修正 .debug_info 里 DW_OP_fbreg 的错误偏移（clang BPF 后端 bug）。
             // 必须在 apply_debug_relocations 之后：那时 .debug_addr 已 patch 为函数 guest
             // 地址，fix_fbreg_offsets 据此把每条 fbreg 关联到所在函数的 stacksize 并改写。
-            // （同时填 loclist_ss_：loclistx 索引 → 所属函数 stacksize，供下一步用。）
+            // （同时填 loclist_ss_：loclistx 索引 -> 所属函数 stacksize，供下一步用。）
             fix_fbreg_offsets(extras);
             // 修正 .debug_loclists 里 DW_OP_breg10 的错误偏移（同源 bug，参数/变量 spill 的位置）。
             // 必须在 fix_fbreg_offsets 之后（用其填的 loclist_ss_）。三阶段重写：loclist 按真实
-            // 长度重建 → offset_table 重算 → 贡献区位移，产出 old_base→new_base 表。
+            // 长度重建 -> offset_table 重算 -> 贡献区位移，产出 old_base->new_base 表。
             fix_loclists_breg10(extras);
-            // 用 old_base→new_base 定长改写 .debug_info 里 DW_AT_loclists_base 的 sec_offset。
+            // 用 old_base->new_base 定长改写 .debug_info 里 DW_AT_loclists_base 的 sec_offset。
             // 必须在 fix_loclists_breg10 之后（用其填的 loclists_base_remap_），且在最终 .debug_info
             // （fix_fbreg_offsets 重建后）上扫描；定长改写不改长度，故不影响布局。
             remap_loclists_base(extras);
         }
 
-        // 3. 计算文件布局（此时各 extras[].data 已是最终内容/尺寸）
+        // -  计算文件布局（此时各 extras[].data 已是最终内容/尺寸）
         FileLayout layout = compute_file_layout(extras, extras_base, next_sh,
                                                  names.shstrtab_idx, interp_idx, need_dynamic);
 
-        // 4. 回填动态 section 的 vaddr 并 patch DT_*
+        // -  回填动态 section 的 vaddr 并 patch DT_*
         std::unordered_map<size_t, uint64_t> dyn_vaddr_map;
         if (need_dynamic) {
             dyn_vaddr_map = backfill_dynamic_vaddrs(extras, layout.extra_offs, dyn_idx, interp_idx);
         }
 
-        // 5. 写出
+        // -  写出
         if (!write_ehdr(f, layout)) return false;
         if (!write_phdrs(f, extras, layout, dyn_vaddr_map, dyn_idx, interp_idx, need_dynamic)) return false;
         if (!write_payload(f, extras, layout)) return false;
@@ -2212,10 +2212,10 @@ private:
     }
 
     // 解码 .stack_sizes：每个 obj 的 .stack_sizes + 其 .rel.stack_sizes，建立
-    // 函数 guest 地址 → 栈大小 的全局表 stack_sizes_。供 fix_fbreg_offsets 查询。
+    // 函数 guest 地址 -> 栈大小 的全局表 stack_sizes_。供 fix_fbreg_offsets 查询。
     //
     // .stack_sizes 记录格式（clang -fstack-size-section）：
-    //   每条 = [8 字节 ABS64 重定位 → 指向函数 .text 内地址][ULEB128 stacksize]
+    //   每条 = [8 字节 ABS64 重定位 -> 指向函数 .text 内地址][ULEB128 stacksize]
     // 重定位是 SHT_REL（addend 嵌入在 .stack_sizes 字节里），符号是 STT_SECTION（.text），
     // 故函数地址 = section.guest_addr + sym.value(0) + embedded addend。
     // 注意：.stack_sizes 既非 loadable 也非 debug 段，loader 不会为它读 embedded addend
@@ -2267,14 +2267,14 @@ private:
     // 背景：clang BPF 把栈变量偏移算成 +(stacksize-N)（BPF frame base 是帧顶 R10，
     // 通用实现按帧底算），正确应为 -N。本函数按所在函数的 stacksize 把 +N 改成 +N-stacksize。
     //
-    // 难点：SLEB128 改写常变长(+4→-120 是 1→2 字节)，变长会移动后续 DIE 偏移，而
+    // 难点：SLEB128 改写常变长(+4->-120 是 1->2 字节)，变长会移动后续 DIE 偏移，而
     // .debug_info 里遍布 DW_FORM_ref1/2/4/8（CU 内 DIE 偏移引用，如 DW_AT_type）。
-    // in-place 改写若不同步 remap 这些 ref 就悬空 → "invalid abbreviation"。
+    // in-place 改写若不同步 remap 这些 ref 就悬空 -> "invalid abbreviation"。
     //
     // 解法（两遍 buffer 重建，避免 in-place 多级偏移级联）：
     //   Pass A：逐 DIE 扫描，把每个 DIE 序列化成「重建字节块」。fbreg 改写直接产生新字节；
     //           ref1/2/4/8 字段记位置+旧 CU 偏移值，待 Pass B remap。
-    //   Pass B：按 DIE 顺序算 old_off→new_off 映射，回填 ref 值；拼成新 CU，回填 unit_length。
+    //   Pass B：按 DIE 顺序算 old_off->new_off 映射，回填 ref 值；拼成新 CU，回填 unit_length。
     //   长度变化的 CU 收集起来，最后一次性重建整段 .debug_info 贡献区。
     //
     // 只处理 .debug_info 内联的 DW_FORM_exprloc（实测 100% fbreg 在此形态）。
@@ -2282,7 +2282,7 @@ private:
         if (stack_sizes_.empty()) return;
 
         // form 字节数（DWARF5 BPF 实际集）。定长返回字节数；变长返回 -1。
-        // form 编号见 DWARF5 §7.5.5（data1=0x0b；strx1/addrx1=0x25/0x29）。
+        // form 编号见 DWARF5 7.5.5 节（data1=0x0b；strx1/addrx1=0x25/0x29）。
         auto form_fixed_size = [](uint64_t form) -> int {
             switch (form) {
             case 0x01: return 8;   // addr (BPF 8 字节)
@@ -2312,7 +2312,7 @@ private:
             default:   return -1;  // 变长/特殊
             }
         };
-        // CU 内 DIE 偏移引用的 form → 字节数（变长 ref_udata 返回 -1）。非 ref 返回 0。
+        // CU 内 DIE 偏移引用的 form -> 字节数（变长 ref_udata 返回 -1）。非 ref 返回 0。
         auto ref_form_size = [](uint64_t form) -> int {
             switch (form) {
             case 0x11: return 1;  // ref1
@@ -2403,7 +2403,7 @@ private:
             // 基于合并段（已 patch）分析：必须用 info_sec->data（apply_debug_relocations 已
             // patch 了 DW_AT_addr_base/sec_offset 等），否则 addr_base/str_offsets_base 读到
             // 未 patch 值。但要限制循环在本 obj 贡献区 [contrib_off, contrib_off+orig_size) 内，
-            // 不能越界读到别的 obj 的 CU（用错 abbrev 表 → 级联错位）。
+            // 不能越界读到别的 obj 的 CU（用错 abbrev 表 -> 级联错位）。
             const auto& d = info_sec->data;
             const size_t contrib_start = info_ds->contrib_off;
             const size_t contrib_end = info_ds->contrib_off + info_ds->data.size();
@@ -2528,7 +2528,7 @@ private:
                             size_t s = q; uint64_t v = read_uleb(q);
                             de.bytes.insert(de.bytes.end(), d.begin() + s, d.begin() + q);
                             if (attr == 0x11) { found_low_pc = true; low_pc_addrx = v; }
-                            // DW_AT_location(loclistx) → 记录该 loclist 所属函数的 stacksize，
+                            // DW_AT_location(loclistx) -> 记录该 loclist 所属函数的 stacksize，
                             // 供 fix_loclists_breg10 修 .debug_loclists 里的 DW_OP_breg10 偏移。
                             // 键用 loclists_base + 索引（loclists_base 是偏移表段内绝对偏移，
                             // 索引 *4 后定位偏移表项；loclists_base + 索引 唯一标识该 CU 的该 loclist）。
@@ -2600,7 +2600,7 @@ private:
                 for (auto& de : dies) if (de.has_fbreg) { need = true; break; }
                 if (!need) { p = cu_end; continue; }
 
-                // Pass B：算 old_off→new_off，回填 ref。
+                // Pass B：算 old_off->new_off，回填 ref。
                 std::unordered_map<uint64_t, uint64_t> new_off;
                 uint64_t acc = cu_header_len;
                 for (auto& de : dies) { new_off[de.old_off] = acc; acc += de.bytes.size(); }
@@ -2663,8 +2663,8 @@ private:
     // 三阶段完整重写（不再 padding 到原长，故 stacksize>64 的 SLEB128 变长 loclist 也能修）：
     //   A. 每条 loclist 按修正后 SLEB128 的【真实长度】重建。
     //   B. offset_table[i] 用新 loclist 起点相对新 loclists_base 的偏移重算（条数/定长 4B 不变，只值变）。
-    //   C. 贡献区按真实新长度拼接 → 后续贡献区起点位移 → 其 loclists_base 改变；
-    //      记录 old_base→new_base 到 loclists_base_remap_，由 remap_loclists_base 定长改写 .debug_info。
+    //   C. 贡献区按真实新长度拼接 -> 后续贡献区起点位移 -> 其 loclists_base 改变；
+    //      记录 old_base->new_base 到 loclists_base_remap_，由 remap_loclists_base 定长改写 .debug_info。
     //
     // 之所以可行：所有 loclist 引用都用 DW_FORM_loclistx（索引形式），consumer 只经 offset_table
     // 定位每条 loclist 起点、读到自己的 end_of_list 即止，loclist 之间无需物理连续/定长。
@@ -2713,7 +2713,7 @@ private:
             // 阶段 A：重建每条 loclist（按真实长度）。new_lists[i] = 该 loclist 重建后字节。
             std::vector<std::vector<uint8_t>> new_lists(off_cnt);
             bool any_change = false;
-            // parse_ok=false 表示本贡献区解析出错（未知 LLE code 等）→ 放弃，保留原字节。
+            // parse_ok=false 表示本贡献区解析出错（未知 LLE code 等）-> 放弃，保留原字节。
             bool parse_ok = true;
 
             for (uint32_t i = 0; i < off_cnt && parse_ok; i++) {
@@ -2793,7 +2793,7 @@ private:
             }
 
             if (!parse_ok || !any_change) {
-                // 解析失败或无可改写项 → 保留原贡献区字节，loclists_base 不变（old_base→old_base）。
+                // 解析失败或无可改写项 -> 保留原贡献区字节，loclists_base 不变（old_base->old_base）。
                 contribs.push_back({cs, hdr_end - cs,
                                     std::vector<uint8_t>(d.begin() + cs, d.begin() + hdr_end), old_base});
                 continue;
@@ -2801,7 +2801,7 @@ private:
 
             // 阶段 B：重算 offset_table（值变，条数/定长 4B 不变）。new_off_tbl[i] = 第 i 条
             //   loclist 新起点 相对新 loclists_base(= 贡献区新起点+12) 的偏移。
-            //   新 loclist 体从 offset_table 之后开始排列，第 i 条起点 = off_cnt*4 + Σ_{j<i} new_lists[j].size()。
+            //   新 loclist 体从 offset_table 之后开始排列，第 i 条起点 = off_cnt*4 + sum_{j<i} new_lists[j].size()。
             std::vector<uint8_t> new_off_tbl((size_t)off_cnt * 4, 0);
             size_t acc = (size_t)off_cnt * 4;  // 相对 offset_table 起点的偏移
             for (uint32_t i = 0; i < off_cnt; i++) {
@@ -2843,7 +2843,7 @@ private:
             // 间隙 [pos, c.old_start)：原样拷贝，其内字节位移同 out 当前长度。
             if (c.old_start > pos)
                 out.insert(out.end(), src.begin() + pos, src.begin() + c.old_start);
-            // 贡献区位移：old_base = old_start + 12 → new_base = out.size() + 12。
+            // 贡献区位移：old_base = old_start + 12 -> new_base = out.size() + 12。
             size_t new_start = out.size();
             uint64_t new_base = new_start + 12;
             loclists_base_remap_[c.old_base] = new_base;
@@ -2855,7 +2855,7 @@ private:
         ll_out->data = std::move(out);
     }
 
-    // 用 fix_loclists_breg10 产出的 old_base→new_base 表，定长改写 .debug_info 里所有
+    // 用 fix_loclists_breg10 产出的 old_base->new_base 表，定长改写 .debug_info 里所有
     // DW_AT_loclists_base(0x8c) 的 4 字节 sec_offset 槽（DW_FORM_sec_offset=0x17, DWARF32 定长）。
     // 贡献区按真实长度重建后位移，其 loclists_base（sec_offset，已由 apply_debug_relocations
     // patch 为段内绝对偏移）必须同步更新，否则 loclistx 解引用越界。
@@ -2863,8 +2863,8 @@ private:
     // 这里只做【定长字节级改写】，不改 DIE 边界/长度，故可在 fix_fbreg_offsets（变长重建）
     // 之后再扫一遍最终的 .debug_info。注意：fbreg 重建改变了各 obj 贡献区在合并段里的边界，
     // 故不能按 obj 贡献区逐段扫（contrib_off/旧 data.size() 已失效），改为：
-    //   1. 把所有 obj 的 .debug_abbrev 合并成一张全局 abbrev 表（键=表段内绝对偏移，即 abbr_offset）；
-    //   2. 把整个合并 .debug_info 当作一条连续的 CU 流，从头扫到尾。
+    //   -  把所有 obj 的 .debug_abbrev 合并成一张全局 abbrev 表（键=表段内绝对偏移，即 abbr_offset）；
+    //   -  把整个合并 .debug_info 当作一条连续的 CU 流，从头扫到尾。
     void remap_loclists_base(std::vector<SecBuf>& extras) {
         if (loclists_base_remap_.empty()) return;
 
@@ -3021,7 +3021,7 @@ private:
 
     // 应用 DWARF 段的重定位（.rel.debug_*）。两类：
     //   - target 是 debug 段：patch 写在 extras[extra_idx].data 里
-    //   - 符号值按 resolve_debug_value：debug→debug 取段内偏移，debug→loadable 取 guest 地址
+    //   - 符号值按 resolve_debug_value：debug->debug 取段内偏移，debug->loadable 取 guest 地址
     // 类型仅 R_BPF_64_ABS32(3)/R_BPF_64_ABS64(2)（DWARF 不会出现 lddw/call）。
     void apply_debug_relocations(std::vector<SecBuf>& extras) {
         for (size_t oi = 0; oi < objects_.size(); oi++) {
@@ -3065,7 +3065,7 @@ private:
         }
     }
 
-    // 符号所在 section → 输出 ELF 的 section index（text/rodata/data/bss/ABS）
+    // 符号所在 section -> 输出 ELF 的 section index（text/rodata/data/bss/ABS）
     Elf64_Half sym_to_shndx(const LoadedObject& obj, size_t sec_idx,
                              Elf64_Half bss_shndx, const Elf64_Half seg_shndx[3]) const {
         if (sec_idx == SIZE_MAX || sec_idx >= obj.sections.size()) return SHN_ABS;
@@ -3119,7 +3119,7 @@ private:
             sym_count++;
         };
 
-        // 1. 本地符号（STB_LOCAL 的 FUNC/OBJECT；section 符号 STT_SECTION 也算 local，
+        // -  本地符号（STB_LOCAL 的 FUNC/OBJECT；section 符号 STT_SECTION 也算 local，
         //    但对反汇编帮助不大且无名字，跳过）
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             const auto& obj = objects_[oi];
@@ -3134,14 +3134,14 @@ private:
         // sh_info = 第一个 global 的下标（local 区结束位置）
         symtab.info = (Elf64_Word)sym_count;
 
-        // 2. 全局符号（去重：每个 global 名只输出 globals_ 里的定义）
+        // -  全局符号（去重：每个 global 名只输出 globals_ 里的定义）
         for (const auto& kv : globals_) {
             const auto& obj = objects_[kv.second.obj_idx];
             const auto& sym = obj.symbols[kv.second.sym_idx];
             emit(obj, sym, STB_GLOBAL);
         }
 
-        // 3. 合成全局符号（__init_array_start/end 等，SHN_ABS）
+        // -  合成全局符号（__init_array_start/end 等，SHN_ABS）
         for (const auto& kv : synthetic_globals_) {
             Elf64_Sym s = {};
             s.st_name = add_name(kv.first);
@@ -3161,15 +3161,15 @@ private:
         extras[symtab_idx].link = extras_base + (Elf64_Word)strtab_idx;
     }
 
-    // 收集所有 UND 符号名（跨模块重定位引用的未定义符号 → .dynsym 的导入部分）。
+    // 收集所有 UND 符号名（跨模块重定位引用的未定义符号 -> .dynsym 的导入部分）。
     // DYNAMIC_EXE：入口符号若不在 globals_ 也加入，让 .rela.plt 能引用（PLT 桩作 e_entry）。
     // 同时跟踪每个名字是否「纯 weak UND」：某名字的所有 UND 引用都是 STB_WEAK（且无 globals_
     // 定义、不是 _DYNAMIC/入口）时，标记为 weak——输出到 .dynsym 时写 STB_WEAK，loader 对其
-    // 解析失败静默处理（weak UND → 0 是标准 ld 语义，如 musl 的 __init_array_start 等边界符号）。
+    // 解析失败静默处理（weak UND -> 0 是标准 ld 语义，如 musl 的 __init_array_start 等边界符号）。
     struct UndNames {
         std::vector<std::string> names;
-        std::unordered_map<std::string, size_t> idx;            // name → names 下标
-        std::unordered_map<std::string, bool> is_weak;          // name → 是否纯 weak UND
+        std::unordered_map<std::string, size_t> idx;            // name -> names 下标
+        std::unordered_map<std::string, bool> is_weak;          // name -> 是否纯 weak UND
     };
     UndNames collect_und_names() const {
         UndNames out;
@@ -3260,7 +3260,7 @@ private:
         // _DYNAMIC：标准 ld 在 PIE/.so 上合成的符号，指向 .dynamic section 起始。
         // musl __init_tls/dl_iterate_phdr 用它（weak 引用）反推加载基址。bpfvm-ld
         // 这里合成 defined 符号，避免运行时加载器报 "unresolved symbol '_DYNAMIC'"
-        // （虽然 weak UND → 0 语义上安全，musl 走 PT_PHDR 兜底，但消掉噪音更干净）。
+        // （虽然 weak UND -> 0 语义上安全，musl 走 PT_PHDR 兜底，但消掉噪音更干净）。
         // st_value 在 backfill_dynamic_vaddrs 里回填（.dynamic vaddr 那时才确定）。
         Elf64_Word dynamic_name_off = (Elf64_Word)dynstr.data.size();
         const std::string dynamic_name = "_DYNAMIC";
@@ -3278,14 +3278,14 @@ private:
         dynsym.link = extras_base + (Elf64_Word)out.dynstr_idx;
         Elf64_Sym zsym = {};
         dynsym.data.insert(dynsym.data.end(), (uint8_t*)&zsym, (uint8_t*)&zsym + sizeof(zsym));
-        std::unordered_map<std::string, size_t> dynsym_idx;  // name → .dynsym index (0-based)
+        std::unordered_map<std::string, size_t> dynsym_idx;  // name -> .dynsym index (0-based)
         for (size_t i = 0; i < und_names.size(); i++) {
             Elf64_Sym s = {};
             s.st_name = und_name_offs[i];
             const std::string& nm = und_names[i];
             bool weak = und.is_weak.count(nm) && und.is_weak.at(nm);
             // 纯 weak UND（如 __init_array_start/__fini_array_start）：保留 STB_WEAK，loader
-            // 对其解析失败静默处理（weak UND → 0，标准 ld 语义）；其余 UND 保持 STB_GLOBAL。
+            // 对其解析失败静默处理（weak UND -> 0，标准 ld 语义）；其余 UND 保持 STB_GLOBAL。
             s.st_info = GELF_ST_INFO(weak ? STB_WEAK : STB_GLOBAL, STT_NOTYPE);
             s.st_shndx = SHN_UNDEF;
             dynsym.data.insert(dynsym.data.end(), (uint8_t*)&s, (uint8_t*)&s + sizeof(s));
@@ -3478,7 +3478,7 @@ private:
         dynamic.type = SHT_DYNAMIC;
         dynamic.addralign = 8;
         dynamic.entsize = sizeof(Elf64_Dyn);
-        dynamic.link = extras_base + (Elf64_Word)out.dynstr_idx;  // .dynamic.sh_link → .dynstr
+        dynamic.link = extras_base + (Elf64_Word)out.dynstr_idx;  // .dynamic.sh_link -> .dynstr
         auto add_dyn = [&](int64_t tag, uint64_t val) {
             Elf64_Dyn d;
             d.d_tag = tag;
@@ -3567,7 +3567,7 @@ private:
 
     // 计算文件布局：phnum/shnum/shstrndx/段文件 offset/extra 文件 offset/sh_off
     // 文件结构：[ELF header][PT_LOAD phdrs][padding to page][段数据][extras][section headers]
-    // seg_data_off 页对齐：保证 p_offset ≡ p_vaddr (mod 0x1000) 对所有 PT_LOAD 成立
+    // seg_data_off 页对齐：保证 p_offset == p_vaddr (mod 0x1000) 对所有 PT_LOAD 成立
     FileLayout compute_file_layout(const std::vector<SecBuf>& extras, Elf64_Half extras_base,
                                     Elf64_Half next_sh, size_t shstrtab_idx, size_t interp_idx,
                                     bool need_dynamic) const {
@@ -3606,7 +3606,7 @@ private:
     }
 
     // 回填动态 section 的 vaddr：在所有 PT_LOAD 段的 vaddr 范围之后分配，
-    // 且 vaddr ≡ offset (mod 0x1000)（满足 PT_LOAD 的 p_offset ≡ p_vaddr 对齐约束）。
+    // 且 vaddr == offset (mod 0x1000)（满足 PT_LOAD 的 p_offset == p_vaddr 对齐约束）。
     // 段间有 vaddr gap（页对齐）但文件无 gap，所以不能用 offset+delta 简单映射
     // （会落到段内）。这里独立分配：page_base = 段尾页对齐 + (first_off mod 0x1000)。
     // 同时 patch .dynamic 里的 DT_SYMTAB/DT_STRTAB/DT_HASH/DT_RELA/DT_JMPREL/DT_PLTGOT 指针。
@@ -3669,7 +3669,7 @@ private:
         return dyn_vaddr_map;
     }
 
-    // ELF header。STATIC_EXE → ET_EXEC（固定地址）；SHARED_LIB/DYNAMIC_EXE → ET_DYN（PIE）
+    // ELF header。STATIC_EXE -> ET_EXEC（固定地址）；SHARED_LIB/DYNAMIC_EXE -> ET_DYN（PIE）
     bool write_ehdr(FILE* f, const FileLayout& L) const {
         Elf64_Ehdr ehdr = {};
         ehdr.e_ident[EI_MAG0] = ELFMAG0;
@@ -3746,7 +3746,7 @@ private:
             if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
         }
         // PT_LOAD 覆盖动态 section 区：vaddr = offset + delta（页对齐），
-        // 满足 p_offset ≡ p_vaddr (mod 0x1000) 让 readelf 不报 "not located in any PT_LOAD"。
+        // 满足 p_offset == p_vaddr (mod 0x1000) 让 readelf 不报 "not located in any PT_LOAD"。
         // VM 不读这些 section（构建期 patch 完），mmap 它们只是占位。
         if (need_dynamic) {
             uint64_t first_off = L.extra_offs[dyn_idx.dynstr_idx];
@@ -3794,7 +3794,7 @@ private:
         return true;
     }
 
-    // 文件 payload：padding 到段数据区 → 段数据（按段顺序拼接各 section）→ extras
+    // 文件 payload：padding 到段数据区 -> 段数据（按段顺序拼接各 section）-> extras
     bool write_payload(FILE* f, const std::vector<SecBuf>& extras, const FileLayout& L) const {
         long pos = ftell(f);
         if ((uint64_t)pos < L.seg_data_off) {
@@ -3842,7 +3842,7 @@ private:
         return true;
     }
 
-    // section headers: NULL → .text → .plt? → .rodata → .data → .got.plt? → .bss? → extras
+    // section headers: NULL -> .text -> .plt? -> .rodata -> .data -> .got.plt? -> .bss? -> extras
     bool write_shdrs(FILE* f, const std::vector<SecBuf>& extras, const FileLayout& L,
                       const std::unordered_map<size_t, uint64_t>& dyn_vaddr_map,
                       const ShstrtabOut& names) const {
@@ -3981,7 +3981,7 @@ private:
             case 10: {  // R_BPF_64_32 — 32-bit relative for BPF_CALL
                 // FP 虚拟指令符号：pass 用 extern __ksym __bpf_fp_<ID> 生成，clang emit
                 // src_reg=1 + 本重定位。linker 改写为 src_reg=2 + imm=<ID>（FP 专用通道，
-                // VM 按 src_reg=2 走 do_softfp）。byte[1] 高 4 位是 src_reg：0x10→0x20。
+                // VM 按 src_reg=2 走 do_softfp）。byte[1] 高 4 位是 src_reg：0x10->0x20。
                 if (fp_ksym) {
                     uint32_t fp_id = 0;
                     if (!parse_fp_ksym_id(sym.name, fp_id)) {
@@ -4001,7 +4001,7 @@ private:
                 // 普通 call：imm = (target - call_site) / 8 - 1
                 // clang 对未解析 call 写 imm=-1（占位符），不是有效 addend，必须忽略。
                 //（BPF call 的 imm 单位是 bpf_insn；VM 执行 pc+=imm 后 pc++ 到下一条，
-                // 所以 target = call_site + (imm+1)*8 → imm = (target-call_site)/8 - 1）
+                // 所以 target = call_site + (imm+1)*8 -> imm = (target-call_site)/8 - 1）
                 uint64_t call_site = target.guest_addr + r.offset;
                 uint64_t tgt = S;
                 // PIC + UND 符号：跨模块函数调用走 PLT 桩（运行期 GOT 间接）。

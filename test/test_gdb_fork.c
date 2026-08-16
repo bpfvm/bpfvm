@@ -7,10 +7,10 @@
 //   - fork 子进程继承断点（do_clone 里 child 继承父 VM_DEBUG_ATTACHED + 断点集）
 //
 // 运行方式：
-//   1. CTest 自动跑（非 GDB 模式）：作为普通 test_* 用例被 CMake glob 自动注册，
+//   -  CTest 自动跑（非 GDB 模式）：作为普通 test_* 用例被 CMake glob 自动注册，
 //      ./build/bpfvm test/test_gdb_fork.out 直接跑完，验证 fork + waitpid 基本功能
 //      （父子各循环 3 次，父 waitpid 收到子 exit 42，最终 exit 0）。
-//   2. 手测（需 patched GDB，见 patches/README.md）——多进程调试专项验证。
+//   -  手测（需 patched GDB，见 patches/README.md）——多进程调试专项验证。
 //      对齐 QEMU -gdb/-S 的两种启动模式 + 可重复 attach：
 //
 //      默认模式（VM 全速 JIT 跑，GDB 连上才 attach，停在当前 pc）：

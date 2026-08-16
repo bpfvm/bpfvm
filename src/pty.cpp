@@ -90,7 +90,7 @@ static void* pump_thread_fn(void* raw) {
                 }
             } else if(fd == STDIN_FILENO && (events[i].events & (EPOLLIN | EPOLLRDHUP))) {
                 // 仅 PTY 模式注册了 STDIN_FILENO（见上 epoll_ctl），非 PTY 不会进此分支。
-                // 含 RDHUP：stdin 端断开（/dev/null、管道耗尽、真 tty 的 Ctrl+D…），
+                // 含 RDHUP：stdin 端断开（/dev/null、管道耗尽、真 tty 的 Ctrl+D...），
                 // 此时 read 通常返回 0（EOF），走下面的 master 关闭路径把 EOF 透传给 guest。
                 ssize_t r = TEMP_FAILURE_RETRY(read(STDIN_FILENO, buf, sizeof(buf)));
                 if(r < 0) goto done;

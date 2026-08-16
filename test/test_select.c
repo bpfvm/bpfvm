@@ -1,10 +1,10 @@
 // test_select.c — 验证 bpfvm 的 select/pselect6 实现（OpenSSL s_client 依赖）。
 //
 // 覆盖：
-//   1. pipe + select 读端就绪：写一字节后 select 应返回 1 且 fd 在 readfds 里。
-//   2. select 超时：空 pipe 上 select(tv=100ms) 应返回 0（无就绪），耗时应≥100ms。
-//   3. select 写端就绪：pipe 写端几乎总是就绪（缓冲未满），select 应返回≥1。
-//   4. select NULL timeout（永久阻塞）的 0-fd 集合不测（会挂死）；改测 EINVAL 路径可选。
+//   -  pipe + select 读端就绪：写一字节后 select 应返回 1 且 fd 在 readfds 里。
+//   -  select 超时：空 pipe 上 select(tv=100ms) 应返回 0（无就绪），耗时应>=100ms。
+//   -  select 写端就绪：pipe 写端几乎总是就绪（缓冲未满），select 应返回>=1。
+//   -  select NULL timeout（永久阻塞）的 0-fd 集合不测（会挂死）；改测 EINVAL 路径可选。
 //
 // OpenSSL 的 BIO_socket_wait 直接调 select()，故本测试守护 s_client/s_server 的可用性。
 // 对 host（glibc）同样成立，故 host 对照也通过。
@@ -30,7 +30,7 @@ int main(void) {
     int pfd[2];
     if (pipe(pfd) < 0) { printf("FAIL: pipe: %s\n", strerror(errno)); return 1; }
 
-    /* 1. 读端就绪 */
+    /* -  读端就绪 */
     {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -61,7 +61,7 @@ int main(void) {
         }
     }
 
-    /* 2. 超时 */
+    /* -  超时 */
     {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -79,7 +79,7 @@ int main(void) {
         }
     }
 
-    /* 3. 写端就绪 */
+    /* -  写端就绪 */
     {
         fd_set wfds;
         FD_ZERO(&wfds);

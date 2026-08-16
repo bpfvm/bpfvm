@@ -48,6 +48,9 @@
 - Indentation: 4 spaces; braces on the same line as control statements/functions.
 - Names: types use `CamelCase` or existing patterns (e.g., `vmOptions`), functions/variables use `lower_snake_case`, macros/constants use `UPPER_SNAKE_CASE`.
 - Keep includes grouped: standard headers, then project headers.
+- No numbered lists in comments (`1)`, `2)`, `a)`, or `5b`-style inserted items): inserting/removing an entry would force renumbering everything after it. Use dashes or descriptive headers instead.
+- Keep comments concise and current-state only: no restating what the code plainly says, no redundancy, and no history ("previously…", "same as the old X", "moved from Y"). Describe what the code is, not what it was.
+- Comments use ASCII and Chinese characters only: no other Unicode symbols (→, ≠, ×, ①, emoji, …) — they may render as garbage or blanks on some terminals/fonts and break greppability. Use plain ASCII equivalents (`->`, `!=`, `*`, `...`) instead. Exception: box-drawing characters (`─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼ ═ ...`) may be used to draw diagrams and tables in comments.
 
 ## Testing Guidelines
 - Unit tests live in `insn_test.cpp` and are built into `bpfvm_test`.
@@ -104,6 +107,12 @@ The VM uses a hybrid interpreter/JIT execution model:
 - musl: `rm -rf musl/build`
 - busybox: `find busybox/ -name *.o -delete`
 they can all be rebuilt by `scripts/build_root.sh`.
+
+## Build & CTest troubleshooting (stale artifacts after toolchain/env change)
+Stale binaries compiled by a previous (newer) toolchain keep higher `GLIBC_*`/`GLIBCXX_*` version requirements and fail at load time with errors like `version 'GLIBC_2.38' not found` or `GLIBCXX_3.4.32 not found`. CMake/Make incremental builds only check source mtimes, so these stale artifacts are reused as-is when sources haven't changed. Two flavors:
+- **`unit_tests` / `bpfvm`-built binaries (`build/`)** — caused by stale `.o` linked against a newer libstdc++/glibc. Fix: reconfigure so CMake re-runs compiler detection and rebuilds everything: `cmake -S . -B build && cmake --build build` (or `rm -rf build && cmake -S . -B build && cmake --build build` for a fully clean rebuild).
+- **`*.host` variants under `test/`** — the CTest `host` variant runs native binaries (`test/*.host`) compiled by the Makefile with `HOST_CC := clang`. These are not rebuilt when their `.c`/`.cpp` sources are unchanged. Fix: `make -C test clean` then rebuild (the `bpf_programs_build` fixture rebuilds them on next `ctest`).
+- **pass-plugin errors (`libBpf*.so`: missing headers / not found / stale)** — the pass `.so` is built into `build/` and loaded via `-fpass-plugin=`. If a pass fails to build or load, a plain reconfigure rebuilds it: `cmake -S . -B build` (re-runs CMake, regenerates the pass targets) then `cmake --build build`. No need to delete `build/`.
 
 ## BPF Architecture Constraints (summary + pointers)
 The BPF backend has three hard limits that this repo lifts transparently at compile time via LLVM passes — **write guest code as standard C/C++, no manual rewriting needed**. For the full three-layer mechanism (pass / linker / VM execution), see the 架构设计与实现 (architecture & implementation) section of README:

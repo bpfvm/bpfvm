@@ -323,7 +323,7 @@ void test_alu64_div_signed_by_zero_reg() {
     ebpf_vm->r(1) = 42;
     ebpf_vm->r(2) = 0;
     bpf_insn instructions[] = {
-        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div r1, 0 → 0
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div r1, 0 -> 0
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -340,7 +340,7 @@ void test_alu64_mod_signed_by_zero_reg() {
     ebpf_vm->r(1) = 42;
     ebpf_vm->r(2) = 0;
     bpf_insn instructions[] = {
-        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod r1, 0 → r1
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod r1, 0 -> r1
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -359,7 +359,7 @@ void test_alu64_div_intmin_neg1() {
     ebpf_vm->r(1) = (uint64_t)INT64_MIN;
     ebpf_vm->r(2) = (uint64_t)(int64_t)-1;
     bpf_insn instructions[] = {
-        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div INT64_MIN, -1 → INT64_MIN
+        { BPF_ALU64 | BPF_DIV | BPF_X, 1, 2, 1, 0 },   // signed div INT64_MIN, -1 -> INT64_MIN
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -376,7 +376,7 @@ void test_alu64_mod_intmin_neg1() {
     ebpf_vm->r(1) = (uint64_t)INT64_MIN;
     ebpf_vm->r(2) = (uint64_t)(int64_t)-1;
     bpf_insn instructions[] = {
-        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod INT64_MIN, -1 → 0
+        { BPF_ALU64 | BPF_MOD | BPF_X, 1, 2, 1, 0 },   // signed mod INT64_MIN, -1 -> 0
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -393,7 +393,7 @@ void test_alu32_div_intmin_neg1() {
     ebpf_vm->r(1) = (uint64_t)(uint32_t)INT32_MIN;
     ebpf_vm->r(2) = (uint64_t)(uint32_t)(uint32_t)-1;
     bpf_insn instructions[] = {
-        { BPF_ALU | BPF_DIV | BPF_X, 1, 2, 1, 0 },     // 32-bit signed div INT32_MIN, -1 → INT32_MIN
+        { BPF_ALU | BPF_DIV | BPF_X, 1, 2, 1, 0 },     // 32-bit signed div INT32_MIN, -1 -> INT32_MIN
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -410,7 +410,7 @@ void test_alu32_mod_intmin_neg1() {
     ebpf_vm->r(1) = (uint64_t)(uint32_t)INT32_MIN;
     ebpf_vm->r(2) = (uint64_t)(uint32_t)(uint32_t)-1;
     bpf_insn instructions[] = {
-        { BPF_ALU | BPF_MOD | BPF_X, 1, 2, 1, 0 },     // 32-bit signed mod INT32_MIN, -1 → 0
+        { BPF_ALU | BPF_MOD | BPF_X, 1, 2, 1, 0 },     // 32-bit signed mod INT32_MIN, -1 -> 0
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 1, 0, 0 },
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
     };
@@ -691,7 +691,7 @@ void test_alu_end_be16_upper_bits() {
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
     uint64_t ret = ebpf_vm->run(&option);
-    // be16 takes lower 16 bits (0xCCDD), byte-swaps → 0xDDCC, zero-extends to 64 bits
+    // be16 takes lower 16 bits (0xCCDD), byte-swaps -> 0xDDCC, zero-extends to 64 bits
     bool success = (ret == 0xDDCC);
     print_test_result("test_alu_end_be16_upper_bits", success);
     assert(success);
@@ -1510,7 +1510,7 @@ void test_syscall_waitpid_any_no_child_wnohang() {
 
 
 // Test atomic64 OR with FETCH:
-// Memory = 0xFF00, r2 = 0x0F0F → mem becomes 0xFF0F, r2 gets old value 0xFF00
+// Memory = 0xFF00, r2 = 0x0F0F -> mem becomes 0xFF0F, r2 gets old value 0xFF00
 void test_atomic64_or_fetch() {
     std::cout << "--- Running Test: test_atomic64_or_fetch ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -1541,7 +1541,7 @@ void test_atomic64_or_fetch() {
 }
 
 // Test atomic64 AND with FETCH:
-// Memory = 0xFF0F, r2 = 0x0FFF → mem becomes 0x0F0F, r2 gets old value 0xFF0F
+// Memory = 0xFF0F, r2 = 0x0FFF -> mem becomes 0x0F0F, r2 gets old value 0xFF0F
 void test_atomic64_and_fetch() {
     std::cout << "--- Running Test: test_atomic64_and_fetch ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -1572,7 +1572,7 @@ void test_atomic64_and_fetch() {
 }
 
 // Test atomic64 XOR with FETCH:
-// Memory = 0xFF00, r2 = 0x0FF0 → mem becomes 0xF0F0, r2 gets old value 0xFF00
+// Memory = 0xFF00, r2 = 0x0FF0 -> mem becomes 0xF0F0, r2 gets old value 0xFF00
 void test_atomic64_xor_fetch() {
     std::cout << "--- Running Test: test_atomic64_xor_fetch ---" << std::endl;
     auto ebpf_vm = vm::create();

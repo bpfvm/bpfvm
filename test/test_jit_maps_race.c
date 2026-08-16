@@ -2,10 +2,10 @@
  * #2 探测：JIT compile 路径遍历 vm->maps 无锁，与并发 mmap/munmap 竞争。
  *
  * 思路：CLONE_VM 线程共享同一份 maps。
- *   - 一组线程不停 mmap/munmap（修改 maps list → 迭代器/节点变动）
+ *   - 一组线程不停 mmap/munmap（修改 maps list -> 迭代器/节点变动）
  *   - 另一组线程不停调用许多「不同」的函数（每个新函数入口触发 JIT compile，
  *     compile() 内部 for(auto& m : *v->maps) 无锁遍历找段边界）
- * 反复碰撞，期望触发：迭代器失效 → 崩溃 / 段错误 / 卡死。
+ * 反复碰撞，期望触发：迭代器失效 -> 崩溃 / 段错误 / 卡死。
  *
  * 通过标准：正常跑完打印 ok，退出码 0（无崩溃即说明该路径未被触发/已被容忍）。
  * host 基线：glibc 无此概念（host 的 malloc/mmap 走内核，不涉及 guest maps），

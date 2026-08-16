@@ -13,8 +13,8 @@
 //     utimensat/faccessat/truncate/ftruncate），musl 包装完成。
 //
 // 已知降级（VM 未实现对应 syscall，测试中避开）：
-//   - copy_file（依赖 sendfile，ENOSYS → 返回错误）
-//   - space()（依赖 statfs，ENOSYS → capacity/free/available 置 (uintmax_t)-1）
+//   - copy_file（依赖 sendfile，ENOSYS -> 返回错误）
+//   - space()（依赖 statfs，ENOSYS -> capacity/free/available 置 (uintmax_t)-1）
 //
 // host 变体用 g++ 编宿主 glibc，作为对照基线（同源码）。
 
@@ -60,7 +60,7 @@ int main() {
         printf("FAIL path stem: '%s'\n", p.stem().c_str());
         ++failures;
     }
-    // 迭代：root/sub/a.txt → ["", root, sub, a.txt]（前导 / 产生空元素，但这里 root 是相对名）
+    // 迭代：root/sub/a.txt -> ["", root, sub, a.txt]（前导 / 产生空元素，但这里 root 是相对名）
     {
         std::vector<std::string> parts;
         for (const auto& e : p) parts.push_back(e.string());
@@ -232,7 +232,7 @@ int main() {
 
     // ===== (9) copy（目录递归 copy，非 copy_file）=====
     // 注意：copy 对每个文件内部调 copy_file，而 copy_file 在 VM 上依赖 sendfile
-    // （未实现 → ENOSYS 降级）。故 copy(recursive) 对含文件的目录会部分失败。
+    // （未实现 -> ENOSYS 降级）。故 copy(recursive) 对含文件的目录会部分失败。
     // 这里只验证目录结构被创建（copy 对子目录的创建不依赖 copy_file），文件复制
     // 失败用 error_code 容错，不计入 failures（已知降级）。
     fs::path copy_dst = root / "copy_of_sub";

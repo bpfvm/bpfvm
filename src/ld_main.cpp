@@ -3,16 +3,16 @@
 //
 // 三种模式（对齐标准 ld 默认行为，共用一套链接逻辑）：
 //
-//   1. 默认（动态可执行，PIE ET_DYN + DT_NEEDED）：
+//   -  默认（动态可执行，PIE ET_DYN + DT_NEEDED）：
 //        bpfvm-ld foo.o -l libc.so -o foo.linked
 //      跨模块函数调用默认走 PLT/GOT；跨模块数据引用由 .rela.dyn 记录，
 //      VM 运行时按实际加载地址 patch。
 //
-//   2. -static（静态自包含 ET_EXEC，固定地址）：
+//   -  -static（静态自包含 ET_EXEC，固定地址）：
 //        bpfvm-ld -static foo.o -l:libpdclib.a -o foo.linked
 //      只搜 .a，构建期全部 patch。
 //
-//   3. -shared（动态库 .so，PIE ET_DYN）：
+//   -  -shared（动态库 .so，PIE ET_DYN）：
 //        bpfvm-ld -shared --soname libc.so libpdclib.a -o libc.so
 //      p_vaddr=0，可在任意地址加载；VM 加载时按 .rela.dyn 做运行时重定位。
 //
@@ -48,9 +48,9 @@ static void usage(const char* prog) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << prog << " [options] <input>\n";
     std::cerr << "\nModes:\n";
-    std::cerr << "  (default)       Dynamic exe (PIE ET_DYN): .o + .so deps → DT_NEEDED\n";
-    std::cerr << "  -static         Static exe (ET_EXEC): .o + .a → self-contained\n";
-    std::cerr << "  -shared         Shared library (.so): archive → PIE ET_DYN with exports\n";
+    std::cerr << "  (default)       Dynamic exe (PIE ET_DYN): .o + .so deps -> DT_NEEDED\n";
+    std::cerr << "  -static         Static exe (ET_EXEC): .o + .a -> self-contained\n";
+    std::cerr << "  -shared         Shared library (.so): archive -> PIE ET_DYN with exports\n";
     std::cerr << "\nOptions:\n";
     std::cerr << "  -o <file>          Output file (default: a.out)\n";
     std::cerr << "  -e <name>          Entry symbol (default: _start)\n";

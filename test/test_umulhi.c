@@ -6,12 +6,12 @@
  *   #define BN_UMULT_LOHI(lo,hi,a,b) ({ uint128_t r=(uint128_t)(a)*(b); (hi)=r>>64; (lo)=r; })
  *
  * 触发链路（无 pass 时）：
- *   (u128)a*b >> 64  →  IR: zext i64→i128; mul i128; lshr i128,64; trunc→i64
- *   → BPF 后端 lower 成 __multi3 调用 → ISel 拒绝("__multi3 not supported")。
+ *   (u128)a*b >> 64  ->  IR: zext i64->i128; mul i128; lshr i128,64; trunc->i64
+ *   -> BPF 后端 lower 成 __multi3 调用 -> ISel 拒绝("__multi3 not supported")。
  *
  * BpfSoftFp pass 识别 mul i128 模式：
- *   - 低半 trunc(prod)            → 原生 mul i64（BPF_MUL）
- *   - 高半 trunc(lshr(prod,64))   → BPF_FP_UMULH（走 softfp 通道，VM 侧 x86 mulq /
+ *   - 低半 trunc(prod)            -> 原生 mul i64（BPF_MUL）
+ *   - 高半 trunc(lshr(prod,64))   -> BPF_FP_UMULH（走 softfp 通道，VM 侧 x86 mulq /
  *     aarch64 mul+umulh；r0 返回高半）
  *
  * volatile 输入防常量折叠，强制走运行时 mul i128 路径。对照 x86 原生结果，
@@ -19,7 +19,7 @@
  *
  * 覆盖（对照 test_multi3 的 umul.with.overflow 路径，本测试覆盖直接 u128 乘法）：
  *   - 不溢出（乘积在 64 位内，高半=0）
- *   - 溢出（乘积超过 64 位，高半≠0）
+ *   - 溢出（乘积超过 64 位，高半!=0）
  *   - schoolbook 进位链边界（(2^32)^2、(2^32-1)^2、跨 32 位组合）
  *   - 极值（0 / UINT64_MAX / 2^63 等）
  *   - BN_UMULT_LOHI（同时取高/低半）与 BN_UMULT_HIGH（仅取高半）两种形态
@@ -76,7 +76,7 @@ int main(void) {
     CHECK_HI(0xFFFFFFFFULL, 0x100000001ULL, 0, "(2^32-1)*(2^32+1)");   /* = 2^64-1 */
     CHECK_HI(0x7FFFFFFFFFFFFFFFULL, 2, 0, "(2^63-1)*2");               /* = 2^64-2 */
 
-    /* === 溢出（高半 ≠ 0）=== */
+    /* === 溢出（高半 != 0）=== */
     CHECK_HI(0xFFFFFFFFFFFFFFFFULL, 2, 1, "UINT64_MAX*2");             /* hi=1 */
     CHECK_HI(0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
              0xFFFFFFFFFFFFFFFEULL, "UINT64_MAX^2");                   /* hi=2^64-2 */

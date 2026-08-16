@@ -5,7 +5,7 @@
 
 # === 源文件 ===
 # 与 CMakeLists 的 glob（test_*.c + test_*.cpp）对齐：所有 test_*.c / test_*.cpp 都算测试。
-# 编译 flags 按语言分派（C → CC_FLAGS，C++ → CXX_FLAGS）
+# 编译 flags 按语言分派（C -> CC_FLAGS，C++ -> CXX_FLAGS）
 SOURCES := $(filter-out libgot.c, $(wildcard *.c))
 TARGETS := $(SOURCES:.c=.out)
 DYN_TARGETS := $(SOURCES:.c=.linked)
@@ -43,7 +43,7 @@ SOFTFP := $(wildcard ../build/libBpfSoftFp.so)
 #  （C 的 thread_local/_Thread_local 仍被 Sema 拒绝）。
 EMUTLS := $(wildcard ../build/libBpfEmutls.so)
 # BpfLibcallLower：@llvm.memcpy/memmove/memset/trap + floor/ceil/trunc/round intrinsic
-#   → 对 musl 函数的 call。C++ 结构体拷贝/vector realloc 必需
+#   -> 对 musl 函数的 call。C++ 结构体拷贝/vector realloc 必需
 LIBCALL := $(wildcard ../build/libBpfLibcallLower.so)
 
 # 所有 pass 对 C/C++ 统一注入（emutls pass 对无 emutls 标注的 C 源是 no-op）。
@@ -153,8 +153,8 @@ host-build: $(HOST_TARGETS) $(CXX_HOST_TARGETS) libgot.host.so
 all: $(TARGETS) $(DYN_TARGETS) $(CXX_TARGETS) $(CXX_DYN_TARGETS) host-build
 
 # === 链接 ===
-# 静态链接（-static）：.o + libc.a（含 _start）→ 自包含 ET_EXEC。
-# 动态链接（默认）：.o 引用 libc.so（自带 _start）→ PIE ET_DYN + DT_NEEDED（运行时 mmap .so）。
+# 静态链接（-static）：.o + libc.a（含 _start）-> 自包含 ET_EXEC。
+# 动态链接（默认）：.o 引用 libc.so（自带 _start）-> PIE ET_DYN + DT_NEEDED（运行时 mmap .so）。
 # C++ 用例：
 #   - 静态（.out）：链 libcxx.a（C++ runtime + libc++ 库符号，静态链入）。
 #   - 动态（.linked）：链 libcxx.so（生成 DT_NEEDED libcxx.so，运行时走 PLT/GOT + .rela.dyn）。
@@ -181,7 +181,7 @@ $(CXX_DYN_TARGETS): %.linked: %.o $(LIBCXX_BPFSO) $(LIBC_BPFSO)
 
 # === 动态链接（运行时 PLT/GOT + .rela.dyn）===
 # libgot 建成 .so：导出 got_add/got_counter/got_hash（不带 _start，PIE）。
-# 内部调 libc strlen → 依赖 libc.so（DT_NEEDED），构造主程序→libgot→libc 的链式依赖。
+# 内部调 libc strlen -> 依赖 libc.so（DT_NEEDED），构造主程序->libgot->libc 的链式依赖。
 $(GOT_SO): libgot.o $(LIBC_BPFSO)
 	../build/bpfvm-ld -shared --soname libgot.so $< -L ../root/lib -l:libc.so -o $@
 libgot.a: libgot.o

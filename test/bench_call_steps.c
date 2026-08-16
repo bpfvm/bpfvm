@@ -1,10 +1,10 @@
 /*
- * bench_call_steps.c — 定量拆解 BPF→BPF call 各步骤代价。
+ * bench_call_steps.c — 定量拆解 BPF->BPF call 各步骤代价。
  *
  * 方法：线性回归。生成一组 leaf 函数，体大小递增（0/5/10/20/40/80 条 ALU），
  * 每个 leaf 配一个调用它的循环。固定迭代次数 ITERS，测各变体耗时：
  *
- *   耗时(leaf_k) = ITERS × (T_call_fixed + k × T_per_insn)
+ *   耗时(leaf_k) = ITERS * (T_call_fixed + k * T_per_insn)
  *
  *   T_call_fixed = 纯调用机制开销（push_frame/pop_frame/cache/check，与 leaf 大小无关）
  *   T_per_insn   = JIT 执行单条 BPF ALU 指令的时间（斜率）

@@ -1,5 +1,5 @@
 /*
- * bench_callcost.c — 测量 BPF→BPF 直接调用（emit_call_bpf fast path）的 JIT 额外开销。
+ * bench_callcost.c — 测量 BPF->BPF 直接调用（emit_call_bpf fast path）的 JIT 额外开销。
  *
  * 两个等价循环，唯一差别是每次迭代是否经过一次函数调用：
  *   inline_loop : 运算直接写在循环里（leaf 被 JIT 内联，无 call）
@@ -40,7 +40,7 @@ static uint64_t inline_loop(uint64_t iters) {
     return x;
 }
 
-/* 版本 B：每次迭代直接调用 leaf()（编译期已知目标 → BPF 相对 call → fast path）。 */
+/* 版本 B：每次迭代直接调用 leaf()（编译期已知目标 -> BPF 相对 call -> fast path）。 */
 static uint64_t call_loop(uint64_t iters) {
     uint64_t x = 1;
     for (uint64_t i = 0; i < iters; i++) {

@@ -2,14 +2,14 @@
  *
  * waitid 用独立 ABI（idtype, id, siginfo*, options），与 wait4/waitpid 参数布局
  * 完全不同。本测试验证 VM 的 do_waitid handler 正确：
- *   1) fork 子进程正常退出 → waitid(WEXITED) 报告 si_code==CLD_EXITED、
+ *   -  fork 子进程正常退出 -> waitid(WEXITED) 报告 si_code==CLD_EXITED、
  *      si_signo==SIGCHLD、si_pid==child、si_status==退出码（原始值，非 wait4 状态字）。
- *   2) fork 子进程被 SIGKILL → si_code==CLD_KILLED、si_status==SIGKILL（原始信号号）。
- *   3) P_ALL 等任意子进程。
+ *   -  fork 子进程被 SIGKILL -> si_code==CLD_KILLED、si_status==SIGKILL（原始信号号）。
+ *   -  P_ALL 等任意子进程。
  *
  * 注意 si_status 语义：对 SIGCHLD 事件，si_status 存【原始值】（退出码/信号号），
  * 不是 wait4 的 (code<<8|sig) 状态字，故不能套用 WEXITSTATUS/WTERMSIG 宏——这与
- * Linux 实测一致（_exit(42)→si_status=42，SIGKILL→si_status=9）。
+ * Linux 实测一致（_exit(42)->si_status=42，SIGKILL->si_status=9）。
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -23,7 +23,7 @@ int main(void) {
     write(fd, "x", 1);
     close(fd);
 
-    /* 1) access() — musl 内部 faccessat(AT_FDCWD, path, amode, 0)，无 flag 走 3 参路径 */
+    /* -  access() — musl 内部 faccessat(AT_FDCWD, path, amode, 0)，无 flag 走 3 参路径 */
     if (access("faccessat_sample", R_OK) != 0) {
         printf("access(sample, R) failed errno=%d\n", errno);
         return 1;
@@ -38,7 +38,7 @@ int main(void) {
         return 1;
     }
 
-    /* 2) 直接 faccessat(...,0) — 显式 4 参，r4=0 */
+    /* -  直接 faccessat(...,0) — 显式 4 参，r4=0 */
     if (faccessat(AT_FDCWD, "faccessat_sample", R_OK, 0) != 0) {
         printf("faccessat(sample, R, 0) failed errno=%d\n", errno);
         return 1;

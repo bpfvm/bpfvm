@@ -19,7 +19,7 @@
 
 #define N 4
 
-/* seen[i]：退出码 i+1 的子进程被回收的次数。恰好一次 ⇒ 全 1。 */
+/* seen[i]：退出码 i+1 的子进程被回收的次数。恰好一次 => 全 1。 */
 static int seen[N];
 static pthread_mutex_t seen_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int bad = 0;   /* 非预期退出码/状态 */
@@ -54,7 +54,7 @@ struct waiter_arg {
     int ok;
 };
 
-/* per-child waiter：waitpid 自己专属的子进程。可能被 collector 抢走 → 得 ECHILD（合法）。 */
+/* per-child waiter：waitpid 自己专属的子进程。可能被 collector 抢走 -> 得 ECHILD（合法）。 */
 static void *waiter(void *p) {
     struct waiter_arg *a = p;
     ready_signal();

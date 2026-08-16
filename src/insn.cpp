@@ -311,7 +311,7 @@ bool vm::deliver_signal() {
         return false;
     }
     // 信号帧的返回地址。无待决重启时用当前 pc（被中断处）；有待决 ERESTARTSYS 时
-    // 按 SA_RESTART 决定：置 SA_RESTART → 返回 syscall 指令（重启）；否则返回 syscall
+    // 按 SA_RESTART 决定：置 SA_RESTART -> 返回 syscall 指令（重启）；否则返回 syscall
     // 的下一条指令，并填 r(0) = -EINTR（语义同 Linux：未带 SA_RESTART 的信号打断
     // 可重启 syscall 后向用户态返回 -EINTR）。
     uint64_t ret_addr = pc_;
@@ -1439,7 +1439,7 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         printf("entry: 0x%lx\n", (unsigned long)vmImage.entry);
     }
 
-    // setup_stack 接收 map（key→value），内部拼成 "KEY=VALUE" 写入栈。
+    // setup_stack 接收 map（key->value），内部拼成 "KEY=VALUE" 写入栈。
     if(!setup_stack(options->argv, options->envp, info)) {
         return 0;
     }
@@ -1527,7 +1527,7 @@ bool vm::setup_stack(const std::vector<std::string>& argv,
     //   NULL
     //   envp[0..envc-1] 指针
     //   NULL
-    //   auxv[]  （每个条目 2×uint64，以 {AT_NULL,0} 结尾）
+    //   auxv[]  （每个条目 2 x uint64，以 {AT_NULL,0} 结尾）
     //   argv/env 字符串
     //   "bpf\0" 平台串
     //   16 字节随机数据（AT_RANDOM）

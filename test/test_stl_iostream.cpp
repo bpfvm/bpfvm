@@ -30,7 +30,7 @@ int main() {
     }
     std::cerr << "cerr ok\n";
 
-    // (2) stringstream 内存流：整数 → 字符串，读回比对（真正验证 num_put 格式化正确）。
+    // (2) stringstream 内存流：整数 -> 字符串，读回比对（真正验证 num_put 格式化正确）。
     {
         std::ostringstream oss;
         oss << 42 << " " << -7 << " " << 1234567;
@@ -41,7 +41,7 @@ int main() {
         }
     }
 
-    // (3) istringstream 字符串 → 整数（验证 num_get 解析 + istream >>）。
+    // (3) istringstream 字符串 -> 整数（验证 num_get 解析 + istream >>）。
     {
         std::istringstream iss("100 200 300");
         int a = 0, b = 0, c = 0;
