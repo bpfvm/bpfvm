@@ -4,7 +4,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
 # 公共 env（ROOT_DIR / COMMON_CFLAGS / pass 探测 / make_ld_wrapper 等）见 scripts/env.sh。
 # 本脚本所有产物（musl/libcxx 库 + 头 + 各可执行）统一装到 root/：
-#   root/include：musl C 头（bits/、sys/...）。
+#   root/include：musl C 头（bits/、sys/...）+ C++ 头（c++/v1/，build_libcxx 安装）。
 #   root/lib：libc.a/libm.a/...、dlstart.lo/dynlink.lo、libc.so->ld-bpf.so、libcxx.a/libcxx.so、libcrypto/libssl.{a,so}。
 #   root/bin：dash/sbase/busybox/openssl。
 #
@@ -56,8 +56,8 @@ build_libc_bpfso() {
     rm "${ROOT_DIR}/root/lib/dlstart.lo" "${ROOT_DIR}/root/lib/dynlink.lo"
 }
 
-# 构建 C++ 运行时（libcxx.a + libcxx.so）。
-#   libcxx.a：由 scripts/build_libcxx.sh 编译 libc++/libc++abi 源码打成静态库，放到 root/lib/。
+# 构建 C++ 运行时（libcxx.a + libcxx.so）；libcxx.a 与 root/include/c++/v1 头文件的
+# 构建/安装见 scripts/build_libcxx.sh（LLVM runtimes CMake）。
 #   libcxx.so：用 bpfvm-ld -shared 从 libcxx.a 合成（PIE ET_DYN），依赖 libc.so（DT_NEEDED），
 #     仿 build_libc_bpfso，直接产出到 root/lib/（rootfs 与 ctest 运行时共用）。
 # 必须在 build_libc_bpfso 之后调用（libcxx.so 依赖 libc.so 存在）。

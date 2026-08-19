@@ -29,7 +29,7 @@
     - `BpfLibcallLower.cpp`: lowers memcpy/memmove/memset/trap + floor/ceil/trunc/round intrinsics into musl calls.
 - `musl/`: default C library for BPF targets (musl 1.2.6 port); built via `sh musl/build.sh` → installs to `root/{include,lib}`. Porting internals in the musl porting section of README.
 - `dash/`: shell sources for the BPF cross-build.
-- `root/`: unified install root for the C/C++ toolchain + rootfs. `root/include` (musl headers), `root/lib` (`libc.a`/`libc.so`/`ld-bpf.so`/`libcxx.a`/`libcxx.so`/`libcrypto.{a,so}`/`libssl.{a,so}`/...), `root/bin` (dash/busybox/openssl). Built by `sh musl/build.sh` + `./scripts/build_root.sh [components...]`.
+- `root/`: unified install root for the C/C++ toolchain + rootfs. `root/include` (musl headers + C++ headers in `c++/v1/`), `root/lib` (`libc.a`/`libc.so`/`ld-bpf.so`/`libcxx.a`/`libcxx.so`/`libcrypto.{a,so}`/`libssl.{a,so}`/...), `root/bin` (dash/busybox/openssl). Built by `./scripts/build_root.sh [components...]`.
 - `test/`: small BPF test programs (`.c`) and expected outputs (`.out`), built via a local Makefile.
 - `build/`: local build outputs (CMake and cross-build artifacts).
 - `patches/`: out-of-tree patches for upstream dependencies this repo needs but cannot fix in-tree (e.g. `gdb-bpf-ptr-bit.patch` — see "Known GDB bugs" below). `patches/README.md` has per-patch usage + build instructions.

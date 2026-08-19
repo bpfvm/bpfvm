@@ -31,9 +31,6 @@ set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
     -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
     -D_GNU_SOURCE \
     -Dthread_local='__attribute__((annotate("emutls")))' \
-    -D_LIBCPP_HAS_THREAD_API_PTHREAD \
-    -D_LIBCPP_HAS_MUSL_LIBC \
-    -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
     -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include \

@@ -328,7 +328,7 @@ BPF VM 支持 **C++ 语言子集**：用 `clang++ -target bpf -fno-exceptions -f
 - 命名空间、`constexpr`、函数重载、引用、`auto`、lambda（带捕获）。
 - `operator new` / `operator delete` 由 musl `malloc`/`free` 支撑（在 `.cpp` 里定义它们；mangle 为 `_Znwm`/`_ZdlPv`，无需 C++ 运行时库即可解析）。
 
-**经 libc++ 的 STL**（`libcxx.a`/`libcxx.so`，由 `scripts/build_libcxx.sh` 构建）：标准库可用，含 RTTI（`typeid`/`dynamic_cast`）和 `<thread>`/`<mutex>`/`<future>`/`<barrier>`（musl pthread 之上的 libc++ pthread 后端）。
+**经 libc++ 的 STL**（`libcxx.a`/`libcxx.so`，由 `scripts/build_libcxx.sh` 构建）：标准库可用，含 RTTI（`typeid`/`dynamic_cast`）和 `<thread>`/`<mutex>`/`<future>`/`<barrier>`（musl pthread 之上的 libc++ pthread 后端）。构建完全从 LLVM 源码树出发（需解压 LLVM 源码 tarball 到 `/tmp/llvm-toolchain-*`，或设 `LLVM_SRC` 指向源码树）。
 
 **已验证的编译期限制**（clang 19，`-target bpf -fno-exceptions -frtti`）：
 - `throw` / `try`：`error: cannot use 'throw'/'try' with exceptions disabled`。RTTI已启用，故 `dynamic_cast` 和 `typeid` 可用（见 `test/test_stl_rtti.cpp`）；仅引用 `dynamic_cast` 失败（`bad_cast`）不可用，因为它需要异常。

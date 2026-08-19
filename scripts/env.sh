@@ -8,7 +8,6 @@ CLANG_RES="$(clang -print-resource-dir)/include"
 BPFVM_LD="${ROOT_DIR}/build/bpfvm-ld"
 
 # BPF pass 插件路径常量。COMMON_CFLAGS 按 if-exist 探测加入；
-# libcxx 的 STL_CXX_FLAGS 直接引用这些常量（去掉硬编码 build/libBpf*.so）。
 PASS_WIDEARGS="${ROOT_DIR}/build/libBpfWideArgs.so"
 PASS_SOFTFP="${ROOT_DIR}/build/libBpfSoftFp.so"
 PASS_LIBCALLLOWER="${ROOT_DIR}/build/libBpfLibcallLower.so"

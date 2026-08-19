@@ -1,173 +1,96 @@
 #!/bin/bash
-# 构建 BPF target 的 C++ runtime（libcxx.a）。
+# 构建 BPF target 的 C++ runtime（libcxx.a）
+# cmake -S runtimes -DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi
 #
-# 由两部分组成：
-#   -  libc++ 源文件（-frtti，LIBCXX_BUILDING_LIBCXXABI）：algorithm/string/vector/
-#      regex/iostream/thread/filesystem 等 + exception.cpp（走官方 exception_libcxxabi.ipp，
-#      用 cxa_noexception.cpp 的 __cxa_* 实现 exception_ptr/uncaught_exceptions）。
-#   -  libc++abi 源文件（-frtti）：private_typeinfo（RTTI/dynamic_cast 全实现）、
-#      cxa_noexception（-fno-exceptions 下的 __cxa_uncaught_exceptions 等）、
-#      cxa_virtual（__cxa_pure_virtual）、cxa_handlers/cxa_default_handlers
-#      （terminate/new_handler）、cxa_vector/cxa_demangle/fallback_malloc/abort_message、
-#      stdlib_typeinfo/stdlib_exception/stdlib_stdexcept/cxa_aux_runtime、
-#      cxa_guard（static 局部守卫，GlobalMutex 实现）、stdlib_new_delete（operator new/delete
-#      20 个弱符号变体，含 nothrow/对齐版）。
+# 产物：root/include/c++/v1/（libc++ + libc++abi 头）；中间产物在 build/libcxx/。
+#      libcxx.so 由 build_root.sh 从 libcxx.a 合成，不在本脚本。
 #
-# 用法：./scripts/build_libcxx.sh
-# 产物：root/lib/libcxx.a（最终库安装到 root/lib，与 musl 的 libc.a/libc.so 同目录）
-# 中间：build/libcxx_obj/*.o（编译对象，被 .gitignore 的 build/ 覆盖）
-#
-# 配合系统 clang 自带的 libc++ 头文件（header-only 部分）+ BpfLibcallLower pass，
-# 支持 vector/string/map/sort/optional/expected/memory_resource/variant/
-# unique_ptr/regex/iostream/thread/filesystem 等常用 STL。
+# 用法：[LLVM_SRC=/path/to/llvm-project] ./scripts/build_libcxx.sh
+# 需要：clang/clang++（host）、cmake、make、ar；musl 头已装到 root/include（先跑 build_musl）。
 
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "${ROOT_DIR}"
 
-# 探测 libc++ 头目录：让 clang 自己给（-print-file-name=include/c++/v1 直接返回
-LIBCXX_INC=$(clang++ -print-file-name=include/c++/v1 2>/dev/null)
-if ! [ -f "$LIBCXX_INC/vector" ]; then
-    echo "libc++ headers not found: clang -print-file-name=include/c++/v1 -> '$LIBCXX_INC'" >&2
-    exit 1
-fi
-echo "==> libc++ headers: $LIBCXX_INC"
-
-mkdir -p root/lib build/libcxx_obj
-
-# 编译 libc++ 源文件（algorithm/string/vector/regex/iostream/thread/...）。
-# 这些源文件来自系统 libc++，用 STL_CXX_FLAGS（含 libc++ 头 + 绕过宏）编译。
-# 探测 libc++ 源码目录。Debian 的 libc++-dev 包只装头和预编译 .a，不含 .cpp 源码，
-# 故源码需手动提供（LLVM 源码 tarball 解压到 /tmp/llvm-toolchain-* 或类似位置）。
-# 候选（取最新版本）：/tmp/llvm-toolchain-*/libcxx/src、/usr/local/llvm-*/src/libcxx 等。
-LIBCXX_SRC=""
-for p in $(ls -d /tmp/llvm-toolchain-*/libcxx/src /usr/local/llvm-*/src/libcxx /usr/lib/llvm-*/src/libcxx 2>/dev/null | sort -Vr); do
-    if [ -f "$p/algorithm.cpp" ]; then LIBCXX_SRC="$p"; break; fi
+LLVM_TREE=""
+for p in "${LLVM_SRC:-}" $(ls -d ${ROOT_DIR}/llvm /usr/local/llvm-* /usr/lib/llvm-* 2>/dev/null | sort -Vr); do
+    [ -n "$p" ] || continue
+    if [ -f "$p/runtimes/CMakeLists.txt" ] && [ -f "$p/libcxx/src/algorithm.cpp" ] \
+       && [ -f "$p/libcxxabi/src/private_typeinfo.cpp" ]; then
+        LLVM_TREE="$p"; break
+    fi
 done
-# LIBCXX_BUILDING_LIBCXXABI：让 libc++ 源知道 ABI 库是 libc++abi（与下面编译的
-#   libc++abi 源配对）。影响 3 个 libc++ 源：
-#   exception.cpp  -> 走 exception_libcxxabi.ipp + exception_pointer_cxxabi.ipp，
-#     自动用 cxa_noexception.cpp 提供的 __cxa_uncaught_exceptions /
-#     __cxa_increment/decrement_exception_refcount / __cxa_current_primary_exception /
-#     __cxa_rethrow_primary_exception 实现 std::exception_ptr / uncaught_exceptions /
-#     nested_exception。
-#   new_handler.cpp -> set/get_new_handler 交给 libc++abi cxa_default_handlers.cpp。
-#   typeinfo.cpp -> ~type_info 交给 libc++abi stdlib_typeinfo.cpp。
-STL_CXX_FLAGS="-std=c++23 -target bpf -mcpu=v4 -O1 -fno-exceptions -frtti -fno-builtin -fno-math-errno \
-    -mllvm -bpf-stack-size=16384 \
-    -nostdinc \
-    -D_GNU_SOURCE \
-    -D_LIBCPP_HAS_THREAD_API_PTHREAD \
-    -D_LIBCPP_HAS_MUSL_LIBC \
-    -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE \
-    -D_LIBCPP_BUILDING_LIBRARY \
-    -DLIBCXX_BUILDING_LIBCXXABI \
-    -isystem $LIBCXX_INC \
-    -isystem root/include/ \
-    -isystem include \
-    -I $LIBCXX_SRC \
-    -fpass-plugin=${PASS_LIBCALLLOWER} \
+if [ -z "$LLVM_TREE" ]; then
+    echo "未找到 LLVM 源码树（需 monorepo 布局，含 runtimes/ + libcxx/ + libcxxabi/）。" >&2
+    echo "请解压 LLVM 源码 tarball 到 ${ROOT_DIR}/llvm，或设 LLVM_SRC=/path/to/llvm-project" >&2
+    exit 1
+fi
+echo "==> LLVM source tree: $LLVM_TREE"
+
+BUILD_DIR="${ROOT_DIR}/build/libcxx"
+CLANG_RES="$(clang++ -print-resource-dir)/include"
+
+# BPF 交叉编译 flags（与 test/Makefile 的 CXX_FLAGS 同一套）。
+# 注意不要在这里 -isystem 任何 C++ 头目录（源码 include 或生成的 build/include/c++/v1）：
+# LLVM 的 runtimes 构建会把整套 libc++ 头拷进生成目录并以目标 -I（CXX_INCLUDES，
+# 排命令行最前）引入；若再叠加同目录 -isystem，重复路径会让 cstddef/cstdint 的
+# include_next 链在带 include guard 的包装副本处提前终止，musl 的 stddef.h/stdint.h
+# 永远串不上（::int32_t 未定义）。目标 -I 在前、下面的 musl -isystem 在后，顺序天然正确。
+BASE_FLAGS="-target bpf -mcpu=v4 -O1 -fno-builtin -fno-math-errno \
+    -mllvm -bpf-stack-size=16384 -nostdinc -D_GNU_SOURCE \
+    -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem $CLANG_RES \
     -fpass-plugin=${PASS_WIDEARGS} \
-    -fpass-plugin=${PASS_SOFTFP}"
+    -fpass-plugin=${PASS_SOFTFP} \
+    -fpass-plugin=${PASS_LIBCALLLOWER}"
+CMAKE_C_FLAGS="$BASE_FLAGS"
+CMAKE_CXX_FLAGS="-std=c++23 -fno-exceptions -frtti $BASE_FLAGS"
 
-OBJS=""
-if [ -d "$LIBCXX_SRC" ]; then
-    echo "==> libc++ sources detected: $LIBCXX_SRC"
-    # 编译 $LIBCXX_SRC 下全部 .cpp，仅排除少数在 BPF 上编不过或有冲突的：
-    #   new.cpp           — 与 stdlib_new_delete.cpp 的 operator new/delete 符号完全重叠
-    #                       （二选一取 libc++abi 版的 stdlib_new_delete.cpp）。
-    # memory_resource.cpp 靠 stdlib_new_delete 的对齐版 operator new/delete
-    #   （St11align_val_t）满足 pmr 引用。expected.cpp 在 c++23 下
-    # #if _LIBCPP_STD_VER >= 23 门控的声明可见（STL_CXX_FLAGS 已是 c++23）。
-    # 其余全部纳入（algorithm/string/vector/regex/iostream/thread/memory_resource/expected/
-    #   atomic/chrono/random/strstream/charconv/...）。fstream.cpp 编译为 0 符号（模板
-    #   实例化被 #if 包），无副作用。
-    EXCLUDE="new.cpp"
-    n=0
-    for src in "$LIBCXX_SRC"/*.cpp; do
-        b=$(basename "$src")
-        case " $EXCLUDE " in *" $b "*) continue;; esac
-        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/${b%.cpp}.o"
-        OBJS="$OBJS build/libcxx_obj/${b%.cpp}.o"
-        n=$((n+1))
-    done
-    echo "   [OK] libc++ sources ($n, excluded: $EXCLUDE)"
+# 全量重建：避免改 flags/换 LLVM 版本后残留陈旧配置与对象（脚本不依赖增量）。
+rm -rf "$BUILD_DIR"
+mkdir -p root/lib
 
-    # ryu 浮点格式化算法（charconv.cpp 的浮点 to_chars 调用 __f2s_buffered_n /
-    # __d2s_buffered_n / __d2fixed_buffered_n 等）。必须随 charconv 一起编译，否则
-    # 库带未定义引用。
-    for src in "$LIBCXX_SRC"/ryu/*.cpp; do
-        b=$(basename "$src")
-        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/ryu_${b%.cpp}.o"
-        OBJS="$OBJS build/libcxx_obj/ryu_${b%.cpp}.o"
-    done
-    echo "   [OK] ryu (浮点 to_chars)"
+echo "==> configuring LLVM runtimes (libcxx + libcxxabi)"
+#   -  EXCEPTIONS/SHARED=OFF（默认 ON）；STATIC_ABI_LIBRARY=ON（默认 OFF）；
+#      UNWINDER/TESTS/DOCS/BENCHMARKS=OFF（默认 ON）。
+#   -  时区数据库（LIBCXX_ENABLE_TIME_ZONE_DATABASE）Generic 平台默认 OFF，不传即关。
+#      其实现读 /usr/share/zoneinfo 且落在不发布的 libc++experimental.a；若将来把
+#      CMAKE_SYSTEM_NAME 改为 Linux（默认翻成 ON），须显式补 =OFF。
+cmake -S "${LLVM_TREE}/runtimes" -B "$BUILD_DIR" \
+    -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+    -DCMAKE_C_COMPILER="$(command -v clang)" \
+    -DCMAKE_CXX_COMPILER="$(command -v clang++)" \
+    -DCMAKE_C_FLAGS="${CMAKE_C_FLAGS}" \
+    -DCMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS}" \
+    -DCMAKE_SYSTEM_NAME=Generic \
+    -DCMAKE_SYSTEM_PROCESSOR=bpf \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_INSTALL_PREFIX="${ROOT_DIR}/root" \
+    -DLIBCXX_ENABLE_EXCEPTIONS=OFF \
+    -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF \
+    -DLIBCXX_ENABLE_SHARED=OFF \
+    -DLIBCXXABI_ENABLE_SHARED=OFF \
+    -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
+    -DLIBCXX_HAS_PTHREAD_API=ON \
+    -DLIBCXX_HAS_MUSL_LIBC=ON \
+    -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+    -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+    -DLIBCXX_INCLUDE_TESTS=OFF \
+    -DLIBCXXABI_INCLUDE_TESTS=OFF \
+    -DLIBCXX_INCLUDE_DOCS=OFF
 
-    # filesystem 子系统（解锁 <filesystem>）。编译 $LIBCXX_SRC/filesystem/ 下全部 .cpp。
-    for src in "$LIBCXX_SRC"/filesystem/*.cpp; do
-        b=$(basename "$src")
-        clang++ $STL_CXX_FLAGS -c "$src" -o "build/libcxx_obj/fs_${b%.cpp}.o"
-        OBJS="$OBJS build/libcxx_obj/fs_${b%.cpp}.o"
-    done
-    echo "   [OK] filesystem"
-else
-    echo "==> libc++ sources not found (only stub will be in libcxx.a)" >&2
-    exit 1
-fi
+echo "==> building libc++ / libc++abi"
+cmake --build "$BUILD_DIR" -j"$(nproc)"
 
-# 编译 libc++abi 源文件，提供 C++ RTTI runtime（typeid/dynamic_cast）+ no-exception
-# 运行时（__cxa_uncaught_exceptions 等）+ terminate/new_handler。
-# libc++abi 用 -frtti 编（必须，否则 typeinfo vtable 不发）；上面 libc++ 源也用 -frtti
-# （库符号的 vtable/typeinfo 必须与用户代码 RTTI 设置匹配，否则跨模块引用 typeinfo 会 undefined）。
-# 探测 libc++abi 源码目录（同 LIBCXX_SRC，Debian 包不含源码，取最新版本 tarball）。
-# 候选优先用 LIBCXX_SRC 的同级目录（tarball 里 libcxx/libcxxabi 并列），再回退到通配符扫描。
-LIBCXXABI_SRC=""
-if [ -n "$LIBCXX_SRC" ] && [ -f "$LIBCXX_SRC/../libcxxabi/src/private_typeinfo.cpp" ]; then
-    LIBCXXABI_SRC="$LIBCXX_SRC/../libcxxabi/src"
-fi
-if [ -z "$LIBCXXABI_SRC" ]; then
-    for p in $(ls -d /tmp/llvm-toolchain-*/libcxxabi/src /usr/local/llvm-*/src/libcxxabi/src /usr/lib/llvm-*/src/libcxxabi/src 2>/dev/null | sort -Vr); do
-        if [ -f "$p/private_typeinfo.cpp" ]; then LIBCXXABI_SRC="$p"; break; fi
-    done
-fi
-if [ -n "$LIBCXXABI_SRC" ]; then
-    LIBCXXABI_INC=$(cd "$LIBCXXABI_SRC/../include" && pwd)
-    # ABI_FLAGS = STL_CXX_FLAGS（已是 -frtti + -I $LIBCXX_SRC）+ libc++abi include
-    # （__cxxabi_config.h / cxxabi.h，cxa_aux_runtime.cpp 用；stdlib_stdexcept.cpp 的
-    # #include "include/refstring.h" 由 -I $LIBCXX_SRC 解析）+ clang resource include
-    # （unwind.h——cxa_exception.h 无条件 include，cxa_noexception.cpp 经它引入）。
-    CLANG_INC="$(clang++ -print-resource-dir)/include"
-    ABI_FLAGS="$STL_CXX_FLAGS -isystem $LIBCXXABI_INC -isystem $CLANG_INC"
-    echo "==> libc++abi sources detected: $LIBCXXABI_SRC"
-    # 编译 $LIBCXXABI_SRC 下全部 .cpp，仅排除在 BPF 上编不过的：
-    #   cxa_exception.cpp          — 有异常版 __cxa_*（__cxa_throw/allocate_exception/...），
-    #                                 与 cxa_noexception.cpp 的无异常版 9 个符号重复且语义冲突，
-    #                                 -fno-exceptions 下用 cxa_noexception.cpp。
-    #   cxa_exception_storage.cpp  — __cxa_get_globals（异常线程本地存储），-fno-exceptions 下
-    #                                 无引用，纳入是死代码。
-    #   cxa_personality.cpp        — 含 throw，-fno-exceptions 下编不过；异常人格函数，不需要。
-    #   cxa_thread_atexit.cpp      — 用 __thread 原生 TLS，BPF 不支持，编不过。
-    #                                 __cxa_thread_atexit 符号改由 musl 提供（见
-    #                                 musl/src/thread/bpf/cxa_thread_atexit.c），配合 emutls
-    #                                 控制块的 dtor 字段实现 thread_local 每线程析构。
-    ABI_EXCLUDE="cxa_exception.cpp cxa_exception_storage.cpp cxa_personality.cpp cxa_thread_atexit.cpp"
-    n=0
-    for src in "$LIBCXXABI_SRC"/*.cpp; do
-        b=$(basename "$src")
-        case " $ABI_EXCLUDE " in *" $b "*) continue;; esac
-        clang++ $ABI_FLAGS -c "$src" -o "build/libcxx_obj/abi_${b%.cpp}.o"
-        OBJS="$OBJS build/libcxx_obj/abi_${b%.cpp}.o"
-        n=$((n+1))
-    done
-    echo "   [OK] libc++abi ($n, excluded: $ABI_EXCLUDE)"
-else
-    echo "==> libc++abi sources not found (RTTI runtime required)" >&2
-    exit 1
-fi
+echo "==> installing headers + libc++.a to root/"
+rm -rf "${ROOT_DIR}/root/include/c++"
+cmake --install "$BUILD_DIR" >/dev/null
 
-# 打成静态库。先清空旧 .a：ar rcs 不会删除已存在但本次未列出的成员，
-# 否则上次构建的陈旧 .o（如旧 pass 编的）会残留累积。
-echo "==> creating root/lib/libcxx.a"
-rm -f root/lib/libcxx.a
-ar rcs root/lib/libcxx.a $OBJS
-echo "==> done: root/lib/libcxx.a ($(wc -c < root/lib/libcxx.a) bytes)"
+[ -f "$BUILD_DIR/lib/libc++.a" ] || { echo "libc++.a 未产出（构建失败？）" >&2; exit 1; }
+cp -f "$BUILD_DIR/lib/libc++.a" "${ROOT_DIR}/root/lib/libcxx.a"
+# 清掉 install 落地的原始命名/附属档案，rootfs 只保留 libcxx.a（单一 C++ 库入口）。
+rm -f "${ROOT_DIR}/root/lib/libc++.a" "${ROOT_DIR}/root/lib/libc++abi.a" \
+      "${ROOT_DIR}/root/lib/libc++experimental.a"
+[ -f "${ROOT_DIR}/root/include/c++/v1/vector" ] || { echo "头文件未安装到 root/include/c++/v1" >&2; exit 1; }
+
+echo "==> done: root/lib/libcxx.a ($(wc -c < root/lib/libcxx.a) bytes),"
+echo "==>       root/include/c++/v1 ($(find root/include/c++/v1 -type f | wc -l) header files)"

@@ -85,21 +85,16 @@ CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-
 #   c++23 是 c++20 的超集，现有测试无回归；libcxx.a 跨版本混编无碍（mangling 不依赖语言版本）。
 # - libc++ 头（$LIBCXX_INC）必须在 musl 之前：cstddef 的 #include_next <stddef.h>
 #   要求 libc++ 的 stddef.h 先被找到，再 #include_next 串联到 musl 的。
-# - 绕过宏（_LIBCPP_HAS_THREAD_API_PTHREAD 等）：BPF target 无平台宏（__linux__ 等），
-#   libc++ __config 的线程 API 自动探测会 #error "No thread API"；直接定义 pthread API
-#   短路该探测，并让 <thread>/<mutex>/<future> 走 pthread 后端（musl 提供 pthread_*）。
 # - -fno-exceptions -frtti：异常禁用（BPF 无异常 runtime，throw/try 编译期被拒）；
 #   RTTI 启用——libcxx.a 含 libc++abi 的 typeinfo 子集（__dynamic_cast/__cxa_bad_typeid 等），
 #   typeid/dynamic_cast 可用。
-# 探测 libc++ 头目录：让 clang 自己给（-print-file-name=include/c++/v1 返回 clang 内部
-# 解析的路径，不假设布局，也不含 wasm32-wasi 的 ABI __2 头）。找不到返回参数本身，
-# 用 wildcard 校验 vector 后置空，-isystem 即跳过。
-LIBCXX_INC := $(shell clang++ -print-file-name=include/c++/v1 2>/dev/null)
+# libc++ 头目录：root/include/c++/v1（scripts/build_libcxx.sh 安装，与库同源）。
+# 用 wildcard 校验 vector 后置空（未构建时报缺头，不静默漏链）。
+LIBCXX_INC := ../root/include/c++/v1
 LIBCXX_INC := $(if $(wildcard $(LIBCXX_INC)/vector),$(LIBCXX_INC),)
 CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
              -mllvm -bpf-stack-size=16384 -nostdinc \
              -fno-builtin -fno-math-errno -fno-exceptions -frtti \
-             -D_LIBCPP_HAS_THREAD_API_PTHREAD -D_LIBCPP_HAS_MUSL_LIBC \
              $(if $(LIBCXX_INC),-isystem $(LIBCXX_INC)) \
              -isystem ../root/include/ -isystem ../include \
              -Dthread_local='__attribute__((annotate("emutls")))' \

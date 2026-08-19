@@ -55,15 +55,15 @@ if(BPFVM_BUILD_BPF)
         set(_bpf_reason "clang not in PATH")
     endif()
 
-    # libc++ 头 + clang resource include（与 scripts/build_libcxx.sh 同逻辑）。
+    # 依赖检测：libc++ 头（root/include/c++/v1，由 scripts/build_libcxx.sh 安装）
+    # 与 clang resource include。
     if(_bpf_on)
         execute_process(COMMAND ${BPFVM_CLANGXX_BIN} -print-resource-dir
                         OUTPUT_VARIABLE _bpf_clang_res OUTPUT_STRIP_TRAILING_WHITESPACE)
-        execute_process(COMMAND ${BPFVM_CLANGXX_BIN} -print-file-name=include/c++/v1
-                        OUTPUT_VARIABLE _bpf_libcxx_inc OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(NOT IS_ABSOLUTE "${_bpf_libcxx_inc}" OR NOT EXISTS "${_bpf_libcxx_inc}/vector")
+        set(_bpf_libcxx_inc "${CMAKE_SOURCE_DIR}/root/include/c++/v1")
+        if(NOT EXISTS "${_bpf_libcxx_inc}/vector")
             set(_bpf_on OFF)
-            set(_bpf_reason "libc++ headers not found; clang -print-file-name=include/c++/v1 -> '${_bpf_libcxx_inc}'")
+            set(_bpf_reason "missing root/include/c++/v1 (run ./scripts/build_root.sh first)")
         endif()
     endif()
 
