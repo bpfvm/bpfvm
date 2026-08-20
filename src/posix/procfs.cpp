@@ -584,7 +584,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     // 其余（DevFd 保 tty 身份、虚拟 fd 无 host fd）退回 clone():
     // dup 语义：host fd 共享 offset，但保留类型身份——pty 的 TIOCGPGRP/TIOCSCTTY 语义不丢。
     if(auto flink = node.as<FdLinkGen>()) {
-        if(flags & O_NOFOLLOW) {
+        if(flags & BPF_O_NOFOLLOW) {
             errno = ELOOP;
             return nullptr;
         }
@@ -592,7 +592,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
         if(typeid(tfd) == typeid(HostFd)) {
             char p[32];
             snprintf(p, sizeof(p), "/proc/self/fd/%d", flink->target->host_fd());
-            int nfd = ::openat(AT_FDCWD, p, flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+            int nfd = ::openat(AT_FDCWD, p, guest_open_flags((unsigned)flags & ~(BPF_O_NOFOLLOW | BPF_O_CLOEXEC)), 0);
             if(nfd >= 0) {
                 return std::make_shared<HostFd>(nfd, flink->target->path);
             }
@@ -607,7 +607,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
         auto nf = flink->target->clone();
         if(!nf) return nullptr;   // errno 已由 clone 设（dup 失败 EMFILE 等）
         // O_TRUNC 仅对可截断文件生效（Linux：pipe 等 FIFO 忽略之），失败 EINVAL/ESPIPE 放行。
-        if(flags & O_TRUNC) {
+        if(flags & BPF_O_TRUNC) {
             int rc = nf->ftruncate(0);
             if(rc < 0 && rc != -EINVAL && rc != -ESPIPE) {
                 errno = -rc; 
@@ -622,7 +622,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     // writecount 检查。一次 image() 快照贯穿判活与取 fd：持快照期间 fd 被钉住，
     // 不与目标 run() 退出释放引用竞争。
     if(auto elink = node.as<ExeLinkGen>()) {
-        if(flags & O_NOFOLLOW) {
+        if(flags & BPF_O_NOFOLLOW) {
             errno = ELOOP;
             return nullptr;
         }
@@ -631,21 +631,22 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
             errno = ENOENT;
             return nullptr;
         }
-        if(flags & (O_WRONLY | O_RDWR)) {
+        if(flags & (BPF_O_WRONLY | BPF_O_RDWR)) {
             errno = ETXTBSY;
             return nullptr;
         }
         char p[32];
         snprintf(p, sizeof(p), "/proc/self/fd/%d", img->fd);
-        int nfd = ::openat(AT_FDCWD, p, flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+        int hf = guest_open_flags((unsigned)flags & ~(BPF_O_NOFOLLOW | BPF_O_CLOEXEC));
+        int nfd = ::openat(AT_FDCWD, p, hf, 0);
         if(nfd < 0 && (errno == ENOENT || errno == ENOTDIR)) {
-            nfd = ::open(img->exe.c_str(), flags & ~(O_NOFOLLOW | O_CLOEXEC), 0);
+            nfd = ::open(img->exe.c_str(), hf, 0);
         }
         if(nfd < 0) return nullptr;   // errno 已由 openat/open 设
         return std::make_shared<HostFd>(nfd, (*elink)());   // path = ps->exe_path（guest 视角）
     }
     // /proc 整棵只读：任何写/截断访问一律 EROFS（与 Linux 只读 procfs 挂载一致）。
-    if(flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND)) {
+    if(flags & (BPF_O_WRONLY | BPF_O_RDWR | BPF_O_TRUNC | BPF_O_APPEND)) {
         errno = EROFS;
         return nullptr;
     }
@@ -653,7 +654,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     // 须自查；仅末段，escape 的中间段链接不受影响）。target 经 resolve_symlink 规范成
     // 绝对 guest 路径后经 ResolvePath 重解析（套 chroot + 按前缀分发），返回真实 fd。
     if(auto link = node.as<LinkGen>()) {
-        if(flags & O_NOFOLLOW) { errno = ELOOP; return nullptr; }
+        if(flags & BPF_O_NOFOLLOW) { errno = ELOOP; return nullptr; }
         std::string target = resolve_symlink(guest, (*link)());
         if(target.empty()) { errno = ENOENT; return nullptr; }
         return ResolvePath(self, target)->open(flags, mode);

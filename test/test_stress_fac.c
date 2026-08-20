@@ -1,7 +1,9 @@
 /* Stress: call faccessat with flag=0 (3-arg path) many times via musl wrapper,
  * check for inconsistent results (garbage r4 causing sporadic EINVAL/wrong perm).
  * 样本用 guest 自建文件（跨沙箱环境一致，不依赖系统路径如 /bin）。 */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>

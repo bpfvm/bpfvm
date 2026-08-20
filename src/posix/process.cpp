@@ -79,7 +79,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
         }
         exe_file = std::make_shared<HostFd>(d, dirfd_entry->path);
     } else {
-        exe_file = ResolvePath(this, guest_abs_path(path, dirfd))->open(O_RDONLY, 0);
+        exe_file = ResolvePath(this, guest_abs_path(path, dirfd))->open((int)BPF_O_RDONLY, 0);
     }
     auto exe = std::dynamic_pointer_cast<HostFd>(exe_file);
     if(!exe) {

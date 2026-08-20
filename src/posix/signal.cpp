@@ -440,10 +440,8 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
         return -EINVAL;
     }
 
-    // guest（musl）经 __libc_sigaction 把用户态 struct sigaction 转成内核 sigaction
-    // 布局（arch/bpf/ksigaction.h，复制自 x86_64）再调本 syscall，故此处按内核
-    // sigaction 布局解析，而非 guest 用户态 struct sigaction。布局定义见
-    // include/signal.h（bpf::sigaction）。
+    // guest（musl）经 __libc_sigaction 把用户态 struct sigaction 转成内核布局
+    // （bpf::sigaction）再调本 syscall，故按该布局解析 guest 内存。
     if(oldact_addr != 0) {
         auto* oldact = static_cast<bpf::sigaction*>(v->mmu_w(oldact_addr, sizeof(bpf::sigaction)));
         if(oldact == nullptr) {

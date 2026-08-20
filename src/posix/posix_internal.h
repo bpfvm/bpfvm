@@ -4,16 +4,38 @@
 // posix/ 内部共享头：仅被 posix/*.cpp 引用，不暴露给 main.cpp / insn_test.cpp。
 // 承载所有拆出 .cpp 共用的 include 组与参数转换辅助函数，避免每个文件重复一大段。
 
+#include "guest_abi.h"
+
 #include "posix_syscall.h"
 #include "include/bpf_syscall.h"
 
 namespace bpf{
-    #define BPF_NO_SYSCALL
-#ifdef __unused
-    #undef __unused
-#endif
-    #include "include/signal.h"
-    #include "include/sys/epoll.h"
+
+// guest 内核态 sigaction 布局（4 x 8B）：musl 经 __libc_sigaction 把用户态
+// struct sigaction 转成此布局再调 syscall。mask 是单 u64，musl 侧为
+// unsigned mask[2]，二进制兼容。
+struct sigaction {
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t restorer;
+    uint64_t mask;
+};
+
+typedef union epoll_data {
+    void *ptr;
+    int fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+// guest epoll_event：musl 仅对 __x86_64__ packed，BPF 目标为自然对齐 16B。
+// 显式 _pad 字段名带下划线避免误用。
+struct epoll_event {
+    uint32_t events;
+    uint32_t _pad;
+    epoll_data_t data;
+};  // 16B
+
 }
 
 #include <errno.h>

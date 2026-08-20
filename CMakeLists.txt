@@ -12,7 +12,7 @@ pkg_check_modules(LIBELF REQUIRED libelf)
 #SET(BUILD_SHARED_LIBRARIES OFF)
 #SET(CMAKE_EXE_LINKER_FLAGS "-static")
 
-add_compile_options(-Wall -Wextra -fPIC -fno-omit-frame-pointer)
+add_compile_options(-Wall -Wextra -Werror -fPIC -fno-omit-frame-pointer)
 
 include_directories(${LIBELF_INCLUDE_DIRS})
 link_directories(${LIBELF_LIBRARY_DIRS})
@@ -58,8 +58,6 @@ if(BPFVM_BUILD_BPF)
     # 依赖检测：libc++ 头（root/include/c++/v1，由 scripts/build_libcxx.sh 安装）
     # 与 clang resource include。
     if(_bpf_on)
-        execute_process(COMMAND ${BPFVM_CLANGXX_BIN} -print-resource-dir
-                        OUTPUT_VARIABLE _bpf_clang_res OUTPUT_STRIP_TRAILING_WHITESPACE)
         set(_bpf_libcxx_inc "${CMAKE_SOURCE_DIR}/root/include/c++/v1")
         if(NOT EXISTS "${_bpf_libcxx_inc}/vector")
             set(_bpf_on OFF)
@@ -94,7 +92,6 @@ if(BPFVM_BUILD_BPF)
                 -DBPFVM_CLANG=${BPFVM_CLANG_BIN}
                 -DBPFVM_CLANGXX=${BPFVM_CLANGXX_BIN}
                 -DBPFVM_LIBCXX_INC=${_bpf_libcxx_inc}
-                -DBPFVM_CLANG_RES_INC=${_bpf_clang_res}/include
                 -DBPFVM_BPFVM_LD=$<TARGET_FILE:bpfvm-ld>
                 -DBPFVM_PASS_WIDEARGS=$<TARGET_FILE:BpfWideArgs>
                 -DBPFVM_PASS_SOFTFP=$<TARGET_FILE:BpfSoftFp>

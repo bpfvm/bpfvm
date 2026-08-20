@@ -226,9 +226,8 @@ int64_t PosixSyscall::do_statx(vm* v) {
     if(!path.empty() && path.back() == '/') {
         flags &= ~AT_SYMLINK_NOFOLLOW;
     }
-    /* host struct statx 与 guest 的均源自 Linux UAPI stat.h，布局二进制兼容（同 256 字节、
-     * 同偏移），故直接用 host 类型：statx() 直写后 memcpy 进 guest 缓冲即可，无需逐字段转换，
-     * 也不必依赖 guest 头 include/sys/stat.h。 */
+    /* host 与 guest 的 struct statx 均源自 Linux UAPI stat.h，布局二进制兼容，
+     * 直接用 host 类型写 guest 缓冲即可，无需逐字段转换。 */
     auto out = static_cast<struct statx*>(v->mmu_w(v->r(5), sizeof(struct statx)));
     if(out == nullptr) {
         return -EFAULT;

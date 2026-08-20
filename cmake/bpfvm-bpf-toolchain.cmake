@@ -20,8 +20,7 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
     -nostdinc -fno-builtin -fno-math-errno -D_GNU_SOURCE \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
-    -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include \
-    -isystem ${BPFVM_ROOT}/include -isystem ${BPFVM_CLANG_RES_INC}"
+    -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include"
     CACHE STRING "BPF C flags" FORCE)
 
 # 关键：libc++ 头(BPFVM_LIBCXX_INC)必须在 musl(root/include)前——cstddef 的
@@ -29,12 +28,11 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
 # 不加 -g：规避 clang BPF 后端 EmitExternalFunctionDeclaration 崩溃。
 set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
     -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
-    -D_GNU_SOURCE \
+    -D_GNU_SOURCE -Werror=macro-redefined \
     -Dthread_local='__attribute__((annotate("emutls")))' \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
-    -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include \
-    -isystem ${BPFVM_ROOT}/include -isystem ${BPFVM_CLANG_RES_INC}"
+    -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include"
     CACHE STRING "BPF C++ flags" FORCE)
 
 # 用 bpfvm-ld 当链接器。它兼容 clang/gcc 风格 argv（见 ld_main.cpp），支持

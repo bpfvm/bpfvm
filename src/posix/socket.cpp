@@ -497,14 +497,6 @@ int64_t PosixSyscall::do_getpeername(vm* v) {
 // epoll
 // ===========================================================================
 //
-// epoll_event 布局陷阱：guest（BPF arch）的非 packed 16B 布局定义在
-// include/sys/epoll.h（bpf::epoll_event，经 bpf:: 命名空间引用），host（x86_64）的
-// struct epoll_event 是 packed 12B。故：
-//   guest(BPF, bpf::epoll_event)：offsetof(events)=0, offsetof(data)=8, sizeof=16
-//   host(x86_64)：offsetof(events)=0, offsetof(data)=4, sizeof=12
-//
-// 解法：用显式结构体代表 host 侧紧凑布局，逐元素拷贝 events + data（data 是 opaque
-// union，VM 不解析，用户存什么 wait 就返回什么）。guest 侧直接用 bpf::epoll_event。
 
 int64_t PosixSyscall::do_epoll_create1(vm* v) {
     int flags = arg_s32(v->r(1));

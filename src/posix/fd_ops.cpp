@@ -40,7 +40,7 @@ int64_t PosixSyscall::do_dup3(vm* v) {
     if(old_fd == new_fd) {
         return -EINVAL;
     }
-    if(flags & ~O_CLOEXEC) {
+    if(flags & ~BPF_O_CLOEXEC) {
         return -EINVAL;
     }
 
@@ -53,7 +53,7 @@ int64_t PosixSyscall::do_dup3(vm* v) {
     if(!handle) {
         return -errno;
     }
-    if(flags & O_CLOEXEC) {
+    if(flags & BPF_O_CLOEXEC) {
         handle->cloexec = true;
     }
     // 若 new_fd 已被占用：dup2/dup3 静默关闭旧 fd（Linux 语义）。旧 fd 若是最后一个
@@ -78,17 +78,18 @@ int64_t PosixSyscall::do_pipe2(vm* v) {
     int flags = arg_s32(v->r(2));
     int host_fds[2] = {-1, -1};
 
-    int rc = pipe2(host_fds, flags);
+    // pipe2 的 flag 里只有 O_DIRECT 会与宿主错位（aarch64），其余同值
+    int rc = pipe2(host_fds, guest_setfl_flags((unsigned)flags));
     if(rc == -1) {
         return -errno;
     }
 
     auto handle0 = std::make_shared<HostFd>(host_fds[0]);
-    if (flags & O_CLOEXEC) {
+    if (flags & BPF_O_CLOEXEC) {
         handle0->cloexec = true;
     }
     auto handle1 = std::make_shared<HostFd>(host_fds[1]);
-    if (flags & O_CLOEXEC) {
+    if (flags & BPF_O_CLOEXEC) {
         handle1->cloexec = true;
     }
     // 两端在同一个 mutate 内分配，保证不抢同号。Linux 不要求两端连续，从 fd0+1 找
@@ -146,7 +147,16 @@ int64_t PosixSyscall::do_fcntl(vm* v) {
 
     uint64_t arg = v->r(3);
     int rc = -1;
-    if (cmd == F_GETLK) {
+    if (cmd == F_GETFL) {
+        // 宿主 -> guest 反向重排（见 guest_abi.h）
+        rc = fcntl(hfd, F_GETFL);
+        if(rc >= 0) {
+            rc = host_fgetfl_to_guest(rc);
+        }
+    } else if (cmd == F_SETFL) {
+        // 可置位 flag 里只有 O_DIRECT 会错位（aarch64），其余同值
+        rc = fcntl(hfd, F_SETFL, guest_setfl_flags((unsigned)arg));
+    } else if (cmd == F_GETLK) {
         void* guest_arg = v->mmu_w(arg, sizeof(struct flock));
         if(guest_arg == nullptr) {
             return -EFAULT;

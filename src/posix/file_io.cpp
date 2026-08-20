@@ -60,7 +60,7 @@ int64_t PosixSyscall::do_openat(vm* v) {
     std::shared_ptr<Fd> handle = ResolvePath(this, guest_abs_path(path, dirfd))->open(flags, mode);
     if(!handle) return -errno;
 
-    if(flags & O_CLOEXEC) handle->cloexec = true;
+    if(flags & BPF_O_CLOEXEC) handle->cloexec = true;
     return ps->fds_emplace(std::move(handle));
 }
 

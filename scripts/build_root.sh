@@ -15,6 +15,15 @@ make_ld_wrapper
 ROOT_BIN_DIR="${ROOT_DIR}/root/bin"
 mkdir -p "${ROOT_BIN_DIR}"
 
+build_header() {
+    echo "Copy headers..."
+    mkdir -p "${ROOT_DIR}/root/include"
+    cp -vf "${ROOT_DIR}/include/bpf_syscall.h" "${ROOT_DIR}/root/include/"
+    cp -rvf "${ROOT_DIR}/include/asm"          "${ROOT_DIR}/root/include/"
+    cp -rvf "${ROOT_DIR}/include/asm-generic"  "${ROOT_DIR}/root/include/"
+    cp -rvf "${ROOT_DIR}/include/linux"        "${ROOT_DIR}/root/include/"
+}
+
 # 构建 musl（BPF 目标的 C 标准库）。musl/build.sh 交叉编译产出 libc.a 和头，
 # 直接安装到 root/{include,lib}（PREFIX=$ROOT_DIR/root，显式传入避免依赖默认）。
 build_musl() {
@@ -258,6 +267,7 @@ for comp in "$@"; do
     esac
 done
 
+build_header
 build_musl
 build_libc_bpfso
 build_libcxx

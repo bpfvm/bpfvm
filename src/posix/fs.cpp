@@ -141,7 +141,7 @@ std::shared_ptr<Fd> HostFd::clone() const {
 // 前缀；DevFd::open 委托开标准设备时直接用 /dev/null 等绝对路径，不经 chroot）。
 std::shared_ptr<HostFd> HostFd::open(const std::string& host_path, int flags, mode_t mode,
                                      std::string guest_abs) {
-    int fd = ::openat(AT_FDCWD, host_path.c_str(), flags, mode);
+    int fd = ::openat(AT_FDCWD, host_path.c_str(), guest_open_flags((unsigned)flags), mode);
     if(fd < 0) return nullptr;   // errno 已由 openat 设
     return std::make_shared<HostFd>(fd, std::move(guest_abs));
 }
@@ -461,7 +461,8 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
         // 打开 host slave，包成 DevFd，携带同一 GuestTty（与 master 共享）。
         char slave_name[64];
         snprintf(slave_name, sizeof(slave_name), "/dev/pts/%d", ptn);
-        int slave = ::open(slave_name, flags & ~O_CREAT, mode);
+        // guest -> 宿主位重排（见 guest_abi.h），另剥 O_CREAT
+        int slave = ::open(slave_name, guest_open_flags((unsigned)flags & ~BPF_O_CREAT), mode);
         if(slave < 0) return nullptr;   // errno 已由 open 设
         return std::make_shared<DevFd>(slave, guest_abs, tty);
     }
@@ -604,7 +605,7 @@ std::shared_ptr<Fd> DevPath::open(int flags, mode_t mode) {
     if(info && info->kind == DevInfo::Symlink) {
         // O_NOFOLLOW：末段是符号链接，按 open(2) 判 ELOOP（do_openat 不看此 flag，
         // 虚拟符号链接须自查）。
-        if(flags & O_NOFOLLOW) { errno = ELOOP; return nullptr; }
+        if(flags & BPF_O_NOFOLLOW) { errno = ELOOP; return nullptr; }
         // follow target（/proc/self/fd/N，经 ResolvePath 重解析）。
         return ResolvePath(self, info->link)->open(flags, mode);
     }
