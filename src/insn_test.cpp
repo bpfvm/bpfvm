@@ -1603,6 +1603,178 @@ void test_atomic64_xor_fetch() {
     assert(success);
 }
 
+// ---------------------------------------------------------------------------
+// RFC 9669 w32 零扩展语义回归
+// ---------------------------------------------------------------------------
+
+// 单次运行，收集 exit 值与 data_mem（0x2000, 64B）终态。断言只走内存副作用与
+// 返回值——这是两种执行引擎一致的契约（r6-r9 退出后解释器为帧恢复值、JIT 为
+// 物理终值，不可断言）。解释器/JIT 覆盖由 ctest 变体提供（unit_tests 默认阈值
+// 下直线程序走解释器；unit_tests_jit 设 JIT_THRESHOLD=1 强制 JIT）。
+static bool run_case(const bpf_insn* insns, size_t n, uint64_t mem_init,
+                     uint64_t* ret_out, uint64_t mem_out[6]) {
+    auto ebpf_vm = vm::create();
+    unsigned char* data_mem = nullptr;
+    if (!add_data_mem(*ebpf_vm, 0x2000, 64, &data_mem)) return false;
+    *(uint64_t*)data_mem = mem_init;
+    if (!load_program_to_vm(ebpf_vm, insns, n)) return false;
+    *ret_out = ebpf_vm->run(&option);
+    memcpy(mem_out, data_mem, 48);
+    return true;
+}
+
+static void lddw_insn(bpf_insn* p, uint8_t dst, uint64_t val) {
+    p[0] = { BPF_LD | BPF_IMM | BPF_DW, dst, 0, 0, (int32_t)(uint32_t)val };
+    p[1] = { 0, 0, 0, 0, (int32_t)(uint32_t)(val >> 32) };
+}
+
+static constexpr uint64_t W32_DIRTY_HI = 0xdeadbeef00000000ULL;
+
+static bool w32_case_check(const char* case_name, uint64_t ret, const uint64_t mem[6],
+                           uint64_t want_ret, const uint64_t want_mem[6]) {
+    bool ok = (ret == want_ret);
+    for (int i = 0; i < 6; i++) ok &= (mem[i] == want_mem[i]);
+    if (!ok) {
+        fprintf(stderr, "  FAIL[%s]: ret=0x%llx (want 0x%llx) mem=%llx,%llx,%llx,%llx,%llx,%llx"
+                " (want %llx,%llx,%llx,%llx,%llx,%llx)\n", case_name,
+                (unsigned long long)ret, (unsigned long long)want_ret,
+                (unsigned long long)mem[0], (unsigned long long)mem[1],
+                (unsigned long long)mem[2], (unsigned long long)mem[3],
+                (unsigned long long)mem[4], (unsigned long long)mem[5],
+                (unsigned long long)want_mem[0], (unsigned long long)want_mem[1],
+                (unsigned long long)want_mem[2], (unsigned long long)want_mem[3],
+                (unsigned long long)want_mem[4], (unsigned long long)want_mem[5]);
+    }
+    return ok;
+}
+
+// RFC 9669 5.3 CMPXCHG："In either case, the value that was at dst + offset
+// before the operation is zero-extended and loaded back to R0."
+// 脏高位只有手搓指令流能构造（clang 物化 u32 操作数自带零扩展）；x86 cmpxchg
+// 命中时 RAX 不被硬件写，零扩展依赖发射器显式补的 mov eax,eax，本用例守护之。
+void test_atomic32_cmpxchg_zext() {
+    std::cout << "--- Running Test: test_atomic32_cmpxchg_zext ---" << std::endl;
+    bool success = true;
+    // 成功：mem 初值 0x11223344 == r0 低 32 -> mem <- src 低 32，r0 = zext(旧 mem)
+    {
+        bpf_insn prog[10];
+        int n = 0;
+        lddw_insn(&prog[n], 1, 0x2000); n += 2;
+        lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x55667788); n += 2;
+        lddw_insn(&prog[n], 0, W32_DIRTY_HI | 0x11223344); n += 2;
+        prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_CMPXCHG };
+        prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 0, 8, 0 };
+        prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 16, 0 };
+        prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+
+        uint64_t ret; uint64_t mem[6];
+        { [[maybe_unused]] bool ok = run_case(prog, n, 0x11223344, &ret, mem); assert(ok); }
+        // src 不被 CMPXCHG 修改（RFC 只写 R0），保留脏高位
+        uint64_t want_mem[6] = { 0x55667788, 0x11223344, W32_DIRTY_HI | 0x55667788, 0, 0, 0 };
+        success &= w32_case_check("cmpxchg/success", ret, mem, 0x11223344, want_mem);
+    }
+    // 失败：mem 初值 0xaabbccdd != r0 低 32 -> mem 不变，r0 = zext(旧 mem)
+    {
+        bpf_insn prog[10];
+        int n = 0;
+        lddw_insn(&prog[n], 1, 0x2000); n += 2;
+        lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x55667788); n += 2;
+        lddw_insn(&prog[n], 0, W32_DIRTY_HI | 0x11223344); n += 2;
+        prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_CMPXCHG };
+        prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 0, 8, 0 };
+        prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 16, 0 };
+        prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+
+        uint64_t ret; uint64_t mem[6];
+        { [[maybe_unused]] bool ok = run_case(prog, n, 0xaabbccdd, &ret, mem); assert(ok); }
+        uint64_t want_mem[6] = { 0xaabbccdd, 0xaabbccdd, W32_DIRTY_HI | 0x55667788, 0, 0, 0 };
+        success &= w32_case_check("cmpxchg/fail", ret, mem, 0xaabbccdd, want_mem);
+    }
+    print_test_result("test_atomic32_cmpxchg_zext", success);
+    assert(success);
+}
+
+// RFC 9669 5.3 FETCH："the operation also overwrites src with the value that
+// was in memory before it was modified"（32 位内存旧值零扩展写入 src）。
+// 覆盖 add|xchg|or|xor 四种 FETCH 路径（x86：lock xadd / xchg / CAS 循环）。
+void test_atomic32_fetch_zext() {
+    std::cout << "--- Running Test: test_atomic32_fetch_zext ---" << std::endl;
+    bpf_insn prog[20];
+    int n = 0;
+    lddw_insn(&prog[n], 1, 0x2000); n += 2;
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x11111111); n += 2;
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_ADD | BPF_FETCH };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 8, 0 };
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0xaaaaaaaa); n += 2;
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_XCHG };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 16, 0 };
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x0000f00f); n += 2;
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_OR | BPF_FETCH };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 24, 0 };
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x000000ff); n += 2;
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_W, 1, 2, 0, BPF_XOR | BPF_FETCH };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 32, 0 };
+    prog[n++] = { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 };
+    prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+
+    uint64_t ret; uint64_t mem[6];
+    { [[maybe_unused]] bool ok = run_case(prog, n, 0x11223344, &ret, mem); assert(ok); }
+    // add|fetch: mem 0x11223344+0x11111111=0x22334455，r2=zext(0x11223344)
+    // xchg:      mem <- 0xaaaaaaaa，r2=zext(0x22334455)
+    // or|fetch:  mem <- 0xaaaafaaf，r2=zext(0xaaaaaaaa)
+    // xor|fetch: mem <- 0xaaaafa50，r2=zext(0xaaaafaaf)
+    uint64_t want_mem[6] = { 0xaaaafa50, 0x11223344, 0x22334455, 0xaaaaaaaa, 0xaaaafaaf, 0 };
+    bool success = w32_case_check("fetch", ret, mem, 0xaaaafaaf, want_mem);
+    print_test_result("test_atomic32_fetch_zext", success);
+    assert(success);
+}
+
+// RFC 9669 5：模零时 "for ALU the upper 32 bits of the destination register
+// are zeroed"。imm 除数的模零路径无 32 位写，零扩展由 MOD 分支就地完成。
+void test_alu32_mod_zero_imm_zext() {
+    std::cout << "--- Running Test: test_alu32_mod_zero_imm_zext ---" << std::endl;
+    bpf_insn prog[8];
+    int n = 0;
+    lddw_insn(&prog[n], 1, 0x2000); n += 2;
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x55667788); n += 2;
+    prog[n++] = { BPF_ALU | BPF_MOD | BPF_K, 2, 0, 0, 0 };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 0, 0 };
+    prog[n++] = { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 };
+    prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+
+    uint64_t ret; uint64_t mem[6];
+    { [[maybe_unused]] bool ok = run_case(prog, n, 0, &ret, mem); assert(ok); }
+    uint64_t want_mem[6] = { 0x55667788, 0, 0, 0, 0, 0 };
+    bool success = w32_case_check("mod0", ret, mem, 0x55667788, want_mem);
+    print_test_result("test_alu32_mod_zero_imm_zext", success);
+    assert(success);
+}
+
+// RFC 9669 5：w32 no-op 立即数（add/xor/lsh 0、mul/div 1）仍要求
+// dst = (u32)(dst op imm)。JIT 的 no-op 窥孔跳过指令发射，零扩展由窥孔就地完成。
+void test_alu32_noop_imm_zext() {
+    std::cout << "--- Running Test: test_alu32_noop_imm_zext ---" << std::endl;
+    bpf_insn prog[12];
+    int n = 0;
+    lddw_insn(&prog[n], 1, 0x2000); n += 2;
+    lddw_insn(&prog[n], 2, W32_DIRTY_HI | 0x55667788); n += 2;
+    prog[n++] = { BPF_ALU | BPF_ADD | BPF_K, 2, 0, 0, 0 };
+    prog[n++] = { BPF_ALU | BPF_XOR | BPF_K, 2, 0, 0, 0 };
+    prog[n++] = { BPF_ALU | BPF_LSH | BPF_K, 2, 0, 0, 0 };
+    prog[n++] = { BPF_ALU | BPF_MUL | BPF_K, 2, 0, 0, 1 };
+    prog[n++] = { BPF_ALU | BPF_DIV | BPF_K, 2, 0, 0, 1 };
+    prog[n++] = { BPF_STX | BPF_MEM | BPF_DW, 1, 2, 0, 0 };
+    prog[n++] = { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 };
+    prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+
+    uint64_t ret; uint64_t mem[6];
+    { [[maybe_unused]] bool ok = run_case(prog, n, 0, &ret, mem); assert(ok); }
+    uint64_t want_mem[6] = { 0x55667788, 0, 0, 0, 0, 0 };
+    bool success = w32_case_check("noop_imm", ret, mem, 0x55667788, want_mem);
+    print_test_result("test_alu32_noop_imm_zext", success);
+    assert(success);
+}
+
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
     setenv("BPF_TEST_NO_CLEAN_MMAP", "1", 1);
@@ -1703,6 +1875,11 @@ int main() {
     test_atomic64_or_fetch();
     test_atomic64_and_fetch();
     test_atomic64_xor_fetch();
+    // RFC 9669 w32 零扩展回归
+    test_atomic32_cmpxchg_zext();
+    test_atomic32_fetch_zext();
+    test_alu32_mod_zero_imm_zext();
+    test_alu32_noop_imm_zext();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

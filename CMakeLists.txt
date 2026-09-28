@@ -124,6 +124,9 @@ endif()
 
 if(BUILD_TESTING)
     add_test(NAME unit_tests COMMAND bpfvm_test)
+    # 强制 JIT 变体：JIT_THRESHOLD=1 使每个 pc 首次命中即编译，全部用例在 JIT 下复跑
+    add_test(NAME unit_tests_jit COMMAND bpfvm_test)
+    set_tests_properties(unit_tests_jit PROPERTIES ENVIRONMENT "JIT_THRESHOLD=1")
 
     add_test(
         NAME bpf_programs_build
