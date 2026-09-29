@@ -108,7 +108,7 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     if(!fresh->setup_stack(argv_strings, envp_map, load_info)) {
         return -E2BIG;
     }
-    if(!fresh->mmu(entry)) {
+    if(!fresh->mmu(entry, sizeof(bpf_insn))) {
         return -ENOEXEC;
     }
     // exec 替换整个进程映像：按 POSIX/Linux 语义，同进程其它线程必须终止，只剩调用 exec

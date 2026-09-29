@@ -557,6 +557,10 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
 
     // Bounds check 2: addr + size <= guest_end
     add_imm(X2, X0, access_size, true);
+    // 回绕检查：addr+size 溢出 2^64 时 X2 反而变小，仅凭范围比较会误判命中
+    cmp_reg(X2, X0, true);
+    ctx.miss_jumps.push_back(size());
+    emit_insn(0x54000000u | ARMCond::CC); // B.cc (end < addr -> slow)
     ldr_imm(X1, X15, off_ge, true);
     cmp_reg(X2, X1, true);
     ctx.miss_jumps.push_back(size());

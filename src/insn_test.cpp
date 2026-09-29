@@ -1,3 +1,4 @@
+#include <elf.h>
 #include "insn.h"
 #include "include/bpf_syscall.h"
 #include <iostream>
@@ -11,6 +12,10 @@
 #include <signal.h>
 #include "posix/posix_syscall.h"
 #include "empty_syscall.h"
+
+#ifndef EM_BPF
+#define EM_BPF 247
+#endif
 
 // Helper function to print test results
 void print_test_result(const std::string& test_name, bool success) {
@@ -1775,6 +1780,115 @@ void test_alu32_noop_imm_zext() {
     assert(success);
 }
 
+// ---------------------------------------------------------------------------
+// 边界检查回归（安全修复守护用例）
+// ---------------------------------------------------------------------------
+
+// 程序被内存违例终止时 run() 的契约返回值（log_mem_violation 置 VM_KILLED 并写 r0）
+static bool run_killed_by_violation(std::shared_ptr<vm> ebpf_vm, const bpf_insn* insns, size_t n) {
+    if (!load_program_to_vm(ebpf_vm, insns, n)) return false;
+    uint64_t ret = ebpf_vm->run(&option);
+    return ret == 128 + SIGKILL && (ebpf_vm->get_flags() & vm::VM_KILLED);
+}
+
+// addr+size 溢出 2^64 的访存（wrap_addr = 2^64-8，+8 回绕）必须被拒：
+// JIT 快路径回绕、helper 慢路径回绕、解释器 mmu 溢出检查共用本构造。
+// unit_tests 默认阈值下走解释器（解释器 mmu 历来有溢出检查），unit_tests_jit
+// （JIT_THRESHOLD=1）走 JIT 快/慢路径，是本用例的主战场。
+void test_mem_wraparound_rejected() {
+    std::cout << "--- Running Test: test_mem_wraparound_rejected ---" << std::endl;
+    constexpr uint64_t wrap_addr = 0xFFFFFFFFFFFFFFF8ULL;
+    auto make_loop = [&](bpf_insn mem_op) {
+        bpf_insn prog[10];
+        int n = 0;
+        lddw_insn(&prog[n], 1, wrap_addr); n += 2;
+        lddw_insn(&prog[n], 6, 200); n += 2;
+        prog[n++] = mem_op;                                          // idx 4: loop head
+        prog[n++] = { BPF_ALU64 | BPF_ADD | BPF_K, 6, 0, 0, -1 };    // idx 5
+        prog[n++] = { BPF_JMP | BPF_JNE | BPF_K, 6, 0, -3, 0 };      // idx 6: r6!=0 回跳 idx4
+        prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };              // idx 7
+        return run_killed_by_violation(vm::create(), prog, n);
+    };
+    bool success = true;
+    success &= make_loop({ BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 0, 0 });
+    success &= make_loop({ BPF_STX | BPF_MEM | BPF_DW, 1, 0, 0, 0 });
+    success &= make_loop({ BPF_STX | BPF_ATOMIC | BPF_DW, 1, 2, 0, BPF_ADD });
+    print_test_result("test_mem_wraparound_rejected", success);
+    assert(success);
+}
+
+// 数据段恰好一页：段尾最后一个字节的 DW 访问越过宿主 mmap 边界，必须被拒
+// （mmu 须按实访问宽度检查，而非默认 1 字节）。JIT 路径本就传全宽，主守护解释器。
+void test_ldx_stx_segment_end_rejected() {
+    std::cout << "--- Running Test: test_ldx_stx_segment_end_rejected ---" << std::endl;
+    long page_size = sysconf(_SC_PAGESIZE);
+    const uint64_t seg_end = 0x2000 + page_size;
+    auto make_case = [&](bpf_insn mem_op) {
+        auto ebpf_vm = vm::create();
+        unsigned char* data_mem = nullptr;
+        if (!add_data_mem(*ebpf_vm, 0x2000, 64, &data_mem)) return false;
+        bpf_insn prog[6];
+        int n = 0;
+        lddw_insn(&prog[n], 1, seg_end - 1); n += 2;
+        prog[n++] = mem_op;
+        prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+        return run_killed_by_violation(ebpf_vm, prog, n);
+    };
+    bool success = true;
+    success &= make_case({ BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 0, 0 });
+    success &= make_case({ BPF_STX | BPF_MEM | BPF_DW, 1, 0, 0, 0 });
+    success &= make_case({ BPF_STX | BPF_ATOMIC | BPF_DW, 1, 2, 0, BPF_ADD });
+    print_test_result("test_ldx_stx_segment_end_rejected", success);
+    assert(success);
+}
+
+// PT_LOAD p_filesz 超过 p_memsz 决定的映射：加载必须在 pread 前拒绝，
+// 否则按文件长度直写宿主 mmap 越界。正例（filesz==memsz）守护不误伤正常 ELF。
+void test_load_elf_filesz_overflow_rejected() {
+    std::cout << "--- Running Test: test_load_elf_filesz_overflow_rejected ---" << std::endl;
+    // p_offset=0x1000, p_vaddr=0x1000, 文件 0x3000 字节
+    auto make_elf = [](uint64_t filesz, uint64_t memsz) {
+        std::vector<unsigned char> buf(0x3000, 0);
+        Elf64_Ehdr eh{};
+        memcpy(eh.e_ident, ELFMAG, SELFMAG);
+        eh.e_ident[EI_CLASS] = ELFCLASS64;
+        eh.e_ident[EI_DATA] = ELFDATA2LSB;
+        eh.e_type = ET_EXEC;
+        eh.e_machine = EM_BPF;
+        eh.e_entry = 0x1000;
+        eh.e_phoff = sizeof(Elf64_Ehdr);
+        eh.e_phentsize = sizeof(Elf64_Phdr);
+        eh.e_phnum = 1;
+        memcpy(buf.data(), &eh, sizeof(eh));
+        Elf64_Phdr ph{};
+        ph.p_type = PT_LOAD;
+        ph.p_flags = PF_R | PF_X;
+        ph.p_offset = 0x1000;
+        ph.p_vaddr = 0x1000;
+        ph.p_filesz = filesz;
+        ph.p_memsz = memsz;
+        memcpy(buf.data() + sizeof(Elf64_Ehdr), &ph, sizeof(ph));
+        return buf;
+    };
+    auto try_load = [&](const std::vector<unsigned char>& buf) {
+        char tmpl[] = "/tmp/bpfvm_test_elfXXXXXX";
+        int fd = mkstemp(tmpl);
+        assert(fd >= 0);
+        unlink(tmpl);
+        assert(write(fd, buf.data(), buf.size()) == (ssize_t)buf.size());
+        ElfLoadInfo info = load_elf(fd, "poc", [](memmap&&) {}, {});
+        close(fd);
+        return info;
+    };
+    bool success = true;
+    // p_filesz=0x1800 > 映射 0x1000（memsz=0x1000 页取整）：必须拒绝
+    success &= (try_load(make_elf(0x1800, 0x1000)).entry == 0);
+    // filesz == memsz：正常加载
+    success &= (try_load(make_elf(0x40, 0x40)).entry == 0x1000);
+    print_test_result("test_load_elf_filesz_overflow_rejected", success);
+    assert(success);
+}
+
 int main() {
     std::cout << "Starting eBPF VM Tests..." << std::endl;
     setenv("BPF_TEST_NO_CLEAN_MMAP", "1", 1);
@@ -1880,6 +1994,11 @@ int main() {
     test_atomic32_fetch_zext();
     test_alu32_mod_zero_imm_zext();
     test_alu32_noop_imm_zext();
+
+    // 边界检查回归（安全修复守护用例）
+    test_mem_wraparound_rejected();
+    test_ldx_stx_segment_end_rejected();
+    test_load_elf_filesz_overflow_rejected();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

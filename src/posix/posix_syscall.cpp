@@ -264,7 +264,7 @@ int64_t PosixSyscall::do_clock_gettime(vm* v) {
 }
 
 int64_t PosixSyscall::do_nanosleep(vm* v) {
-    const struct timespec* req = static_cast<const struct timespec*>(v->mmu(v->r(1)));
+    const struct timespec* req = static_cast<const struct timespec*>(v->mmu(v->r(1), sizeof(struct timespec)));
     if(req == nullptr) {
         return -EFAULT;
     }

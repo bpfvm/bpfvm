@@ -28,7 +28,7 @@ bool PosixSyscall::read_c_string_array(vm* v, uint64_t addr, std::vector<std::st
         return true;
     }
     for(size_t i = 0; i < max_count; i++) {
-        void* p = v->mmu(addr + i * sizeof(uint64_t));
+        void* p = v->mmu(addr + i * sizeof(uint64_t), sizeof(uint64_t));
         if(p == nullptr) {
             return false;
         }
@@ -275,7 +275,7 @@ int64_t PosixSyscall::do_utimensat(vm* v) {
     struct timespec* times_ptr = nullptr;
 
     if (times_addr != 0) {
-        int64_t* raw = (int64_t*)v->mmu(times_addr);
+        int64_t* raw = (int64_t*)v->mmu(times_addr, 4 * sizeof(int64_t));
         if (raw == nullptr) {
             return -EFAULT;
         }

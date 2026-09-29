@@ -653,6 +653,10 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
     // 使用 RCX（scratch）而非 RDX（BPF r5），避免破坏 BPF 寄存器
     emit8(0x48); emit8(0x8D); emit8(0x88);                   // lea rcx, [rax + disp32]
     emit32((uint32_t)access_size);
+    // 回绕检查：addr+size 溢出 2^64 时 rcx 反而变小，仅凭范围比较会误判命中
+    emit8(0x48); emit8(0x39); emit8(0xC1);                   // cmp rcx, rax
+    ctx.miss_jumps.push_back(size());
+    emit8(0x0F); emit8(0x82); emit32(0);                     // JB .slow
     // cmp rcx, [rbp + r11 + guest_end]
     emit8(0x4A); emit8(0x3B);
     emit8(0x8C);  // ModRM: mod=10, reg=RCX(1), rm=100(SIB)
