@@ -1274,6 +1274,10 @@ bool vm::step() {
         log_mem_violation("exec", pc_);
         return false;
     }
+    if(cur->dst_reg > 10 || cur->src_reg > 10) {
+        log_mem_violation("register number", pc_);
+        return false;
+    }
     if(options.verbose) {
         std::lock_guard<std::mutex> lock(log_mutex);
         printf("[#%d] ", options.sys->id());

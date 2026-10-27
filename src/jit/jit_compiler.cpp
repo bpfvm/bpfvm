@@ -586,6 +586,11 @@ JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         if (!reachable[i]) continue;
         pc_offsets[i] = (uint32_t)e.size();
 
+        if (entry_pc[i].dst_reg > 10 || entry_pc[i].src_reg > 10) {
+            mark_failed();
+            return nullptr;
+        }
+
         // Safepoint at back-edge targets (loop headers)
         if (back_edge_targets[i]) {
             // 本 safepoint 所在 BPF 指令（循环头）的 guest pc：信号处理返回后应

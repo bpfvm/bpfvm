@@ -1791,6 +1791,47 @@ static bool run_killed_by_violation(std::shared_ptr<vm> ebpf_vm, const bpf_insn*
     return ret == 128 + SIGKILL && (ebpf_vm->get_flags() & vm::VM_KILLED);
 }
 
+// 寄存器号越界守护：dst_reg/src_reg 是 4-bit 编码（0..15），reg[] 只有 11 项且 r(n)
+// 不查界——r11..r15 别名紧随其后的 vm 内部字段（flags/jit_scratch/insn_count/
+// tlb[0].guest_base/guest_end），原子 FETCH 变体还会把 guest 内存值写回 src_reg，
+// 可借此改写 VM 内部状态、伪造 TLB 条目（未映射 guest 地址获得宿主指针）。
+// 守护：>10 一律按非法指令终止，且 TLB 不得被伪造（run 后 mmu(未映射地址) 为 nullptr）。
+void test_reg_index_oob_rejected() {
+    std::cout << "--- Running Test: test_reg_index_oob_rejected ---" << std::endl;
+    // DATA 与 BOGUS 都选 tlb_index==0 的页（(>>12)^(>>20) 折叠后 & 2047 == 0），
+    // 复现攻击路径：数据段先填槽 0，伪造后 BOGUS 经同槽命中伪条目。
+    const uint64_t DATA  = 0x2000000000000ULL;
+    const uint64_t BOGUS = 0x3000000000000ULL;
+
+    auto ebpf_vm = vm::create();
+    unsigned char* host_data = nullptr;
+    assert(add_data_mem(*ebpf_vm, DATA, 4096, &host_data));
+    *(uint64_t*)(host_data + 0) = 0x0000000000000000ULL;  // 未拦截时经 src_reg=14 写入 tlb[0].guest_base
+    *(uint64_t*)(host_data + 8) = 0xFFFFFFFFFFFFFFFFULL;  // 未拦截时经 src_reg=15 写入 tlb[0].guest_end
+
+    bpf_insn prog[6];
+    int n = 0;
+    lddw_insn(&prog[n], 1, DATA); n += 2;
+    // stx atomic xchg [r1+8], r15 / [r1+0], r14：src_reg 越界别名 vm 内部字段
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_DW, 1, 15, 8, BPF_XCHG };
+    prog[n++] = { BPF_STX | BPF_ATOMIC | BPF_DW, 1, 14, 0, BPF_XCHG };
+    prog[n++] = { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 };
+    if (!load_program_to_vm(ebpf_vm, prog, n)) { assert(false); }
+    uint64_t ret = ebpf_vm->run(&option);
+    bool success = (ret == 128 + SIGKILL) && (ebpf_vm->get_flags() & vm::VM_KILLED);
+    success &= ebpf_vm->mmu(BOGUS, 8) == nullptr;    // TLB 未被伪造（读路径）
+    success &= ebpf_vm->mmu_w(BOGUS, 8) == nullptr;  // 写路径同样拦截
+
+    // alu64 的 src_reg 越界读（泄漏 jit_scratch 等 vm 内部字段）同样必须拒绝
+    bpf_insn prog2[] = {
+        { BPF_ALU64 | BPF_MOV | BPF_X, 0, 12, 0, 0 },  // mov r0, r12
+        { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }
+    };
+    success &= run_killed_by_violation(vm::create(), prog2, 2);
+    print_test_result("test_reg_index_oob_rejected", success);
+    assert(success);
+}
+
 // addr+size 溢出 2^64 的访存（wrap_addr = 2^64-8，+8 回绕）必须被拒：
 // JIT 快路径回绕、helper 慢路径回绕、解释器 mmu 溢出检查共用本构造。
 // unit_tests 默认阈值下走解释器（解释器 mmu 历来有溢出检查），unit_tests_jit
@@ -1999,6 +2040,7 @@ int main() {
     test_mem_wraparound_rejected();
     test_ldx_stx_segment_end_rejected();
     test_load_elf_filesz_overflow_rejected();
+    test_reg_index_oob_rejected();
 
     std::cout << "All eBPF VM Tests completed." << std::endl;
     return 0;

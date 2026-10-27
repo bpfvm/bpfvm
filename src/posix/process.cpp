@@ -262,17 +262,16 @@ int64_t PosixSyscall::do_clone(vm* v) {
             child_map.flags = map.flags;
             child_map.path = map.path;
 
-            if(map.flags & PF_W) {
-                if(!map.cow_data && map.data.get_deleter().owned) {
-                    map.cow_data = std::shared_ptr<unsigned char>(
-                        map.data.get(), DataDeleter{map.data.get_deleter().size, true});
-                    map.data.get_deleter().owned = false;
-                }
-                child_map.set_data(map.data.get(), map.size, false);
-                child_map.cow_data = map.cow_data;
-            } else {
-                child_map.set_data(map.data.get(), map.size, false);
+            /* 所有段（含只读 text/rodata）都把宿主页所有权转进 cow_data 共享给子进程：
+             * 可写段供 CoW 分叉，只读段是纯生命周期引用——否则父进程 exec 换 maps 时
+             * 旧 RO 页被 munmap，仍在运行的子进程取指/读常量即 use-after-unmap。 */
+            if(!map.cow_data && map.data.get_deleter().owned) {
+                map.cow_data = std::shared_ptr<unsigned char>(
+                    map.data.get(), DataDeleter{map.data.get_deleter().size, true});
+                map.data.get_deleter().owned = false;
             }
+            child_map.set_data(map.data.get(), map.size, false);
+            child_map.cow_data = map.cow_data;
             child->addmem(std::move(child_map));
         }
         /* emutls 的 fork 继承无需 VM 介入：副本数组经一个 pthread_key 挂在
@@ -282,11 +281,11 @@ int64_t PosixSyscall::do_clone(vm* v) {
     if(share_vm) {
         v->flush_tlb();
     } else {
-        /* fork（非 CLONE_VM）就地修改父地址空间：每段 writable map 建立 cow_data、
-         * data.owned 置 false。父线程组里其它线程（如 pthread_create 出来的 worker）的
-         * TLB 此时是陈旧的——条目仍是 cow=false、host_base 指向原页，会绕过 CoW 直接写
-         * 共享页，破坏 CoW 不变式。必须把同组所有线程的 TLB 一并刷新（仅 v->flush_tlb()
-         * 只清了调用线程）。CLONE_THREAD 不改 maps，无需此步。 */
+        /* fork（非 CLONE_VM）就地修改父地址空间。父线程组里其它线程（如
+         * pthread_create 出来的 worker）的 TLB 此时是陈旧的——条目仍是 cow=false、
+         * host_base 指向原页，会绕过 CoW 直接写共享页，破坏 CoW 不变式。必须把同组
+         * 所有线程的 TLB 一并刷新（仅 v->flush_tlb() 只清了调用线程）。
+         * CLONE_THREAD 不改 maps，无需此步。 */
         std::lock_guard<std::mutex> tlock(tg->mtx);
         for(auto& weak : tg->threads) {
             if(auto t = weak.lock()) t->flush_tlb();
