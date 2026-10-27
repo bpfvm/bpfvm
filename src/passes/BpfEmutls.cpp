@@ -330,7 +330,7 @@ struct BpfEmutlsPass : public PassInfoMixin<BpfEmutlsPass> {
     // `call @__cxa_atexit(dtor, &var, dso)`：把 dtor 回填进 var 对应的控制块，并删除该
     // call。识别条件是被调函数名为 __cxa_atexit，且 arg1（对象地址）经 stripPointerCasts
     // 后是某个 emutls 全局。arg0=dtor 经 bitcast 到 ptr 存入控制块；arg2（dso）不提取
-    //——BPF 无 dlopen/dlclose，运行时不使用。
+    //——musl 的 dlclose 仅校验句柄、从不卸载 DSO，运行期不存在 DSO 卸载，dso 无消费者。
     void collectDtors(Module &M,
                       const DenseMap<GlobalVariable *, GlobalVariable *> &CtrlOf) {
         Type *PtrTy = PointerType::get(M.getContext(), 0);
