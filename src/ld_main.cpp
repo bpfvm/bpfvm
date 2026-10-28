@@ -147,6 +147,13 @@ int main(int argc, char** argv) {
             if (!v) return 1;
             opt.entry_name = v; continue;
         }
+        // -export-dynamic / -E / -rdynamic：把主程序全局符号导出到 .dynsym。DYNAMIC_EXE
+        // 模式本来就无条件导出全部非 hidden 全局符号，识别后即 no-op——但必须在 -e<name>
+        // 紧凑形式之前判断，否则 "-export-dynamic" 会被吞成 -e + "xport-dynamic" 入口符号。
+        if (a == "--export-dynamic" || a == "-export-dynamic" || a == "-E" ||
+            a == "-rdynamic" || a == "--export_dynamic") {
+            continue;
+        }
         if (a.substr(0, 2) == "-e" && a.size() > 2) { opt.entry_name = a.substr(2); continue; }
 
         // -o<file> / -o <file>
@@ -194,6 +201,7 @@ int main(int argc, char** argv) {
         if (a == "-target" || a == "-isystem" || a == "-I" || a == "-D" || a == "-include" ||
             a == "-mllvm" || a == "-Xclang" || a == "-add-plugin" || a == "-plugin-arg" ||
             a == "-x" ||
+            a == "-Xlinker" ||
             a == "-plugin" || a == "-rpath" || a == "-rpath-link" || a == "-T" ||
             // 标准 ld 带参数选项（bpfvm-ld 不实现其语义，但须吞掉参数避免被当输入文件）
             a == "-Map" || a == "-Script" || a == "-version-script" ||
