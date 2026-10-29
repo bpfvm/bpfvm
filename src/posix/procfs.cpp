@@ -5,6 +5,8 @@
 // PosixSyscall 上；经 PosixSyscall 的 public 进程标识
 // 字段（pid/ppid/tg/pgrp/session/comm_/ps）与 *_of 静态转发（options_of/maps_of/
 // flags_of）+ find_task/sys/list_pids 读 vm/进程内部。
+// 例外：与 gen_* 模拟数据同源的机器信息 syscall（uname/sysinfo）定义在本文件，
+// 保证 uname(2)/sysinfo(2) 与 /proc/version、/proc/meminfo、/proc/uptime 恒一致。
 //
 // /proc 基于 guest 绝对路径匹配（仿 /dev/tty、/dev/ptmx 等特殊设备），不拼 chroot
 // root 前缀。[pid] 用 guest 的 pid/tgid，完全按 guest 语义生成 —— 这是"模拟"而非
@@ -14,9 +16,11 @@
 // read 按 pos 切片。与 Linux 一致（进程改 argv 后 /proc 仍反映旧值）。
 //
 
+#define _GNU_SOURCE 1   // struct utsname 的 domainname 字段（glibc 下需 GNU 扩展；musl 恒有）
 #include "posix_internal.h"
 
 #include <sys/sysinfo.h>
+#include <sys/utsname.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -243,9 +247,24 @@ static std::string gen_cpuinfo() {
     return out;
 }
 
+// guest 视角的机器信息：gen_meminfo 与 do_sysinfo 共用的数据源。内存/负载固定
+// 模拟（宿主的 RAM/负载对 guest 这台"机器"无意义，且跨宿主不稳定），uptime 与
+// /proc/uptime 同源（CLOCK_MONOTONIC）。procs 由 do_sysinfo 补填（需读
+// PosixSyscall 内部的进程表，自由函数不可见）。
+static void fill_sysinfo(struct sysinfo* si) {
+    memset(si, 0, sizeof(*si));
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    si->uptime = ts.tv_sec;
+    si->totalram = 2ul << 30;   // 2 GiB
+    si->freeram = 1ul << 30;    // 1 GiB
+    si->mem_unit = 1;
+    si->procs = 1;
+}
+
 static std::string gen_meminfo() {
     struct sysinfo si;
-    sysinfo(&si);
+    fill_sysinfo(&si);
     // si.mem_unit 是字节单位（现代内核为 1）。转 kB：pages * mem_unit / 1024。
     unsigned long unit = si.mem_unit ? si.mem_unit : 1;
     auto kb = [unit](unsigned long pages) { return pages * unit / 1024; };
@@ -755,3 +774,40 @@ int ProcPath::access(int mode, int flags) {
     }
     return node.as<NoneGen>() ? -ENOENT : 0;
 }
+
+
+// =====================================================================
+// 机器信息 syscall：模拟字段与上节 gen_* 同源（uname.release/version 对
+// /proc/version，sysinfo 各项对 /proc/meminfo、/proc/uptime），不透传宿主。
+// =====================================================================
+
+int64_t PosixSyscall::do_uname(vm* v) {
+    struct utsname* buf = static_cast<struct utsname*>(v->mmu_w(v->r(1), sizeof(*buf)));
+    if(buf == nullptr) {
+        return -EFAULT;
+    }
+    // guest 输出跨宿主稳定，宿主机名等信息不进 guest。nodename 即 guest 的
+    // gethostname 结果（musl 无独立调用，经 uname 取）。
+    memset(buf, 0, sizeof(*buf));
+    strncpy(buf->sysname,    "Linux",        sizeof(buf->sysname) - 1);
+    strncpy(buf->nodename,   "bpfvm",        sizeof(buf->nodename) - 1);
+    strncpy(buf->release,    "6.12.0",       sizeof(buf->release) - 1);
+    strncpy(buf->version,    "#1 SMP bpfvm", sizeof(buf->version) - 1);
+    strncpy(buf->machine,    "bpf",          sizeof(buf->machine) - 1);
+    strncpy(buf->domainname, "(none)",       sizeof(buf->domainname) - 1);
+    return 0;
+}
+
+int64_t PosixSyscall::do_sysinfo(vm* v) {
+    // guest(musl) 与 glibc 的 struct sysinfo 在 64 位下布局一致（glibc 照抄内核 UAPI）
+    struct sysinfo* info = static_cast<struct sysinfo*>(v->mmu_w(v->r(1), sizeof(*info)));
+    if(info == nullptr) {
+        return -EFAULT;
+    }
+    fill_sysinfo(info);
+    // procs：本 VM 的存活 guest 进程数（进程表是 PosixSyscall 私有状态，在此补填）
+    std::lock_guard<std::mutex> lock(pid_map_mutex);
+    info->procs = (unsigned short)pid_map.size();
+    return 0;
+}
+

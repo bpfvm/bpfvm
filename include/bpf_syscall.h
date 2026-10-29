@@ -101,6 +101,15 @@
 #define BPF_SYS_GETGID          88  /* getgid() */
 #define BPF_SYS_GETEGID         89  /* getegid() */
 #define BPF_SYS_GETGROUPS       90  /* getgroups(size, gid_t list[]) — bpfvm 无补充组，返回 0 */
+#define BPF_SYS_CLOCK_NANOSLEEP 91  /* clock_nanosleep(clk, flags, req, rem) — time.sleep 主路径 */
+#define BPF_SYS_FSYNC           92  /* fsync(fd) — os.fsync / sqlite */
+#define BPF_SYS_FDATASYNC       93  /* fdatasync(fd) */
+#define BPF_SYS_UNAME           94  /* uname(utsname*) */
+#define BPF_SYS_SYSINFO         95  /* sysinfo(sysinfo*) */
+#define BPF_SYS_PPOLL           96  /* ppoll(pollfd*, nfds, timespec*, sigmask*) — ppoll_time64 复用 */
+#define BPF_SYS_SENDFILE        97  /* sendfile(out, in, off_t*, count) — shutil 快路径 */
+#define BPF_SYS_EVENTFD2        98  /* eventfd2(count, flags) — eventfd() 复用 */
+#define BPF_SYS_PRLIMIT64       99  /* prlimit64(pid, res, new*, old*) — musl getrlimit/setrlimit 转调 */
 
 #define BPF_CALL_BASE 0x10000u
 #define BPF_CALL_ID(id) (BPF_CALL_BASE + (uint32_t)(id))
@@ -199,6 +208,15 @@
 #define BPF_CALL_GETGID           BPF_CALL_ID(BPF_SYS_GETGID)
 #define BPF_CALL_GETEGID          BPF_CALL_ID(BPF_SYS_GETEGID)
 #define BPF_CALL_GETGROUPS        BPF_CALL_ID(BPF_SYS_GETGROUPS)
+#define BPF_CALL_CLOCK_NANOSLEEP  BPF_CALL_ID(BPF_SYS_CLOCK_NANOSLEEP)
+#define BPF_CALL_FSYNC            BPF_CALL_ID(BPF_SYS_FSYNC)
+#define BPF_CALL_FDATASYNC        BPF_CALL_ID(BPF_SYS_FDATASYNC)
+#define BPF_CALL_UNAME            BPF_CALL_ID(BPF_SYS_UNAME)
+#define BPF_CALL_SYSINFO          BPF_CALL_ID(BPF_SYS_SYSINFO)
+#define BPF_CALL_PPOLL            BPF_CALL_ID(BPF_SYS_PPOLL)
+#define BPF_CALL_SENDFILE         BPF_CALL_ID(BPF_SYS_SENDFILE)
+#define BPF_CALL_EVENTFD2         BPF_CALL_ID(BPF_SYS_EVENTFD2)
+#define BPF_CALL_PRLIMIT64        BPF_CALL_ID(BPF_SYS_PRLIMIT64)
 #define BPF_CALL_PSELECT6         BPF_CALL_ID(BPF_SYS_PSELECT6)
 
 #endif //BPF_SYSCALL_H

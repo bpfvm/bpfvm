@@ -3,6 +3,7 @@
 #include <asm/ioctl.h>
 #include <sys/ioctl.h>   // FIONBIO/FIONREAD（socket 非阻塞/可读字节查询，OpenSSL BIO 用）
 #include <sys/select.h>  // fd_set / FD_ZERO / FD_SET（do_pselect6）
+#include <sys/eventfd.h>
 
 int64_t PosixSyscall::do_umask(vm* v) {
     uint32_t new_mask = arg_u32(v->r(1));
@@ -317,27 +318,11 @@ int64_t PosixSyscall::do_ioctl(vm* v) {
     }
 }
 
-int64_t PosixSyscall::do_poll(vm* v) {
-    // guest/host 的 struct pollfd 布局一致（{int fd; short events; short revents;}），
-    // 故把 guest 数组当作 host 数组就地读写；唯一要做的是 guest fd -> host fd 翻译。
-    nfds_t n = arg_size(v->r(2));
-    int timeout = arg_s32(v->r(3));  // ms；负数=永久阻塞，0=非阻塞
-
-    // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE -> EINVAL。bpfvm 无 rlimit 概念，
-    // 给一个固定上限，避免 guest 传极大 n 导致下面的 vector(n) 全量构造时 bad_alloc/OOM。
-    if(n > 1024) {
-        return -EINVAL;
-    }
-
-    struct pollfd* gfds = nullptr;
-    if(n > 0) {
-        // 翻译整段数组（mmu_w 校验 [addr, addr+size) 全在映射范围内）。
-        gfds = static_cast<struct pollfd*>(v->mmu_w(v->r(1), sizeof(struct pollfd) * n));
-        if(gfds == nullptr) {
-            return -EFAULT;
-        }
-    }
-
+// poll/ppoll 的公共主体：guest fd -> host fd 翻译 + 阻塞宿主 poll + revents 回写。
+// guest/host 的 struct pollfd 布局一致（{int fd; short events; short revents;}），
+// 故把 guest 数组当作 host 数组就地读写。gfds 为已 mmu_w 翻译的 guest 数组
+// （n==0 时可为 nullptr）；timeout 毫秒精度，负数=永久阻塞。
+int64_t PosixSyscall::poll_core(struct pollfd* gfds, nfds_t n, int timeout) {
     // 构造 host 侧数组：合法 guest fd 翻译成对应 host fd；非法 guest fd（不在 ps->fds 表内）
     // 用 fd=-1 让宿主 poll 忽略该条，并在 guest 上预填 POLLNVAL（POSIX：fd 不打开算"事件"）。
     // guest fd<0（POSIX：忽略此条）同样置 host fd=-1，但 revents 清零。
@@ -394,6 +379,59 @@ int64_t PosixSyscall::do_poll(vm* v) {
     return rc + preset;
 }
 
+int64_t PosixSyscall::do_poll(vm* v) {
+    // n 上限：Linux 上 poll 会校验 nfds > RLIMIT_NOFILE -> EINVAL。bpfvm 无 rlimit 概念，
+    // 给一个固定上限，避免 guest 传极大 n 导致下面的 vector(n) 全量构造时 bad_alloc/OOM。
+    nfds_t n = arg_size(v->r(2));
+    if(n > 1024) {
+        return -EINVAL;
+    }
+
+    struct pollfd* gfds = nullptr;
+    if(n > 0) {
+        // 翻译整段数组（mmu_w 校验 [addr, addr+size) 全在映射范围内）。
+        gfds = static_cast<struct pollfd*>(v->mmu_w(v->r(1), sizeof(struct pollfd) * n));
+        if(gfds == nullptr) {
+            return -EFAULT;
+        }
+    }
+    // timeout(ms)：负数=永久阻塞，0=非阻塞
+    return poll_core(gfds, n, arg_s32(v->r(3)));
+}
+
+
+int64_t PosixSyscall::do_ppoll(vm* v) {
+    // ppoll(pollfd*, nfds, timespec* tmo, sigmask*, sigsetsize)。与 do_poll 共用 poll_core，
+    // 差异仅在超时来源（timespec 毫秒精度换算，NULL=永久阻塞）；sigmask 忽略（同 pselect6）。
+    nfds_t n = arg_size(v->r(2));
+    if(n > 1024) {
+        return -EINVAL;
+    }
+
+    int timeout_ms = -1;
+    if(v->r(3) != 0) {
+        const struct timespec* ts = (const struct timespec*)v->mmu(v->r(3), sizeof(struct timespec));
+        if(ts == nullptr) {
+            return -EFAULT;
+        }
+        if(ts->tv_sec < 0 || ts->tv_nsec < 0) {
+            return -EINVAL;
+        }
+        // 上限钳制（tv_sec*1000 溢出 int）。永久阻塞用 -1
+        if(ts->tv_sec > (int64_t)(INT32_MAX - 1000) / 1000) timeout_ms = INT32_MAX;
+        else timeout_ms = (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+    }
+
+    struct pollfd* gfds = nullptr;
+    if(n > 0) {
+        gfds = static_cast<struct pollfd*>(v->mmu_w(v->r(1), sizeof(struct pollfd) * n));
+        if(gfds == nullptr) {
+            return -EFAULT;
+        }
+    }
+    return poll_core(gfds, n, timeout_ms);
+}
+
 int64_t PosixSyscall::do_pselect6(vm* v) {
     // pselect6(n, fd_set* rfds, fd_set* wfds, fd_set* efds, timespec* ts, sigmask_data*)
     // select() 在 musl 里经 BpfWideArgs 转成本调用（6 参）。把 fd_set 位图转成 pollfd
@@ -415,7 +453,7 @@ int64_t PosixSyscall::do_pselect6(vm* v) {
         if(!ts) return -EFAULT;
         if(ts->tv_sec < 0 || ts->tv_nsec < 0) return -EINVAL;
         // 上限钳制（tv_sec*1000 在 tv_sec~INT_MAX/1000 处溢出 int）。永久阻塞用 -1。
-        if(ts->tv_sec > (int64_t)INT32_MAX / 1000) timeout_ms = INT32_MAX;
+        if(ts->tv_sec > (int64_t)(INT32_MAX - 1000) / 1000) timeout_ms = INT32_MAX;
         else timeout_ms = (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
     }
     // 第 6 参 sigmask_data 暂忽略（单线程，原子切换信号掩码无意义）。r0 经 BpfWideArgs 传入。
@@ -476,4 +514,20 @@ int64_t PosixSyscall::do_pselect6(vm* v) {
     for(int fd : vfd_r) FD_SET(fd, grfds);
     for(int fd : vfd_w) FD_SET(fd, gwfds);
     return ready + preset;
+}
+
+
+int64_t PosixSyscall::do_eventfd2(vm* v) {
+    // eventfd2(count, flags)。EFD_CLOEXEC/EFD_NONBLOCK 与 asm-generic O_* 同值，直接透传
+    unsigned initval = arg_u32(v->r(1));
+    int flags = arg_s32(v->r(2));
+    int hfd = eventfd(initval, flags);
+    if(hfd == -1) {
+        return -errno;
+    }
+    auto handle = std::make_shared<HostFd>(hfd);
+    if(flags & BPF_O_CLOEXEC) {
+        handle->cloexec = true;
+    }
+    return ps->fds_emplace(handle);
 }

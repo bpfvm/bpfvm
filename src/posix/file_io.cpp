@@ -1,4 +1,5 @@
 #include "posix_internal.h"
+#include <sys/sendfile.h>
 
 // 后台 tty 访问门控：do_read/do_write/readv/writev 调。
 // POSIX/Linux 实测语义（非前台组访问控制终端）：
@@ -249,6 +250,72 @@ int64_t PosixSyscall::do_pwrite(vm* v) {
     ssize_t rc = h->pwrite(buf, count, (off_t)v->r(4));
     if(rc < 0) {
         return (rc == -EINTR) ? SYSCALL_RESTART : rc;
+    }
+    return rc;
+}
+
+int64_t PosixSyscall::do_fsync(vm* v) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
+        return -EBADF;
+    }
+    int hfd = h->host_fd();
+    if(hfd < 0) {
+        return -EINVAL;
+    }
+    if(fsync(hfd) == -1) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_fdatasync(vm* v) {
+    auto h = ps->find_fd(arg_s32(v->r(1)));
+    if(!h) {
+        return -EBADF;
+    }
+    int hfd = h->host_fd();
+    if(hfd < 0) {
+        return -EINVAL;
+    }
+    if(fdatasync(hfd) == -1) {
+        return -errno;
+    }
+    return 0;
+}
+
+int64_t PosixSyscall::do_sendfile(vm* v) {
+    // sendfile(out_fd, in_fd, off_t* off, count)。guest/host off_t 均 64 位。
+    auto out_h = ps->find_fd(arg_s32(v->r(1)));
+    auto in_h = ps->find_fd(arg_s32(v->r(2)));
+    if(!out_h || !in_h) {
+        return -EBADF;
+    }
+    int out_fd = out_h->host_fd();
+    int in_fd = in_h->host_fd();
+    if(out_fd < 0 || in_fd < 0) {
+        return -EINVAL;
+    }
+    off_t off_val = 0;
+    off_t* off_arg = nullptr;
+    if(v->r(3) != 0) {
+        auto* g = static_cast<const off_t*>(v->mmu(v->r(3), sizeof(off_t)));
+        if(g == nullptr) {
+            return -EFAULT;
+        }
+        off_val = *g;
+        off_arg = &off_val;
+    }
+    size_t count = arg_size(v->r(4));
+    ssize_t rc = ::sendfile(out_fd, in_fd, off_arg, count);
+    if(rc == -1) {
+        return (errno == EINTR) ? SYSCALL_RESTART : -errno;
+    }
+    if(v->r(3) != 0) {
+        auto* g = static_cast<off_t*>(v->mmu_w(v->r(3), sizeof(off_t)));
+        if(g != nullptr) {
+            *g = off_val;
+        }
     }
     return rc;
 }

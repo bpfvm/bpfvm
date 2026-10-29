@@ -29,6 +29,27 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
     return code;
 }
 
+// shebang（#!）脚本头解析：提取解释器路径与至多一个参数（Linux binfmt_script 语义，
+// 解释器名之后的整行剩余（含空格）作为单个参数）。buf 须为已截断到首行 '\n' 之前的
+// 内容；非脚本或解释器路径为空返回 false。与 Linux 一致不剥 '\r'（CRLF 脚本的
+// 解释器名/参数带 \r，exec 以 ENOENT/用法错失败）。
+static bool parse_shebang(const char* buf, size_t n, std::string& interp, std::string& arg) {
+    if(n < 2 || buf[0] != '#' || buf[1] != '!') {
+        return false;
+    }
+    size_t i = 2;
+    while(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    size_t start = i;
+    while(i < n && buf[i] != ' ' && buf[i] != '\t') i++;
+    interp.assign(buf + start, i - start);
+    if(interp.empty()) {
+        return false;
+    }
+    while(i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    arg.assign(buf + i, n - i);
+    return true;
+}
+
 // execveat(dirfd, path, argv, envp, flags) —— 唯一的 exec 入口。
 // execve(path,...) 在 musl 里等价转发为 execveat(AT_FDCWD, path, argv, envp, 0)，
 int64_t PosixSyscall::do_execveat(vm* v) {
@@ -41,13 +62,6 @@ int64_t PosixSyscall::do_execveat(vm* v) {
 
     if (dirfd == AT_FDCWD && (flags & AT_EMPTY_PATH)) {
         return -EINVAL;   // AT_EMPTY_PATH 需要有效 dirfd，不能是 AT_FDCWD
-    }
-    std::shared_ptr<Fd> dirfd_entry;
-    if(dirfd != AT_FDCWD) {
-        dirfd_entry = ps->find_fd(dirfd);
-        if(!dirfd_entry) {
-            return -EBADF;
-        }
     }
 
     std::vector<std::string> argv_strings;
@@ -64,6 +78,23 @@ int64_t PosixSyscall::do_execveat(vm* v) {
         auto eq = e.find('=');
         if(eq != std::string::npos) {
             envp_map[e.substr(0, eq)] = e.substr(eq + 1);
+        }
+    }
+    return exec_common(v, dirfd, path, argv_strings, envp_map, flags, 0);
+}
+
+int64_t PosixSyscall::exec_common(vm* v, int dirfd, const std::string& path,
+                                  std::vector<std::string>& argv_strings,
+                                  const std::map<std::string, std::string>& envp_map,
+                                  int flags, int depth) {
+    if(depth >= 4) {
+        return -ELOOP;
+    }
+    std::shared_ptr<Fd> dirfd_entry;
+    if(dirfd != AT_FDCWD) {
+        dirfd_entry = ps->find_fd(dirfd);
+        if(!dirfd_entry) {
+            return -EBADF;
         }
     }
     // 打开可执行文件（符号链接穿透；/proc 魔法链接直连底层 fd，已删文件仍可加载）。
@@ -90,6 +121,42 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     std::string host_path = guest_abs;
     if(!ps->root.empty()) {
         host_path = std::filesystem::path(ps->root + guest_abs).lexically_normal().string();
+    }
+
+    // shebang（#!）脚本在 load_elf 之前探测：走 ELF 失败路径会向 stderr 打加载诊断。
+    char head[128];
+    ssize_t got = pread(exe->host_fd(), head, sizeof(head), 0);
+    if(got >= 2 && head[0] == '#' && head[1] == '!') {
+        size_t line_len = (size_t)got;
+        const char* nl = (const char*)memchr(head, '\n', line_len);
+        if(nl != nullptr) {
+            line_len = (size_t)(nl - head);
+        }
+        std::string interp, arg;
+        if(!parse_shebang(head, line_len, interp, arg)) {
+            return -ENOEXEC;
+        }
+
+        // AT_EMPTY_PATH（fexecve）无调用者路径，按 Linux 合成 /dev/fd/N 作为脚本参数
+        std::string fdpath;
+        const std::string* script_arg = &path;
+        if(flags & AT_EMPTY_PATH) {
+            if(dirfd_entry->cloexec) {
+                return -ENOENT;
+            }
+            fdpath = "/dev/fd/" + std::to_string(dirfd);
+            script_arg = &fdpath;
+        }
+        std::vector<std::string> new_argv;
+        new_argv.push_back(interp);
+        if(!arg.empty()) {
+            new_argv.push_back(arg);
+        }
+        new_argv.push_back(*script_arg);
+        if(argv_strings.size() > 1) {
+            new_argv.insert(new_argv.end(), argv_strings.begin() + 1, argv_strings.end());
+        }
+        return exec_common(v, AT_FDCWD, interp, new_argv, envp_map, 0, depth + 1);
     }
 
     // 加载 ELF 并替换整个 guest 地址空间为新程序。
@@ -149,6 +216,14 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
     comm_ = make_comm(guest_abs);
+    // exec 只替换本进程的地址空间：maps 容器可能被其它 vm 共享（CLONE_VM，共享点
+    // 见 do_clone），而下方 swap 是原地换容器内容，直接换会把共享者的地址空间一并
+    // 换掉，fresh 析构再释放旧页，共享者恢复执行即踩已释放内存。use_count>1 是
+    // 近似判据：退出中的 CLONE_THREAD sibling 在换空自己的 maps_ptr 前仍持引用，
+    // 也会走到这里，断开无害；fork 路径容器本就独立，不触发。
+    if(maps_ptr(v).use_count() > 1) {
+        maps_ptr(v) = std::make_shared<std::vector<memmap>>();
+    }
     // exec 换镜像：整体替换为新 image（fresh 自己那份引用由其析构自动减）。旧 image
     // 引用归零时关旧 fd（对齐 Linux exec 换 mm->exe_file）。
     v->set_image(fresh->image());

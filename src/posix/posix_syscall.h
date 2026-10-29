@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>   // AT_FDCWD（guest_abs_path/resolve_path 的 dirfd 默认值）
 #include <sys/socket.h>   // sockaddr/socklen_t（sockaddr_to_host/to_guest 声明）
+#include <poll.h>   // pollfd/nfds_t（poll_core 声明）
 
 // 信号队列扫描上限（handle_signals 单轮最多处理的信号数，防止极端情况下死循环）。
 // 原 MpscQueue 的固定容量；改 deque+锁后队列本身无界，此常量仅作单轮 drain 上限。
@@ -230,6 +231,16 @@ class PosixSyscall: public SyscallHandler{
     // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
     void notify_parent_sigchld();
 
+    // do_execveat 与 shebang 递归共用的 exec 主体。depth 是 shebang 递归深度，
+    // 上限 4（Linux BINPRM_MAX_RECURSION）。
+    int64_t exec_common(vm* v, int dirfd, const std::string& path,
+                        std::vector<std::string>& argv_strings,
+                        const std::map<std::string, std::string>& envp_map,
+                        int flags, int depth);
+
+    // poll/ppoll 的公共主体；超时毫秒精度，负数=永久阻塞
+    int64_t poll_core(struct pollfd* gfds, nfds_t n, int timeout_ms);
+
 public:
     const uint64_t pid;          // task id（== tid）。gettid 返回此值。
     // 程序名（/proc/[pid]/comm，basename(exe)，<=15 字节，Linux TASK_COMM_LEN-1）。
@@ -364,6 +375,9 @@ public:
     int64_t do_writev(vm* v);
     int64_t do_pread(vm* v);
     int64_t do_pwrite(vm* v);
+    int64_t do_fsync(vm* v);
+    int64_t do_fdatasync(vm* v);
+    int64_t do_sendfile(vm* v);
     int64_t do_getrandom(vm* v);
     int64_t do_getdents64(vm* v);
     int64_t do_set_tid_address(vm* v);
@@ -396,6 +410,12 @@ public:
     int64_t do_epoll_ctl(vm* v);
     int64_t do_epoll_pwait(vm* v);
     int64_t do_signalfd4(vm* v);
+    int64_t do_clock_nanosleep(vm* v);
+    int64_t do_uname(vm* v);
+    int64_t do_sysinfo(vm* v);
+    int64_t do_prlimit64(vm* v);
+    int64_t do_ppoll(vm* v);
+    int64_t do_eventfd2(vm* v);
 };
 
 #endif

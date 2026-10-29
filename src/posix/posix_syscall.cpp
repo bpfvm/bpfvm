@@ -1,5 +1,6 @@
 #include "posix_internal.h"
 #include "pty.h"
+#include <sys/resource.h>
 
 std::atomic<uint64_t> PosixSyscall::next_pid{1};
 std::unordered_map<uint64_t, std::shared_ptr<vm>> PosixSyscall::pid_map;
@@ -263,34 +264,38 @@ int64_t PosixSyscall::do_clock_gettime(vm* v) {
     return 0;
 }
 
-int64_t PosixSyscall::do_nanosleep(vm* v) {
-    const struct timespec* req = static_cast<const struct timespec*>(v->mmu(v->r(1), sizeof(struct timespec)));
+// nanosleep/clock_nanosleep 公共主体。宿主 glibc clock_nanosleep 不走 -1/errno
+// 约定，直接返回正 errno。
+static int64_t clock_nanosleep_core(vm* v, clockid_t clk, int flags,
+                                    uint64_t req_addr, uint64_t rem_addr) {
+    const struct timespec* req = static_cast<const struct timespec*>(v->mmu(req_addr, sizeof(struct timespec)));
     if(req == nullptr) {
         return -EFAULT;
     }
-
     struct timespec* rem = nullptr;
-    if(v->r(2) != 0) {
-        rem = static_cast<struct timespec*>(v->mmu_w(v->r(2), sizeof(*rem)));
+    if(rem_addr != 0) {
+        rem = static_cast<struct timespec*>(v->mmu_w(rem_addr, sizeof(*rem)));
         if(rem == nullptr) {
             return -EFAULT;
         }
     }
 
-    struct timespec host_req = {};
-    if(req != nullptr) {
-        host_req = *req;
-    }
-
+    struct timespec host_req = *req;
     struct timespec host_rem = {};
-    int rc = nanosleep(&host_req, rem != nullptr ? &host_rem : nullptr);
-    if(rc == -1) {
-        if(rem != nullptr) {
-            *rem = host_rem;
-        }
-        return -errno;
+    int rc = clock_nanosleep(clk, flags, &host_req, rem != nullptr ? &host_rem : nullptr);
+    if(rc == EINTR && rem != nullptr) {
+        *rem = host_rem;
     }
-    return 0;
+    return rc == 0 ? 0 : -rc;
+}
+
+// nanosleep(req, rem) 即 clock_nanosleep(CLOCK_REALTIME, 0, req, rem)
+int64_t PosixSyscall::do_nanosleep(vm* v) {
+    return clock_nanosleep_core(v, CLOCK_REALTIME, 0, v->r(1), v->r(2));
+}
+
+int64_t PosixSyscall::do_clock_nanosleep(vm* v) {
+    return clock_nanosleep_core(v, (clockid_t)arg_s32(v->r(1)), arg_s32(v->r(2)), v->r(3), v->r(4));
 }
 
 int64_t PosixSyscall::do_getrandom(vm* v) {
@@ -318,107 +323,172 @@ int64_t PosixSyscall::do_alloca(vm* v) {
     return (int64_t)v->alloca(inc);
 }
 
+// prlimit 的宿主侧包装：glibc 原型第二参是内部枚举 __rlimit_resource，C++ 不做
+// int->enum 隐式转换；musl 为 int。
+static int host_prlimit(int resource, const struct rlimit* nw, struct rlimit* old) {
+#ifdef __GLIBC__
+    return prlimit(0, (__rlimit_resource)resource, nw, old);
+#else
+    return prlimit(0, resource, nw, old);
+#endif
+}
+
+int64_t PosixSyscall::do_prlimit64(vm* v) {
+    int64_t pid = (int64_t)v->r(1);
+    // 仅支持查/改自身（pid==0 或本组 tgid），跨进程一律 EPERM
+    if(pid != 0 && (uint64_t)pid != tg->tgid) {
+        return -EPERM;
+    }
+    // 宿主 prlimit 以 pid=0 直接作用于 VM 进程自身：guest setrlimit 会真实改动
+    // 宿主进程的 rlimit，1:1 进程模型下属设计使然。
+    int resource = arg_s32(v->r(2));
+    uint64_t new_ptr = v->r(3);
+    uint64_t old_ptr = v->r(4);
+    struct rlimit new_lim {};
+    bool has_new = new_ptr != 0;
+    if(has_new) {
+        const struct rlimit* g = static_cast<const struct rlimit*>(v->mmu(new_ptr, sizeof(struct rlimit)));
+        if(g == nullptr) {
+            return -EFAULT;
+        }
+        new_lim = *g;
+    }
+    struct rlimit old_lim {};
+    struct rlimit* old_out = nullptr;
+    if(old_ptr != 0) {
+        old_out = static_cast<struct rlimit*>(v->mmu_w(old_ptr, sizeof(struct rlimit)));
+        if(old_out == nullptr) {
+            return -EFAULT;
+        }
+    }
+    int rc = host_prlimit(resource, has_new ? &new_lim : nullptr, old_out ? &old_lim : nullptr);
+    if(rc == -1) {
+        return -errno;
+    }
+    if(old_out) {
+        *old_out = old_lim;
+    }
+    return 0;
+}
+
 int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     uint32_t sys_id = call;
     if(call >= BPF_CALL_BASE) {
         sys_id = BPF_CALL_TO_ID(call);
     }
     switch (sys_id) {
-    case BPF_SYS_MMAP:          return do_mmap(v);
-    case BPF_SYS_MUNMAP:        return do_munmap(v);
-    case BPF_SYS_EXIT:          return do_exit(v);
-    case BPF_SYS_EXIT_GROUP:    return do_exit_group(v);
-    case BPF_SYS_NANOSLEEP:     return do_nanosleep(v);
-    case BPF_SYS_OPENAT:        return do_openat(v);
-    case BPF_SYS_READ:          return do_read(v);
-    case BPF_SYS_WRITE:         return do_write(v);
-    case BPF_SYS_LSEEK:         return do_lseek(v);
-    case BPF_SYS_TRUNCATE:      return do_truncate(v);
-    case BPF_SYS_FTRUNCATE:     return do_ftruncate(v);
-    case BPF_SYS_CLOSE:         return do_close(v);
-    case BPF_SYS_UNLINKAT:      return do_unlinkat(v);
-    case BPF_SYS_MKDIRAT:       return do_mkdirat(v);
-    case BPF_SYS_SYMLINKAT:     return do_symlinkat(v);
-    case BPF_SYS_LINKAT:        return do_linkat(v);
-    case BPF_SYS_RENAMEAT2:     return do_renameat2(v);
-    case BPF_SYS_READLINKAT:    return do_readlinkat(v);
-    case BPF_SYS_EXECVEAT:      return do_execveat(v);
-    case BPF_SYS_CLONE:         return do_clone(v);
-    case BPF_SYS_GETPID:        return do_getpid(v);
-    case BPF_SYS_GETPPID:       return do_getppid(v);
-    case BPF_SYS_WAIT4:         return do_wait4(v);
-    case BPF_SYS_WAITID:        return do_waitid(v);
-    case BPF_SYS_DUP:           return do_dup(v);
-    case BPF_SYS_DUP3:          return do_dup3(v);
-    case BPF_SYS_PIPE2:         return do_pipe2(v);
-    case BPF_SYS_FCHDIR:        return do_fchdir(v);
-    case BPF_SYS_GETCWD:        return do_getcwd(v);
-    case BPF_SYS_STATX:         return do_statx(v);
-    case BPF_SYS_FCHMODAT:      return do_fchmodat(v);
-    case BPF_SYS_UTIMENSAT:     return do_utimensat(v);
-    case BPF_SYS_FACCESSAT:     return do_faccessat(v);
-    case BPF_SYS_KILL:          return do_kill(v);
-    case BPF_SYS_TKILL:         return do_tkill(v);
-    case BPF_SYS_TGKILL:        return do_tgkill(v);
-    case BPF_SYS_SIGACTION:     return do_sigaction(v);
-    case BPF_SYS_SIGPROCMASK:   return do_sigprocmask(v);
-    case BPF_SYS_SETPGID:       return do_setpgid(v);
-    case BPF_SYS_GETPGID:       return do_getpgid(v);
-    case BPF_SYS_GETPGRP:       return do_getpgrp(v);
-    case BPF_SYS_SETSID:        return do_setsid(v);
-    case BPF_SYS_GETSID:        return do_getsid(v);
-    case BPF_SYS_FCNTL:         return do_fcntl(v);
-    case BPF_SYS_IOCTL:         return do_ioctl(v);
-    case BPF_SYS_UMASK:         return do_umask(v);
-    case BPF_SYS_SIGSETJMP:     return do_sigsetjmp(v);
-    case BPF_SYS_SIGLONGJMP:    return do_siglongjmp(v);
-    case BPF_SYS_CLOCK_GETTIME: return do_clock_gettime(v);
-    // —— musl/libc 兼容性补充 ——
-    case BPF_SYS_MPROTECT:       return do_mprotect(v);
-    case BPF_SYS_READV:          return do_readv(v);
-    case BPF_SYS_WRITEV:         return do_writev(v);
-    case BPF_SYS_PREAD:          return do_pread(v);
-    case BPF_SYS_PWRITE:         return do_pwrite(v);
-    case BPF_SYS_GETRANDOM:      return do_getrandom(v);
-    case BPF_SYS_GETDENTS64:     return do_getdents64(v);
+    // —— 内存 ——
+    case BPF_SYS_MMAP:       return do_mmap(v);
+    case BPF_SYS_MUNMAP:     return do_munmap(v);
+    case BPF_SYS_MPROTECT:   return do_mprotect(v);
+    case BPF_SYS_MADVISE:    return do_madvise(v);
+    case BPF_SYS_ALLOCA:     return do_alloca(v);
+    // —— 进程 / 线程 ——
+    case BPF_SYS_EXIT:       return do_exit(v);
+    case BPF_SYS_EXIT_GROUP: return do_exit_group(v);
+    case BPF_SYS_EXECVEAT:   return do_execveat(v);
+    case BPF_SYS_CLONE:      return do_clone(v);
+    case BPF_SYS_WAIT4:      return do_wait4(v);
+    case BPF_SYS_WAITID:     return do_waitid(v);
+    case BPF_SYS_GETPID:     return do_getpid(v);
+    case BPF_SYS_GETPPID:    return do_getppid(v);
+    case BPF_SYS_GETTID:     return do_gettid(v);
     case BPF_SYS_SET_TID_ADDRESS:return do_set_tid_address(v);
-    case BPF_SYS_MADVISE:        return do_madvise(v);
-    case BPF_SYS_SCHED_YIELD:    return do_sched_yield(v);
-    case BPF_SYS_GETTID:         return do_gettid(v);
-    case BPF_SYS_SET_TLS:        return do_set_tls(v);
-    case BPF_SYS_GET_TLS:        return do_get_tls(v);
-    case BPF_SYS_FUTEX:          return do_futex(v);
-    case BPF_SYS_ALLOCA:         return do_alloca(v);
-    case BPF_SYS_POLL:           return do_poll(v);
-    case BPF_SYS_PSELECT6:       return do_pselect6(v);
+    case BPF_SYS_SET_TLS:    return do_set_tls(v);
+    case BPF_SYS_GET_TLS:    return do_get_tls(v);
+    case BPF_SYS_SCHED_YIELD:return do_sched_yield(v);
+    case BPF_SYS_FUTEX:      return do_futex(v);
+    // —— 进程组 / 会话 ——
+    case BPF_SYS_SETPGID:    return do_setpgid(v);
+    case BPF_SYS_GETPGID:    return do_getpgid(v);
+    case BPF_SYS_GETPGRP:    return do_getpgrp(v);
+    case BPF_SYS_SETSID:     return do_setsid(v);
+    case BPF_SYS_GETSID:     return do_getsid(v);
+    // —— fd 管理 ——
+    case BPF_SYS_DUP:        return do_dup(v);
+    case BPF_SYS_DUP3:       return do_dup3(v);
+    case BPF_SYS_PIPE2:      return do_pipe2(v);
+    case BPF_SYS_FCNTL:      return do_fcntl(v);
+    case BPF_SYS_IOCTL:      return do_ioctl(v);
+    // —— 文件 I/O ——
+    case BPF_SYS_OPENAT:     return do_openat(v);
+    case BPF_SYS_CLOSE:      return do_close(v);
+    case BPF_SYS_READ:       return do_read(v);
+    case BPF_SYS_WRITE:      return do_write(v);
+    case BPF_SYS_READV:      return do_readv(v);
+    case BPF_SYS_WRITEV:     return do_writev(v);
+    case BPF_SYS_PREAD:      return do_pread(v);
+    case BPF_SYS_PWRITE:     return do_pwrite(v);
+    case BPF_SYS_LSEEK:      return do_lseek(v);
+    case BPF_SYS_TRUNCATE:   return do_truncate(v);
+    case BPF_SYS_FTRUNCATE:  return do_ftruncate(v);
+    case BPF_SYS_FSYNC:      return do_fsync(v);
+    case BPF_SYS_FDATASYNC:  return do_fdatasync(v);
+    case BPF_SYS_SENDFILE:   return do_sendfile(v);
+    // —— 文件系统 / 路径 ——
+    case BPF_SYS_GETDENTS64: return do_getdents64(v);
+    case BPF_SYS_STATX:      return do_statx(v);
+    case BPF_SYS_UNLINKAT:   return do_unlinkat(v);
+    case BPF_SYS_MKDIRAT:    return do_mkdirat(v);
+    case BPF_SYS_SYMLINKAT:  return do_symlinkat(v);
+    case BPF_SYS_LINKAT:     return do_linkat(v);
+    case BPF_SYS_RENAMEAT2:  return do_renameat2(v);
+    case BPF_SYS_READLINKAT: return do_readlinkat(v);
+    case BPF_SYS_FCHMODAT:   return do_fchmodat(v);
+    case BPF_SYS_UTIMENSAT:  return do_utimensat(v);
+    case BPF_SYS_FACCESSAT:  return do_faccessat(v);
+    case BPF_SYS_FCHDIR:     return do_fchdir(v);
+    case BPF_SYS_GETCWD:     return do_getcwd(v);
+    case BPF_SYS_UMASK:      return do_umask(v);
+    // —— 信号 ——
+    case BPF_SYS_KILL:       return do_kill(v);
+    case BPF_SYS_TKILL:      return do_tkill(v);
+    case BPF_SYS_TGKILL:     return do_tgkill(v);
+    case BPF_SYS_SIGACTION:  return do_sigaction(v);
+    case BPF_SYS_SIGPROCMASK:return do_sigprocmask(v);
+    case BPF_SYS_SIGSETJMP:  return do_sigsetjmp(v);
+    case BPF_SYS_SIGLONGJMP: return do_siglongjmp(v);
+    // —— 时间 ——
+    case BPF_SYS_NANOSLEEP:  return do_nanosleep(v);
+    case BPF_SYS_CLOCK_GETTIME:return do_clock_gettime(v);
+    case BPF_SYS_CLOCK_NANOSLEEP:return do_clock_nanosleep(v);
+    // —— I/O 多路复用 ——
+    case BPF_SYS_POLL:       return do_poll(v);
+    case BPF_SYS_PPOLL:      return do_ppoll(v);
+    case BPF_SYS_PSELECT6:   return do_pselect6(v);
+    case BPF_SYS_EPOLL_CREATE1:return do_epoll_create1(v);
+    case BPF_SYS_EPOLL_CTL:  return do_epoll_ctl(v);
+    case BPF_SYS_EPOLL_PWAIT:return do_epoll_pwait(v);
     // —— 网络（透传 host socket fd）——
-    case BPF_SYS_SOCKET:         return do_socket(v);
-    case BPF_SYS_SOCKETPAIR:     return do_socketpair(v);
-    case BPF_SYS_BIND:           return do_bind(v);
-    case BPF_SYS_LISTEN:         return do_listen(v);
-    case BPF_SYS_CONNECT:        return do_connect(v);
-    case BPF_SYS_ACCEPT4:        return do_accept4(v);
-    case BPF_SYS_SENDTO:         return do_sendto(v);
-    case BPF_SYS_RECVFROM:       return do_recvfrom(v);
-    case BPF_SYS_SENDMSG:        return do_sendmsg(v);
-    case BPF_SYS_RECVMSG:        return do_recvmsg(v);
-    case BPF_SYS_SHUTDOWN:       return do_shutdown(v);
-    case BPF_SYS_SETSOCKOPT:     return do_setsockopt(v);
-    case BPF_SYS_GETSOCKOPT:     return do_getsockopt(v);
-    case BPF_SYS_GETSOCKNAME:    return do_getsockname(v);
-    case BPF_SYS_GETPEERNAME:    return do_getpeername(v);
-    // —— epoll ——
-    case BPF_SYS_EPOLL_CREATE1:  return do_epoll_create1(v);
-    case BPF_SYS_EPOLL_CTL:      return do_epoll_ctl(v);
-    case BPF_SYS_EPOLL_PWAIT:    return do_epoll_pwait(v);
-    // —— signalfd ——
-    case BPF_SYS_SIGNALFD4:      return do_signalfd4(v);
+    case BPF_SYS_SOCKET:     return do_socket(v);
+    case BPF_SYS_SOCKETPAIR: return do_socketpair(v);
+    case BPF_SYS_BIND:       return do_bind(v);
+    case BPF_SYS_LISTEN:     return do_listen(v);
+    case BPF_SYS_CONNECT:    return do_connect(v);
+    case BPF_SYS_ACCEPT4:    return do_accept4(v);
+    case BPF_SYS_SENDTO:     return do_sendto(v);
+    case BPF_SYS_RECVFROM:   return do_recvfrom(v);
+    case BPF_SYS_SENDMSG:    return do_sendmsg(v);
+    case BPF_SYS_RECVMSG:    return do_recvmsg(v);
+    case BPF_SYS_SHUTDOWN:   return do_shutdown(v);
+    case BPF_SYS_SETSOCKOPT: return do_setsockopt(v);
+    case BPF_SYS_GETSOCKOPT: return do_getsockopt(v);
+    case BPF_SYS_GETSOCKNAME:return do_getsockname(v);
+    case BPF_SYS_GETPEERNAME:return do_getpeername(v);
+    // —— signalfd / eventfd ——
+    case BPF_SYS_SIGNALFD4:  return do_signalfd4(v);
+    case BPF_SYS_EVENTFD2:   return do_eventfd2(v);
     // —— 身份查询（单用户 uid=gid=0）——
-    case BPF_SYS_GETUID:         return do_getuid(v);
-    case BPF_SYS_GETEUID:        return do_geteuid(v);
-    case BPF_SYS_GETGID:         return do_getgid(v);
-    case BPF_SYS_GETEGID:        return do_getegid(v);
-    case BPF_SYS_GETGROUPS:      return do_getgroups(v);
+    case BPF_SYS_GETUID:     return do_getuid(v);
+    case BPF_SYS_GETEUID:    return do_geteuid(v);
+    case BPF_SYS_GETGID:     return do_getgid(v);
+    case BPF_SYS_GETEGID:    return do_getegid(v);
+    case BPF_SYS_GETGROUPS:  return do_getgroups(v);
+    // —— 系统信息 / 随机数 / 资源限制 ——
+    case BPF_SYS_UNAME:      return do_uname(v);
+    case BPF_SYS_SYSINFO:    return do_sysinfo(v);
+    case BPF_SYS_GETRANDOM:  return do_getrandom(v);
+    case BPF_SYS_PRLIMIT64:  return do_prlimit64(v);
     default:
         /* 未实现的 syscall（包括 musl 移植用 BPF_CALL_BASE 占位的 brk/mremap/futex
          * 等探测型调用）。统一返回 -ENOSYS，让 musl 走兜底/降级路径。仅在 BPF_DEBUG
