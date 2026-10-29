@@ -1308,9 +1308,10 @@ void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64
 // .overflow：栈溢出 -> VM_KILLED（LDAXR/STLXR 原子 or）-> vm_exit。
 // ---------------------------------------------------------------------------
 
-void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
+void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
                                   std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
                                   std::vector<size_t>& call_cache_offs) {
+    (void)callee_gpa;
     size_t flags_cbnz = 0;  // CBNZ .slow 的 patch offset
 
     // -  调用点 safepoint：flags!=0 走 .slow
@@ -1319,10 +1320,14 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     // entry_fast 信任 aarch64 寄存器（见 entry_fast 注释），故 fast path 无 flush。
 
     // -  内联 push_frame（仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)）
-    // 2a. 读 cur_frame[0]（caller 帧头 total_len 在低 32 位）
+    // 2a. 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
     auto rctx = begin_mem_access(X23, 0, 8, /*is_write=*/false);  // X0 = cur_frame host
-    ldr_imm(X1, X0, 0, true);                // X1 = cur_frame[0]
-    mov_reg(X1, X1, false);                  // mov W1, W1 (total_len = 低32, 零扩展)
+    // and_imm 的内部 temp 是 X2（先 mov_imm X2 再 and）：X2 不得作源，也不得跨 and_imm 存活
+    ldr_imm(X1, X0, 0, true);                     // X1 = cur_frame[0]
+    lsr_imm(X15, X1, FRAME_ALLOCA_SHIFT, true);   // X15 = f >> 24
+    and_imm(X1, X1, FRAME_SIZE_MASK, true);       // X1 = stack_size
+    and_imm(X15, X15, FRAME_ALLOCA_MASK, true);   // X15 = alloca_len
+    add_reg(X1, X1, X15, true);                   // X1 = caller_total_len
     mov_reg(X0, X23, true);                   // X0 = r10 (old sp)
     sub_reg(X0, X0, X1, true);                // X0 = r10 - caller_total_len
     sub_imm(X0, X0, 64, true);                // X0 = frame_base
@@ -1334,8 +1339,10 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
 
     // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
     auto wctx = begin_mem_access(X0, 0, 64, /*is_write=*/true);  // X0 = 帧 host（base=X0=frame_base）
-    ldr_imm(X1, X28, (int32_t)off_stack_limit_, true);  // X1 = stack_limit
-    str_imm(X1, X0, 0, true);                          // frame[0] = stack_limit
+    // frame[0] = callee_frame（编译期读帧槽的立即数；is_signal=0、alloca_len=0 时
+    // frame_flags_make 的编码值 == stack_size 本身）
+    mov_imm(X1, callee_frame, true);
+    str_imm(X1, X0, 0, true);                          // frame[0] = callee_frame
     str_imm(X23, X0, 8, true);                         // frame[1] = old r10 (X23 尚未更新)
     mov_imm(X1, ret_gpa, true); str_imm(X1, X0, 16, true);  // frame[2] = ret_gpa
     str_imm(X19, X0, 24, true);                        // frame[3] = r6
@@ -1467,8 +1474,8 @@ void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int b
     str_imm(X2, X28, (int32_t)(off_reg_ + 10 * 8), true);  // vm->reg[10] = old_sp
 
     // -  信号帧：r0..r5 从 frame[7..12](@0x38..0x60) 覆盖写 vm->reg[0..5]。
-    //    is_signal = frame[0] bit32。普通帧（bit32=0）跳过。
-    lsr_imm(X15, X15, 32, true);
+    //    is_signal = frame[0] bit48。普通帧（bit48=0）跳过。
+    lsr_imm(X15, X15, 48, true);
     cbz(X15, true);
     size_t sig_je = size() - 4;
     ldr_imm(X1, X0, 0x38, true); str_imm(X1, X28, (int32_t)(off_reg_ + 0 * 8), true);  // r0

@@ -36,7 +36,8 @@ static void print_usage(const char* prog) {
         << "Options:\n"
         << "  -v, --verbose               verbose output\n"
         << "  -l, --insn-limit <N>        max instructions before exit 255 (0 = unlimited)\n"
-        << "  -S, --stack-size <N>        per-frame stack bytes (default 16384)\n"
+        << "  -S, --stack-size <N>        per-frame fallback bytes, used only when the\n"
+        << "                              function has no frame slot (default 16384)\n"
         << "  -R, --root <dir>            chroot into <dir>; guest paths resolved under it\n"
         << "  -e, --env <KEY=VALUE>       inject env var for guest (repeatable; overrides default)\n"
         << "  -t, --pty                   force PTY mode for stdio\n"
@@ -75,6 +76,11 @@ int real_main(int argc, char** argv) {
             break;
         case 'S':
             options->stack_limit = std::stoull(optarg, nullptr, 0);
+            // frame[0] 的 stack_size 是 24 位字段（insn.h），超过即静默截断，直接拒绝。
+            if(options->stack_limit >= (1ull << 24)) {
+                std::cerr << "stack size must be < " << (1ull << 24) << " bytes" << std::endl;
+                return 1;
+            }
             break;
         case 'R':
             options->root = optarg;

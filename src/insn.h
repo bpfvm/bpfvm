@@ -5,6 +5,7 @@
 #ifndef INSN_H
 #define INSN_H
 #include "elf_loader.h"
+#include "frame_slot.h"
 
 #include <list>
 #include <map>
@@ -27,21 +28,38 @@
 
 extern std::mutex log_mutex;
 
-#define STACK_SIZE (8 * 1024 * 1024)
+#define STACK_SIZE (16 * 1024 * 1024)
 #define STACK_BASE 0x10000000ULL
+// 栈区必须整体位于 0x40000000 之下：guest 模块加载区（PIE/ldso/依赖库）从
+// 0x40000000 起分配（elf_loader.cpp 的 next_alloc），上界越过即静默重叠。
+static_assert(STACK_BASE + STACK_SIZE <= 0x40000000ULL, "guest stack overlaps module load area");
 
-// 栈帧 frame_base[0] 的编码：
-//   bit 0..31 : 本函数栈帧总长度 = stack_limit + alloca_len
-//   bit    32 : is_signal（1=信号帧 128B / 0=普通帧 64B）；其余高位保留。
+// 栈帧 frame_base[0] 的编码（规范化：total = stack_size + alloca_len 按需求和，
+// 不冗余存储）：
+//   bit  0..23 : stack_size —— 本函数编译期帧大小（帧槽精确值或 -S 回退）
+//   bit 24..47 : alloca_len —— 本函数已 alloca 的字节数
+//   bit     48 : is_signal（1=信号帧 128B / 0=普通帧 64B）
+//   bit 49..63 : 保留
+// 两字段均按字节精确编码，同受栈界约束（total <= STACK_SIZE），见下方 static_assert。
 // 帧布局详见 insn.cpp 的 Stack Frame Layout。
 constexpr uint32_t NORMAL_FRAME_SIZE = 64;
 constexpr uint32_t SIGNAL_FRAME_SIZE = 128;
-#define FRAME_FLAG_SIGNAL  (1ull << 32)
-#define FRAME_LEN_MASK     0xFFFFFFFFull          // 低 32 位 = stack_limit + alloca_len
-#define frame_flags_make(is_sig, total_len) \
-    ((uint64_t)(((uint64_t)(total_len) & FRAME_LEN_MASK) | ((is_sig) ? FRAME_FLAG_SIGNAL : 0)))
+// frame[0] 24 位字段的上限须覆盖栈上界（帧的 total 及各分量都 < STACK_SIZE）。
+static_assert(STACK_SIZE <= (1ull << 24), "frame[0] 24-bit fields cannot hold stack bound");
+#define FRAME_FLAG_SIGNAL  (1ull << 48)
+#define FRAME_SIZE_MASK    0xFFFFFFull           // bit  0..23 = 帧大小
+#define FRAME_ALLOCA_MASK  0xFFFFFFull           // bit 24..47 = alloca_len
+#define FRAME_ALLOCA_SHIFT 24
+#define frame_flags_make(is_sig, stack_size, alloca_len) \
+    (((uint64_t)(stack_size) & FRAME_SIZE_MASK) \
+     | (((uint64_t)(alloca_len) << FRAME_ALLOCA_SHIFT) \
+        & ((uint64_t)FRAME_ALLOCA_MASK << FRAME_ALLOCA_SHIFT)) \
+     | ((is_sig) ? FRAME_FLAG_SIGNAL : 0))
 #define frame_is_signal(flags0)  (((flags0) & FRAME_FLAG_SIGNAL) != 0)
-#define frame_total_len(flags0)  ((uint64_t)((flags0) & FRAME_LEN_MASK))
+#define frame_stack_size(flags0) ((uint64_t)((flags0) & FRAME_SIZE_MASK))
+#define frame_alloca_len(flags0)  ((uint64_t)(((flags0) >> FRAME_ALLOCA_SHIFT) & FRAME_ALLOCA_MASK))
+#define frame_total_len(flags0)   (frame_stack_size(flags0) + frame_alloca_len(flags0))
+
 
 #ifndef PF_X
 #define PF_X		0x1
@@ -203,9 +221,8 @@ struct vmOptions {
     bool verbose = false;
     bool raw_stack = false;
     uint64_t insn_limit = 0;  // 0 = 无限制
-    // 每个函数栈帧为编译器分配的局部变量预留的区大小（默认 16KiB，对齐
-    // -mllvm -bpf-stack-size=16384）。可经 bpfvm -S 调整，用于与 guest 编译时
-    // 的栈帧上限对齐。frame[0] 低 32 位存的总长度 = stack_limit + alloca_len。
+    // 每帧局部变量区大小的默认值（帧槽缺失/FALLBACK 时使用，见 frame_slot.h）。
+    // 如果没启用动态栈能力的话，需与其编译期 -bpf-stack-size 对齐。
     uint64_t stack_limit = 16 * 1024;
     std::vector<std::string> argv;
     std::map<std::string, std::string> envp;
@@ -426,7 +443,9 @@ public:
     bool setup_stack(const std::vector<std::string>& argv,
                      const std::map<std::string, std::string>& envp,
                      const ElfLoadInfo& info);
-    bool push_frame(uint64_t return_addr, bool is_signal = false);
+    bool push_frame(uint64_t return_addr, uint64_t callee_entry = 0, bool is_signal = false);
+    // 读 callee 入口前 8 字节帧槽（frame_slot.h），返回该函数编译期帧大小；
+    uint64_t frame_size_of(uint64_t callee_entry);
     // 调用 handle_signals 决策并通过 push_frame 投递信号 handler（压信号帧、r(1)=sig、pc=handler）。
     bool deliver_signal();
     int64_t alloca(int64_t inc);

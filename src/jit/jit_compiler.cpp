@@ -134,7 +134,7 @@ bool JitCompiler<EmitterT>::helper_do_softfp(vm* v, uint32_t call_id) {
 
 template<typename EmitterT>
 void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64_t target) {
-    if (!v->push_frame(ret_gpa)) {
+    if (!v->push_frame(ret_gpa, target)) {
         return;
     }
     if (!v->mmu(target, sizeof(bpf_insn))) {
@@ -147,7 +147,7 @@ void JitCompiler<EmitterT>::helper_call_indirect(vm* v, uint64_t ret_gpa, uint64
 
 template<typename EmitterT>
 void JitCompiler<EmitterT>::helper_call_bpf(vm* v, uint64_t ret_gpa, uint64_t callee_gpa) {
-    if (!v->push_frame(ret_gpa)) {
+    if (!v->push_frame(ret_gpa, callee_gpa)) {
         v->flags.fetch_or(vm::VM_EXITED, std::memory_order_release);
         return;
     }
@@ -340,7 +340,7 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
                                                std::vector<JumpPlaceholder>& placeholders,
                                                std::vector<AbortPatchInfo>& abort_patches,
                                                std::vector<size_t>& call_cache_offs,
-                                               int& compiled_count) {
+                                               int& compiled_count, vm* v) {
     const bpf_insn* insn = entry_pc + i;
     uint8_t cls = insn->code & 0x07;
 
@@ -396,7 +396,10 @@ bool JitCompiler<EmitterT>::emit_instruction(EmitterT& e, const bpf_insn* entry_
             } else if (insn->src_reg == 1) {
                 uint64_t ret_gpa    = entry_gpa + (uint64_t)(i + 1) * sizeof(bpf_insn);
                 uint64_t callee_gpa = entry_gpa + (uint64_t)(i + 1 + insn->imm) * sizeof(bpf_insn);
-                e.emit_call_bpf(ret_gpa, callee_gpa, abort_patches, i, call_cache_offs);
+                // 编译期读被调函数帧槽（frame_slot.h），运行期内联 push 直接嵌立即数；
+                // 无槽回退 v->options.stack_limit（-S 启动后不变，嵌立即数安全）。
+                e.emit_call_bpf(ret_gpa, callee_gpa, v->frame_size_of(callee_gpa),
+                                abort_patches, i, call_cache_offs);
                 compiled_count++;
             } else if (insn->src_reg == 2) {
                 // 浮点专用通道：先 JIT 原生（emit_call_softfp），未命中（如 x86 的
@@ -600,7 +603,7 @@ JitEntry* JitCompiler<EmitterT>::compile(vm* v, uint64_t gpa) {
         }
 
         if (!emit_instruction(e, entry_pc, entry_gpa, i,
-                              placeholders, abort_patches, call_cache_offs, compiled_count)) {
+                              placeholders, abort_patches, call_cache_offs, compiled_count, v)) {
             mark_failed();
             return nullptr;
         }

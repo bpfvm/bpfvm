@@ -1645,9 +1645,10 @@ bool X86Emitter::emit_call_softfp(const bpf_insn* insn) {
 // .overflow：栈溢出 -> VM_KILLED -> vm_exit。
 // ---------------------------------------------------------------------------
 
-void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
+void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
                                std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
                                std::vector<size_t>& call_cache_offs) {
+    (void)callee_gpa;
     // -  调用点 safepoint：flags!=0 走 .slow
     emit8(0x83); emit8(modrm(2, 7, X86::RBP)); emit32((uint32_t)off_flags_);
     emit8(0x00);                            // cmp dword [rbp+off_flags], 0
@@ -1656,10 +1657,14 @@ void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
     // entry_fast 信任 x86 寄存器（见 entry_fast 注释），故 fast path 无 flush。
 
     // -  内联 push_frame（仅用 RAX/RCX/R11 scratch，不碰 r1-r5 参数与 r6-r9/r10）
-    // 2a. 读 cur_frame[0]（caller 帧头 total_len 在低 32 位）
+    // 2a. 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
     auto rctx = begin_mem_access(X86::R15, 0, 8, /*is_write=*/false);  // RAX = cur_frame host
     emit8(0x48); emit8(0x8B); emit8(0x08);  // mov rcx, [rax]  (cur_frame[0])
-    emit8(0x89); emit8(0xC9);                // mov ecx, ecx    (total_len = 低32, 零扩展)
+    emit8(0x49); emit8(0x89); emit8(0xCB);  // mov r11, rcx
+    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(FRAME_ALLOCA_SHIFT);  // shr r11, 24
+    emit8(0x41); emit8(0x81); emit8(0xE3); emit32((uint32_t)FRAME_ALLOCA_MASK);  // and r11d, mask (alloca_len)
+    emit8(0x81); emit8(0xE1); emit32((uint32_t)FRAME_SIZE_MASK);                // and ecx, mask (stack_size)
+    emit8(0x44); emit8(0x01); emit8(0xD9);  // add ecx, r11d    (total_len，零扩展)
     mov_r64(X86::RAX, X86::R15);             // mov rax, r15    (rax = r10 = old sp)
     sub64();                                 // sub rax, rcx    (rax = r10 - caller_total_len)
     sub64_imm(64);                           // sub rax, 64     (rax = frame_base)
@@ -1671,8 +1676,9 @@ void X86Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa,
 
     // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
     auto wctx = begin_mem_access(X86::RAX, 0, 64, /*is_write=*/true);  // RAX = 帧 host
-    //   [rax+0]  = stack_limit（frame_flags_make(false, stack_limit) = stack_limit）
-    load_r64(X86::RCX, (int32_t)off_stack_limit_);
+    //   [rax+0] = callee_frame（编译期读帧槽的立即数；is_signal=0、alloca_len=0
+    //             时 frame_flags_make 的编码值 == stack_size 本身）
+    emit8(0x48); emit8(0xB9); emit64(callee_frame);        // mov rcx, callee_frame
     emit8(0x48); emit8(0x89); emit8(0x08);                 // mov [rax], rcx
     //   [rax+8]  = old r10 (R15，尚未更新)
     emit8(0x4C); emit8(0x89); emit8(0x78); emit8(0x08);   // mov [rax+8], r15
@@ -1839,8 +1845,8 @@ void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_i
     store_r64((int32_t)(off_reg_ + 9 * 8), X86::RCX);
 
     // -  信号帧：r0..r5 从 frame[7..12](@+0x38..0x60) 覆盖写 vm->reg[0..5]。
-    //    is_signal = frame[0] bit32。普通帧（bit32=0）跳过。
-    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(32);     // shr r11, 32
+    //    is_signal = frame[0] bit48。普通帧（bit48=0）跳过。
+    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(48);     // shr r11, 48
     emit8(0x45); emit8(0x85); emit8(0xDB);                 // test r11d, r11d
     size_t sig_je = size();
     emit8(0x0F); emit8(0x84); emit32(0);                   // JE .no_signal

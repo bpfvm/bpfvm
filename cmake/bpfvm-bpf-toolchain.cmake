@@ -15,8 +15,9 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_C_COMPILER   ${BPFVM_CLANG})
 set(CMAKE_CXX_COMPILER ${BPFVM_CLANGXX})
 
-# C flags（照搬 test/Makefile 的 C 部分）。
-set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
+# C flags（照搬 test/Makefile 的 C 部分）。-ffunction-sections：每函数一个输入段，
+# bpfvm-ld 据此给每个函数入口配精确帧槽（frame_slot.h）。
+set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -ffunction-sections \
     -nostdinc -fno-builtin -fno-math-errno -D_GNU_SOURCE \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
@@ -26,7 +27,7 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
 # 关键：libc++ 头(BPFVM_LIBCXX_INC)必须在 musl(root/include)前——cstddef 的
 # #include_next <stddef.h> 要求 libc++ 的 stddef.h 先被找到，再串联到 musl。
 # 不加 -g：规避 clang BPF 后端 EmitExternalFunctionDeclaration 崩溃。
-set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
+set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -ffunction-sections \
     -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
     -D_GNU_SOURCE -Werror=macro-redefined \
     -Dthread_local='__attribute__((annotate("emutls")))' \

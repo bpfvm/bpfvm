@@ -75,6 +75,7 @@ endif
 #   BPF_FP_SQRT_。去掉 errno 副作用不影响正确性（BPF 无 errno）。
 # 浮点由 BpfSoftFp pass 在 IR 层处理，不依赖 -fno-builtin。
 CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 \
+            -ffunction-sections \
             -nostdinc -fno-builtin -fno-math-errno -Werror=macro-redefined \
             -isystem ../root/include/ -g -fstack-size-section \
             $(PASS_FLAGS)
@@ -93,7 +94,7 @@ CC_FLAGS := -std=gnu11 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-
 LIBCXX_INC := ../root/include/c++/v1
 LIBCXX_INC := $(if $(wildcard $(LIBCXX_INC)/vector),$(LIBCXX_INC),)
 CXX_FLAGS := -std=c++23 -D_GNU_SOURCE -target bpf -mcpu=v4 -O1 \
-             -mllvm -bpf-stack-size=16384 -nostdinc \
+             -mllvm -bpf-stack-size=16384 -ffunction-sections -nostdinc \
              -fno-builtin -fno-math-errno -fno-exceptions -frtti \
              $(if $(LIBCXX_INC),-isystem $(LIBCXX_INC)) \
              -isystem ../root/include/ \

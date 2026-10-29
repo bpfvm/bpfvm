@@ -259,7 +259,7 @@ int64_t PosixSyscall::exec_common(vm* v, int dirfd, const std::string& path,
     v->r(1) = fresh->r(1);
     v->r(10) = STACK_BASE + STACK_SIZE - 8;
     v->pc() = entry;
-    v->push_frame(0);
+    v->push_frame(0, entry);
     v->pc() -= sizeof(bpf_insn);
     return 0;
 }
@@ -379,7 +379,7 @@ int64_t PosixSyscall::do_clone(vm* v) {
         child->r(10) = stack;
         // 提供了新栈（pthread 路径），写入哨兵帧, clone返回后应该立即调用func(arg)，压入一个真实帧
         if(uint64_t* sent = static_cast<uint64_t*>(v->mmu_w(stack, sizeof(uint64_t)))) {
-            *sent = frame_flags_make(false, 0);
+            *sent = frame_flags_make(false, 0, 0);
         }
     }
     child->pc() = v->pc() + sizeof(bpf_insn);

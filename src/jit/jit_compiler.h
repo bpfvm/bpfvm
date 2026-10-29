@@ -29,6 +29,7 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
                               std::vector<AbortPatchInfo>& aborts,
                               std::vector<size_t>& cache_offs,
                               uint64_t gpa, uint64_t ret_gpa, uint64_t callee_gpa,
+                              uint64_t frame,
                               const HelperTable& helpers,
                               const bpf_insn* entry_pc) {
     // VM state setup
@@ -50,7 +51,7 @@ concept JitEmitter = requires(T& e, const bpf_insn* insn, int idx,
     e.emit_ja(insn, idx, jmps);
     e.emit_ja32(insn, idx, jmps);
     e.emit_call_syscall(insn, idx, gpa);
-    e.emit_call_bpf(ret_gpa, callee_gpa, aborts, idx, cache_offs);
+    e.emit_call_bpf(ret_gpa, callee_gpa, frame, aborts, idx, cache_offs);
     e.emit_call_indirect(insn, gpa);
     e.emit_exit(aborts, idx);
 
@@ -136,7 +137,7 @@ private:
                           std::vector<JumpPlaceholder>& placeholders,
                           std::vector<AbortPatchInfo>& abort_patches,
                           std::vector<size_t>& call_cache_offs,
-                          int& compiled_count);
+                          int& compiled_count, vm* v);
 
     // Allocate executable memory (W^X), return pointer or nullptr.
     void* finalize_code(EmitterT& e);

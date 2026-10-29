@@ -19,6 +19,7 @@
 //
 
 #include "elf_linker.h"
+#include "frame_slot.h"
 
 #include <iostream>
 #include <fstream>
@@ -48,6 +49,10 @@ enum SegClass : uint8_t { SEG_TEXT, SEG_RODATA, SEG_DATA };
 // 单个 PLT 桩的字节大小（lddw + ldx，与 emit_plt_stub 输出一致）。
 // 运行期加载器（elf_loader.cpp）也用同一定值定位 PLT 桩。
 constexpr size_t kPltStubSize = 40;
+// 单个 PLT 表项 = 帧槽(8) + 桩(40)：桩的槽写帧大小 0（桩自身无局部区，
+// 桩内 call *r6 再按真实目标函数的槽压帧），与 exec 段头插槽同一约定
+// （运行期 push_frame 读 桩入口-8）。
+constexpr size_t kPltEntrySize = 8 + kPltStubSize;
 
 // 单个加载后的 section
 struct LoadedSection {
@@ -65,6 +70,9 @@ struct LoadedSection {
     Elf64_Xword sh_flags = 0;    // 原 sh_flags（SHF_ALLOC|SHF_EXECINSTR|SHF_WRITE 等）
     Elf64_Xword addralign = 1;   // 原 sh_addralign
     Elf64_Xword entsize = 0;     // 原 sh_entsize
+    // 帧槽（frame_slot.h）：final-link 下每个非空可执行 PROGBITS section 头部
+    // 插 8 字节槽（计入 ls.size，段内代码/符号值/重定位 offset 整体 +8）。
+    bool slotted = false;
 };
 
 // 符号
@@ -121,11 +129,12 @@ struct LoadedObject {
     std::vector<DebugSec> debug_secs;  // 本 obj 拥有的 .debug_* 段（按出现顺序）
     // obj.sections[idx] -> debug_secs 下标；只对属于 debug 的 section 有效
     std::unordered_map<size_t, size_t> dbg_sec_local_idx;
-    // clang -fstack-size-section 产出的 .stack_sizes 段原始字节（keep_debug 时搬运）。
-    // 用于链接期修复 DW_OP_fbreg 偏移（见 fix_fbreg_offsets）。每条记录 =
-    // [8字节 ABS64 重定位 -> 函数 .text 地址][ULEB128 stacksize]，重定位在 obj.relocations 里。
-    std::vector<uint8_t> stack_sizes_data;
-    size_t stack_sizes_sec_idx = SIZE_MAX;  // .stack_sizes 在 obj.sections 的下标（reloc 查找用）
+    // clang -fstack-size-section 产出的 .stack_sizes 段原始字节。
+    // -ffunction-sections 下每个函数 section 配一个同名 .stack_sizes（一对象多个），
+    // 全部收集（keep_debug 时随 -r 搬运；帧槽填充读它）。
+    // 每条记录 = [8字节 ABS64 重定位 -> 函数 .text 内地址][ULEB128 stacksize]，
+    // 重定位在 obj.relocations 里（target_sec = 对应 .stack_sizes 下标）。
+    std::vector<std::pair<size_t, std::vector<uint8_t>>> stack_sizes_secs;
 };
 
 // 全局符号表
@@ -1058,10 +1067,8 @@ public:
             }
             // .stack_sizes（clang -fstack-size-section）：元数据段，供后续 final-link 的
             // fix_fbreg_offsets 解出栈大小。按名合并，重定位随通用路径重写。
-            if (objects_[oi].stack_sizes_sec_idx != SIZE_MAX &&
-                !objects_[oi].stack_sizes_data.empty()) {
-                append(oi, objects_[oi].stack_sizes_sec_idx, ".stack_sizes", 1,
-                       objects_[oi].stack_sizes_data);
+            for (auto& [ss_idx, ss_data] : objects_[oi].stack_sizes_secs) {
+                append(oi, ss_idx, ".stack_sizes", 1, ss_data);
             }
         }
     }
@@ -1444,6 +1451,12 @@ private:
             ls.sh_flags = shdr.sh_flags;
             ls.addralign = shdr.sh_addralign ? shdr.sh_addralign : 1;
             ls.entsize = shdr.sh_entsize;
+            // 帧槽：final-link 的非空可执行 PROGBITS 段头部插 8 字节（frame_slot.h）。
+            // -r 不插（partial link 重排段，槽会在合并时丢失；final link 再补）。
+            // 只做段级整体平移（代码字节不动，符号/重定位 +8），不改写任何指令。
+            ls.slotted = (mode_ != Mode::RELOCATABLE) && ls.executable &&
+                         ls.type == SHT_PROGBITS && shdr.sh_size > 0;
+            if (ls.slotted) ls.size = shdr.sh_size + 8;
             obj.sections.push_back(ls);
         }
 
@@ -1500,14 +1513,16 @@ private:
                         obj.debug_secs.push_back(std::move(ds));
                     }
                 }
-                // .stack_sizes（clang -fstack-size-section）：keep_debug 时搬运原始字节，
-                // 供 fix_fbreg_offsets 解出每个函数的栈大小。其重定位随 .rel.stack_sizes 进
-                // obj.relocations（target_sec = 本段下标）。
-                if (keep_debug_ && shdr.sh_type == SHT_PROGBITS && ls.name == ".stack_sizes") {
+                // .stack_sizes（clang -fstack-size-section）：非 ALLOC 元数据，不进 VM。
+                // 帧槽填充与 fix_fbreg_offsets 都要读，无条件收集；
+                // -ffunction-sections 下同名段有多个（每函数 section 一个），全收。
+                if (shdr.sh_type == SHT_PROGBITS && ls.name == ".stack_sizes") {
                     Elf_Data* d = elf_getdata(scn, nullptr);
                     if (d && d->d_size > 0) {
-                        obj.stack_sizes_data.assign((uint8_t*)d->d_buf, (uint8_t*)d->d_buf + d->d_size);
-                        obj.stack_sizes_sec_idx = sec_idx - 1;
+                        obj.stack_sizes_secs.emplace_back(
+                            sec_idx - 1,
+                            std::vector<uint8_t>((uint8_t*)d->d_buf,
+                                                 (uint8_t*)d->d_buf + d->d_size));
                     }
                 }
                 continue;
@@ -1521,7 +1536,9 @@ private:
             }
             Elf_Data* d = elf_getdata(scn, nullptr);
             if (d && d->d_size > 0) {
-                memcpy(obj.host_mem + ls.offset, d->d_buf, d->d_size);
+                // slotted 段头 8 字节是帧槽（memset 已清零，fill_frame_slots 填值），
+                // 代码数据后移 8。
+                memcpy(obj.host_mem + ls.offset + (ls.slotted ? 8 : 0), d->d_buf, d->d_size);
             }
         }
 
@@ -1627,7 +1644,9 @@ private:
                     if (read_embedded && target_sec < obj.sections.size()) {
                         const auto& tgt = obj.sections[target_sec];
                         if (tgt.loadable) {
-                            const unsigned char* patch = obj.host_mem + tgt.offset + r.offset;
+                            // slotted 段的数据在段内 +8（帧槽在头部），此处按数据真实位置读
+                            const unsigned char* patch = obj.host_mem + tgt.offset + r.offset
+                                                      + (tgt.slotted ? 8 : 0);
                             r.addend = read_embedded_addend(patch, r.type);
                         } else {
                             // SHT_REL 的 DWARF 重定位（.rel.debug_*）：patch 点在 debug 段原始字节里。
@@ -1642,6 +1661,22 @@ private:
                     }
                 }
                 obj.relocations.push_back(r);
+            }
+        }
+
+        // 帧槽平移：slotted 段的代码数据整体后移了 8 字节，段内一切定位同步 +8：
+        //   符号值（含函数入口与 STT_SECTION 段基——段基即原数据起点，+8 后
+        //   S+A 语义保持原坐标）；重定位 addend 与段内 pc 相对跳转均不需改。
+        //   指向 slotted 段的重定位 patch 点 offset 例外：patch 字节随数据后移。
+        for (auto& s : obj.symbols) {
+            if (s.defined && s.sec_idx < obj.sections.size() &&
+                obj.sections[s.sec_idx].slotted) {
+                s.value += 8;
+            }
+        }
+        for (auto& r : obj.relocations) {
+            if (r.target_sec < obj.sections.size() && obj.sections[r.target_sec].slotted) {
+                r.offset += 8;
             }
         }
 
@@ -1959,14 +1994,14 @@ private:
         //     地址——但 GDB 对 PIE remote target 默认按文件内偏移匹配，二者需一致，故 PIE
         //     下 .debug_addr 填文件内偏移可用（VM 加载基址与 GDB 推断一致即可）。
         const bool emit_debug = (keep_debug_ && mode_ != Mode::SHARED_LIB);
+        // 帧槽填充与 DWARF fbreg 修正共用 函数地址->栈大小 表；帧槽三种模式都要填。
+        build_stack_size_map();
+        fill_frame_slots();
         if (emit_debug) {
             collect_debug_sections(extras);
             // 合成 .debug_frame（clang BPF 不生成 CFI；GDB bt 靠它回溯栈）。
             // 在 collect_debug_sections 之后：它已跳过输入的空 .debug_frame，这里补合成版。
             synthesize_debug_frame(extras);
-            // 建 函数地址->栈大小 表（来自 -fstack-size-section 的 .stack_sizes），供
-            // fix_fbreg_offsets 修正 DW_OP_fbreg。不依赖 extras，只读 obj.stack_sizes_data。
-            build_stack_size_map();
         }
         // 2b. 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
         //     -s/--strip-all 时跳过（对齐标准 ld；运行时符号解析仍走 .dynsym）。
@@ -2219,45 +2254,75 @@ private:
     // 重定位是 SHT_REL（addend 嵌入在 .stack_sizes 字节里），符号是 STT_SECTION（.text），
     // 故函数地址 = section.guest_addr + sym.value(0) + embedded addend。
     // 注意：.stack_sizes 既非 loadable 也非 debug 段，loader 不会为它读 embedded addend
-    //（r.addend 保持 0），必须直接从 stack_sizes_data 读。
+    //（r.addend 保持 0），必须直接从 .stack_sizes 字节读。
     void build_stack_size_map() {
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             LoadedObject& obj = objects_[oi];
-            if (obj.stack_sizes_data.empty() || obj.stack_sizes_sec_idx == SIZE_MAX) continue;
-            const auto& data = obj.stack_sizes_data;
-            // 收集本 obj 所有 target 为 .stack_sizes 的重定位，按 offset 排序。
-            std::vector<const LoadedReloc*> rels;
-            for (const auto& r : obj.relocations) {
-                if (r.target_sec == obj.stack_sizes_sec_idx) rels.push_back(&r);
+            for (auto& [ss_idx, data] : obj.stack_sizes_secs) {
+                build_stack_size_map_one(oi, ss_idx, data);
             }
-            std::sort(rels.begin(), rels.end(),
-                      [](const LoadedReloc* a, const LoadedReloc* b){ return a->offset < b->offset; });
-            for (const LoadedReloc* rp : rels) {
-                const LoadedReloc& r = *rp;
-                if (r.sym_idx >= obj.symbols.size()) continue;
-                // section 符号(.text)的 guest 地址；STB_LOCAL 走 resolve_symbol 的 local 分支。
-                auto symval = resolve_symbol(oi, r.sym_idx);
-                if (!symval) continue;
-                // embedded addend：直接从 .stack_sizes 字节读 8 字节小端（type ABS64）。
-                if (r.offset + 8 > data.size()) continue;
-                uint64_t addend = 0;
-                memcpy(&addend, data.data() + r.offset, 8);
-                uint64_t func_addr = *symval + addend;
-                // stacksize：紧跟在 8 字节槽后的 ULEB128。
-                size_t p = r.offset + 8;
-                if (p >= data.size()) continue;
-                uint64_t stacksize = 0;
-                int shift = 0;
-                while (p < data.size()) {
-                    uint8_t b = data[p++];
-                    stacksize |= (uint64_t)(b & 0x7F) << shift;
-                    shift += 7;
-                    if (!(b & 0x80)) break;
-                }
-                stack_sizes_[func_addr] = stacksize;
+        }
+    }
+
+    void build_stack_size_map_one(size_t oi, size_t ss_idx,
+                                  const std::vector<uint8_t>& data) {
+        LoadedObject& obj = objects_[oi];
+        // 收集 target 为该 .stack_sizes 段的重定位，按 offset 排序。
+        std::vector<const LoadedReloc*> rels;
+        for (const auto& r : obj.relocations) {
+            if (r.target_sec == ss_idx) rels.push_back(&r);
+        }
+        std::sort(rels.begin(), rels.end(),
+                  [](const LoadedReloc* a, const LoadedReloc* b){ return a->offset < b->offset; });
+        for (const LoadedReloc* rp : rels) {
+            const LoadedReloc& r = *rp;
+            if (r.sym_idx >= obj.symbols.size()) continue;
+            // section 符号(.text)的 guest 地址；STB_LOCAL 走 resolve_symbol 的 local 分支。
+            auto symval = resolve_symbol(oi, r.sym_idx);
+            if (!symval) continue;
+            // embedded addend：直接从 .stack_sizes 字节读 8 字节小端（type ABS64）。
+            // slotted 段的 addend 已在装载时 +8（段头帧槽），指向函数真实入口。
+            if (r.offset + 8 > data.size()) continue;
+            uint64_t addend = 0;
+            memcpy(&addend, data.data() + r.offset, 8);
+            uint64_t func_addr = *symval + addend;
+            // stacksize：紧跟在 8 字节槽后的 ULEB128。
+            size_t p = r.offset + 8;
+            if (p >= data.size()) continue;
+            uint64_t stacksize = 0;
+            int shift = 0;
+            while (p < data.size()) {
+                uint8_t b = data[p++];
+                stacksize |= (uint64_t)(b & 0x7F) << shift;
+                shift += 7;
+                if (!(b & 0x80)) break;
+            }
+            stack_sizes_[func_addr] = stacksize;
+            if (g_debug)
+                std::cerr << "[elf_linker] stacksize: 0x" << std::hex << func_addr << " = "
+                          << std::dec << stacksize << "\n";
+        }
+    }
+
+    // 填帧槽值：每个 slotted 段的槽描述段内偏移 0 处的函数（-ffunction-sections 下
+    // 即该段唯一函数，入口恰在槽后 8 字节，运行期读 entry-8 命中）。多函数段仅首函数
+    // 被槽覆盖，其余函数入口 -8 是代码字节、无魔数，运行期走 -S 回退。
+    // 无 .stack_sizes 条目（手写汇编 / 未开 -fstack-size-section 的构建）写 FALLBACK。
+    // 须在 layout_segments（guest_addr 就绪）与 build_stack_size_map 之后调用。
+    void fill_frame_slots() {
+        for (auto& obj : objects_) {
+            for (auto& ls : obj.sections) {
+                if (!ls.slotted) continue;
+                uint64_t entry = ls.guest_addr + 8;
+                auto it = stack_sizes_.find(entry);
+                uint64_t size = (it != stack_sizes_.end()) ? it->second : FRAME_SLOT_FALLBACK;
+                uint64_t slot = make_frame_slot(size);
+                memcpy(obj.host_mem + ls.offset, &slot, 8);
                 if (g_debug)
-                    std::cerr << "[elf_linker] stacksize: 0x" << std::hex << func_addr << " = "
-                              << std::dec << stacksize << "\n";
+                    std::cerr << "[elf_linker] frame slot @0x" << std::hex << ls.guest_addr
+                              << " -> 0x" << entry << std::dec
+                              << " size=" << (size == FRAME_SLOT_FALLBACK ? -1 : (int64_t)size)
+                              << "\n";
             }
         }
     }
@@ -4093,10 +4158,10 @@ private:
             go.sections.push_back(gs);
             objects_.push_back(std::move(go));
         }
-        // PLT 段：N*kPltStubSize 字节，初值 0（字节码待回填）
+        // PLT 段：N*kPltEntrySize 字节，初值 0（字节码待回填，槽在 synthesize 时写死）
         pool_used_ = (pool_used_ + 7) & ~size_t(7);
         size_t plt_off = pool_used_;
-        size_t plt_bytes = got_syms.size() * kPltStubSize;
+        size_t plt_bytes = got_syms.size() * kPltEntrySize;
         if (plt_off + plt_bytes > pool_size_) {
             std::cerr << "[elf_linker] pool exhausted for PLT\n";
             return false;
@@ -4122,7 +4187,9 @@ private:
         }
         for (size_t i = 0; i < got_syms.size(); i++) {
             got_slots_[got_syms[i]] = {got_obj_idx, i * 8};
-            plt_entries_[got_syms[i]] = {plt_obj_idx, i * kPltStubSize};
+            plt_entries_[got_syms[i]] = {plt_obj_idx, kPltEntrySize * i + 8};  // 桩起始（跳过帧槽）
+            uint64_t slot = make_frame_slot(0);
+            memcpy(pool_ + plt_off + kPltEntrySize * i, &slot, 8);
         }
         // 记录 GOT 段的 obj_idx，供 .rela.dyn 生成 PLT 桩 lddw 重定位用
         got_obj_idx_ = got_obj_idx;
