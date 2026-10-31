@@ -198,7 +198,9 @@ class PosixSyscall: public SyscallHandler{
             fds_mutate([&](FdMap& m){
                 fd = min_fd;
                 while(m.count(fd)) fd++;
-                m[fd] = std::move(handle);
+                // 必须拷贝：CAS 重试重跑 lambda，move 掏空的 handle 会插入
+                // key 占号、值为 null 的条目
+                m[fd] = handle;
             });
             return fd;
         }

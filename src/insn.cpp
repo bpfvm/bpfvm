@@ -1462,7 +1462,12 @@ void vm::dump_stats() const {
         fprintf(stderr, "[BPF] JIT执行函数次数: %" PRIu64 "\n", s.jit_func_runs);
         fprintf(stderr, "[BPF] 编译时平均函数大小: %.1f条\n",
                 (double)s.jit_compiled_insns / s.jit_compiles);
-        fprintf(stderr, "[BPF] 编译耗时: %.1fms\n", s.compile_ns / 1e6);
+        fprintf(stderr, "[BPF] 编译耗时(含探测): %.1fms (map路径 %.1fms/%lu次, 真实编译 %.1fms)\n",
+                s.map_path_ns / 1e6, (s.map_path_ns - s.real_compile_ns) / 1e6,
+                (unsigned long)s.map_path_calls, s.real_compile_ns / 1e6);
+        fprintf(stderr, "[BPF] 真实编译分相: 定段 %.1fms, BFS %.1fms, emit %.1fms, patch %.1fms, finalize %.1fms\n",
+                s.seg_ns / 1e6, s.bfs_ns / 1e6, s.emit_ns / 1e6,
+                s.patch_ns / 1e6, s.finalize_ns / 1e6);
     }
 }
 

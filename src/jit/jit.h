@@ -25,6 +25,19 @@ struct JumpPlaceholder {
     size_t patch_offset;      // offset in emitter buffer
     int target_bpf_index;     // target BPF instruction index (relative to entry_pc)
     PlaceholderKind kind;
+    // 越界跳转(目标在编译区间外,典型是回跳到入口之前)的 deopt 桩:patch 到
+    // flush_and_exit 而非区间内目标;跳转前已由 emit_set_pc_imm 写好 vm->pc_
+    bool deopt = false;
+};
+
+// 间接调用单型内联缓存槽（每调用点一个；慢路径 helper 填充）
+struct IndirectICSlot {
+    // tag=未填 哨兵：0 与 ~0 都是 guest 真实可见的垃圾函数指针值（空指针/-1），
+    // 任何哨兵取值都只是概率防御；命中路径对 entry 的空判（->.slow 走 helper
+    // 的 mmu 校验）才是兜底，保证哨兵相撞不崩宿主
+    uint64_t tag = ~0ull;  // 上次目标 gpa（~0=未填）
+    void* entry = nullptr; // 目标的 entry_fast
+    uint64_t frame = 0;    // 目标的编译期帧大小（push_frame 用）
 };
 
 struct AbortPatchInfo {
@@ -56,9 +69,8 @@ struct JitEntry {
     JitEntryKind kind = JitEntryKind::Counting;
     uint32_t count = 0;              // 热点计数（编译成功后不再重置，不再被读取）
 
-    void* code = nullptr;             // executable entry point
+    void* code = nullptr;             // executable entry point（RX arena 内）
     int insn_count = 0;               // total BPF instructions compiled
-    size_t code_size = 0;             // mmap'd allocation size
     uint64_t gpa = 0;                  // first BPF instruction (guest address)
     std::vector<uint32_t> pc_offsets; // BPF index -> code offset
     // 跨函数直跳第二入口（跳过 entry safepoint），offset from code。
@@ -66,6 +78,8 @@ struct JitEntry {
     // inline cache：每个 BPF->BPF call 站点一槽，缓存 callee 的 entry_fast 入口（0=未缓存）。
     // compile() 在 e.data()（RW）patch 占位为 &call_cache[idx]，再固化 RX，无运行时 patch。
     std::vector<uint64_t> call_cache;
+    // 间接调用站点单型 IC（tag/entry/frame 三元组），同 call_cache 方式 patch 槽地址
+    std::vector<IndirectICSlot> ic_slots;
 };
 
 // ---------------------------------------------------------------------------
@@ -75,7 +89,16 @@ struct JitStats {
     uint64_t jit_compiles = 0;
     uint64_t jit_compiled_insns = 0;
     uint64_t jit_func_runs = 0;
-    uint64_t compile_ns = 0;       // total JIT compilation time (ns)
+    // 诊断拆分：map 路径（含热点计数）与真实编译（过阈值后的 emit/patch）
+    uint64_t map_path_calls = 0;
+    uint64_t map_path_ns = 0;      // 含 real_compile_ns（t_real 建于 t_map 存活期内）
+    uint64_t real_compile_ns = 0;
+    // real_compile 内部分相（嵌套互斥）
+    uint64_t seg_ns = 0;           // mmu 取入口 + 线性扫 maps 定段
+    uint64_t bfs_ns = 0;           // discover_reachable（含每次调用的向量分配）
+    uint64_t emit_ns = 0;          // prologue + 逐指令 emit
+    uint64_t patch_ns = 0;         // placeholder/abort/slot 地址 patch
+    uint64_t finalize_ns = 0;      // mmap + clear_cache + mprotect
 };
 
 // ---------------------------------------------------------------------------
@@ -95,6 +118,8 @@ struct HelperTable {
     // (vm*, callee_gpa, uint64_t* slot) -> void*: inline cache miss 慢路径。查 callee；
     //   命中则 *slot=target 返回 target，未编译则 v->pc_=callee_gpa 返回 nullptr。
     void* resolve_and_cache = nullptr;
+    // (vm*, ret_gpa, target, IndirectICSlot*): 间接调用慢路径 = call_indirect + 填槽
+    void* call_indirect_ic = nullptr;
 };
 
 // ---------------------------------------------------------------------------

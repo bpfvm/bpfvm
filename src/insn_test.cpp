@@ -4,7 +4,9 @@
 #include <iostream>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring> // For memcpy
+#include <string>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1805,7 +1807,8 @@ void test_reg_index_oob_rejected() {
 
     auto ebpf_vm = vm::create();
     unsigned char* host_data = nullptr;
-    assert(add_data_mem(*ebpf_vm, DATA, 4096, &host_data));
+    // 调用不得放进 assert：Release(-DNDEBUG) 下会被整句移除，host_data 留空导致空指针写
+    { [[maybe_unused]] bool ok = add_data_mem(*ebpf_vm, DATA, 4096, &host_data); assert(ok); }
     *(uint64_t*)(host_data + 0) = 0x0000000000000000ULL;  // 未拦截时经 src_reg=14 写入 tlb[0].guest_base
     *(uint64_t*)(host_data + 8) = 0xFFFFFFFFFFFFFFFFULL;  // 未拦截时经 src_reg=15 写入 tlb[0].guest_end
 
@@ -1912,11 +1915,16 @@ void test_load_elf_filesz_overflow_rejected() {
         return buf;
     };
     auto try_load = [&](const std::vector<unsigned char>& buf) {
-        char tmpl[] = "/tmp/bpfvm_test_elfXXXXXX";
-        int fd = mkstemp(tmpl);
+        // Android 无 /tmp，模板目录取 TMPDIR（Termux 已设），缺省回落 /tmp
+        const char* dir = getenv("TMPDIR");
+        std::string tmpl = (dir && *dir) ? dir : "/tmp";
+        tmpl += "/bpfvm_test_elfXXXXXX";
+        int fd = mkstemp(tmpl.data());
         assert(fd >= 0);
-        unlink(tmpl);
-        assert(write(fd, buf.data(), buf.size()) == (ssize_t)buf.size());
+        unlink(tmpl.c_str());
+        // 调用不得放进 assert：Release(-DNDEBUG) 下 write 会被整句移除，文件为空导致误报加载失败
+        [[maybe_unused]] ssize_t n = write(fd, buf.data(), buf.size());
+        assert(n == (ssize_t)buf.size());
         ElfLoadInfo info = load_elf(fd, "poc", [](memmap&&) {}, {});
         close(fd);
         return info;

@@ -36,6 +36,13 @@ protected:
     size_t entry_fast_offset = 0;
 
 public:
+    // 跨编译复用：清空代码缓冲（保留容量）并复位 prologue 记录的偏移。
+    void reset() {
+        buf_.clear();
+        vm_exit_offset = 0;
+        entry_fast_offset = 0;
+    }
+
     // --- Byte emission ---
     void emit8(uint8_t v) { buf_.push_back(v); }
     void emit16(uint16_t v) {

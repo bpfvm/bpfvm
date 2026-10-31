@@ -504,6 +504,13 @@ void AArch64Emitter::call_helper(void* addr) {
     blr(X15);
 }
 
+// LDR literal：重取此前 emit 的 8 字节数据（emit_call_indirect 的 IC 槽地址复用）。
+// imm19 相对 ldr 自身编址（4 字节单位、有符号），同序列内重引用距离 <300B。
+void AArch64Emitter::ldr_literal_at(uint8_t dst, size_t data_off) {
+    int32_t imm19 = (int32_t)(data_off - size()) / 4;
+    emit_insn(0x58000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rd(dst));
+}
+
 // ---------------------------------------------------------------------------
 // Patching  (B.cond/CBZ/CBNZ: imm19 at bits 23:5; B: imm26 at bits 25:0)
 // ---------------------------------------------------------------------------
@@ -514,6 +521,23 @@ void AArch64Emitter::patch_branch_cond(size_t off, size_t target) {
     insn = (insn & 0xFF00001Fu) | (((uint32_t)rel & 0x7FFFFu) << 5);
     memcpy(data() + off, &insn, 4);
 }
+size_t AArch64Emitter::emit_far_cond(uint8_t cond) {
+    // imm19=2: 跳过下一条 b(imm19=1 只到 b 本身)
+    emit_insn(0x54000000u | ((uint32_t)2 << 5) | (uint32_t)(cond ^ 1));
+    size_t off = size();
+    b_uncond();
+    return off;
+}
+
+size_t AArch64Emitter::emit_far_czero(uint8_t reg, bool is_64, bool taken_when_zero) {
+    size_t off = size();
+    if (taken_when_zero) cbnz(reg, is_64); else cbz(reg, is_64);
+    size_t b_off = size();
+    b_uncond();
+    patch_branch_cond(off, b_off + 4);
+    return b_off;
+}
+
 void AArch64Emitter::patch_branch_uncond(size_t off, size_t target) {
     int32_t rel = (int32_t)(target - off) / 4;
     uint32_t insn; memcpy(&insn, data() + off, 4);
@@ -598,8 +622,7 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     mov_imm(X2, (uint64_t)access_size, true); // arg3 = size
     call_helper(is_write ? helpers_->mmu_w : helpers_->mmu);
     restore_caller_saved();
-    cbz(X0, true);                   // null -> .vm_exit (recorded as abort)
-    ctx.abort_jumps.push_back(size() - 4);
+    ctx.abort_jumps.push_back(emit_far_czero(X0, true, /*taken_when_zero=*/true));  // null -> abort
 
     // .done
     ctx.done_offset = size();
@@ -966,14 +989,13 @@ bool AArch64Emitter::emit_stx_atomic(const bpf_insn* insn,
 // Conditional jumps
 // ---------------------------------------------------------------------------
 
-bool AArch64Emitter::emit_jmp(const bpf_insn* insn, int cur, bool is_64,
-                                std::vector<JumpPlaceholder>& phs) {
+bool AArch64Emitter::jmp_load_operands(const bpf_insn* insn, bool is_64, uint8_t& cc) {
     uint8_t op = insn->code & 0xf0;
     bool is_x = (insn->code & 0x08) == BPF_X;
     if (is_64 && (op == BPF_JA || op == BPF_CALL || op == BPF_EXIT)) return false;
     if (!is_64 && op == BPF_JA) return false;
 
-    uint8_t cc = 0; bool is_test = false;
+    bool is_test = false;
     switch (op) {
     case BPF_JEQ:  cc = ARMCond::EQ; break;
     case BPF_JNE:  cc = ARMCond::NE; break;
@@ -997,9 +1019,42 @@ bool AArch64Emitter::emit_jmp(const bpf_insn* insn, int cur, bool is_64,
         if (is_x) { load_bpf(insn->src_reg, X1); cmp_reg(X0, X1, is_64); }
         else cmp_imm(X0, insn->imm, is_64);
     }
+    return true;
+}
+
+bool AArch64Emitter::emit_jmp(const bpf_insn* insn, int cur, bool is_64,
+                                std::vector<JumpPlaceholder>& phs) {
+    uint8_t cc = 0;
+    if (!jmp_load_operands(insn, is_64, cc)) return false;
+    size_t off = emit_far_cond(cc);
+    phs.push_back({off, cur + 1 + insn->off, PlaceholderKind::Unconditional});
+    return true;
+}
+
+// deopt 前置:vm->pc_ = imm64(与 x86 对应;X0 为调用间 scratch)
+void AArch64Emitter::emit_set_pc_imm(uint64_t gpa) {
+    mov_imm(X0, gpa);
+    str_imm(X0, X28, (int32_t)off_pc_, true);
+}
+
+// 越界条件跳转的 deopt(与 x86 emit_jmp_deopt 语义对齐):条件成立走桩(写 vm->pc_
+// 后跳 flush_and_exit),不成立反转 b.cond 跳过桩顺序继续。不能无条件先写 pc_:
+// 条件不成立时留下脏 pc_,后续任意退出路径都会把它当真。
+// 桩体长度可变(emit_set_pc_imm 的 movz/movk 条数随立即数变化),反转 b.cond 必须
+// 先发占位、桩 emit 完再 patch_branch_cond 回填——B.cond 位移相对分支指令自身,
+// 手数桩内指令条数一旦与实际不符,"跳过桩"会落进桩中间(如桩尾 b),未跳转路径
+// 也会带着脏 pc_ 走 deopt 出口。
+bool AArch64Emitter::emit_jmp_deopt(const bpf_insn* insn, bool is_64, uint64_t target_gpa,
+                                    std::vector<JumpPlaceholder>& phs) {
+    uint8_t cc = 0;
+    if (!jmp_load_operands(insn, is_64, cc)) return false;
+    size_t skip = size();
+    b_cond(cc ^ 1);
+    emit_set_pc_imm(target_gpa);
     size_t off = size();
-    b_cond(cc);
-    phs.push_back({off, cur + 1 + insn->off, PlaceholderKind::Conditional});
+    b_uncond();
+    phs.push_back({off, -1, PlaceholderKind::Unconditional, /*deopt=*/true});
+    patch_branch_cond(skip, off + 4);
     return true;
 }
 
@@ -1270,8 +1325,7 @@ void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t e
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
     call_helper(helpers_->do_syscall);
     // Check return (al != 0 means ok)
-    cbz(X0, false);
-    patch_branch_cond(size() - 4, vm_exit_offset);
+    patch_branch_uncond(emit_far_czero(X0, false, /*taken_when_zero=*/true), vm_exit_offset);
     reload_from_vm();
 }
 
@@ -1308,18 +1362,16 @@ void AArch64Emitter::emit_call_softfp_slow(const bpf_insn* insn, int cur, uint64
 // .overflow：栈溢出 -> VM_KILLED（LDAXR/STLXR 原子 or）-> vm_exit。
 // ---------------------------------------------------------------------------
 
-void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
-                                  std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
-                                  std::vector<size_t>& call_cache_offs) {
-    (void)callee_gpa;
-    size_t flags_cbnz = 0;  // CBNZ .slow 的 patch offset
-
-    // -  调用点 safepoint：flags!=0 走 .slow
+size_t AArch64Emitter::emit_call_flags_check() {
     ldr_imm(X0, X28, (int32_t)off_flags_, false);  // W0 = flags (32-bit load)
-    flags_cbnz = size(); cbnz(X0, false);           // CBNZ W0, .slow
-    // entry_fast 信任 aarch64 寄存器（见 entry_fast 注释），故 fast path 无 flush。
+    size_t flags_cbnz = size(); cbnz(X0, false);   // CBNZ W0, .slow
+    return flags_cbnz;
+}
 
-    // -  内联 push_frame（仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)）
+size_t AArch64Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
+                                              std::vector<AbortPatchInfo>& abort_patches,
+                                              int bpf_index) {
+    // 仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)。
     // 2a. 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
     auto rctx = begin_mem_access(X23, 0, 8, /*is_write=*/false);  // X0 = cur_frame host
     // and_imm 的内部 temp 是 X2（先 mov_imm X2 再 and）：X2 不得作源，也不得跨 and_imm 存活
@@ -1337,12 +1389,18 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64
     str_imm(X0, X28, (int32_t)off_scratch_, true);     // 暂存 frame_base（write-probe 会踩 scratch）
     finish_mem_access(rctx, abort_patches, bpf_index);
 
-    // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
-    auto wctx = begin_mem_access(X0, 0, 64, /*is_write=*/true);  // X0 = 帧 host（base=X0=frame_base）
+    // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）。
     // frame[0] = callee_frame（编译期读帧槽的立即数；is_signal=0、alloca_len=0 时
-    // frame_flags_make 的编码值 == stack_size 本身）
-    mov_imm(X1, callee_frame, true);
-    str_imm(X1, X0, 0, true);                          // frame[0] = callee_frame
+    // frame_flags_make 的编码值 == stack_size 本身）；间接调用从 IC 槽取
+    auto wctx = begin_mem_access(X0, 0, 64, /*is_write=*/true);  // X0 = 帧 host（base=X0=frame_base）
+    if (src.from_slot) {
+        ldr_literal_at(X1, src.lit_off);            // X1 = slot（重取快路径字面量）
+        ldr_imm(X2, X1, 16, true);                  // X2 = slot->frame（callee 编译期帧大小）
+        str_imm(X2, X0, 0, true);                   // frame[0] = callee_frame
+    } else {
+        mov_imm(X1, src.imm, true);
+        str_imm(X1, X0, 0, true);                          // frame[0] = callee_frame
+    }
     str_imm(X23, X0, 8, true);                         // frame[1] = old r10 (X23 尚未更新)
     mov_imm(X1, ret_gpa, true); str_imm(X1, X0, 16, true);  // frame[2] = ret_gpa
     str_imm(X19, X0, 24, true);                        // frame[3] = r6
@@ -1352,6 +1410,53 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64
     ldr_imm(X23, X28, (int32_t)off_scratch_, true);    // X23 = frame_base（从暂存读回）
     str_imm(X23, X28, (int32_t)(off_reg_ + 10 * 8), true);  // vm->reg[10] = frame_base
     finish_mem_access(wctx, abort_patches, bpf_index);
+    return overflow_b;
+}
+
+void AArch64Emitter::emit_call_overflow_stub(size_t overflow_b) {
+    // .overflow：栈溢出 -> 原子 or VM_KILLED -> vm_exit
+    size_t overflow = size();
+    patch_branch_cond(overflow_b, overflow);
+    mov_imm(X0, (uint64_t)vm::VM_KILLED, false);   // W0 = VM_KILLED(4)
+    add_imm(X1, X28, (int64_t)off_flags_, true);   // X1 = &flags
+    size_t ov_loop = size();
+    emit_insn(0x885FFC00u | ((uint32_t)X1 << 5) | rd(X2));   // LDAXR W2, [X1]
+    orr_reg(X2, X2, X0, false);                               // ORR W2, W2, W0
+    emit_insn(0x8800FC00u | ((uint32_t)X15 << 16) | ((uint32_t)X1 << 5) | rd(X2)); // STLXR W15, W2, [X1]
+    cbnz(X15, false);
+    patch_branch_cond(size() - 4, ov_loop);
+    size_t ov_b = size(); b_uncond();
+    patch_branch_uncond(ov_b, vm_exit_offset);
+}
+
+void AArch64Emitter::emit_call_cont_tail(uint64_t ret_gpa, std::initializer_list<size_t> cont_jmps) {
+    // .cont：callee 经 vm_exit ret 返回。无 reload——r0=X9、r6-r9/X28 由 ldp 还原。
+    //    唯 r10 须 reload（ldp 还原 callee 入口 r10=frame_base，caller 需 old_sp，emit_exit
+    //    已写 vm->reg[10]）。flag-check 捕 VM_JIT_ABORT/信号；pc-check 兜底非正常返回。
+    size_t cont_target = size();
+    for (size_t jmp : cont_jmps) patch_branch_uncond(jmp, cont_target);
+    ldr_imm(X23, X28, (int32_t)(off_reg_ + 10 * 8), true);  // r10 = vm->reg[10] (= old_sp)
+    ldr_imm(X0, X28, (int32_t)off_flags_, false);            // W0 = flags
+    size_t cont_cbnz = emit_far_czero(X0, false, /*taken_when_zero=*/false);  // flags!=0 -> vm_exit
+    ldr_imm(X1, X28, (int32_t)off_pc_, true);                // X1 = vm->pc
+    mov_imm(X2, ret_gpa, true);                              // X2 = ret_gpa
+    cmp_reg(X1, X2, true);
+    size_t cont_bne = emit_far_cond(ARMCond::NE);            // pc != ret -> vm_exit
+    patch_branch_uncond(cont_cbnz, vm_exit_offset);
+    patch_branch_uncond(cont_bne, vm_exit_offset);
+}
+
+void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
+                                  std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
+                                  std::vector<size_t>& call_cache_offs) {
+    (void)callee_gpa;
+    // -  调用点 safepoint：flags!=0 走 .slow。entry_fast 信任 aarch64 寄存器（见
+    //    entry_fast 注释），故 fast path 无 flush。
+    size_t flags_cbnz = emit_call_flags_check();
+
+    // -  内联 push_frame
+    size_t overflow_b = emit_push_frame_inline(FrameSrc{false, callee_frame, 0},
+                                               ret_gpa, abort_patches, bpf_index);
 
     // -  inline cache：ldr X0,[pc,#8] 取内联数据(slot_addr)；b .+12 跳过 8 字节数据；
     //    ldr X0,[X0] 取缓存 target；cbz -> .slow_resolve。数据由 compile() patch 成 &call_cache[idx]。
@@ -1374,11 +1479,7 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64
     spill_caller_saved();
     mov_reg(X0, X28, true);               // X0 = vm*（helper 入参）
     mov_imm(X1, callee_gpa, true);        // X1 = callee_gpa
-    emit_insn(0x58000042u);               // ldr X2, [pc, #8]  (slot_addr，同上手法)
-    emit_insn(0x14000003u);               // b .+12
-    size_t slot_arg_off = size();
-    emit64(0);
-    call_cache_offs.push_back(slot_arg_off);
+    ldr_literal_at(X2, slot_data_off);    // X2 = &call_cache[idx]（重取快路径字面量）
     call_helper(helpers_->resolve_and_cache);
     restore_caller_saved();
     size_t nc_cbz = size(); cbz(X0, true);  // CBZ X0, .not_compiled
@@ -1404,45 +1505,81 @@ void AArch64Emitter::emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64
     size_t slow_b = size(); b_uncond();
     patch_branch_uncond(slow_b, vm_exit_offset);
 
-    // -  .overflow：栈溢出 -> 原子 or VM_KILLED -> vm_exit
-    size_t overflow = size();
-    patch_branch_cond(overflow_b, overflow);
-    mov_imm(X0, (uint64_t)vm::VM_KILLED, false);   // W0 = VM_KILLED(4)
-    add_imm(X1, X28, (int64_t)off_flags_, true);   // X1 = &flags
-    size_t ov_loop = size();
-    emit_insn(0x885FFC00u | ((uint32_t)X1 << 5) | rd(X2));   // LDAXR W2, [X1]
-    orr_reg(X2, X2, X0, false);                               // ORR W2, W2, W0
-    emit_insn(0x8800FC00u | ((uint32_t)X15 << 16) | ((uint32_t)X1 << 5) | rd(X2)); // STLXR W15, W2, [X1]
-    cbnz(X15, false);
-    patch_branch_cond(size() - 4, ov_loop);
-    size_t ov_b = size(); b_uncond();
-    patch_branch_uncond(ov_b, vm_exit_offset);
-
-    // -  .cont：callee 经 vm_exit ret 返回。无 reload——r0=X9、r6-r9/X28 由 ldp 还原。
-    //    唯 r10 须 reload（ldp 还原 callee 入口 r10=frame_base，caller 需 old_sp，emit_exit
-    //    已写 vm->reg[10]）。flag-check 捕 VM_JIT_ABORT/信号；pc-check 兜底非正常返回。
-    size_t cont_target = size();
-    patch_branch_uncond(after_call_b, cont_target);
-    patch_branch_uncond(sr_b, cont_target);
-    ldr_imm(X23, X28, (int32_t)(off_reg_ + 10 * 8), true);  // r10 = vm->reg[10] (= old_sp)
-    ldr_imm(X0, X28, (int32_t)off_flags_, false);            // W0 = flags
-    size_t cont_cbnz = size(); cbnz(X0, false);              // CBNZ W0, vm_exit
-    ldr_imm(X1, X28, (int32_t)off_pc_, true);                // X1 = vm->pc
-    mov_imm(X2, ret_gpa, true);                              // X2 = ret_gpa
-    cmp_reg(X1, X2, true);
-    size_t cont_bne = size(); b_cond(ARMCond::NE);            // B.NE vm_exit
-    patch_branch_cond(cont_cbnz, vm_exit_offset);
-    patch_branch_cond(cont_bne, vm_exit_offset);
+    emit_call_overflow_stub(overflow_b);
+    emit_call_cont_tail(ret_gpa, {after_call_b, sr_b});
 }
 
-void AArch64Emitter::emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa) {
+// ---------------------------------------------------------------------------
+// CALL indirect (BPF_CALL | BPF_X)
+//
+// 单型内联缓存：CPython 这类函数指针分发密集的负载里，同一站点的目标在热路径上
+// 高度稳定（tp_as_number->nb_add 等按类型单一）。命中时走与直连 call 相同的 JIT 内
+// push+blr（免 flush/step 往返）；未命中走慢路径并由 helper 填槽。
+//
+// fast path（flags==0 且槽 tag==target）结构同 emit_call_bpf：内联 push_frame ->
+// blr entry_fast -> .cont。与直连的两处差异：callee_frame 不是编译期立即数（从槽
+// frame 字段取）、目标入口不经 call_cache（从槽 entry 字段取）。
+//
+// 槽地址全序列只 emit 一份 8 字节字面量数据（快路径占位，compile() patch 成
+// &ic_slots[idx]），tag 比较、frame 装载、entry 装载与慢路径传参共 4 处引用均经
+// ldr-literal 反向引用同一份数据（imm19 相对 ldr 自身编址，同序列内距离 <300B，
+// 远小于 imm19 的 +/-1MB）——ic_cache_offs 每站点恰 1 个占位。
+// entry/frame 不能驻留寄存器跨越 mem-access 区（rctx/wctx 的 TLB miss 会调 helper，
+// caller-saved 全毁），也不能压宿主栈（mem-access 的 abort 分支直达 flush_and_exit，
+// SP 失衡会让 vm_exit 的 ldp 恢复出垃圾），故都在使用点从槽重取。
+//
+// .slow（flags!=0 或 IC miss）：flush + helper_call_indirect_ic（原 call_indirect
+// 语义 + 目标已编译时填槽）-> vm_exit。
+// .overflow：栈溢出 -> VM_KILLED（LDAXR/STLXR 原子 or）-> vm_exit。
+// ---------------------------------------------------------------------------
+
+void AArch64Emitter::emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa,
+                                         std::vector<AbortPatchInfo>& abort_patches,
+                                         int bpf_index, std::vector<size_t>& ic_cache_offs) {
+    // -  调用点 safepoint：flags!=0 走 .slow
+    size_t flags_cbnz = emit_call_flags_check();
+
+    // -  IC 检查：X0 = target（BPF dst 寄存器）；X1 = 槽地址（字面量占位，compile()
+    //    patch 成 &ic_slots[idx]）。未填槽时 tag==~0 与任何合法 gpa 都不等，必走 .slow
+    load_bpf(insn->dst_reg, X0);
+    emit_insn(0x58000041u);               // ldr X1, [pc, #8]   (slot_addr)
+    emit_insn(0x14000003u);               // b .+12             (跳过 8 字节数据)
+    size_t slot_data_off = size();
+    emit64(0);                            // 8 字节 slot_addr 占位
+    ic_cache_offs.push_back(slot_data_off);
+    ldr_imm(X2, X1, 0, true);             // X2 = tag
+    cmp_reg(X2, X0, true);
+    size_t miss_b = size(); b_cond(ARMCond::NE);  // B.NE .slow
+
+    // -  内联 push_frame：frame[0] 的 callee_frame 从 IC 槽的 frame 字段取
+    size_t overflow_b = emit_push_frame_inline(FrameSrc{true, 0, slot_data_off},
+                                               ret_gpa, abort_patches, bpf_index);
+
+    // -  cache 命中：blr X16 进 entry_fast。X28 已是 vm*，无需 mov X0,X28。
+    //    entry 空判 -> .slow：未填槽哨兵与 guest 垃圾目标相撞的兜底
+    //    （机制见 IndirectICSlot 注释）
+    ldr_literal_at(X16, slot_data_off);           // X16 = slot
+    ldr_imm(X16, X16, 8, true);                   // X16 = slot->entry（callee entry_fast）
+    size_t entry_cbz = size(); cbz(X16, true);    // CBZ X16, .slow
+    blr(X16);
+    size_t after_call_b = size(); b_uncond();     // -> .cont
+
+    // -  .slow：flags!=0 / IC miss / entry 未填。flush + target 重读 + helper -> vm_exit
+    size_t slow = size();
+    patch_branch_cond(flags_cbnz, slow);
+    patch_branch_cond(miss_b, slow);
+    patch_branch_cond(entry_cbz, slow);
     flush_to_vm();
-    mov_reg(X0, X28, true);                                       // X0 = vm*
-    mov_imm(X1, ret_gpa, true);                                   // X1 = ret_gpa
-    ldr_imm(X2, X28, (int32_t)(off_reg_ + insn->dst_reg * 8), true); // X2 = target
-    call_helper(helpers_->call_indirect);
-    size_t off = size(); b_uncond();
-    patch_branch_uncond(off, vm_exit_offset);
+    ldr_imm(X2, X28, (int32_t)(off_reg_ + insn->dst_reg * 8), true);  // X2 = target
+    mov_reg(X0, X28, true);                       // X0 = vm*
+    mov_imm(X1, ret_gpa, true);                   // X1 = ret_gpa
+    ldr_literal_at(X3, slot_data_off);            // X3 = &ic_slots[idx]（重取快路径字面量）
+    call_helper(helpers_->call_indirect_ic);
+    size_t slow_b = size(); b_uncond();
+    patch_branch_uncond(slow_b, vm_exit_offset);
+
+    emit_call_overflow_stub(overflow_b);
+    emit_call_cont_tail(ret_gpa, {after_call_b});
 }
 
 void AArch64Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
@@ -1640,9 +1777,9 @@ void AArch64Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) 
     str_imm(X2, X28, (int32_t)off_pc_, true);
     mov_reg(X0, X28, true);
     call_helper(helpers_->safepoint);
-    // helper returns 0=ok, non-zero=exit
-    cbnz(X0, false);
-    patch_branch_cond(size() - 4, vm_exit_offset);
+    // helper returns 0=ok, non-zero=exit。远形式：本慢路径块位于函数体任意位置，
+    // 大片段中距 prologue 的 vm_exit 可超 b.cond imm19（+/-1MB）
+    patch_branch_uncond(emit_far_czero(X0, false, /*taken_when_zero=*/false), vm_exit_offset);
     reload_caller_saved();
 
     // .done

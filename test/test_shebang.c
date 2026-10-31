@@ -11,6 +11,19 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#if defined(__ANDROID__)
+#include <stdio.h>
+/* bionic 不声明 fexecve。按 musl 的实现方式构造（/proc/self/fd 路径 + execve），
+ * 而非 execveat(AT_EMPTY_PATH)：后者内核自持文件引用，O_CLOEXEC 子用例会 exec
+ * 成功，与 guest 侧 musl 的 ENOENT 行为分歧 */
+static int fexecve(int fd, char *const argv[], char *const envp[])
+{
+    char path[32];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    execve(path, argv, envp);
+    return -1;
+}
+#endif
 
 extern char **environ;
 
@@ -22,11 +35,16 @@ static int exec_script(const char *path, char *const cargv[]) {
 }
 
 /* 解释器模式：argv 为 [self, "-x", script, "sarg"]（带参）或 [self, script]（无参）。
- * script 允许两种形态：调用者路径（普通 exec），或 VM/内核合成的 /dev/fd/N
- * （fexecve）；后者按路径重开校验内容确是脚本头。语义不符打印 FAIL 返回 1，
+ * script 允许两种形态：调用者路径（普通 exec），或 fexecve 的 fd 路径——主线
+ * 内核会把它改写成 /dev/fd/N 传给解释器，Android 4.19 原样透传 /proc/self/fd/N，
+ * 两种前缀都认；fd 路径按路径重开校验内容确是脚本头。语义不符打印 FAIL 返回 1，
  * 全对返回 0x22 供驱动方 waitpid 断言。 */
+static int is_fd_path(const char *path) {
+    return strncmp(path, "/dev/fd/", 8) == 0 ||
+           strncmp(path, "/proc/self/fd/", 14) == 0;
+}
 static int check_fd_script(const char *path) {
-    if (strncmp(path, "/dev/fd/", 8) != 0) {
+    if (!is_fd_path(path)) {
         return 1;   /* 普通路径形态，不在此校验 */
     }
     FILE *f = fopen(path, "r");
@@ -47,7 +65,7 @@ static int check_fd_script(const char *path) {
 static int interp_main(int argc, char *argv[]) {
     if (strcmp(argv[1], "-x") == 0) {
         if (argc < 3 || (strstr(argv[2], SCRIPT_NAME) == NULL &&
-                         strncmp(argv[2], "/dev/fd/", 8) != 0)) {
+                         !is_fd_path(argv[2]))) {
             printf("FAIL: expected script path after -x, got: %s\n", argc > 2 ? argv[2] : "(none)");
             return 1;
         }
@@ -58,8 +76,7 @@ static int interp_main(int argc, char *argv[]) {
         if (!check_fd_script(argv[2])) {
             return 1;
         }
-    } else if (strstr(argv[1], SCRIPT_NAME) == NULL &&
-               strncmp(argv[1], "/dev/fd/", 8) != 0) {
+    } else if (strstr(argv[1], SCRIPT_NAME) == NULL && !is_fd_path(argv[1])) {
         printf("FAIL: unexpected argv[1]: %s\n", argv[1]);
         return 1;
     }
@@ -95,7 +112,7 @@ int main(int argc, char *argv[]) {
     if (pid == 0) {
         char *const cargv[] = { (char *)script_path, "sarg", NULL };
         exec_script(script_path, cargv);
-        printf("child: execve script failed (errno=%d)\n", errno);
+        fprintf(stderr, "child: execve script failed (errno=%d)\n", errno);
         _exit(126);
     }
     int status = 0;
@@ -129,16 +146,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 解释器行无换行结尾（EOF 即行尾）：同样可执行，argv 语义与带换行一致 */
+    /* 解释器行无换行结尾（EOF 即行尾）：同样可执行，argv 语义与带换行一致。
+     * Android 4.19 内核对此返回 ENOEXEC（主线接受），host 侧跳过该子用例；
+     * guest 侧照常覆盖——VM 按主线语义实现 */
     f = fopen(script_path, "w");
     fprintf(f, "#!%s -x", self);
     fclose(f);
     chmod(script_path, 0755);
+#if defined(__ANDROID__)
+    printf("SKIP: no-newline shebang on Android host kernel (ENOEXEC)\n");
+#else
     pid = fork();
     if (pid == 0) {
         char *const cargv[] = { (char *)script_path, "sarg", NULL };
         exec_script(script_path, cargv);
-        printf("child: execve script failed (errno=%d)\n", errno);
+        fprintf(stderr, "child: execve script failed (errno=%d)\n", errno);
         _exit(126);
     }
     if (waitpid(pid, &status, 0) != pid) {
@@ -150,9 +172,15 @@ int main(int argc, char *argv[]) {
                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         return 1;
     }
+#endif
 
     /* fexecve（execveat + AT_EMPTY_PATH）脚本：脚本参数被合成为 /dev/fd/N，
-     * 解释器按该路径重开脚本校验内容；非 cloexec fd 跨 exec 存活 -> 0x22 */
+     * 解释器按该路径重开脚本校验内容；非 cloexec fd 跨 exec 存活 -> 0x22。
+     * Android host 跳过本组：4.19 内核不做 /proc/self/fd -> /dev/fd 的 argv 改写、
+     * 经 fd 路径 exec 后重开该路径还得 ENOENT（fd 语义分歧）；guest 全覆盖 */
+#if defined(__ANDROID__)
+    printf("SKIP: fexecve subcases on Android host (fd-path kernel semantics)\n");
+#else
     f = fopen(script_path, "w");
     fprintf(f, "#!%s -x\nfexecve form\n", self);
     fclose(f);
@@ -204,6 +232,7 @@ int main(int argc, char *argv[]) {
                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         return 1;
     }
+#endif
 
     /* 非脚本、非 ELF 的文件必须保持 ENOEXEC */
     f = fopen(script_path, "w");

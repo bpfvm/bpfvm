@@ -115,6 +115,9 @@ public:
 
     bool emit_jmp(const bpf_insn* insn, int current_index, bool is_64,
                   std::vector<JumpPlaceholder>& placeholders);
+    void emit_set_pc_imm(uint64_t gpa);
+    bool emit_jmp_deopt(const bpf_insn* insn, bool is_64, uint64_t target_gpa,
+                        std::vector<JumpPlaceholder>& phs);
     void emit_ja(const bpf_insn* insn, int current_index,
                  std::vector<JumpPlaceholder>& placeholders);
     void emit_ja32(const bpf_insn* insn, int current_index,
@@ -130,12 +133,23 @@ public:
     void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
                        std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
                        std::vector<size_t>& call_cache_offs);
-    void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
+    void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa,
+                             std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
+                             std::vector<size_t>& ic_cache_offs);
     void emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
     // --- Patching (AArch64-specific: B.cond imm19, B imm26) ---
     void patch_branch_cond(size_t inst_offset, size_t target_offset);
     void patch_branch_uncond(size_t inst_offset, size_t target_offset);
+    // b.cond imm19 只有 +/-1MB; 大函数(ceval ~1.4MB)的远条件转移会静默回卷成反方向
+    // 前跳(跳进非执行页)。远条件统一长形式: b.cond 取反跳过下一条 b(imm26 +/-128MB),
+    // 返回 b 的偏移交给 patch_branch_uncond。
+    size_t emit_far_cond(uint8_t cond);
+    // cbz/cbnz 的远形式(测寄存器, 不动 flags; 不能用 b.cond 版本):
+    // 反转 cbz/cbnz 跳过下一条 b。taken_when_zero=true 表示 reg==0 时到达 b。
+    size_t emit_far_czero(uint8_t reg, bool is_64, bool taken_when_zero);
+    // abort 跳转补丁: 本机 abort 跳转是长形式 b(patch uncond); x86 为 jcc rel32
+    void patch_branch_abort(size_t off, size_t target) { patch_branch_uncond(off, target); }
 
 private:
     // --- Low-level instruction emission ---
@@ -257,6 +271,30 @@ private:
 
     // --- Helper call ---
     void call_helper(void* addr);
+    // LDR literal：装载此前 emit 的 8 字节字面量数据（IC 槽地址重引用）
+    void ldr_literal_at(uint8_t dst, size_t data_off);
+
+    // --- 直连/间接 call 快路径共用骨架（emit_call_bpf / emit_call_indirect 组合调用） ---
+    // frame[0]（callee 编译期帧大小）来源：直连为立即数，间接从 IC 槽 frame 字段取
+    struct FrameSrc {
+        bool from_slot;
+        uint64_t imm;      // from_slot=false：callee_frame 立即数
+        size_t lit_off;    // from_slot=true：快路径槽地址字面量偏移（ldr-literal 重取）
+    };
+    // W0 = flags；返回 CBNZ 占位（非 0 走 .slow）
+    size_t emit_call_flags_check();
+    // 内联 push_frame：读 cur_frame 解码 caller 总长 -> 溢出检查 -> 写 64B 新帧
+    // （frame[0] 按 src 装载），返回 B.cc .overflow 占位
+    size_t emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
+                                  std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+    // .overflow：原子置 VM_KILLED -> vm_exit
+    void emit_call_overflow_stub(size_t overflow_b);
+    // .cont：r10 reload + flags/pc 检查；cont_jmps 为跳入 .cont 的 b 占位集合
+    void emit_call_cont_tail(uint64_t ret_gpa, std::initializer_list<size_t> cont_jmps);
+
+    // 条件跳转公共段：校验 op、映射 ARM 条件码、装操作数并置 flags。非法 op 返回
+    // false。emit_jmp / emit_jmp_deopt 共用
+    bool jmp_load_operands(const bpf_insn* insn, bool is_64, uint8_t& cc);
 
     // --- TLB inline ---
     MemAccessContext begin_mem_access(uint8_t base_reg, int16_t offset,

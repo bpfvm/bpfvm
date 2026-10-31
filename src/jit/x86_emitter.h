@@ -106,6 +106,9 @@ public:
 
     bool emit_jmp(const bpf_insn* insn, int current_index, bool is_64,
                   std::vector<JumpPlaceholder>& placeholders);
+    void emit_set_pc_imm(uint64_t gpa);
+    bool emit_jmp_deopt(const bpf_insn* insn, bool is_64, uint64_t target_gpa,
+                        std::vector<JumpPlaceholder>& placeholders);
     void emit_ja(const bpf_insn* insn, int current_index,
                  std::vector<JumpPlaceholder>& placeholders);
     void emit_ja32(const bpf_insn* insn, int current_index,
@@ -122,7 +125,9 @@ public:
     void emit_call_bpf(uint64_t ret_gpa, uint64_t callee_gpa, uint64_t callee_frame,
                        std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
                        std::vector<size_t>& call_cache_offs);
-    void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa);
+    void emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa,
+                             std::vector<AbortPatchInfo>& abort_patches, int bpf_index,
+                             std::vector<size_t>& ic_cache_offs);
     void emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
 
     MemAccessContext begin_mem_access(uint8_t base_x86_reg, int16_t offset,
@@ -133,6 +138,8 @@ public:
     // --- Patching (x86-specific: Jcc rel32, JMP rel32) ---
     void patch_branch_cond(size_t inst_offset, size_t target_offset);
     void patch_branch_uncond(size_t inst_offset, size_t target_offset);
+    // abort 跳转补丁: x86 的 abort 是 jcc rel32(+/-2GB), 与普通条件补丁同机制
+    void patch_branch_abort(size_t off, size_t target) { patch_branch_cond(off, target); }
 
 private:
 
@@ -150,6 +157,31 @@ private:
     // --- Memory access (frame-relative: [RBP + disp32]) ---
     void load_r64(uint8_t dst, int32_t disp);
     void store_r64(int32_t disp, uint8_t src);
+    // mov r64, [rip+disp32]：装载此前 emit 的 8 字节字面量数据（disp32 有符号，
+    // 同片段内反向引用，如 IC 槽地址的复用）
+    void mov_rip_literal(uint8_t dst, size_t data_off);
+
+    // --- 直连/间接 call 快路径共用骨架（emit_call_bpf / emit_call_indirect 组合调用） ---
+    // frame[0]（callee 编译期帧大小）来源：直连为立即数，间接从 IC 槽 frame 字段取
+    struct FrameSrc {
+        bool from_slot;
+        uint64_t imm;      // from_slot=false：callee_frame 立即数
+        size_t lit_off;    // from_slot=true：快路径槽地址字面量偏移（rip 重取）
+    };
+    // cmp vm->flags, 0；返回 JNZ 占位（非 0 走 .slow）
+    size_t emit_call_flags_check();
+    // 内联 push_frame：读 cur_frame 解码 caller 总长 -> 溢出检查 -> 写 64B 新帧
+    // （frame[0] 按 src 装载），返回 JB .overflow 占位
+    size_t emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
+                                  std::vector<AbortPatchInfo>& abort_patches, int bpf_index);
+    // .overflow：原子置 VM_KILLED -> vm_exit
+    void emit_call_overflow_stub(size_t overflow_jb);
+    // .cont：r10 reload + flags/pc 检查；cont_jmps 为跳入 .cont 的 jmp 占位集合
+    void emit_call_cont_tail(uint64_t ret_gpa, std::initializer_list<size_t> cont_jmps);
+
+    // 条件跳转公共段：校验 op、映射 x86 条件码（两字节形式低字节）、装操作数并置
+    // EFLAGS。非法 op 返回 false。emit_jmp / emit_jmp_deopt 共用
+    bool jmp_load_operands(const bpf_insn* insn, bool is_64, uint8_t& x86_cc);
 
     // --- SIB-addressed operations: [RBP + R11 + disp32] ---
     //     R11 用作 TLB 索引寄存器（scratch 寄存器）
