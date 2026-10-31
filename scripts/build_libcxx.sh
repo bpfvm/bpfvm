@@ -1,19 +1,19 @@
 #!/bin/bash
-# 构建 BPF target 的 C++ runtime（libcxx.a）
+# 构建 BPF target 的 C++ runtime（root/lib/libcxx.a + libcxx.so + root/include/c++/v1 头）。
 # cmake -S runtimes -DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi
-#
-# 产物：root/include/c++/v1/（libc++ + libc++abi 头）；中间产物在 build/libcxx/。
-#      libcxx.so 由 build_root.sh 从 libcxx.a 合成，不在本脚本。
-#
 # 用法：[LLVM_SRC=/path/to/llvm-project] ./scripts/build_libcxx.sh
-# 需要：clang/clang++（host）、cmake、make、ar；musl 头已装到 root/include（先跑 build_musl）。
-
+# 依赖：clang/clang++（host）、cmake、make、ar；musl 头 + libc.so 已装到 root/
+#      （先跑 build_musl，或 ./scripts/build_root.sh 无参数）。中间产物在 build/libcxx/。
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
-cd "${ROOT_DIR}"
+require_base
+
+# LLVM 源码缺失时自动浅克隆。锁 llvmorg-19.1.7：trunk 的 libc++ 要求宿主 clang>=21，
+# 本机 clang 19 编不过（#pragma clang attribute 内 __visibility__ 报错）；LLVM_SRC 可指定既有源码树
+[ -n "${LLVM_SRC:-}" ] || clone_if_missing "${ROOT_DIR}/thirdparty/llvm" https://github.com/llvm/llvm-project.git llvmorg-19.1.7
 
 LLVM_TREE=""
-for p in "${LLVM_SRC:-}" $(ls -d ${ROOT_DIR}/llvm /usr/local/llvm-* /usr/lib/llvm-* 2>/dev/null | sort -Vr); do
+for p in "${LLVM_SRC:-}" $(ls -d ${ROOT_DIR}/thirdparty/llvm /usr/local/llvm-* /usr/lib/llvm-* 2>/dev/null | sort -Vr); do
     [ -n "$p" ] || continue
     if [ -f "$p/runtimes/CMakeLists.txt" ] && [ -f "$p/libcxx/src/algorithm.cpp" ] \
        && [ -f "$p/libcxxabi/src/private_typeinfo.cpp" ]; then
@@ -21,14 +21,13 @@ for p in "${LLVM_SRC:-}" $(ls -d ${ROOT_DIR}/llvm /usr/local/llvm-* /usr/lib/llv
     fi
 done
 if [ -z "$LLVM_TREE" ]; then
-    echo "未找到 LLVM 源码树（需 monorepo 布局，含 runtimes/ + libcxx/ + libcxxabi/）。" >&2
-    echo "请解压 LLVM 源码 tarball 到 ${ROOT_DIR}/llvm，或设 LLVM_SRC=/path/to/llvm-project" >&2
+    echo "错误: 未找到 LLVM 源码树（需 monorepo 布局，含 runtimes/ + libcxx/ + libcxxabi/）。" >&2
+    echo "请解压 LLVM 源码 tarball 到 ${ROOT_DIR}/thirdparty/llvm，或设 LLVM_SRC=/path/to/llvm-project" >&2
     exit 1
 fi
-echo "==> LLVM source tree: $LLVM_TREE"
+echo "=== libcxx: LLVM source tree: $LLVM_TREE ==="
 
 BUILD_DIR="${ROOT_DIR}/build/libcxx"
-CLANG_RES="$(clang++ -print-resource-dir)/include"
 
 # BPF 交叉编译 flags（与 test/Makefile 的 CXX_FLAGS 同一套）。
 # 注意不要在这里 -isystem 任何 C++ 头目录（源码 include 或生成的 build/include/c++/v1）：
@@ -38,7 +37,7 @@ CLANG_RES="$(clang++ -print-resource-dir)/include"
 # 永远串不上（::int32_t 未定义）。目标 -I 在前、下面的 musl -isystem 在后，顺序天然正确。
 BASE_FLAGS="-target bpf -mcpu=v4 -O1 -fno-builtin -fno-math-errno \
     -mllvm -bpf-stack-size=16384 -nostdinc -D_GNU_SOURCE \
-    -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem $CLANG_RES \
+    -isystem ${ROOT_DIR}/root/include -isystem ${ROOT_DIR}/include -isystem ${CLANG_RES} \
     -fpass-plugin=${PASS_WIDEARGS} \
     -fpass-plugin=${PASS_SOFTFP} \
     -fpass-plugin=${PASS_LIBCALLLOWER}"
@@ -47,9 +46,9 @@ CMAKE_CXX_FLAGS="-std=c++23 -fno-exceptions -frtti $BASE_FLAGS"
 
 # 全量重建：避免改 flags/换 LLVM 版本后残留陈旧配置与对象（脚本不依赖增量）。
 rm -rf "$BUILD_DIR"
-mkdir -p root/lib
+mkdir -p "${ROOT_DIR}/root/lib"
 
-echo "==> configuring LLVM runtimes (libcxx + libcxxabi)"
+echo "=== libcxx: configure (LLVM runtimes) ==="
 #   -  EXCEPTIONS/SHARED=OFF（默认 ON）；STATIC_ABI_LIBRARY=ON（默认 OFF）；
 #      UNWINDER/TESTS/DOCS/BENCHMARKS=OFF（默认 ON）。
 #   -  时区数据库（LIBCXX_ENABLE_TIME_ZONE_DATABASE）Generic 平台默认 OFF，不传即关。
@@ -78,19 +77,22 @@ cmake -S "${LLVM_TREE}/runtimes" -B "$BUILD_DIR" \
     -DLIBCXXABI_INCLUDE_TESTS=OFF \
     -DLIBCXX_INCLUDE_DOCS=OFF
 
-echo "==> building libc++ / libc++abi"
-cmake --build "$BUILD_DIR" -j"$(nproc)"
+echo "=== libcxx: make libc++ / libc++abi ==="
+cmake --build "$BUILD_DIR" -j"${JOBS}"
 
-echo "==> installing headers + libc++.a to root/"
+echo "=== libcxx: install 头 + libc++.a 到 root/ ==="
 rm -rf "${ROOT_DIR}/root/include/c++"
 cmake --install "$BUILD_DIR" >/dev/null
 
-[ -f "$BUILD_DIR/lib/libc++.a" ] || { echo "libc++.a 未产出（构建失败？）" >&2; exit 1; }
+[ -f "$BUILD_DIR/lib/libc++.a" ] || { echo "错误: libc++.a 未产出（构建失败？）" >&2; exit 1; }
 cp -f "$BUILD_DIR/lib/libc++.a" "${ROOT_DIR}/root/lib/libcxx.a"
 # 清掉 install 落地的原始命名/附属档案，rootfs 只保留 libcxx.a（单一 C++ 库入口）。
 rm -f "${ROOT_DIR}/root/lib/libc++.a" "${ROOT_DIR}/root/lib/libc++abi.a" \
       "${ROOT_DIR}/root/lib/libc++experimental.a"
-[ -f "${ROOT_DIR}/root/include/c++/v1/vector" ] || { echo "头文件未安装到 root/include/c++/v1" >&2; exit 1; }
+[ -f "${ROOT_DIR}/root/include/c++/v1/vector" ] || { echo "错误: 头文件未安装到 root/include/c++/v1" >&2; exit 1; }
 
-echo "==> done: root/lib/libcxx.a ($(wc -c < root/lib/libcxx.a) bytes),"
-echo "==>       root/include/c++/v1 ($(find root/include/c++/v1 -type f | wc -l) header files)"
+echo "=== libcxx: 合成 libcxx.so ==="
+synth_so libcxx
+
+echo "done: root/lib/libcxx.{a,so} ($(wc -c < ${ROOT_DIR}/root/lib/libcxx.a) bytes) + root/include/c++/v1 \
+($(find ${ROOT_DIR}/root/include/c++/v1 -type f | wc -l) headers)"

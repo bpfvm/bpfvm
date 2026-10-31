@@ -4,6 +4,58 @@ Out-of-tree patches for upstream dependencies that this repo needs but cannot
 fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
 `git apply`) from the top of the upstream source tree.
 
+## cpython-3.13.1-bpfvm.patch
+
+**What**: CPython 3.13.1 的 bpfvm 移植 patch,11 个文件,每处均带
+"bpfvm port" 注释:
+
+- `Include/pyport.h` — `__BPF__` 分支:clang 拒绝 BPF 目标的全部 TLS 关键字,
+  引用侧 TU 不定义 `_Py_thread_local`(`HAVE_THREAD_LOCAL` 被 undef),tstate
+  经 `_PyThreadState_GetCurrent()` 回退读取;定义侧 pystate.c 由
+  build_root.sh 的 Makefile 追加规则注入 `-Dthread_local=annotate("emutls")`
+  + `-DBPFVM_EMUTLS_TSTATE` 走 emutls。
+- `_PyArg_UnpackStack` 定参化(`pycore_modsupport.h`/`getargs.c`/
+  `bltinmodule.c`)— 5 定参 + vararg 经 BpfWideArgs vararg 路径改写后达 6 个
+  直传参数,超出 BPF 5 寄存器上限;改为显式双指针输出(p1 可 NULL)。
+- `PyErr_WarnExplicitFormat` 定参化(`warnings.h`/`_warnings.c`)— 同上,
+  单 long long 格式化参数。
+- `Python/import.c` — 无 TLS 回退路径的锁原语修正(上游 bug:EXTENSIONS.mutex
+  已是 PyMutex 仍调 PyThread_acquire_lock)。
+- `Misc/platform_triplet.c` — `__BPF__` 分支 → `bpf-linux-musl`(否则
+  `$CPP` 按 host 预处理误判 x86_64,perf trampoline 误开)。
+- `Programs/python.c` — main 显式 `visibility("default")`(核心
+  -fvisibility=hidden 下动态 PIE 的 main 不进 dynsym,ldso 解析不到入口)。
+- `Modules/selectmodule.c` — `__BPF__` 强制 `SELECT_USES_HEAP`:3 组
+  `fd2obj[FD_SETSIZE+1]` 栈数组 ~49KB,超出 BPF st/ld 16 位帧偏移范围,LLVM
+  会把越界负偏移回卷成正偏移(miscompile,见 bpfvm 仓库 AGENTS.md 的
+  LLVM 已知 bug 清单);改走上游堆分配路径。
+- `Python/pathconfig.c` — `_PyPathConfig_ComputeSysPath0` 的
+  fullpath/link/path0copy 三缓冲(~64KB 栈帧,同一 16 位回卷 miscompile 的
+  另一受害者)改为单块 `PyMem_RawMalloc` 堆分配,退出点统一释放。
+
+**Apply** (从解包后的源码根):
+
+```sh
+tar xf cpython-3.13.1.tar.gz && cd cpython-3.13.1
+patch -p1 < /path/to/bpfvm/patches/cpython-3.13.1-bpfvm.patch
+```
+
+或由 `./scripts/build_root.sh python` 自动完成(build_python 检测 thirdparty/cpython/ 缺失时
+git clone v3.13.1 并应用,幂等)。
+
+**小版本更新(3.13.x)**:换新 tarball 重新解包,直接 `patch -p1` 重放;
+上下文漂移导致 hunk 失败时按 "bpfvm port" 注释手工对齐(每处改动都很小
+且局部),再从新旧干净源码树 diff 重新生成 patch:
+
+```sh
+diff -u pristine/Python/getargs.c thirdparty/cpython/Python/getargs.c | \
+    sed '1s|.*|--- a/Python/getargs.c|;2s|.*|+++ b/Python/getargs.c|'
+```
+
+**Regenerate**: patch 由 11 个文件的 `diff -u`(干净 tarball 解包 vs
+仓库 thirdparty/cpython/)拼合生成,排除 `__pycache__` 等构建噪声;文件清单见 patch 内
+`--- a/` 行。
+
 ## gdb-bpf-ptr-bit.patch
 
 **Fixes**: Two defects in GDB's BPF target (`gdb/bpf-tdep.c`):

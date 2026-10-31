@@ -1,0 +1,271 @@
+--- a/Include/pyport.h
++++ b/Include/pyport.h
+@@ -486,6 +486,13 @@
+ #    define HAVE_THREAD_LOCAL 1
+ #    ifdef thread_local
+ #      define _Py_thread_local thread_local
++#    elif defined(__BPF__) && !defined(BPFVM_EMUTLS_TSTATE)
++       // bpfvm port: clang rejects every TLS keyword (_Thread_local/__thread) for
++       // the BPF target, so referencing TUs fall back to the PyThread_tss_* API
++       // (_PyThreadState_GET() -> _PyThreadState_GetCurrent()). The defining TU
++       // (Python/pystate.c) opts into emutls with -DBPFVM_EMUTLS_TSTATE plus
++       // -Dthread_local=annotate("emutls") via a per-object Makefile rule.
++#      undef HAVE_THREAD_LOCAL
+ #    elif __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+ #      define _Py_thread_local _Thread_local
+ #    elif defined(_MSC_VER)  /* AKA NT_THREADS */
+--- a/Include/internal/pycore_modsupport.h
++++ b/Include/internal/pycore_modsupport.h
+@@ -50,13 +50,17 @@
+     const char *format,
+     ...);
+ 
++// bpfvm port: 定参化（原 ..., 5 定参 + vararg 经 BpfWideArgs 的 vararg 路径改写后
++// 达 6 个直传参数，超出 BPF 5 寄存器上限）。现有调用最多提取 2 个对象，改显式双
++// 指针输出，p1 可为 NULL。
+ extern int _PyArg_UnpackStack(
+     PyObject *const *args,
+     Py_ssize_t nargs,
+     const char *name,
+     Py_ssize_t min,
+     Py_ssize_t max,
+-    ...);
++    PyObject **p0,
++    PyObject **p1);
+ 
+ // Export for '_heapq' shared extension
+ PyAPI_FUNC(void) _PyArg_BadArgument(
+--- a/Python/getargs.c
++++ b/Python/getargs.c
+@@ -2834,15 +2834,16 @@
+ 
+ int
+ _PyArg_UnpackStack(PyObject *const *args, Py_ssize_t nargs, const char *name,
+-                   Py_ssize_t min, Py_ssize_t max, ...)
++                   Py_ssize_t min, Py_ssize_t max, PyObject **p0, PyObject **p1)
+ {
+-    int retval;
+-    va_list vargs;
+-
+-    va_start(vargs, max);
+-    retval = unpack_stack(args, nargs, name, min, max, vargs);
+-    va_end(vargs);
+-    return retval;
++    if (!_PyArg_CheckPositional(name, nargs, min, max)) {
++        return 0;
++    }
++    *p0 = args[0];
++    if (nargs >= 2 && p1 != NULL) {
++        *p1 = args[1];
++    }
++    return 1;
+ }
+ 
+ 
+--- a/Python/bltinmodule.c
++++ b/Python/bltinmodule.c
+@@ -2463,7 +2463,7 @@
+ 
+     /* Keyword arguments are passed through list.sort() which will check
+        them. */
+-    if (!_PyArg_UnpackStack(args, nargs, "sorted", 1, 1, &seq))
++    if (!_PyArg_UnpackStack(args, nargs, "sorted", 1, 1, &seq, NULL))
+         return NULL;
+ 
+     newlist = PySequence_List(seq);
+--- a/Include/cpython/warnings.h
++++ b/Include/cpython/warnings.h
+@@ -10,11 +10,13 @@
+     PyObject *module,
+     PyObject *registry);
+ 
++// bpfvm port: 定参化（6 定参 + vararg 经 vararg 改写后达 7 直传参，超出 BPF 5
++// 寄存器上限）。唯一 GIL 路径调用（gc.c）只传一个 Py_ssize_t 格式化参数。
+ PyAPI_FUNC(int) PyErr_WarnExplicitFormat(
+     PyObject *category,
+     const char *filename, int lineno,
+     const char *module, PyObject *registry,
+-    const char *format, ...);
++    const char *format, long long arg);
+ 
+ // DEPRECATED: Use PyErr_WarnEx() instead.
+ #define PyErr_Warn(category, msg) PyErr_WarnEx((category), (msg), 1)
+--- a/Python/_warnings.c
++++ b/Python/_warnings.c
+@@ -1353,13 +1353,12 @@
+ PyErr_WarnExplicitFormat(PyObject *category,
+                          const char *filename_str, int lineno,
+                          const char *module_str, PyObject *registry,
+-                         const char *format, ...)
++                         const char *format, long long arg)
+ {
+     PyObject *message;
+     PyObject *module = NULL;
+     PyObject *filename = PyUnicode_DecodeFSDefault(filename_str);
+     int ret = -1;
+-    va_list vargs;
+ 
+     if (filename == NULL)
+         goto exit;
+@@ -1369,8 +1368,7 @@
+             goto exit;
+     }
+ 
+-    va_start(vargs, format);
+-    message = PyUnicode_FromFormatV(format, vargs);
++    message = PyUnicode_FromFormat(format, arg);
+     if (message != NULL) {
+         PyObject *res;
+         PyThreadState *tstate = get_current_tstate();
+@@ -1391,7 +1389,6 @@
+             }
+         }
+     }
+-    va_end(vargs);
+ exit:
+     Py_XDECREF(module);
+     Py_XDECREF(filename);
+--- a/Python/import.c
++++ b/Python/import.c
+@@ -747,7 +747,8 @@
+ _PyImport_ResolveNameWithPackageContext(const char *name)
+ {
+ #ifndef HAVE_THREAD_LOCAL
+-    PyThread_acquire_lock(EXTENSIONS.mutex, WAIT_LOCK);
++    // bpfvm port: EXTENSIONS.mutex 是 PyMutex(3.13),无 TLS 回退路径须用对应原语
++    PyMutex_Lock(&EXTENSIONS.mutex);
+ #endif
+     if (PKGCONTEXT != NULL) {
+         const char *p = strrchr(PKGCONTEXT, '.');
+@@ -757,7 +758,7 @@
+         }
+     }
+ #ifndef HAVE_THREAD_LOCAL
+-    PyThread_release_lock(EXTENSIONS.mutex);
++    PyMutex_Unlock(&EXTENSIONS.mutex);
+ #endif
+     return name;
+ }
+@@ -766,12 +767,13 @@
+ _PyImport_SwapPackageContext(const char *newcontext)
+ {
+ #ifndef HAVE_THREAD_LOCAL
+-    PyThread_acquire_lock(EXTENSIONS.mutex, WAIT_LOCK);
++    // bpfvm port: EXTENSIONS.mutex 是 PyMutex(3.13),无 TLS 回退路径须用对应原语
++    PyMutex_Lock(&EXTENSIONS.mutex);
+ #endif
+     const char *oldcontext = PKGCONTEXT;
+     PKGCONTEXT = newcontext;
+ #ifndef HAVE_THREAD_LOCAL
+-    PyThread_release_lock(EXTENSIONS.mutex);
++    PyMutex_Unlock(&EXTENSIONS.mutex);
+ #endif
+     return oldcontext;
+ }
+--- a/Misc/platform_triplet.c
++++ b/Misc/platform_triplet.c
+@@ -140,6 +140,9 @@
+ 
+ # if defined(__x86_64__) && defined(__LP64__)
+ PLATFORM_TRIPLET=x86_64-linux-LIBC
++# elif defined(__BPF__) && defined(__LP64__)
++// bpfvm port: eBPF target (64-bit, musl)
++PLATFORM_TRIPLET=bpf-linux-LIBC
+ # elif defined(__x86_64__) && defined(__ILP32__)
+ PLATFORM_TRIPLET=x86_64-linux-LIBC_X32
+ # elif defined(__i386__)
+--- a/Programs/python.c
++++ b/Programs/python.c
+@@ -9,6 +9,9 @@
+     return Py_Main(argc, argv);
+ }
+ #else
++// bpfvm port: 核心编译带 -fvisibility=hidden,动态 PIE 下 main 不进 dynsym,
++// ldso(_dlstart)解析不到入口。显式 default 可见性导出。
++__attribute__((visibility("default")))
+ int
+ main(int argc, char **argv)
+ {
+--- a/Modules/selectmodule.c
++++ b/Modules/selectmodule.c
+@@ -237,7 +237,9 @@
+ }
+ 
+ #undef SELECT_USES_HEAP
+-#if FD_SETSIZE > 1024
++/* bpfvm port: 3 x fd2obj[FD_SETSIZE+1] 栈数组 ~49KB，超出 BPF st/ld 的 16 位
++   帧偏移范围，LLVM 把越界负偏移回卷成正偏移（miscompile），改走堆分配 */
++#if FD_SETSIZE > 1024 || defined(__BPF__)
+ #define SELECT_USES_HEAP
+ #endif /* FD_SETSIZE > 1024 */
+ 
+--- a/Python/pathconfig.c
++++ b/Python/pathconfig.c
+@@ -384,15 +384,29 @@
+     wchar_t *path0 = argv0;
+     Py_ssize_t n = 0;
+ 
++#if defined(HAVE_REALPATH) || defined(HAVE_READLINK)
++    /* bpfvm port: fullpath/link/path0copy 三缓冲 ~64KB 栈帧超出 BPF st/ld 的
++       16 位偏移范围，LLVM 会把越界负偏移回卷成正偏移（miscompile），
++       改为单块堆分配，所有退出点统一 PyMem_RawFree */
++    wchar_t *pathbuf = PyMem_RawMalloc((4 * MAXPATHLEN + 2) * sizeof(wchar_t));
++    if (pathbuf == NULL) {
++        PyErr_NoMemory();
++        return -1;
++    }
++#endif
++
+ #ifdef HAVE_REALPATH
+-    wchar_t fullpath[MAXPATHLEN];
++    wchar_t *fullpath = pathbuf;
+ #elif defined(MS_WINDOWS)
+     wchar_t fullpath[MAX_PATH];
+ #endif
+ 
+     if (have_module_arg) {
+ #if defined(HAVE_REALPATH) || defined(MS_WINDOWS)
+-        if (!_Py_wgetcwd(fullpath, Py_ARRAY_LENGTH(fullpath))) {
++        if (!_Py_wgetcwd(fullpath, MAXPATHLEN)) {
++#if defined(HAVE_REALPATH) || defined(HAVE_READLINK)
++            PyMem_RawFree(pathbuf);
++#endif
+             return 0;
+         }
+         path0 = fullpath;
+@@ -403,12 +417,13 @@
+     }
+ 
+ #ifdef HAVE_READLINK
+-    wchar_t link[MAXPATHLEN + 1];
++    /* bpfvm port: 与 pathbuf 单块堆分配配套（见上），指针切分三段 */
++    wchar_t *link = pathbuf + MAXPATHLEN;
+     int nr = 0;
+-    wchar_t path0copy[2 * MAXPATHLEN + 1];
++    wchar_t *path0copy = pathbuf + 2 * MAXPATHLEN + 1;
+ 
+     if (have_script_arg) {
+-        nr = _Py_wreadlink(path0, link, Py_ARRAY_LENGTH(link));
++        nr = _Py_wreadlink(path0, link, MAXPATHLEN + 1);
+     }
+     if (nr > 0) {
+         /* It's a symlink */
+@@ -469,7 +484,7 @@
+     /* All other filename syntaxes */
+     if (have_script_arg) {
+ #if defined(HAVE_REALPATH)
+-        if (_Py_wrealpath(path0, fullpath, Py_ARRAY_LENGTH(fullpath))) {
++        if (_Py_wrealpath(path0, fullpath, MAXPATHLEN)) {
+             path0 = fullpath;
+         }
+ #endif
+@@ -487,6 +502,9 @@
+ #endif /* All others */
+ 
+     PyObject *path0_obj = PyUnicode_FromWideChar(path0, n);
++#if defined(HAVE_REALPATH) || defined(HAVE_READLINK)
++    PyMem_RawFree(pathbuf);
++#endif
+     if (path0_obj == NULL) {
+         return -1;
+     }

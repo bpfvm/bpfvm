@@ -1,0 +1,26 @@
+# config.site for cross-building CPython to bpf-unknown-linux (bpfvm).
+# 交叉探测缓存：AC_RUN_IFELSE 无法在宿主执行目标程序，预置结论。
+# 迭代方式：configure 报 "cannot run test program" / 探测结论错时逐项追加。
+
+# —— 交叉下无法运行的目标程序探测 ——
+ac_cv_buggy_getaddrinfo=no
+ac_cv_file__dev_ptmx=yes          # VM 有 /dev/pts 虚拟目录与 TIOCGPTN
+ac_cv_file__dev_ptc=no
+ac_cv_working_tzset=yes
+ac_cv_little_endian_double=yes
+ac_cv_pthread_is_default=yes      # musl pthread 合并在 libc 内且完整
+ac_cv_c_thread_local=no           # clang Sema 拒绝 BPF 目标的 C thread_local，
+                                  # CPython 回退 _Py_thread_local 空展开路径
+
+# —— 禁用的扩展模块（依赖库未移植；n/a 跳过探测直接不编）——
+py_cv_module__bz2=n/a
+py_cv_module__lzma=n/a
+py_cv_module__sqlite3=n/a
+py_cv_module__dbm=n/a
+py_cv_module__gdbm=n/a
+py_cv_module__curses=n/a
+py_cv_module__curses_panel=n/a
+py_cv_module__tkinter=n/a
+py_cv_module__uuid=n/a
+py_cv_module__ctypes=n/a
+py_cv_module__ctypes_test=n/a

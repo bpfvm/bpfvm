@@ -30,7 +30,7 @@ set(CMAKE_C_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -ffunct
 set(CMAKE_CXX_FLAGS "-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -ffunction-sections \
     -nostdinc -fno-builtin -fno-math-errno -fno-exceptions -frtti -std=c++23 \
     -D_GNU_SOURCE -Werror=macro-redefined \
-    -Dthread_local='__attribute__((annotate("emutls")))' \
+    -Dthread_local='__attribute__((annotate(\"emutls\")))' \
     -fpass-plugin=${BPFVM_PASS_WIDEARGS} -fpass-plugin=${BPFVM_PASS_SOFTFP} \
     -fpass-plugin=${BPFVM_PASS_LIBCALLLOWER} -fpass-plugin=${BPFVM_PASS_EMUTLS} \
     -isystem ${BPFVM_LIBCXX_INC} -isystem ${BPFVM_ROOT}/root/include"

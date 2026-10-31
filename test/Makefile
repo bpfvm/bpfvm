@@ -24,8 +24,8 @@ LIBCXX_BPFA := ../root/lib/libcxx.a
 # libcxx.so 由 build_root.sh 的 build_libcxx 从 libcxx.a 合成（依赖 libc.so，DT_NEEDED），
 # 放 ../root/lib/；动态链接用例链它，test 只引用，不自己构建。
 LIBCXX_BPFSO := ../root/lib/libcxx.so
-# libc.so 由 build_root.sh 的 build_libc_bpfso 产出（从 musl libc.a 合成，含 _start），
-# 放 ../root/lib/；test 只引用，不自己构建（也不构建 libc.a，由 musl/build.sh 产出）。
+# libc.so 由 scripts/build_musl.sh 产出（从 musl libc.a 合成，含 _start），
+# 放 ../root/lib/；test 只引用，不自己构建（也不构建 libc.a，由 scripts/build_musl.sh 产出）。
 LIBC_BPFSO := ../root/lib/libc.so
 
 # === BPF pass 插件（clang -fpass-plugin=，语言无关，C/C++ 共用） ===

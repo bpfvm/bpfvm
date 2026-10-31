@@ -1,20 +1,23 @@
 #!/bin/bash
-# 构建 busybox for BPF。
+# 构建 busybox for BPF（root/bin/busybox，动态 PIE）。
 # make busybox_unstripped 编译所有 built-in.o/lib.a 后走 scripts/trylink 最终链接。
 # bpfvm-ld 已兼容 trylink（忽略 --start-group/--sort-*、吞掉 -Map 等带参选项、
 # 按内容分发输入、支持 -r），且 libm.a 等子库软链接到 libc.a（-lm 即 -lc），
 # trylink 直接产出最终二进制。
+# 源码浅克隆 mirror/busybox 到 thirdparty/busybox/。依赖：基础构建。
 #
 # 动态（默认）：PIE ET_DYN，libc.so 作为 DT_NEEDED 依赖。
 #   运行：./build/bpfvm -- busybox/busybox.linked [applet ...]
 # 静态：LINK_MODE=static ./scripts/build_busybox.sh，产出自包含 ET_EXEC。
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+make_ld_wrapper
+require_base
 
 # busybox 某些 applet 区分 linux，需要 __linux__ 宏（COMMON_CFLAGS 默认不带）。
 COMMON_CFLAGS="${COMMON_CFLAGS} -D__linux__"
-BB_DIR="${ROOT_DIR}/busybox"
-make_ld_wrapper
+BB_DIR="${ROOT_DIR}/thirdparty/busybox"
+clone_if_missing "${BB_DIR}" https://github.com/mirror/busybox.git
 
 # 屏蔽系统 bpf-gcc，让 clang fallback 到 host gcc：
 # bpf-gcc 的 *link spec 不透传 -static 给 ld（upstream binutils-bpf 缺陷），静态模式下产出
@@ -32,8 +35,8 @@ EOF
     CLANG_WRAPPER="${LD_WRAPPER_DIR}/clang"
 fi
 
-configure() {
-    echo "=== Configuring busybox ==="
+do_configure() {
+    echo "=== busybox: defconfig + 裁剪 ==="
     cd "${BB_DIR}"
     # 重新生成默认 config
     make HOSTCC=gcc defconfig >/dev/null 2>&1
@@ -98,17 +101,17 @@ configure() {
     make HOSTCC=gcc CC="${CLANG_WRAPPER}" olddefconfig >/dev/null 2>&1 || true
     # 清理上次构建的陈旧 .o（config 改变后，被禁 applet 的 .o 仍会残留并参与链接）
     make clean >/dev/null 2>&1 || true
-    echo "=== Config 关键项检查 ==="
+    echo "=== busybox: config 关键项检查 ==="
     command grep -E 'CONFIG_(SH_IS_ASH|ASH|HUSH|CAT|LS|ECHO|TRUE|FALSE|SLEEP|DATE|ID|UNAME|STATIC|TC|INET|HTTPD|MOUNT|LOGIN|SU|DPKG|FEATURE_SH_STANDALONE|FEATURE_SH_NOFORK)=y' .config || true
 }
 
-build() {
-    echo "=== Building busybox ==="
+do_build() {
+    echo "=== busybox: make ==="
     cd "${BB_DIR}"
     # trylink 直接产出最终二进制（动态 PIE / 静态 ET_EXEC，见顶部说明）。
     local ldflags="-target bpf -nostdlib -L${ROOT_DIR}/root/lib"
     [ "${LINK_MODE}" = "static" ] && ldflags="${ldflags} -static"
-    make -j4 \
+    make -j"${JOBS}" \
          HOSTCC=gcc \
          CC="${CLANG_WRAPPER}" \
          ARCH=bpf \
@@ -120,22 +123,24 @@ build() {
 }
 
 LINK_MODE="${LINK_MODE:-dyn}"
-configure
+do_configure
 
 # === 移植补丁：ash Ctrl+C 退出 bug（LLVM BPF 后端 miscompile workaround）===
 # 给 popstackmark 加 noinline 阻断内联，绕过后端 bug。根因/机制/upstream issue
 # 详见 AGENTS.md 第 5 节 "Known LLVM BPF backend bugs"。
 # 幂等：已是 noinline 则跳过（perl s/// 不匹配已改过的行）。
 if ! perl -0777 -ne 'exit 0 if /static void __attribute__\(\(noinline\)\)\npopstackmark/; exit 1' "${BB_DIR}/shell/ash.c"; then
-    echo "=== Patching ash.c: popstackmark -> noinline (Ctrl+C bug fix) ==="
+    echo "=== busybox: patch ash.c popstackmark -> noinline (Ctrl+C bug fix) ==="
     perl -0777 -i -pe 's/^static void\n(popstackmark\(struct stackmark)/static void __attribute__((noinline))\n$1/m' "${BB_DIR}/shell/ash.c"
 fi
 
-build
+do_build
 
-# trylink 产出即最终二进制，mv为约定文件名（动态 busybox.linked / 静态 busybox.out）。
+# trylink 产出即最终二进制，mv 为约定文件名（动态 busybox.linked / 静态 busybox.out）。
 cd "${BB_DIR}"
 OUT=$([ "${LINK_MODE}" = "static" ] && echo busybox.out || echo busybox.linked)
 mv busybox_unstripped "${OUT}"
 file "${OUT}"
-ls -la "${OUT}"
+# 动态产物装进 root/bin（rootfs 用）；静态产物留给嵌套/分发，不装
+[ "${LINK_MODE}" != "static" ] && cp -f "${OUT}" "${ROOT_DIR}/root/bin/busybox"
+echo "done: ${BB_DIR}/${OUT}"

@@ -9,8 +9,19 @@ root/
 
 .*~
 
-# busybox 上游源码树（本地 clone，不纳入版本控制；构建由根目录 build_busybox.sh 驱动）
-busybox/
-# openssl 上游源码树（本地 clone，不纳入版本控制；构建由 scripts/build_openssl.sh 驱动）
-openssl/
+# thirdparty/：构建 root 的第三方源码树（musl/dash 子模块除外，它们纳入版本控制）
+# busybox 上游源码树（本地 clone；构建由 scripts/build_busybox.sh 驱动）
+thirdparty/busybox/
+# openssl 上游源码树（本地 clone；构建由 scripts/build_root.sh openssl 驱动）
+thirdparty/openssl/
+# zlib 源码树（git clone madler/zlib；构建由 scripts/build_root.sh zlib 驱动）
+thirdparty/zlib/
+# CPython 源码树（解压 tarball 并应用 patches/cpython-3.13.1-bpfvm.patch）
+thirdparty/cpython/
+# sbase 源码树（本地 clone；构建由 scripts/build_root.sh sbase 驱动）
+thirdparty/sbase/
+# readline 源码树（curl 解包 GNU readline 8.2 tarball；构建由 scripts/build_root.sh readline 驱动）
+thirdparty/readline/
+# LLVM 源码树（解压 llvm-project tarball，供 build_libcxx.sh 编 libc++；或设 LLVM_SRC）
+thirdparty/llvm
 **/bpfvm.bpf

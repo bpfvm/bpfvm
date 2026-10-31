@@ -46,7 +46,7 @@ cmake --build build
 在编译任何 BPF Guest 程序之前，需要先构建针对 BPF 目标的 C 标准库（默认 musl）：
 
 ```bash
-sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，及头文件）
+sh scripts/build_musl.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，及头文件）
 ```
 *默认安装前缀是项目根目录的 `root/`，所有构建脚本/Makefile 统一引用 `-Iroot/include`、`-Lroot/lib`。*
 
@@ -55,9 +55,10 @@ sh musl/build.sh     # → 安装到 root/{include,lib}（libc.a 含 _start，�
 `scripts/build_root.sh` 统一构建 C/C++ 运行时（musl、libcxx）与可执行文件，安装到 `root/`（`root/include`、`root/lib`、`root/bin`）：
 
 ```bash
-./scripts/build_root.sh                # 默认：musl libc + libc.so + libcxx + busybox
-./scripts/build_root.sh dash sbase     # 额外构建 dash / sbase（可多选）
-./scripts/build_root.sh openssl        # 额外构建 OpenSSL（库 + CLI）
+./scripts/build_root.sh                # 基础构建：guest 头 + musl（libc.a/libc.so/ldso）+ libcxx
+./scripts/build_root.sh dash sbase     # 只构建指定组件（可多选），不跑基础构建：
+./scripts/build_root.sh openssl        #   busybox / dash / sbase / openssl / zlib / readline / python
+
 # 运行 dash（示例）
 ./build/bpfvm root/bin/dash
 ```
@@ -125,9 +126,14 @@ make -C test
 │   └── insn_test.cpp         # 指令集单元测试
 ├── include/              # BPF Guest 程序使用的头文件（syscall ID、POSIX 类型、浮点 call 编号）
 ├── cmake/                # CMake 辅助脚本（CTest 集成等）
-├── musl/                 # musl 标准 C 库 (默认，含 BPF 移植)
-├── dash/                 # dash shell (子模块)
-├── busybox/              # busybox
+├── thirdparty/          # 构建 root 的第三方源码树
+│   ├── musl/             #   musl 标准 C 库 (默认，含 BPF 移植；子模块)
+│   ├── dash/             #   dash shell (子模块)
+│   ├── busybox/          #   busybox（本地 clone）
+│   ├── openssl/          #   OpenSSL（本地 clone）
+│   ├── zlib/             #   zlib（git clone）
+│   ├── cpython/          #   CPython 3.13（解包 + patches/ 移植补丁）
+│   └── llvm/             #   LLVM 源码（供 build_libcxx.sh 编 libc++）
 ├── test/                 # BPF 集成测试用例
 └── root/                 # Demo rootfs 输出目录
 ```
@@ -196,7 +202,7 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 
 **根因**：`BPFFrameLowering` 没有重写 `TargetFrameLowering::getFrameIndexReference()`。通用实现按帧*底*用栈大小重算栈对象偏移，该模型假定帧指针会在 prologue 中移动；而 BPF 用的是固定、只读的帧指针 R10，永远指向帧*顶*（即 `DW_AT_frame_base = DW_OP_reg10` 的语义）。于是 `[r10-N]` 的变量被标成 `DW_OP_fbreg +(stacksize-N)` —— 只有当帧底为基准时才正确。帧顶为基准时，正偏移就落进帧头 / 保存寄存器区，调试器读到错误槽。内核 eBPF 里一直潜伏（内核程序从不用 DWARF 调试器查栈变量），但破坏任何 BPF 用户态代码的 DWARF 调试。寄存器变量一直正确，因为其定位是 `DW_OP_regN`，不走这条路。
 
-**修复**：`bpfvm-ld` 在链接期修正错误的栈相对偏移。所有 BPF 构建都加 `-fstack-size-section`（`scripts/env.sh`、`musl/build.sh`、`test/Makefile`、`scripts/build_libcxx.sh`），让 clang 产出 `.stack_sizes` 段记录每个函数的栈大小。`bpfvm-ld` 消费它并改写 clang 输出 `+(stacksize-N)` 而非正确 `-N` 的两处（因为 BPF 帧基准 R10 是帧*顶*而非帧底）：
+**修复**：`bpfvm-ld` 在链接期修正错误的栈相对偏移。所有 BPF 构建都加 `-fstack-size-section`（`scripts/env.sh`、`scripts/build_musl.sh`、`test/Makefile`、`scripts/build_libcxx.sh`），让 clang 产出 `.stack_sizes` 段记录每个函数的栈大小。`bpfvm-ld` 消费它并改写 clang 输出 `+(stacksize-N)` 而非正确 `-N` 的两处（因为 BPF 帧基准 R10 是帧*顶*而非帧底）：
 
 1. **`.debug_info` 内联 `DW_FORM_exprloc` 里的 `DW_OP_fbreg`**（`fix_fbreg_offsets`）：每条 `+N` → `+N − stacksize`。因为 SLEB128 重编码可能变长，CU 用两遍 buffer 重建（Pass A 逐 DIE 序列化、Pass B 回填 `DW_FORM_ref1/2/4/8` 的 DIE 偏移并修正 `unit_length` / exprloc 长度）。
 
@@ -361,10 +367,10 @@ int *p = &counter;                     // 函数内取地址（支持，见下�
 ```
 预处理期 `thread_local` 被替换成 `__attribute__((annotate("emutls")))`（早于 Sema，故绕过对 BPF `thread_local` 的拒绝；BPF.h `TLSSupported=false`，后端 `GlobalTLSAddress` ISel 会崩溃）。变量仍是普通 `addrspace(0)` 全局，clang 只是把它标进 `@llvm.global.annotations`，pass 解析该数组反查哪些是 emutls 变量。host 编译不注入该 `-D`，`thread_local` 保持原生语义，故同一源码在 `host` ctest 变体里充作基线。该 `-D` 仅注入 C++ flags（C 的 `thread_local` 来自 `<threads.h>` 宏，命令行 `-D` 会与之冲突；C 端 TLS 不在本方案覆盖范围）。
 
-**机制**（见 `src/passes/BpfEmutls.cpp` + `musl/src/thread/bpf/emutls.c`）：
+**机制**（见 `src/passes/BpfEmutls.cpp` + `thirdparty/musl/src/thread/bpf/emutls.c`）：
 1. `BpfEmutls` pass（经 `-fpass-plugin=libBpfEmutls.so` 加载，在 `PipelineStartEPCallback` 运行，即优化 pipeline 最前——此时 `-O1` 常量折叠尚未执行）解析 `@llvm.global.annotations` 反查所有标注 `emutls` 的全局，为每个合成控制块 `@__emutls_v.<name> = { i64 size, i64 align, i64 index, ptr value, ptr dtor }`（value 为 null=零初始化，否则指向模板 `@__emutls_t.<name>`），并把对该全局的访问（含函数内取地址 `&var` 的 ret/call/store 逃逸形式）改写为 `call ptr @__emutls_get_address(ptr @__emutls_v.<name>)` + 访问返回的每线程副本指针。
 2. bpfvm-ld 走普通 call 重定位 → PLT/GOT 合成，解析到 musl libc 的 `__emutls_get_address`。
-3. musl 运行时（`musl/src/thread/bpf/emutls.c`）用一个 `pthread_key` 把本线程的副本指针数组经 `pthread_setspecific` 挂在 `struct pthread::tsd[]` 上，按控制块 `index` 懒分配/查表（`malloc`/`realloc` 增长，线程退出时由 key destructor `free`），首次访问按模板 `memcpy`（零初始化则清零）。每线程隔离由 musl 的 tp（每 vm 一个 `tp_`）保证——不侵入 `struct pthread` 定义，与 compiler-rt/libgcc 的通行做法一致。
+3. musl 运行时（`thirdparty/musl/src/thread/bpf/emutls.c`）用一个 `pthread_key` 把本线程的副本指针数组经 `pthread_setspecific` 挂在 `struct pthread::tsd[]` 上，按控制块 `index` 懒分配/查表（`malloc`/`realloc` 增长，线程退出时由 key destructor `free`），首次访问按模板 `memcpy`（零初始化则清零）。每线程隔离由 musl 的 tp（每 vm 一个 `tp_`）保证——不侵入 `struct pthread` 定义，与 compiler-rt/libgcc 的通行做法一致。
 4. 非平凡析构：clang 因 `thread_local` 被替换成 `annotate` 属性而走普通全局的进程级 `__cxa_atexit(dtor, &var, dso)`（仅析构主线程副本）。pass 的 `collectDtors` 从 init 函数里识别这条 `__cxa_atexit`（arg1 是某 emutls 全局），把 dtor 转移进控制块字段并删除原 call；`__emutls_get_address` 在每线程首次分配副本时若 `ctrl->dtor` 非空，调 `__cxa_thread_atexit(dtor, 本副本地址, NULL)` 注册本副本析构。dso 句柄不转移——musl 的 dlclose 仅校验句柄、从不卸载 DSO，运行期不存在 DSO 卸载，无需按 DSO 过滤。每线程析构链由 `__pthread_run_cxa_dtors` 在 `__pthread_tsd_run_dtors` 开头（子线程）和 `exit()`（主线程）逆序调用——C++ ABI 要求 thread_local dtor 早于 pthread_key dtor（含 emutls 副本内存 `free`），故析构时副本内存仍有效。覆盖见 `test/test_thread_local_dtor.cpp`。
 
 **fork 语义**：副本数组与副本内存经 `malloc` 落在 guest 可写堆（CoW 段），`pthread_key` 是进程级。子进程的 `tsd[]` 继承父的指针，任一方写入触发 CoW 分叉——自动达到 POSIX fork 的"继承父值、之后独立"。线程（`pthread_create`、带 `CLONE_VM` 的 clone）各获独立 `struct pthread`（空 `tsd`），即标准 `thread_local` 语义。
@@ -388,17 +394,17 @@ int *p = &counter;                     // 函数内取地址（支持，见下�
 
 ## 标准库与移植
 
-### musl 移植（`musl/`）
+### musl 移植（`thirdparty/musl/`）
 
-本项目附带 musl 1.2.6 的移植，作为 BPF 目标的**默认** C 库。用 `sh musl/build.sh`（默认前缀 `$TOP/root`）构建——产出 `root/lib/libc.a`（内含 `crt1.o`/`crti.o`/`crtn.o`，故含 `_start`）+ 独立的 `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`，以及 `root/include/` 中的头文件，故 `-Iroot/include` 与 `-Lroot/lib` 解析到 musl 的头文件和 `libc.a`。`test/Makefile` 和 `scripts/build_root.sh` 直接基于此 musl 构建（静态 `.out` + 动态 `.linked`）。
+本项目附带 musl 1.2.6 的移植，作为 BPF 目标的**默认** C 库。用 `sh scripts/build_musl.sh`（默认前缀 `$TOP/root`）构建——产出 `root/lib/libc.a`（内含 `crt1.o`/`crti.o`/`crtn.o`，故含 `_start`）+ 独立的 `crt1.o`/`Scrt1.o`/`crti.o`/`crtn.o`，以及 `root/include/` 中的头文件，故 `-Iroot/include` 与 `-Lroot/lib` 解析到 musl 的头文件和 `libc.a`。`test/Makefile` 和 `scripts/build_root.sh` 直接基于此 musl 构建（静态 `.out` + 动态 `.linked`）。
 
-#### musl 构建（`musl/build.sh`）
-- **`--disable-shared`**：musl 的 `.so` 由 `bpfvm-ld -shared` 从 `libc.a` 合成（在 `scripts/build_root.sh` 的 `build_libc_bpfso` 中），而非由 musl 自己的构建产出。
+#### musl 构建（`scripts/build_musl.sh`）
+- **`--disable-shared`**：musl 的 `.so` 由 `bpfvm-ld -shared` 从 `libc.a` 合成（在 `scripts/build_musl.sh` 尾部），而非由 musl 自己的构建产出。
 - **`-mllvm -bpf-stack-size=16384`**：musl 的 `crypt_blowfish`（`BF_crypt`）有 ~8.5KB 局部结构；默认 4096 会溢出。
 - **跳过 rcrt1.o / crti.o / crtn.o / Scrt1.o**：`make install` 编译 `rcrt1.o`（静态 PIE 自启动，依赖 `dlstart` 动态链接器逻辑——BPF 不支持；`_start_c` 签名不匹配 + `GETFUNCSYM` 无前向声明）并失败。脚本经 per-target `make obj/crt/crt1.o` **只构建 `crt1.o`**。其它 crt 对象在 BPF 上不必要：`crti.o`/`crtn.o` 编译成空 `.o`（BPF 无 `.init_array`/`.fini_array` 框架），且 `Scrt1.o` 在 BPF 上与 `crt1.o` 相同（clang 对地址引用总发重定位，故 `-fPIC` 不改变输出）。头文件手工拷到 `root/include/`（先 generic/bits，再 bpf/bits，使 BPF 专化覆盖胜出）。
 - **crt1 合并进 libc.a**：BPF 的 `_start` 在 `crt1.o` 中（纯 C，`arch/bpf/crt_arch.h`）。脚本运行 `ar rcs lib/libc.a lib/crt1.o` 使 `libc.a` 自带 `_start`，链接器只需传 `libc.a`/`libc.so`，无需单独 crt 文件或排序。`crt1.o` 同时覆盖静态和 PIE/.so 模式（BPF `-fPIC` 不改变 crt1 输出）。
 - **ldso 对象（`dlstart.lo`/`dynlink.lo`）单独构建；与 libc 合并进单二进制**：标准 musl 把 ldso 代码（`ldso/dlstart.c`、`ldso/dynlink.c`）放进 `libc.so` 而非 `libc.a`（静态链接的程序不需要动态链接器）。由于 BPF 的 `libc.so` 由 `bpfvm-ld -shared` 从 `libc.a` 合成（非 musl 自己的构建），这些对象本会丢失。脚本经 `make obj/ldso/dlstart.lo obj/ldso/dynlink.lo` 构建它们，并随 `libc.a` 一起安装到 `root/lib/`。
-- **`libc.so` == `ld-bpf.so`（单二进制，镜像上游 musl `libc.so` == `ld.so`）**：ldso 必须在任何其它库被重定位之前工作，故它依赖的 libc（`malloc`/`memcpy`/TLS 设置/`__libc_start_main`/...）必须链接进它——它不能从单独的 `libc.so` 导入这些。`scripts/build_root.sh` 的 `build_libc_bpfso` 因此从 `libc.a + dlstart.lo + dynlink.lo` 构建**一个**二进制，`--soname libc.so`，入口 `_dlstart`（`-e _dlstart`），输出到 `root/lib/ld-bpf.so`，`root/lib/libc.so` 是指向它的相对符号链接。这不是浪费的重复：运行时 `load_library("libc.so")` 命中 musl ldso 的 `is_self` 短路（`ldso.name` 在 `__dls2` 中硬编码为 `"libc.so"`，且 `"libc"` 在保留名表中），故程序的 `DT_NEEDED libc.so` 复用已映射的 ldso 而非打开文件——磁盘上单独的 `libc.so` 会是死重。单文件服务三条路径：链接时（`-l:libc.so` 读其 dynsym + `DT_SONAME=libc.so`）、`DT_NEEDED libc.so`（→ `is_self`）、以及 `PT_INTERP=/lib/ld-bpf.so`（VM loader 解析 `ld-bpf.so`，入口 = `load_base + e_entry` → `_dlstart`）。ldso 自做 stage-1 自重定位（`dlstart.c` 的 `_dlstart_c`）；VM loader 只 mmap 段 + 设置 auxv。
+- **`libc.so` == `ld-bpf.so`（单二进制，镜像上游 musl `libc.so` == `ld.so`）**：ldso 必须在任何其它库被重定位之前工作，故它依赖的 libc（`malloc`/`memcpy`/TLS 设置/`__libc_start_main`/...）必须链接进它——它不能从单独的 `libc.so` 导入这些。`scripts/build_musl.sh` 因此从 `libc.a + dlstart.lo + dynlink.lo` 构建**一个**二进制，`--soname libc.so`，入口 `_dlstart`（`-e _dlstart`），输出到 `root/lib/ld-bpf.so`，`root/lib/libc.so` 是指向它的相对符号链接。这不是浪费的重复：运行时 `load_library("libc.so")` 命中 musl ldso 的 `is_self` 短路（`ldso.name` 在 `__dls2` 中硬编码为 `"libc.so"`，且 `"libc"` 在保留名表中），故程序的 `DT_NEEDED libc.so` 复用已映射的 ldso 而非打开文件——磁盘上单独的 `libc.so` 会是死重。单文件服务三条路径：链接时（`-l:libc.so` 读其 dynsym + `DT_SONAME=libc.so`）、`DT_NEEDED libc.so`（→ `is_self`）、以及 `PT_INTERP=/lib/ld-bpf.so`（VM loader 解析 `ld-bpf.so`，入口 = `load_base + e_entry` → `_dlstart`）。ldso 自做 stage-1 自重定位（`dlstart.c` 的 `_dlstart_c`）；VM loader 只 mmap 段 + 设置 auxv。
 - **安装布局**：`root/{include,lib}` 是与 libcxx 和 rootfs 共享的统一安装树；`root/lib` 持有 `libc.a`（含 crt1 合并）、`crt1.o`，以及 ldso 对象 `dlstart.lo`/`dynlink.lo`。
 
 ## 许可证

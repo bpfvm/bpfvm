@@ -7,13 +7,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLANG_RES="$(clang -print-resource-dir)/include"
 BPFVM_LD="${ROOT_DIR}/build/bpfvm-ld"
 
+# 并行度：各构建脚本的 make -j 统一取此值。
+JOBS="${JOBS:-$(nproc)}"
+
 # BPF pass 插件路径常量。COMMON_CFLAGS 按 if-exist 探测加入；
 PASS_WIDEARGS="${ROOT_DIR}/build/libBpfWideArgs.so"
 PASS_SOFTFP="${ROOT_DIR}/build/libBpfSoftFp.so"
 PASS_LIBCALLLOWER="${ROOT_DIR}/build/libBpfLibcallLower.so"
 
 # BPF 交叉编译 flags（C 源：musl/dash/sbase/busybox）。
-# -nostdinc：不用宿主 glibc 头，只用 musl(root/include，由 musl/build.sh 安装) + BPF guest 头(include)。
+# -nostdinc：不用宿主 glibc 头，只用 musl(root/include，由 scripts/build_musl.sh 安装) + BPF guest 头(include)。
 # -fno-builtin：必须保留。否则 clang 会把 mempcpy/strchr/stpcpy/... 等 builtin
 #   优化成对 memcpy 等的调用，而 BPF 后端在 ISel 拒绝这类 builtin lowering
 #   （实测 dash 的 arith_yylex.c:mempcpy 即触发）。强制走 libc 的库实现即可。
@@ -35,6 +38,45 @@ COMMON_CFLAGS="$COMMON_CFLAGS -isystem ${ROOT_DIR}/root/include -isystem ${CLANG
 #   见 README「工具链 / bpfvm-ld -> 调试信息 (DWARF)」一节）
 
 COMMON_LDFLAGS="-target bpf -nostdlib"
+
+# COMMON_CFLAGS 去 -g 版：第三方 C 库/程序（openssl/zlib/readline/cpython）一律用它
+# —— clang -target bpf -g 对部分函数声明 ICE（LLVM #213714，详见 AGENTS.md），
+# 损失的 DWARF 可接受（不调这些库的内部）。
+CFLAGS_NOG="${COMMON_CFLAGS//-g/}"
+
+# 组件脚本（build_<comp>.sh）开工前检查基础产物：musl 头 + libc.a/libc.so
+# （均由 scripts/build_musl.sh 产出；基础构建 = ./scripts/build_root.sh 无参数）。
+require_base() {
+    [ -f "${ROOT_DIR}/root/lib/libc.a" ] && [ -f "${ROOT_DIR}/root/lib/libc.so" ] || {
+        echo "错误: 缺少基础产物 root/lib/libc.{a,so}，先运行一次 ./scripts/build_root.sh（无参数）" >&2
+        exit 1
+    }
+}
+
+# 从 root/lib/<name>.a 合成 root/lib/<name>.so。上游自带的共享库构建假定 gnu ld
+# （-Wl,-soname 等），对 BPF 不可用，统一由 bpfvm-ld -shared 从静态库合成 PIE ET_DYN，
+# DT_NEEDED libc.so。额外依赖以追加参数传入（如 libssl 传 -l:libcrypto.so）。
+synth_so() {
+    local NAME="$1"; shift
+    "${BPFVM_LD}" -shared --soname "${NAME}.so" \
+        -L "${ROOT_DIR}/root/lib" "${ROOT_DIR}/root/lib/${NAME}.a" \
+        "$@" -l:libc.so \
+        -o "${ROOT_DIR}/root/lib/${NAME}.so"
+}
+
+# 第三方源码缺失时自动 git clone（浅克隆；需锁定版本的组件传 ref，如 CPython 的 v3.13.1）。
+# 目标位置残留死链等非目录空壳时清掉再克隆（[ -d ] 对死链为 false，不清会撞"文件已存在"）。
+clone_if_missing() {
+    local DIR="$1" URL="$2" REF="${3:-}"
+    [ -d "${DIR}" ] && return 0
+    [ -e "${DIR}" ] || [ -L "${DIR}" ] && rm -f "${DIR}"
+    echo "=== clone $(basename "${DIR}") (${REF:-默认分支}) ==="
+    if [ -n "${REF}" ]; then
+        git clone --depth 1 --branch "${REF}" "${URL}" "${DIR}" || exit 1
+    else
+        git clone --depth 1 "${URL}" "${DIR}" || exit 1
+    fi
+}
 
 # 让 clang -target bpf 的链接前端（bpf-gcc）改用 bpfvm-ld，绕过 binutils bpf-ld。
 # clang -target bpf 把链接委托给 /usr/bin/bpf-gcc，bpf-gcc 再用 /usr/lib/gcc/bpf/14/ld

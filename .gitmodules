@@ -1,8 +1,8 @@
 [submodule "dash"]
-	path = dash
-	url = https://github.com/choury/dash.git
+	path = thirdparty/dash
+	url = https://github.com/bpfvm/dash.git
 	branch = bpf
 [submodule "musl"]
-	path = musl
+	path = thirdparty/musl
 	url = https://github.com/bpfvm/musl.git
 	branch = bpf-port
