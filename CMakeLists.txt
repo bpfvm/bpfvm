@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
 project(bpfvm)
 
+# 未显式指定构建类型时默认 RelWithDebInfo（-O2 -g）：JIT 编译器/解释器/TLB 等
+# 热路径 C++ 在 -O0 下慢 5-10 倍（python 启动的 JIT 编译耗时一度被放大到 ~500ms），
+# 同时保留调试符号供 gdb。
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
+endif()
+
 include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)

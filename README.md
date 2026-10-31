@@ -192,6 +192,7 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 - **Strip**：`--strip-debug` (`-S`) 仅丢弃 `.debug_*`；`-s` / `--strip-all` 同时丢弃 `.debug_*` 和 `.symtab`/`.strtab`（与标准 `ld` 语义一致）。`-g` 及其变体（`-g2`、`-gdwarf-4`、...）作为 no-op 接受（调试默认已开）。
 - **重定位**：`.rel.debug_*` 重定位在链接期应用，**不**输出到产物（更干净；消费者看到的是预解析值）。处理两类地址引用：debug→debug 引用解析为段内偏移；debug→loadable 引用解析为最终 guest 地址。
 - **符号表**：三种模式现在都输出静态 `.symtab`/`.strtab`，同时包含 GLOBAL 符号和 `STB_LOCAL` FUNC/OBJECT 符号（使 `objdump -d` 能标注本地函数边界）。`sh_info` 按 ELF 约定指向第一个 GLOBAL。PIE 模式下运行时符号解析仍用 `.dynsym`。
+- **导出策略（DYNAMIC_EXE）**：`.dynsym` 导出全部非 hidden 全局符号（动态扩展的 `Py*` UND 向主程序解析靠它），另有一条平台性例外——**被依赖 .so 以非 weak UND 引用的 exe 定义符号，即使 hidden 也强制导出**（dynsym 条目可见性提升为 DEFAULT；UND 引用常为 NOTYPE，收集在 type 过滤之前）。结构性案例是 `main`：本平台 crt（`_start`）住在共享 ldso 里而非静态链进可执行文件，`_start` 对 `main` 的跨模块引用要求主程序必须导出它。这是标准 ld「按需导出」（仅覆盖默认可见符号）在本平台的必要延伸，应用程序（如 `-fvisibility=hidden` 编译的 CPython）无需为此打 patch。
 - `.BTF`/`.BTF.ext`（BPF 内核元数据）和 `.llvm_addrsig` 仍被丢弃（VM 用不到）。
 
 #### 链接期修复 DWARF 栈变量偏移（clang BPF `frame-index` bug）
@@ -255,13 +256,13 @@ llvm-dwarfdump --verify foo.linked                  # 校验 DWARF
 *   **结构体返回**：LLVM 已把 `struct` 返回 lower 成 `sret` 指针约定（`void f(ptr sret, ...)`）；pass 只是剥离 BPF 后端拒绝的 `sret` 属性。语义不变。
 *   **按值结构体参数**：clang 以两种方式 lower C++ 按值聚合参数，`lowerAggregateParams` 把两者都归一化为普通 `ptr`（各 1 个寄存器）：
     *   **大聚合（≥3 字，如 `std::string` 24B）**：clang 已发出 `ptr byval(%T) align N`——调用者把参数 memcpy 进栈临时并传其指针，被调用者把它当普通指针用（`getelementptr`/`load`）。BPF 后端拒绝 `byval` 属性（"pass by value not supported"），故 pass 从每个函数签名和调用点剥离 `byval`（覆盖直接/间接调用和外部 callee）。无类型/函数体改动——参数本就是指针。
-    *   **小聚合（≤2 字，如 `std::pair`=`{i64,i64}`、`__bit_iterator`=`[2 x i64]`、`i128`）**：clang 直接用聚合**值类型**作参数类型（无 `byval`）。BPF 后端把它按元素/字段展开成多个寄存器，于是 `f(__bit_iterator, __bit_iterator, value, proj)` = 2+2+1+1 = 6 寄存器 > 5 寄存器限制 → "too many arguments"。pass 把签名重建为普通 `ptr`，搬移函数体，并改写函数体对值参数的使用及每个调用点的实参。按聚合是否平凡可拷贝分两种子情况：
+    *   **小聚合（≤2 字，如 `std::pair`=`{i64,i64}`、`__bit_iterator`=`[2 x i64]`、`i128`）**：clang 直接用聚合**值类型**作参数类型（无 `byval`）。BPF 后端把它按元素/字段展开成多个寄存器，于是 `f(__bit_iterator, __bit_iterator, value, proj)` = 2+2+1+1 = 6 寄存器 > 5 寄存器限制 → "too many arguments"。pass 把签名重建为普通 `ptr`，搬移函数体，并改写函数体对值参数的使用及每个调用点的实参。调用点的归一化覆盖直接与间接两类（间接调用点 callee 是 `ptr` 变量，opaque pointers 下 `CallBase` 自带 FunctionType，重建签名即无损）——否则函数指针调用会保持 clang 原生按构成展开，与被改写被调方（恒读指针、>5 参时 pack 字段 8B）布局错位而静默错乱（回归：`test/test_indirect_agg.c`）。按聚合是否平凡可拷贝分两种子情况：
         *   **平凡可拷贝**（标量的 `std::pair`、`i128`、...）：被调用者入口插入 `load T, ptr %arg`，调用点把值存入一个入口块新 alloca 并传其指针。按位拷贝正确。
         *   **非平凡可拷贝**（如 `std::shared_ptr` = `{ptr,ptr}` 16B，任何有用户自定义拷贝/移动构造或析构的）：clang 生成 `[2 x i64]` 值参数和形如 `store [2 x i64] %arg, ptr %local; ... move/copy %local ...` 的函数体。按位 `load`/`store` 会破坏移动语义——`move %local` 置空的是 `%local`（那份 load 拷贝），而非调用者的源对象，于是调用者拷贝构造的临时仍被析构、引用计数多减一次（静默：引用计数最终少一，调用者的 `shared_ptr` 悬空，下次 fork/访问 UAF；由 `test/test_sp_copy.cpp` 和 `bpfvm-on-bpfvm` 的 `test_waitid` 崩溃复现，其中 `do_clone` 的 `make_shared<PosixSyscall>(pgrp, session)` 少计了 `pgrp`）。修复镜像 x86 的 invisible-reference ABI：`rewriteValueParamUsesToPointer` 擦除 `store %arg, ptr %local`，把 `%local` RAUW 成指针参数，使函数体直接操作调用者的源对象；调用点在实参为 `load T, ptr %src`（clang 模式：调用者拷贝/移动构造一个临时 `%src` 再 load）时，传 `%src` 本身，使被调用者的移动置空调用者的临时、其析构变成 no-op。非 load 实参（罕见；如另一个调用的返回值）回退到平凡可拷贝的 alloca+store 路径。
     两种情况下语义都不变（按值 = 调用者交给被调用者一份独立拷贝）；每调用点的拷贝被保留（优化器无法证明被调用者不会写向这个现在无归属的指针，故保守保留它）。这解锁了 `f(std::string)` / `f(std::vector)` / `f(std::pair)` / 任意按值聚合——此前被拒绝。
 *   **变参函数**——使用 clang 原生的 `VoidPtrBuiltinVaList`，`va_list` 是指向第一个 vararg 的单个 `void*`：
     *   **被调用者改写**：`R f(T0..Tn, ...)` → `R f(T0..Tn, ptr __va_base)`。`__va_base` 指向一块调用者分配的、持有 vararg 的内存区。函数原型（声明）同样改写。
-    *   **调用者改写**：每个调用点在入口栈上分配 `__bpf_vapack_<func>` 结构体（packed，每槽按 `allocSize(T)` 定大小），把变参实参存入，并把其地址作为 `__va_base` 传入。
+    *   **调用者改写**：每个调用点在入口栈上分配 `__bpf_vapack_<func>` 结构体（packed，标量槽按 `allocSize(T)` 定大小），把变参实参存入，并把其地址作为 `__va_base` 传入。聚合变参例外：callee 的 `va_arg` 对聚合一律按引用（clang 生成 `va_arg ap, ptr` 再解引用），故聚合变参存临时拷贝的**指针**、步长 8（`__int128` 等宽标量不在此列——其 `va_arg` 是直接 16B 载入，仍按 `allocSize` 内嵌）。残留限制：`sizeof<=8` 且可强转成单整数的结构体（如 `{i32,i32}`）在调用点被 clang IRGen 强转成 `i64`，聚合信息已擦除，纯 C 传这类变参仍错位（回归：`test/test_va_struct.c`；ctypes/ffi 不受影响，ffi 侧类型完整按引用传指针）。
     *   **内联函数 lowering**（应用于*所有*函数，不只是变参的）：
         *   `va_start(ap)` → `store __va_base, ap`
         *   `va_arg(ap, T)` → `load T, ptr ap; ap += allocSize(T)`

@@ -14,7 +14,7 @@
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
-COMPONENTS="busybox dash sbase openssl zlib readline python"
+COMPONENTS="busybox dash sbase openssl zlib readline ffi python"
 
 build_base() {
     # guest 头（include/{bpf_syscall.h,asm,asm-generic,linux}）：test 等 guest 程序

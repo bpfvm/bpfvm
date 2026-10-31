@@ -22,5 +22,3 @@ py_cv_module__curses=n/a
 py_cv_module__curses_panel=n/a
 py_cv_module__tkinter=n/a
 py_cv_module__uuid=n/a
-py_cv_module__ctypes=n/a
-py_cv_module__ctypes_test=n/a

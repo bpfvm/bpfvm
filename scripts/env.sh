@@ -24,10 +24,13 @@ PASS_LIBCALLLOWER="${ROOT_DIR}/build/libBpfLibcallLower.so"
 # -D_GNU_SOURCE：musl 的 bits/*.h 用 _POSIX/_GNU/_BSD feature 宏门控；显式开启全部
 #   POSIX/GNU/BSD 接口（musl 应用惯例，避免 struct sigaction 等类型缺失）。
 # -mllvm -bpf-stack-size=16384：dash cd.c:setpwd 等函数局部超限，统一用 16384（与 musl/test 一致）。
+#   单独成变量：组件脚本（如 build_ffi.sh）按名替换覆盖，避免对字面值做 pattern
+#   替换——字面值改动会让替换静默失效。
 # -ffunction-sections：每函数一个输入段。bpfvm-ld 给每个可执行段头插帧槽
-#   （frame_slot.h，值来自 .stack_sizes）；多函数共段时仅首函数有精确槽、
-#   其余运行期回退 -S，故全链路保持此 flag。
-COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 -mllvm -bpf-stack-size=16384 -ffunction-sections -nostdinc -fno-builtin -D_GNU_SOURCE"
+# （frame_slot.h，值来自 .stack_sizes）；多函数共段时仅首函数有精确槽、
+# 其余运行期回退 -S，故全链路保持此 flag。
+STACK_FLAG="-mllvm -bpf-stack-size=16384"
+COMMON_CFLAGS="-target bpf -mcpu=v4 -O1 ${STACK_FLAG} -ffunction-sections -nostdinc -fno-builtin -D_GNU_SOURCE"
 [ -f "$PASS_WIDEARGS" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_WIDEARGS"
 [ -f "$PASS_SOFTFP" ] && COMMON_CFLAGS="$COMMON_CFLAGS -fpass-plugin=$PASS_SOFTFP"
 # BpfLibcallLower：intrinsic -> musl libcall（memcpy/memmove/memset/trap/floor/ceil/trunc/round）。

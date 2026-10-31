@@ -23,8 +23,6 @@ fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
   已是 PyMutex 仍调 PyThread_acquire_lock)。
 - `Misc/platform_triplet.c` — `__BPF__` 分支 → `bpf-linux-musl`(否则
   `$CPP` 按 host 预处理误判 x86_64,perf trampoline 误开)。
-- `Programs/python.c` — main 显式 `visibility("default")`(核心
-  -fvisibility=hidden 下动态 PIE 的 main 不进 dynsym,ldso 解析不到入口)。
 - `Modules/selectmodule.c` — `__BPF__` 强制 `SELECT_USES_HEAP`:3 组
   `fd2obj[FD_SETSIZE+1]` 栈数组 ~49KB,超出 BPF st/ld 16 位帧偏移范围,LLVM
   会把越界负偏移回卷成正偏移(miscompile,见 bpfvm 仓库 AGENTS.md 的
@@ -32,6 +30,9 @@ fix in-tree. Each patch is a unified diff applicable with `patch -p1` (or
 - `Python/pathconfig.c` — `_PyPathConfig_ComputeSysPath0` 的
   fullpath/link/path0copy 三缓冲(~64KB 栈帧,同一 16 位回卷 miscompile 的
   另一受害者)改为单块 `PyMem_RawMalloc` 堆分配,退出点统一释放。
+- `Lib/ctypes/util.py` — `find_library` 追加 musl 式回退:guest 无
+  ldconfig 缓存也无 gcc/ld,最后按 `/lib`/`/usr/local/lib`/`/usr/lib`
+  glob `lib<name>.so*` 返回首个 soname(配合本项目 ffi-bpf 的 `_ctypes`)。
 
 **Apply** (从解包后的源码根):
 

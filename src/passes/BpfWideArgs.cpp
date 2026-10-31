@@ -14,7 +14,8 @@
 //
 //   聚合值参数归一化（lowerAggregateParams）：把会被后端展开成 >1 寄存器的参数
 //     （聚合 / i128）统一成裸 ptr 传递。大聚合 clang 已 lower 成 ptr byval，剥 byval
-//     属性即可；小聚合成值参数重建签名为 ptr。
+//     属性即可；小聚合成值参数重建签名为 ptr。调用点（直接与间接）同步归一化，
+//     间接调用点经被取地址重定向/PLT 命中的被调方均为改写后签名。
 //
 //   >5 参数（rewriteFunction 等）：第 6 个起打包进 packed struct，通过第 5 个
 //     寄存器位的指针传递。
@@ -233,6 +234,8 @@ static AllocaInst *allocSharedPackBuf(Function *Caller, unsigned MaxBytes) {
 // 改写调用点：第 Threshold 个之后的实参按 allocSize 累加字节偏移 store 进共享缓冲区，
 // 前 Threshold 个原样传入，末尾追加缓冲区指针。callee 侧用 packed 结构体 GEP+Load
 //（字段偏移 = allocSize 之和）或 va_arg（按 allocSize 推进）读回，与本处字节偏移自洽。
+static bool needsLowering(Type *T, const DataLayout &DL);
+
 // 间接调用也用同一布局——只要 callee 最终指向被改写过的函数，无需知道具体是谁。
 void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
                            unsigned Threshold) {
@@ -246,6 +249,31 @@ void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
     for (Value *arg : CB->args()) {
         if (idx < Threshold) {
             newArgs.push_back(arg);
+        } else if (arg->getType()->isStructTy() || arg->getType()->isArrayTy()) {
+            // 聚合变参：callee 的 va_arg 对聚合一律按引用（clang 生成
+            // va_arg ap, ptr 再解引用），pack 字段须存指针、步长 8；此前按值
+            // 内嵌与被调方错位（纯 C 传结构体变参即坏）。定参 >5 路径不会
+            // 到这里——聚合实参已被 normalizeIndirectAggregateArgs / sites
+            // 循环先行归一化为 ptr（allocSize 8，走下方的普通分支）。
+            // 只拦聚合不拦 i128 等宽标量：callee 的 va_arg i128 是直接 16B
+            // 载入（步长 allocSize），走下方普通分支内嵌才两侧一致。
+            Value *p;
+            if (auto *LI = dyn_cast<LoadInst>(arg)) {
+                p = LI->getPointerOperand();
+            } else {
+                Function *Caller = CB->getFunction();
+                IRBuilder<> EntryB(&Caller->getEntryBlock(),
+                                    Caller->getEntryBlock().getFirstInsertionPt());
+                AllocaInst *tmp =
+                    EntryB.CreateAlloca(arg->getType(), nullptr, "__va.agg");
+                tmp->setAlignment(Align(DL.getABITypeAlign(arg->getType())));
+                IRBuilder<> S(CB);
+                S.CreateStore(arg, tmp);
+                p = tmp;
+            }
+            Value *elemPtr = B.CreateConstGEP1_32(I8, SharedBuf, offset, "__pack.field");
+            B.CreateStore(p, elemPtr);
+            offset += 8;
         } else {
             // 按 allocSize 累加字节偏移，逐字段 store（packed 布局）
             Value *elemPtr = B.CreateConstGEP1_32(I8, SharedBuf, offset, "__pack.field");
@@ -516,8 +544,59 @@ bool lowerI128Returns(Module &M) {
         NewF->setDSOLocal(F.isDSOLocal());
         jobs.push_back({&F, NewF});
     }
+
+    // 间接调用点（callee 为 ptr 变量）：i128 返回的函数必然已被本 pass 改写为
+    // sret 约定（原签名后端无法编译，能经函数指针调到的目标都已是新签名），
+    // 调用点若保持 i128(...) 旧类型，后端在 call 结果处直接报 "only small
+    // returns supported"。与 normalizeIndirectAggregateArgs 同一论证：按调用点
+    // 自身类型无条件改写；纯驱动 TU（jobs 为空）也有此形态，须在 early return
+    // 之前执行。变参调用点保留 isVarArg、sret 指针作首具名参数，后续 va 打包
+    // 与 >5 参 pack 阶段按新参数表接管。
+    bool indirectChanged = false;
+    for (Function &F : M) {
+        SmallVector<CallInst *, 8> retSites;
+        for (BasicBlock &BB : F)
+            for (Instruction &I : BB) {
+                auto *CI = dyn_cast<CallInst>(&I);
+                if (!CI || CI->getCalledFunction() != nullptr)
+                    continue;   // 直接调用：下方 sites 循环处理
+                if (returnNeedsLowering(CI->getFunctionType()->getReturnType(), DL))
+                    retSites.push_back(CI);
+            }
+        for (CallInst *CI : retSites) {
+            FunctionType *FTy = CI->getFunctionType();
+            Type *retTy = FTy->getReturnType();
+            // alloca 必须在入口块（BPF 要求所有 alloca 集中入口块）。
+            IRBuilder<> EntryB(&F.getEntryBlock(), F.getEntryBlock().getFirstInsertionPt());
+            AllocaInst *tmp = EntryB.CreateAlloca(retTy, nullptr, "__agg.ret");
+            tmp->setAlignment(Align(DL.getABITypeAlign(retTy)));
+
+            SmallVector<Type *, 8> newTys;
+            newTys.push_back(PointerType::getUnqual(Ctx));
+            for (Type *pTy : FTy->params())
+                newTys.push_back(pTy);
+            FunctionType *newFTy =
+                FunctionType::get(Type::getVoidTy(Ctx), newTys, FTy->isVarArg());
+
+            SmallVector<Value *, 8> newArgs;
+            newArgs.push_back(tmp);
+            for (Value *arg : CI->args())
+                newArgs.push_back(arg);
+            IRBuilder<> B(CI);
+            CallInst *NC = B.CreateCall(newFTy, CI->getCalledOperand(), newArgs);
+            NC->setTailCallKind(CI->getTailCallKind());
+            if (!CI->use_empty()) {
+                IRBuilder<> LB(NC->getNextNode());
+                Value *loaded = LB.CreateLoad(retTy, tmp, "__agg.ret.ld");
+                CI->replaceAllUsesWith(loaded);
+            }
+            CI->eraseFromParent();
+            indirectChanged = true;
+        }
+    }
+
     if (jobs.empty())
-        return false;
+        return indirectChanged;
 
     // 搬函数体，改写所有 ret T %v -> store + ret void。
     for (auto &j : jobs) {
@@ -707,6 +786,72 @@ static SmallVector<unsigned, 4> collectAggregateValueParams(Function &F, const D
     return idxs;
 }
 
+// 间接调用点（callee 为 ptr 变量）的聚合实参归一化：被调方已被重建成
+// 裸 ptr 签名，但间接调用点若保持 clang 原生按构成展开（9-16B 拆两个寄存器，
+// >5 参 pack 内嵌 16B），与被调方（读指针 / pack 字段 8B）布局错位。这里把
+// 间接调用点改成与直接调用同一约定：load 传源指针（invisible-ref 语义），
+// 其它入口 alloca + call 前 store。变参调用点只归一化具名参数（变参值由
+// va 打包路径按 allocSize 内嵌，两侧本就一致）；syscall 形式（inttoptr
+// callee）实参皆标量，跳过。opaque pointers 下 CallBase 自带 FunctionType，
+// 重建签名即无损。须在 >5 参数/pack 阶段之前（lowerAggregateParams 整体
+// 先于其运行），使 pack 字段类型与被改写被调方的 pack 布局一致。
+//
+// 无条件执行：模块可能只含"经函数指针调用聚合参数函数"的驱动代码而不定义
+// 任何此类函数（jobs 为空，跨 TU 回调驱动即此形态），扫掠不得随之短路。
+static bool normalizeIndirectAggregateArgs(Module &M, const DataLayout &DL) {
+    bool changed = false;
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                auto *CB = dyn_cast<CallBase>(&I);
+                if (!CB || CB->getCalledFunction() != nullptr)
+                    continue;   // 直接调用：sites 循环已处理
+                if (isSyscallCallee(CB->getCalledOperand()))
+                    continue;
+                FunctionType *FTy = CB->getFunctionType();
+                unsigned fixed = FTy->getNumParams();
+                bool any = false;
+                for (unsigned i = 0; i < fixed && i < CB->arg_size(); ++i) {
+                    if (needsLowering(CB->getArgOperand(i)->getType(), DL)) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any)
+                    continue;
+
+                SmallVector<Type *, 8> newTys;
+                for (unsigned i = 0; i < fixed; ++i)
+                    newTys.push_back(needsLowering(FTy->getParamType(i), DL)
+                                         ? PointerType::getUnqual(F.getContext())
+                                         : FTy->getParamType(i));
+                for (unsigned i = 0; i < fixed && i < CB->arg_size(); ++i) {
+                    Value *arg = CB->getArgOperand(i);
+                    if (!needsLowering(arg->getType(), DL))
+                        continue;
+                    if (auto *LI = dyn_cast<LoadInst>(arg)) {
+                        CB->setArgOperand(i, LI->getPointerOperand());
+                        continue;
+                    }
+                    Type *aggTy = arg->getType();
+                    IRBuilder<> EntryB(&F.getEntryBlock(),
+                                       F.getEntryBlock().getFirstInsertionPt());
+                    AllocaInst *tmp = EntryB.CreateAlloca(aggTy, nullptr, "__agg.ind");
+                    tmp->setAlignment(Align(DL.getABITypeAlign(aggTy)));
+                    IRBuilder<> B(CB);
+                    B.CreateStore(arg, tmp);
+                    CB->setArgOperand(i, tmp);
+                }
+                FunctionType *newFTy =
+                    FunctionType::get(FTy->getReturnType(), newTys, FTy->isVarArg());
+                CB->setCalledFunction(newFTy, CB->getCalledOperand());
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 bool lowerAggregateParams(Module &M) {
     bool changed = false;
     const DataLayout &DL = M.getDataLayout();
@@ -765,6 +910,10 @@ bool lowerAggregateParams(Module &M) {
         jobs.push_back({&F, NewF, idxs});
         changed = true;
     }
+    // 间接调用点归一化须无条件执行（jobs 为空的纯驱动 TU 也要改写），且先于
+    // jobs 的函数体搬移/RAUW（两者处理的调用点不相交，顺序无耦合）。
+    changed |= normalizeIndirectAggregateArgs(M, DL);
+
     if (jobs.empty())
         return changed;
 

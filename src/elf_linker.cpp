@@ -1388,6 +1388,11 @@ public:
 private:
     // .so 提供的符号表（DYNAMIC_EXE 模式用）：symbol name -> 已固定地址
     std::unordered_map<std::string, uint64_t> bpfso_symbols_;
+    // 依赖 .so 以非 weak UND 引用、期望从外部获得的符号名。DYNAMIC_EXE 若只在
+    // 本链接单元有 hidden 定义,导出闸门会跳过 -> 运行期 ldso 解析失败。结构性
+    // 案例:main —— 本平台 crt(_start)住在共享 ldso 里,对 main 的跨模块引用是
+    // 平台契约,不应转嫁给应用程序(此前 cpython 因此打 visibility patch)。
+    std::unordered_set<std::string> bpfso_und_strong_;
     // 从文件加载一个 ET_REL .o
     size_t load_rel_file(const std::string& path) {
         std::vector<uint8_t> data;
@@ -1711,6 +1716,12 @@ private:
     }
 
     // 把 obj 的所有 GLOBAL 符号注册到 globals_
+    // hidden 符号的强制导出判定:标准 ld 的按需导出只覆盖默认可见符号;这里把
+    // 被依赖 .so 强(非 weak)引用的 exe 定义符号越过 hidden 边界提升导出。
+    bool forced_export(const std::string& name) const {
+        return mode_ == Mode::DYNAMIC_EXE && bpfso_und_strong_.count(name) != 0;
+    }
+
     void register_globals(size_t obj_idx) {
         const auto& obj = objects_[obj_idx];
         for (size_t i = 0; i < obj.symbols.size(); i++) {
@@ -1923,8 +1934,15 @@ private:
             int binding = GELF_ST_BIND(sym.st_info);
             int type = GELF_ST_TYPE(sym.st_info);
             if (binding != STB_GLOBAL && binding != STB_WEAK) continue;
+            if (sym.st_shndx == SHN_UNDEF) {  // 导入符号，不是导出
+                // UND 条目常是 NOTYPE(如 ldso 的 main 引用),须在 type 过滤前收集
+                if (binding == STB_GLOBAL) {
+                    char* nm = elf_strptr(elf, dynsym_link, sym.st_name);
+                    if (nm && *nm) bpfso_und_strong_.insert(nm);
+                }
+                continue;
+            }
             if (type != STT_FUNC && type != STT_OBJECT) continue;
-            if (sym.st_shndx == SHN_UNDEF) continue;  // 导入符号，不是导出
             // hidden 符号不跨模块可见，跳过（防御性：正确生成的 .so 不该在 .dynsym 含 hidden
             // 符号，但保护下游不被错误产物污染）。
             if (GELF_ST_VISIBILITY(sym.st_other) == STV_HIDDEN) continue;
@@ -3308,7 +3326,8 @@ private:
             if (sym.name.empty()) continue;
             // hidden 符号不导出到 .dynsym（标准 ELF 语义：不可被其它模块引用）。
             // 本链接单元内的引用由 .rela.dyn 的 def_in_unit 分支处理，故不导出无副作用。
-            if (sym.visibility == STV_HIDDEN) continue;
+            // 例外：被依赖 .so 强引用的符号强制导出（见 forced_export）。
+            if (sym.visibility == STV_HIDDEN && !forced_export(sym.name)) continue;
             if (export_name_off.find(sym.name) != export_name_off.end()) continue;
             Elf64_Word off = (Elf64_Word)dynstr.data.size();
             dynstr.data.insert(dynstr.data.end(), sym.name.begin(), sym.name.end());
@@ -3361,7 +3380,7 @@ private:
             const auto& obj = objects_[kv.second.obj_idx];
             const auto& sym = obj.symbols[kv.second.sym_idx];
             // hidden 符号不导出到 .dynsym（与 dynstr 收集处一致）。
-            if (sym.visibility == STV_HIDDEN) continue;
+            if (sym.visibility == STV_HIDDEN && !forced_export(sym.name)) continue;
             Elf64_Sym s = {};
             auto it = export_name_off.find(sym.name);
             if (it != export_name_off.end()) s.st_name = it->second;
@@ -3369,7 +3388,11 @@ private:
             // 保留原符号 visibility（st_other 低 2 位）。非 hidden 符号（DEFAULT/PROTECTED）
             // 也写出真实值，而非一律 0——PROTECTED 符号导出但不可被预empt（本链接器/loader
             // 目前不区分，但写出正确值让 ELF 符合标准语义）。
-            s.st_other = GELF_ST_VISIBILITY(sym.visibility);
+            // 强制导出的 hidden 符号提升为默认可见,否则 loader 查表会跳过
+            // dynsym 中的 STV_HIDDEN 条目。
+            s.st_other = (sym.visibility == STV_HIDDEN)
+                             ? GELF_ST_VISIBILITY(STV_DEFAULT)
+                             : GELF_ST_VISIBILITY(sym.visibility);
             s.st_shndx = sym_to_shndx(obj, sym.sec_idx, bss_shndx, seg_shndx);
             s.st_value = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
             s.st_size = sym.size;
@@ -3761,18 +3784,39 @@ private:
         return fwrite(&ehdr, sizeof(ehdr), 1, f) == 1;
     }
 
-    // 程序头表：PT_LOAD（每段一个；首段在 has_phdr 时向前扩展覆盖文件头）+
-    // PT_PHDR（可执行文件）+ 动态区 PT_LOAD + PT_INTERP（DYNAMIC_EXE）+ PT_DYNAMIC。
+    // 程序头表：PT_PHDR（可执行文件，gABI 要求先于任何 PT_LOAD）+
+    // PT_LOAD（每段一个；首段在 has_phdr 时向前扩展覆盖文件头）+
+    // 动态区 PT_LOAD + PT_INTERP（DYNAMIC_EXE）+ PT_DYNAMIC。
     bool write_phdrs(FILE* f, const std::vector<SecBuf>& extras, const FileLayout& L,
                       const std::unordered_map<size_t, uint64_t>& dyn_vaddr_map,
                       const DynSecOut& dyn_idx, size_t interp_idx, bool need_dynamic) const {
         // 首个 PT_LOAD：has_phdr 时向前扩展，把 ELF header + phdr table（文件 offset [0, head)）
         // 纳入映射。PT_PHDR 要求它描述的 phdr 表区域被某个 PT_LOAD 覆盖，否则不可读。
         // layout_segments 已给首段 vaddr 预留 head（首段 vaddr = guest_base_ + head），
-        // 这里 p_offset 减到 0、p_vaddr 同步前移 head 回到 guest_base_，filesz/memsz 补 head。
-        // phdr_load_vaddr 记录扩展后首段 vaddr，供下方 PT_PHDR 复用（phdr 表在其内偏移 64）。
-        uint64_t phdr_load_vaddr = 0;  // 扩展后首段 vaddr（PT_PHDR.p_vaddr 的基准）
-        bool first_load = true;
+        // 扩展即 p_offset 减到 0、p_vaddr 同步前移 head，filesz/memsz 补 head。
+        // 先算扩展后首段 vaddr（PT_PHDR.p_vaddr 的基准，phdr 表在其内偏移 64），
+        // 使 PT_PHDR 能先于 PT_LOAD 发射。
+        uint64_t head = 0;
+        int head_seg = -1;   // 首个被使用的段(文件头扩展施加于它)
+        if (L.has_phdr) {
+            for (int c = 0; c < 3; c++) {
+                if (segs_[c].used) { head = L.seg_file_off[c]; head_seg = c; break; }
+            }
+        }
+        // PT_PHDR：phdr 表在文件 offset sizeof(Elf64_Ehdr)=64，对应内存 vaddr = 首段 vaddr + 64。
+        // loader 据此算 auxv AT_PHDR = load_base + p_vaddr，无需依赖文件布局假设。
+        if (L.has_phdr) {
+            Elf64_Phdr ph = {};
+            ph.p_type = PT_PHDR;
+            ph.p_flags = PF_R;
+            ph.p_offset = sizeof(Elf64_Ehdr);
+            ph.p_vaddr = segs_[head_seg].vaddr - head + sizeof(Elf64_Ehdr);
+            ph.p_paddr = ph.p_vaddr;
+            ph.p_filesz = sizeof(Elf64_Phdr) * L.phnum;
+            ph.p_memsz = ph.p_filesz;
+            ph.p_align = 8;
+            if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
+        }
         for (int c = 0; c < 3; c++) {
             if (!segs_[c].used) continue;
             Elf64_Phdr ph = {};
@@ -3784,30 +3828,13 @@ private:
             ph.p_filesz = segs_[c].filesz;
             ph.p_memsz = segs_[c].memsz;
             ph.p_align = 0x1000;
-            if (L.has_phdr && first_load && ph.p_offset != 0) {
-                uint64_t head = ph.p_offset;
+            if (L.has_phdr && c == head_seg && ph.p_offset != 0) {
                 ph.p_offset  = 0;
                 ph.p_vaddr  -= head;
                 ph.p_paddr  -= head;
                 ph.p_filesz += head;
                 ph.p_memsz  += head;
-                phdr_load_vaddr = ph.p_vaddr;
             }
-            first_load = false;
-            if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
-        }
-        // PT_PHDR：phdr 表在文件 offset sizeof(Elf64_Ehdr)=64，对应内存 vaddr = 首段 vaddr + 64。
-        // loader 据此算 auxv AT_PHDR = load_base + p_vaddr，无需依赖文件布局假设。
-        if (L.has_phdr) {
-            Elf64_Phdr ph = {};
-            ph.p_type = PT_PHDR;
-            ph.p_flags = PF_R;
-            ph.p_offset = sizeof(Elf64_Ehdr);
-            ph.p_vaddr = phdr_load_vaddr + sizeof(Elf64_Ehdr);
-            ph.p_paddr = ph.p_vaddr;
-            ph.p_filesz = sizeof(Elf64_Phdr) * L.phnum;
-            ph.p_memsz = ph.p_filesz;
-            ph.p_align = 8;
             if (fwrite(&ph, sizeof(ph), 1, f) != 1) return false;
         }
         // PT_LOAD 覆盖动态 section 区：vaddr = offset + delta（页对齐），

@@ -515,9 +515,12 @@ Path::Path(PosixSyscall* s, std::string g)
     : self(s), guest(std::move(g)) {
     if(s->ps->root.empty()) {
         host = guest;
-    } else {
+    } else if(!guest.empty()) {
         host = std::filesystem::path(s->ps->root + guest).lexically_normal().string();
     }
+    // guest 为空时 host 保持空串:拼前缀会把 "" 规范化成 chroot 根目录(误开
+    // 根目录的 bug);空串原样传给宿主 libc,由内核统一判 ENOENT(open(2)
+    // 对空路径名的行为),全部路径操作无需逐个处理。
 }
 
 std::shared_ptr<Fd> HostPath::open(int flags, mode_t mode) {

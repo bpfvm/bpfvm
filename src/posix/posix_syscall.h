@@ -362,6 +362,7 @@ public:
     int64_t do_tgkill(vm* v);
     int64_t do_sigaction(vm* v);
     int64_t do_sigprocmask(vm* v);
+    int64_t do_sigaltstack(vm* v);
     int64_t do_setpgid(vm* v);
     int64_t do_getpgid(vm* v);
     int64_t do_getpgrp(vm*);

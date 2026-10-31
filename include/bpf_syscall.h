@@ -110,6 +110,7 @@
 #define BPF_SYS_SENDFILE        97  /* sendfile(out, in, off_t*, count) — shutil 快路径 */
 #define BPF_SYS_EVENTFD2        98  /* eventfd2(count, flags) — eventfd() 复用 */
 #define BPF_SYS_PRLIMIT64       99  /* prlimit64(pid, res, new*, old*) — musl getrlimit/setrlimit 转调 */
+#define BPF_SYS_SIGALTSTACK     100 /* sigaltstack(ss*, old*) — stub，查询恒报未启用，见 do_sigaltstack */
 
 #define BPF_CALL_BASE 0x10000u
 #define BPF_CALL_ID(id) (BPF_CALL_BASE + (uint32_t)(id))
@@ -217,6 +218,7 @@
 #define BPF_CALL_SENDFILE         BPF_CALL_ID(BPF_SYS_SENDFILE)
 #define BPF_CALL_EVENTFD2         BPF_CALL_ID(BPF_SYS_EVENTFD2)
 #define BPF_CALL_PRLIMIT64        BPF_CALL_ID(BPF_SYS_PRLIMIT64)
+#define BPF_CALL_SIGALTSTACK      BPF_CALL_ID(BPF_SYS_SIGALTSTACK)
 #define BPF_CALL_PSELECT6         BPF_CALL_ID(BPF_SYS_PSELECT6)
 
 #endif //BPF_SYSCALL_H

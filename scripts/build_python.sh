@@ -19,6 +19,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 make_ld_wrapper
 require_base
 
+# _ctypes 依赖 ffi 组件(root/lib/libffi.{a,so} + pkgconfig/libffi.pc);
+# 未构建时 configure 探测不到 libffi,静默跳过 _ctypes 模块
+if [ ! -f "${ROOT_DIR}/root/lib/pkgconfig/libffi.pc" ]; then
+    echo "提示: root/lib/pkgconfig/libffi.pc 不存在,先跑 ./scripts/build_root.sh ffi,否则 _ctypes 不会编译" >&2
+fi
+
 PY_SRC="${ROOT_DIR}/thirdparty/cpython"
 HOST_INSTALL="${ROOT_DIR}/build/python-host-install/opt/py313-build"
 BUILD_DIR="${ROOT_DIR}/build/python-bpf"

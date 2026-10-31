@@ -174,18 +174,6 @@
  # elif defined(__x86_64__) && defined(__ILP32__)
  PLATFORM_TRIPLET=x86_64-linux-LIBC_X32
  # elif defined(__i386__)
---- a/Programs/python.c
-+++ b/Programs/python.c
-@@ -9,6 +9,9 @@
-     return Py_Main(argc, argv);
- }
- #else
-+// bpfvm port: 核心编译带 -fvisibility=hidden,动态 PIE 下 main 不进 dynsym,
-+// ldso(_dlstart)解析不到入口。显式 default 可见性导出。
-+__attribute__((visibility("default")))
- int
- main(int argc, char **argv)
- {
 --- a/Modules/selectmodule.c
 +++ b/Modules/selectmodule.c
 @@ -237,7 +237,9 @@
@@ -269,3 +257,31 @@
      if (path0_obj == NULL) {
          return -1;
      }
+diff --git a/Lib/ctypes/util.py b/Lib/ctypes/util.py
+index 117bf06..9f6155c 100644
+--- a/Lib/ctypes/util.py
++++ b/Lib/ctypes/util.py
+@@ -336,10 +336,22 @@ def _findLib_ld(name):
+                 pass  # result will be None
+             return result
+ 
++        def _findLib_glob(name):
++            # bpfvm port: musl-style lookup - the guest has no ldconfig cache
++            # and no gcc/ld, so scan the dynamic loader search dirs for
++            # lib<name>.so* and return the first hit's soname.
++            import glob
++            for d in ('/lib', '/usr/local/lib', '/usr/lib'):
++                hits = sorted(glob.glob(f'{d}/lib{name}.so*'))
++                if hits:
++                    return os.path.basename(hits[0])
++            return None
++
+         def find_library(name):
+             # See issue #9998
+             return _findSoname_ldconfig(name) or \
+-                   _get_soname(_findLib_gcc(name)) or _get_soname(_findLib_ld(name))
++                   _get_soname(_findLib_gcc(name)) or _get_soname(_findLib_ld(name)) or \
++                   _findLib_glob(name)
+ 
+ ################################################################
+ # test code

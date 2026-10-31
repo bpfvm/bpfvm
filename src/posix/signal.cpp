@@ -471,6 +471,25 @@ int64_t PosixSyscall::do_sigaction(vm* v) {
     return 0;
 }
 
+int64_t PosixSyscall::do_sigaltstack(vm* v) {
+    // sigaltstack(ss*, old*)。stub：VM 在常规栈同步投递信号（无异步抢占），
+    // 备用栈语义不可达，登记无消费者；校验（SS_ONSTACK/MINSIGSTKSZ）已由
+    // musl 的 sigaltstack() 包装层完成。查询恒报未启用——与"永不激活"的
+    // 事实一致，也恰与 Linux 首次设置的 old 返回值相同。faulthandler
+    // （-X faulthandler / test.support 子进程默认开）只要求设置成功。
+    uint64_t old_addr = v->r(2);
+    if(old_addr != 0) {
+        auto* old = static_cast<uint64_t*>(v->mmu_w(old_addr, 24));
+        if(old == nullptr) {
+            return -EFAULT;
+        }
+        old[0] = 0;
+        old[1] = SS_DISABLE;
+        old[2] = 0;
+    }
+    return 0;
+}
+
 int64_t PosixSyscall::do_sigprocmask(vm* v) {
     // rt_sigprocmask(how, set, old, sigsetsize)。how in {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}。
     // sigset_t 在 bpf/musl 是 128 位（16 字节，2 个 unsigned long）；guest 指针指向 16 字节
