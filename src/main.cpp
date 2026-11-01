@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
+#include <cstring>
 
 
 static int gdb_stop_flag = 0;
@@ -44,6 +46,29 @@ static void print_usage(const char* prog) {
         << "  -g, --gdb <port>            start GDB RSP server on <port>\n"
         << "                              (VM runs at full speed; GDB attaches on connect)\n"
         << "      --stop                  with --gdb: freeze VM at start until GDB connects\n";
+}
+
+// 宿主 ps/top 显示 guest 程序而非 bpfvm。/proc/pid/cmdline 读的就是 argv 字符串区
+//（exec 布局连续存放，envp 在更高地址不受影响），其边界 arg_start..arg_end 无特权
+// 改不了，超长即截断；ps 与 top 分看 cmdline/comm，故 prctl(PR_SET_NAME) 一并设置
+//（内核按 TASK_COMM_LEN=16 截断）。须在 argv 字符串全部消费完之后调用。
+static void set_guest_title(char** host_argv, int argc, int guest_first) {
+    std::string prog = host_argv[guest_first];
+    auto slash = prog.find_last_of('/');
+    std::string comm = (slash != std::string::npos) ? prog.substr(slash + 1) : prog;
+
+    char* base = host_argv[0];
+    char* last = host_argv[argc - 1] + strlen(host_argv[argc - 1]);
+    size_t cap = (size_t)(last - base) + 1;
+    std::string title;
+    for(int i = guest_first; i < argc; i++) {
+        if(i > guest_first) title.push_back(' ');
+        title += host_argv[i];
+    }
+    size_t n = std::min(title.size(), cap - 1);
+    memcpy(base, title.data(), n);
+    memset(base + n, 0, cap - n);
+    prctl(PR_SET_NAME, comm.c_str(), 0, 0, 0);
 }
 
 int real_main(int argc, char** argv) {
@@ -199,7 +224,9 @@ int real_main(int argc, char** argv) {
     if(!options->root.empty()) {
         options->envp["HOME"] = "/";
         // argv[optind] 是 guest 视角路径，dirname 得其所在 guest 目录（如 /bin）。
-        options->envp["PATH"] = dirname((char*)argv[optind]);
+        // dirname 原地改写入参，须传副本：argv[optind] 之后还要供 set_guest_title 使用。
+        std::string av0 = argv[optind];
+        options->envp["PATH"] = dirname(av0.data());
     } else {
         char* cwd = getcwd(nullptr, 0);
         options->envp["HOME"] = cwd;
@@ -210,6 +237,7 @@ int real_main(int argc, char** argv) {
     for (const auto& [k, val] : extra_envp) {
         options->envp[k] = val;
     }
+    set_guest_title(argv, argc, optind);
     umask(0);
 
     // --gdb：启动 GDB RSP server（独立线程，listen <gdb_port>，阻塞等 GDB 连接）。server 对象

@@ -446,6 +446,8 @@ int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     case BPF_SYS_TGKILL:     return do_tgkill(v);
     case BPF_SYS_SIGACTION:  return do_sigaction(v);
     case BPF_SYS_SIGPROCMASK:return do_sigprocmask(v);
+    case BPF_SYS_SIGSUSPEND: return do_sigsuspend(v);
+    case BPF_SYS_PRCTL:      return do_prctl(v);
     case BPF_SYS_SIGALTSTACK:return do_sigaltstack(v);
     case BPF_SYS_SIGSETJMP:  return do_sigsetjmp(v);
     case BPF_SYS_SIGLONGJMP: return do_siglongjmp(v);

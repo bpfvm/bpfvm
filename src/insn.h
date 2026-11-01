@@ -171,6 +171,10 @@ struct sig_info {
 };
 
 inline constexpr int64_t SYSCALL_RESTART = -512;
+// ERESTARTNOHAND 语义：仅当没有执行信号处理函数时才重启（Linux 对 rt_sigsuspend 用之）。
+// 投递了 handler 则向用户态返 -EINTR，即使 handler 带 SA_RESTART 也不重启——否则
+// sigsuspend 会在 handler 返回后再次睡回等待，调用者永远拿不到返回值。
+inline constexpr int64_t SYSCALL_RESTART_NOHAND = -511;
 
 class SyscallHandler{
 protected:
@@ -362,6 +366,9 @@ private:
     // do_syscall 在此记录该 syscall 指令地址。0 = 无待决重启。deliver_signal 投递
     // 信号时据此 + SA_RESTART 决定重启（PC 回该地址）或转 -EINTR，随后清零。
     uint64_t restart_syscall_pc_ = 0;
+    // 待决重启是否为 NOHAND 语义（SYSCALL_RESTART_NOHAND）：deliver_signal 投递
+    // handler 时忽略 SA_RESTART 一律转 -EINTR。
+    bool restart_nohand_ = false;
 
     // 调试回调集合（见 DebugHooks）。原子整体替换，fork/clone 时子继承父的快照。
     AtomicDebugHooks debug_hooks_;
@@ -383,9 +390,10 @@ private:
             if(flags.load(std::memory_order_acquire) & VM_DEBUG_STOP) debug_park();
         }
         int64_t ret = (options.sys->syscall)(this, call);
-        if(ret == SYSCALL_RESTART) {
+        if(ret == SYSCALL_RESTART || ret == SYSCALL_RESTART_NOHAND) {
             // 重启：不写 r(0)（保留调用前的值，由重投递的 syscall 重新设置），记 pc 供重启。
             restart_syscall_pc_ = pc_;
+            restart_nohand_ = (ret == SYSCALL_RESTART_NOHAND);
             return true;
         }
         // 先把返回值写回 r(0)——含 exit/exit_group 的退出码（这俩 syscall 返回 code 并置

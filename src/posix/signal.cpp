@@ -504,6 +504,16 @@ int64_t PosixSyscall::do_sigprocmask(vm* v) {
         return -EINVAL;
     }
 
+    // 先读 set 再写 old：busybox sigprocmask2 传 old=set 同一地址，先写 old 会覆盖 set
+    uint64_t bits = 0;
+    if(set_addr != 0) {
+        // 读 guest sigset_t 低 8 字节（信号 1..63 足够覆盖 NSIG=32）。
+        auto* set_ptr = static_cast<const uint64_t*>(v->mmu(set_addr, sizeof(uint64_t)));
+        if(set_ptr == nullptr) {
+            return -EFAULT;
+        }
+        bits = *set_ptr;
+    }
     // oldset 总是反映当前 mask，写回 16 字节 sigset_t（低 long = mask，高 long = 0）。
     if(old_addr != 0) {
         auto* old_ptr = static_cast<uint64_t*>(v->mmu_w(old_addr, 2 * sizeof(uint64_t)));
@@ -513,14 +523,7 @@ int64_t PosixSyscall::do_sigprocmask(vm* v) {
         old_ptr[0] = sigmask.load(std::memory_order_relaxed);
         old_ptr[1] = 0;
     }
-
     if(set_addr != 0) {
-        // 读 guest sigset_t 低 8 字节（信号 1..63 足够覆盖 NSIG=32）。
-        auto* set_ptr = static_cast<const uint64_t*>(v->mmu(set_addr, sizeof(uint64_t)));
-        if(set_ptr == nullptr) {
-            return -EFAULT;
-        }
-        uint64_t bits = *set_ptr;
         // 仅保留有效位（bit (sig-1), sig in [1, NSIG-1]）；SIGKILL/SIGSTOP 不可阻塞。
         constexpr uint64_t valid = (NSIG < 64) ? ((1ULL << (NSIG - 1)) - 1) : ~0ULL;
         bits &= valid;
@@ -687,6 +690,47 @@ int64_t PosixSyscall::do_signalfd4(vm* v) {
     }
     sfd->mask.store(mask, std::memory_order_relaxed);
     return fd;
+}
+
+int64_t PosixSyscall::do_sigsuspend(vm* v) {
+    // 语义对齐 Linux ERESTARTNOHAND：只在信号 handler 执行后以 -EINTR 返回，
+    // 否则重启本 syscall 继续睡。
+    uint64_t new_mask;
+    if(!parse_guest_sigset(v, v->r(1), new_mask)) {
+        return -EFAULT;
+    }
+    // 不恢复调用前掩码：VM 的信号帧机制无 sigreturn 钩子，POSIX 要求的"handler 返回后
+    // 恢复"没有落点。调用方按惯例随后自行设置掩码（dash waitproc 循环出口的
+    // sigclearmask、sigsetjmp/siglongjmp 的 env 掩码恢复）。
+    sigmask.store(new_mask, std::memory_order_release);
+    while(true) {
+        if(v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_DEBUG_STOP)) {
+            return SYSCALL_RESTART_NOHAND;  // 交回 safepoint：kill 退出 / stop 挂起
+        }
+        {
+            std::lock_guard<std::mutex> lk(pending_signals.mtx());
+            bool deliverable = false;
+            for(const auto& e : pending_signals.raw()) {
+                uint64_t bit = (e.sig >= 1 && e.sig < NSIG) ? (1ULL << (e.sig - 1)) : 0;
+                if(bit && !(new_mask & bit)) {
+                    deliverable = true;
+                    break;
+                }
+            }
+            if(deliverable) {
+                break;  // safepoint 的 handle_signals 会用同一掩码判定并投递
+            }
+            // 只剩被阻塞的 pending 信号：VM_SIGNAL_PENDING 保持置位（handle_signals 仅
+            // 在队列清空时清它），wait_for 见它即返 -EINTR，等待会退化成无睡眠自旋。
+            // 持队列锁清标志与 queue_signal 的 push+置位互斥，新信号到来会重新置位并
+            // wakeup；do_sigprocmask / siglongjmp 解锁重扫时也会补设。
+            v->clear_flags(vm::VM_SIGNAL_PENDING);
+        }
+        v->set_flags(vm::VM_BLOCKED);
+        v->wait_for(nullptr);
+        v->clear_flags(vm::VM_BLOCKED);
+    }
+    return SYSCALL_RESTART_NOHAND;
 }
 
 bool SignalFd::deliver(const SigEvent& ev) {

@@ -1,5 +1,6 @@
 #include "posix_internal.h"
 #include <sys/wait.h>    // WEXITED/WSTOPPED/WNOWAIT（waitid 选项标志）
+#include <sys/prctl.h>   // PR_SET_NAME/PR_GET_NAME
 
 int64_t PosixSyscall::do_exit(vm* v) {
     int code = arg_s32(v->r(1));
@@ -215,6 +216,8 @@ int64_t PosixSyscall::exec_common(vm* v, int dirfd, const std::string& path,
     options(v).envp = std::move(envp_map);
     ps->exe_path = guest_abs;
     comm_ = make_comm(guest_abs);
+    // 同步宿主线程名（ps -eLf / top -H 的 guest 进程视图）
+    pthread_setname_np(pthread_self(), comm_.c_str());
     // exec 只替换本进程的地址空间：maps 容器可能被其它 vm 共享（CLONE_VM，共享点
     // 见 do_clone），而下方 swap 是原地换容器内容，直接换会把共享者的地址空间一并
     // 换掉，fresh 析构再释放旧页，共享者恢复执行即踩已释放内存。use_count>1 是
@@ -430,6 +433,8 @@ int64_t PosixSyscall::do_clone(vm* v) {
     auto* holder = new std::shared_ptr<vm>(child);
     rc = pthread_create(&worker, &attr, [](void* arg) -> void* {
         auto* child = static_cast<std::shared_ptr<vm>*>(arg);
+        // guest fork 出的进程是宿主线程：设线程名供 ps -eLf / top -H 区分
+        pthread_setname_np(pthread_self(), sys(child->get())->comm_.c_str());
         (*child)->run();
         // host pthread 即将结束：清 tid，防止线程组内其他线程退出时（do_exit_group 等）
         // 遍历 tg->threads 对已结束的 pthread 调 pthread_kill（bionic 对失效 pthread_t
@@ -846,4 +851,36 @@ int64_t PosixSyscall::do_get_tls(vm* v) {
     // 读取 thread pointer（guest 侧 __get_tp 用）。单线程下调用稀疏
     // （stdio getc/putc 热路径因 f->lock==0 短路，不触发 __pthread_self）。
     return (int64_t)tp(v);
+}
+
+// PR_SET_NAME/PR_GET_NAME：comm 读写（daemon 改名惯例；busybox exec 后经它把 comm
+// 修正为 applet 名，re_execed_comm 判定读回）。截 15 字节 = TASK_COMM_LEN-1。
+int64_t PosixSyscall::do_prctl(vm* v) {
+    int option = arg_s32(v->r(1));
+    switch(option) {
+    case PR_SET_NAME: {
+        // 内核语义：裸拷 16 字节，不要求 NUL 终止
+        auto* name = static_cast<const char*>(v->mmu(v->r(2), 16));
+        if(!name) {
+            return -EFAULT;
+        }
+        char buf[16];
+        memcpy(buf, name, 16);
+        buf[15] = 0;
+        comm_ = buf;
+        pthread_setname_np(pthread_self(), comm_.c_str());
+        return 0;
+    }
+    case PR_GET_NAME: {
+        auto* buf = static_cast<char*>(v->mmu_w(v->r(2), 16));
+        if(!buf) {
+            return -EFAULT;
+        }
+        memset(buf, 0, 16);
+        memcpy(buf, comm_.c_str(), std::min(comm_.size(), (size_t)15));
+        return 0;
+    }
+    default:
+        return -EINVAL;
+    }
 }

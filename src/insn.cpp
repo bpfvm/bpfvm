@@ -330,6 +330,7 @@ bool vm::deliver_signal() {
         if(restart_syscall_pc_ != 0) {
             pc_ = restart_syscall_pc_;
             restart_syscall_pc_ = 0;
+            restart_nohand_ = false;
         }
         return true;
     }
@@ -342,13 +343,14 @@ bool vm::deliver_signal() {
     // 可重启 syscall 后向用户态返回 -EINTR）。
     uint64_t ret_addr = pc_;
     if(restart_syscall_pc_ != 0) {
-        if(info.sa_flags & SA_RESTART) {
+        if((info.sa_flags & SA_RESTART) && !restart_nohand_) {
             ret_addr = restart_syscall_pc_;
         } else {
             r(0) = (uint64_t)(int64_t)-EINTR;
             ret_addr = restart_syscall_pc_ + sizeof(bpf_insn);
         }
         restart_syscall_pc_ = 0;
+        restart_nohand_ = false;
     }
     if(!push_frame(ret_addr, info.handler, true)) {
         return false;
