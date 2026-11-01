@@ -58,13 +58,10 @@ using namespace llvm;
 
 namespace {
 
-// BPF 后端限制是 5 个参数，所以 >5 就需要打包。
-// 第 5 个位置用来放结构体指针，前 4 个仍是寄存器参数。
 constexpr unsigned KEEP_REGS = 4;          // 保留为寄存器参数的个数
 constexpr unsigned BPF_ARG_LIMIT = 5;      // BPF 后端的硬上限
 
 // 通用排除条件：对所有改写路径都适用。
-// 排除 llvm.* / __clang_ 等内部符号、intrinsic。
 static bool isInternalOrIntrinsic(Function &F) {
     if (F.getName().starts_with("llvm."))
         return true;
@@ -86,8 +83,6 @@ static bool isSyscallCallee(Value *Callee) {
 }
 
 // 判断一个函数是否是变参函数（需要 varargs 改写路径）。
-// 包含：有定义的变参函数、被调用的变参声明（prototype）。
-// 排除：无定义且无人调用、内部符号/intrinsic。
 static bool isVarArgFunction(Function &F) {
     if (F.isDeclaration() && F.use_empty())
         return false;                      // 无定义又没人调用，不用管
@@ -100,7 +95,6 @@ static bool isVarArgFunction(Function &F) {
 //  - 参数个数 > 5
 //  - 不是变参（变参走 isVarArgFunction 单独路径）
 //  - 不是声明（要么有定义体，要么是用户声明的 prototype——但只有有 call 点才有意义）
-// 排除 llvm.* / __clang_ 等内部符号。
 bool needsRewrite(Function &F) {
     if (F.isDeclaration() && F.use_empty())
         return false;                      // 无定义又没人调用，不用管
@@ -121,7 +115,7 @@ StructType *buildPackType(Function &F) {
     for (auto it = F.arg_begin() + KEEP_REGS; it != F.arg_end(); ++it) {
         elems.push_back(it->getType());
     }
-    // 用函数名命名，便于调试 & 跨模块一致；packed 保证字段偏移 = allocSize 之和
+    // 用函数名命名，便于调试 & 跨模块一致
     return StructType::create(F.getContext(), elems,
                               ("__bpf_pack_" + F.getName()).str(),
                               true /*packed*/);
@@ -251,8 +245,8 @@ void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
             newArgs.push_back(arg);
         } else if (arg->getType()->isStructTy() || arg->getType()->isArrayTy()) {
             // 聚合变参：callee 的 va_arg 对聚合一律按引用（clang 生成
-            // va_arg ap, ptr 再解引用），pack 字段须存指针、步长 8；此前按值
-            // 内嵌与被调方错位（纯 C 传结构体变参即坏）。定参 >5 路径不会
+            // va_arg ap, ptr 再解引用），pack 字段须存指针、步长 8，按值
+            // 内嵌则与被调方错位（纯 C 传结构体变参即坏）。定参 >5 路径不会
             // 到这里——聚合实参已被 normalizeIndirectAggregateArgs / sites
             // 循环先行归一化为 ptr（allocSize 8，走下方的普通分支）。
             // 只拦聚合不拦 i128 等宽标量：callee 的 va_arg i128 是直接 16B
@@ -275,7 +269,6 @@ void rewriteCallSitePacked(CallBase *CB, Value *Callee, Value *SharedBuf,
             B.CreateStore(p, elemPtr);
             offset += 8;
         } else {
-            // 按 allocSize 累加字节偏移，逐字段 store（packed 布局）
             Value *elemPtr = B.CreateConstGEP1_32(I8, SharedBuf, offset, "__pack.field");
             B.CreateStore(arg, elemPtr);
             offset += DL.getTypeAllocSize(arg->getType());
@@ -342,8 +335,6 @@ static void rewriteCallSiteSyscall6(CallBase *CB, Value *Callee) {
     CI->eraseFromParent();
 }
 
-// 一个待改写的调用点：调用谁（Callee：直接调用是 NewF，间接调用是函数指针 Value）、
-// 第几个实参起打包（Threshold）。
 struct PackSite {
     CallBase *CB;
     Value *Callee;     // 直接调用 = NewF；间接调用 = 原 callee（Value*）
@@ -1284,8 +1275,6 @@ static bool lowerVaIntrinsics(Function &F, Value *VaBase) {
         }
     }
 
-    // 清除被写回参数的 readonly/readnone/nocapture：lower 后这些参数会被 store，
-    // clang 原标的「不修改内存」属性已不成立，留着会让后续 instcombine 删掉推进 store。
     for (unsigned idx : mutatedArgIndices) {
         if (idx < F.arg_size()) {
             F.removeParamAttr(idx, Attribute::ReadOnly);
@@ -1355,9 +1344,6 @@ static Function *rewriteVarArgFunction(Function &F) {
     return NewF;
 }
 
-// 改写变参调用点的逻辑已统一到 rewriteCallSitePacked（Threshold = NumNamed），
-// 故此处不再需要单独的 rewriteVarArgCallSite。
-
 struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
         bool changed = false;
@@ -1386,11 +1372,9 @@ struct BpfWideArgsPass : PassInfoMixin<BpfWideArgsPass> {
             changed = true;
         }
 
-        // 调用点改写。同一 caller 的所有调用点（>5 参数 + 变参混合）共用入口块一块
-        // 缓冲区：每个调用点发起 call 前从偏移 0 完整覆写，call 返回后即不再使用，
-        // 窗口互不重叠。这样把"每调用点独立 alloca"导致的栈膨胀压缩为每 caller 单个
-        // alloca。间接调用点（collectIndirectCallSites 独立扫描）即使 work/vaWork 空
-        // 也要改，故本阶段无条件执行。
+        // 调用点改写（共享缓冲区策略见 allocSharedPackBuf）。间接调用点
+        // （collectIndirectCallSites 独立扫描）即使 work/vaWork 空也要改，
+        // 故本阶段无条件执行。
         {
             const DataLayout &DL = M.getDataLayout();
             SiteMap byCaller;
@@ -1491,7 +1475,6 @@ static Value *emitVlaSyscall(IRBuilder<> &B, LLVMContext &Ctx, uint64_t CallId,
         I64Args.push_back(A);
     }
 
-    // 函数类型：RetTy(I64...)。统一用 i64 入参；返回值用 RetTy（i64 或 ptr）。
     SmallVector<Type *, 4> ArgTys(I64Args.size(), I64Ty);
     Type *EffRetTy = RetTy->isPointerTy() ? I64Ty : RetTy;
     FunctionType *FTy = FunctionType::get(EffRetTy, ArgTys, false);
@@ -1654,7 +1637,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
     // 因 alloca 变大而获得额外 padding，不越界）。对非 alloca（堆/全局/参数）不动——
     // 它们的对齐由分配方保证，且 _Atomic 语义要求对象布局容纳原子访问。
     static void widenUnderlyingAllocaAlign(Value *Addr) {
-        // 剥掉 bitcast / GEP（零偏移），找到底层 alloca。
+        // 剥掉 bitcast，找到底层 alloca。
         Value *U = Addr->stripPointerCasts();
         // 只处理「整个 alloca 的起始」（GEP 带偏移的不安全，无法靠提升对齐修复）。
         if(auto *AI = dyn_cast<AllocaInst>(U)) {
@@ -1706,7 +1689,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
         return Builder.CreateTrunc(Shift, ValueType, "extracted");
     }
 
-    // D2a: i8/i16 cmpxchg -> i32 子字节 CAS loop（照搬 expandPartwordCmpXchg）。
+    // i8/i16 cmpxchg -> i32 子字节 CAS loop（照搬 expandPartwordCmpXchg）。
     // IR 序列见 llvm/lib/CodeGen/AtomicExpandPass.cpp:1015 注释。
     static bool expandPartwordCmpXchg(AtomicCmpXchgInst *CI) {
         Value *Addr = CI->getPointerOperand();
@@ -1791,7 +1774,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
         }
     }
 
-    // D2b: i8/i16 atomicrmw -> i32 子字节 CAS loop（照搬 expandPartwordAtomicRMW）。
+    // i8/i16 atomicrmw -> i32 子字节 CAS loop（照搬 expandPartwordAtomicRMW）。
     // Or/Xor/And 直接 widen 成 i32 原子位运算（周边位为 0/1 不影响结果；And 需把
     //   非目标字节置 1 避免清掉）。Add/Sub/Nand 在移位后的位上算再 mask 回目标字节。
     //   Min/Max/UMin/UMax extract 出窄值原宽算再 insert 回宽槽。
@@ -1806,7 +1789,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
 
         PartwordMaskValues PMV = createMaskInstrs(Builder, AI, ValueType, Addr, AI->getAlign());
 
-        // 分支 1: Or/Xor/And widen 成 i32 原子位运算（不需 CAS loop）。
+        // Or/Xor/And：widen 成 i32 原子位运算（不需 CAS loop）。
         if(Op == AtomicRMWInst::Or || Op == AtomicRMWInst::Xor || Op == AtomicRMWInst::And) {
             Value *ValOperand_Shifted = Builder.CreateShl(
                 Builder.CreateZExt(AI->getValOperand(), PMV.WordType), PMV.ShiftAmt,
@@ -1822,7 +1805,7 @@ class BpfAtomicLowerPass : public PassInfoMixin<BpfAtomicLowerPass> {
             return true;
         }
 
-        // 分支 2/3: CAS loop（在移位后的位上算，或 extract 后原宽算）。
+        // 其余 op：CAS loop（在移位后的位上算，或 extract 后原宽算）。
         // 预计算移位后的 incr（Add/Sub/Nand/Xchg 用；Min/Max 等用原宽 Inc）。
         Value *ValOperand_Shifted = nullptr;
         if(Op == AtomicRMWInst::Xchg || Op == AtomicRMWInst::Add ||
@@ -1922,13 +1905,13 @@ public:
                        RMW->getType()->getIntegerBitWidth() < 32)
                         NarrowRMWs.push_back(RMW);
                 } else if(isa<FenceInst>(&I)) {
-                    // D3: atomic_thread_fence -> 删除（见下文 D3 段）。
+                    // atomic_thread_fence -> 删除（见下文）。
                     Fences.push_back(cast<FenceInst>(&I));
                 }
             }
         }
 
-        // D3: atomic_thread_fence（任意 ordering）-> 直接删除。
+        // atomic_thread_fence（任意 ordering）-> 直接删除。
         // BPF 后端无 fence 指令（eBPF ISA 只有 RMW 原子 lock_xadd/xchg/cmpxchg，无独立
         // 内存屏障），ISel 对 AtomicFence 节点报 "Cannot select"。本 VM 单线程顺序执行
         // guest 指令，RMW 原子本身已带全屏障语义，跨线程同步靠 futex（do_futex 的
@@ -1940,7 +1923,7 @@ public:
             Changed = true;
         }
 
-        // D2 先展开窄原子（会插入普通 load，不该被 D1 再降级）。
+        // 先展开窄原子（会插入普通 load，不该被 atomic load/store 降级处理）。
         for(AtomicCmpXchgInst *CmpX : NarrowCmpXchgs) {
             expandPartwordCmpXchg(CmpX);
             Changed = true;
@@ -1950,7 +1933,7 @@ public:
             Changed = true;
         }
 
-        // D1: load atomic T, ptr <order>, align A  ->  load T, ptr, align A
+        // load atomic T, ptr <order>, align A  ->  load T, ptr, align A
         // 直接构造普通 LoadInst（IRBuilder 的 CreateLoad 无带 Align 的重载），
         // 复制对齐/volatile/调试元数据，order 设为 NotAtomic，插在原指令前再替换。
         for(LoadInst *LI : Loads) {
@@ -1965,7 +1948,7 @@ public:
             Changed = true;
         }
 
-        // D1: store atomic T v, ptr <order>, align A  ->  store T v, ptr, align A
+        // store atomic T v, ptr <order>, align A  ->  store T v, ptr, align A
         for(StoreInst *SI : Stores) {
             StoreInst *New = new StoreInst(SI->getValueOperand(), SI->getPointerOperand(),
                                             SI->isVolatile(), SI->getAlign(),

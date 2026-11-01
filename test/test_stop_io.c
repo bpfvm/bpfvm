@@ -1,9 +1,6 @@
-/* 验证阻塞中的 read 被 SIGTSTP+SIGCONT 快速连续后仍正确阻塞（新模型：STOP 不踢 host syscall）。
+/* 验证阻塞中的 read 被 SIGTSTP+SIGCONT 快速连续后仍正确阻塞（STOP 不踢 host syscall）。
  * 父进程 stop->立即 cont（不给子进程 CPU），子进程的 read 应从未被 EINTR 打断，
  * 继续等数据。这验证了"STOP 不踢 host syscall，CONT 先到则无事发生过"。
- *
- * 对照：旧模型下 stop+cont 快速连续会误返回 EINTR（VM_STOPPED 被 CONT 清，
- * read 查不到标志），read 提前退出。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +14,7 @@ int main(void) {
     int fd[2];
     if(pipe(fd) < 0) return 1;
 
-    /* 同步管道：子进程进入阻塞 read 前通知父进程，取代盲等 usleep(1s) */
+    /* 同步管道：子进程进入阻塞 read 前通知父进程 */
     int syncfd[2];
     if (pipe(syncfd) < 0) return 1;
 
@@ -35,7 +32,7 @@ int main(void) {
     }
     close(fd[0]);
 
-    /* 等子进程确认即将进入阻塞 read（同步，不再依赖固定 usleep）*/
+    /* 等子进程确认即将进入阻塞 read（同步）*/
     close(syncfd[1]);
     char ack;
     if (read(syncfd[0], &ack, 1) != 1) {

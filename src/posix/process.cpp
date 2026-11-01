@@ -72,7 +72,6 @@ int64_t PosixSyscall::do_execveat(vm* v) {
     if(!read_c_string_array(v, v->r(4), envp_strings, 1024, 4096)) {
         return -EFAULT;
     }
-    // envp_strings 是从 guest 读出的 "KEY=VALUE" 列表（read_c_string_array 的输出）
     std::map<std::string, std::string> envp_map;
     for(const auto& e : envp_strings) {
         auto eq = e.find('=');
@@ -649,7 +648,6 @@ int64_t PosixSyscall::do_wait_common(vm* v, int idtype, int64_t id, int options,
                 cs->tg->remove_waiter(v);
             }
         }
-        // 回到循环顶重判 claim_one。
     }
 }
 

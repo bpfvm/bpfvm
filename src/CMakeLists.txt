@@ -2,9 +2,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-# VM 核心 + JIT 源（本目录维护）。add_library 直接用相对路径；
-# 再用 list(TRANSFORM PREPEND) 加上本目录相对项目根的相对前缀，CACHE INTERNAL 导出到
-# 全局作用域，供顶层转发给 nesting 子项目。
+# VM 核心 + JIT 源（本目录维护）。
 set(_lib_sources
     insn.cpp
     elf_loader.cpp

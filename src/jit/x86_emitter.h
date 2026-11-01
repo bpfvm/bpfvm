@@ -73,14 +73,12 @@ namespace X86 {
 }
 
 // BPF register -> x86 register mapping (all 11 BPF registers)
-//   r0=R8, r1=R9, r2=R10, r3=RDI, r4=RSI, r5=RDX,
-//   r6=RBX, r7=R12, r8=R13, r9=R14, r10=R15
 constexpr uint8_t BPF_REG_MAP[11] = {
     X86::R8,  X86::R9,  X86::R10, X86::RDI, X86::RSI, X86::RDX,
     X86::RBX, X86::R12, X86::R13, X86::R14, X86::R15,
 };
 
-// Caller-saved BPF registers: r0-r5 (mapped to R8, R9, R10, RDI, RSI, RDX)
+// Caller-saved BPF registers: r0-r5
 // These must be saved/restored around helper calls.
 constexpr int BPF_CALLER_SAVED_COUNT = 6;
 constexpr uint8_t BPF_CALLER_SAVED_X86[BPF_CALLER_SAVED_COUNT] = {

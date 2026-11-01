@@ -13,7 +13,6 @@
 #include <sys/stat.h>
 
 
-// --stop 标志：getopt_long 匹配到 --stop 时通过 flag 字段自动置 1，无需 switch case。
 static int gdb_stop_flag = 0;
 
 static struct option long_options[] = {
@@ -49,8 +48,8 @@ static void print_usage(const char* prog) {
 
 int real_main(int argc, char** argv) {
     std::shared_ptr<vmOptions> options = std::make_shared<vmOptions>();
-    options->verbose = false; // 默认值
-    options->raw_stack = false; // 默认值
+    options->verbose = false;
+    options->raw_stack = false;
     options->sys = std::make_shared<PosixSyscall>();
 
     // PTY 三态：默认 auto（stdin 是 tty 则开，贴近真实终端行为；管道/CI 下关，保持既有
@@ -134,7 +133,6 @@ int real_main(int argc, char** argv) {
         return 1;
     }
 
-    // 创建 syscall handler；指定了 --root 则进入 chroot（cwd 重置为 /）。
     if(!options->root.empty()) {
         set_loader_root(options->root);
     }
@@ -172,7 +170,6 @@ int real_main(int argc, char** argv) {
 
     struct sigaction sa = {};
 
-    // Ignore SIGTRAP
     sa.sa_handler = SIG_IGN;
     sigaction(SIGTRAP, &sa, nullptr);
 
@@ -193,13 +190,12 @@ int real_main(int argc, char** argv) {
     if(use_pty) sigaddset(&block_mask, SIGWINCH);
     sigprocmask(SIG_BLOCK, &block_mask, nullptr);
 
-    // PTY 模式做字节转发 + 信号路由；非 PTY 模式仅信号路由。
     options->pty->start_pump(options->sys.get(), vm.get());
     options->argv.reserve(argc - optind);
     for(int i = optind; i < argc; i++) {
         options->argv.emplace_back(argv[i]);
     }
-    // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/），故 HOME 用 guest cwd，
+    // HOME / PATH：chroot 模式下 guest 看到的是 root 内的路径（cwd=/）。
     if(!options->root.empty()) {
         options->envp["HOME"] = "/";
         // argv[optind] 是 guest 视角路径，dirname 得其所在 guest 目录（如 /bin）。
@@ -219,7 +215,7 @@ int real_main(int argc, char** argv) {
     // --gdb：启动 GDB RSP server（独立线程，listen <gdb_port>，阻塞等 GDB 连接）。server 对象
     // 生命周期覆盖 run()；持 shared_ptr<vm> 保证 vm 在 server 线程访问期间存活。
     // JIT 的禁用由 per-vm 的 VM_DEBUG_ATTACHED flag 控制（GdbServer attach 时设置，detach 时清除），
-    // 不再用全局 setenv——detach 后 JIT 可恢复，且不影响同进程其他 vm。
+    // detach 后 JIT 可恢复，且不影响同进程其他 vm。
     // gdb_stop_flag（--stop）：run() 前就 attach + 冻结主 vm，等 GDB 连上后 continue 才放行
     // （对齐 QEMU -S）；默认（不带 --stop）让主 vm 全速 JIT 跑，GDB 连上才 attach 停在当前 pc。
     std::unique_ptr<GdbServer> gdb_server;
@@ -231,7 +227,7 @@ int real_main(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    // 不跑析构：real_main 返回值即可代表程序退出码，main 直接 _Exit，跳过全局对象/静态
-    // 析构，与旧实现行为一致。real_main 内部栈对象正常析构（PTY termios 恢复等已处理）。
+    // 不跑析构：main 直接 _Exit，跳过全局对象/静态析构。
+    // real_main 内部栈对象正常析构（PTY termios 恢复等已处理）。
     _Exit(real_main(argc, argv));
 }

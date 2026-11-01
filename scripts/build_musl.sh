@@ -17,7 +17,6 @@ PREFIX="${1:-$ROOT_DIR/root}"
 MUSL_DIR="${ROOT_DIR}/thirdparty/musl"
 BUILD="$ROOT_DIR/build/musl"
 
-# pass 插件路径（优先用项目 build/ 下的，回退到环境变量）
 WIDEARGS="${WIDEARGS:-$ROOT_DIR/build/libBpfWideArgs.so}"
 SOFTFP="${SOFTFP:-$ROOT_DIR/build/libBpfSoftFp.so}"
 

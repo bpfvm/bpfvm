@@ -10,12 +10,12 @@
 #include <mutex>
 #include <optional>
 #include <unistd.h>
-#include <fcntl.h>   // AT_FDCWD（guest_abs_path/resolve_path 的 dirfd 默认值）
+#include <fcntl.h>   // AT_FDCWD（guest_abs_path 的 dirfd 默认值）
 #include <sys/socket.h>   // sockaddr/socklen_t（sockaddr_to_host/to_guest 声明）
 #include <poll.h>   // pollfd/nfds_t（poll_core 声明）
 
 // 信号队列扫描上限（handle_signals 单轮最多处理的信号数，防止极端情况下死循环）。
-// 原 MpscQueue 的固定容量；改 deque+锁后队列本身无界，此常量仅作单轮 drain 上限。
+// 队列本身无界，此常量仅作单轮 drain 上限。
 #define BPF_SIGNAL_QUE_SIZE 1024
 
 // 会话（session）：setsid 创建，sid == leader->pid。
@@ -106,8 +106,8 @@ struct SigEvent {
 
 // 信号队列：deque + 互斥锁。
 //
-// 容量上限 = BPF_SIGNAL_QUE_SIZE：push 满则丢弃（与原 MpscQueue 一致，
-// 防止信号风暴下 deque 无限增长 OOM）。实现见 signal_queue.cpp。
+// 容量上限 = BPF_SIGNAL_QUE_SIZE：push 满则丢弃（防止信号风暴下 deque 无限增长
+// OOM）。实现见 signal_queue.cpp。
 class SignalQueue {
     std::deque<SigEvent> q_;
     std::mutex mtx_;
@@ -143,7 +143,7 @@ class PosixSyscall: public SyscallHandler{
         std::array<signal_action, NSIG> signal_actions{};
         // chroot 根目录（宿主绝对路径，无尾斜杠）。空 = 不 chroot。
         // 随 fork/clone 自动传播（与 cwd 同级）。ps->cwd 存 guest 视角路径，
-        // resolve_path 负责 cwd -> 宿主路径时拼上此 root。
+        // guest 路径换算宿主路径时拼上此 root。
         std::string root;
         // guest 程序路径（/proc/[pid]/exe symlink 目标，guest 视角绝对路径）。
         // 进程级（mm_struct::exe_file）：do_execveat 成功后更新；main.cpp 初次加载时补写。

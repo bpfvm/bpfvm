@@ -11,9 +11,9 @@
 //
 // host 变体用 clang++ 编宿主 glibc，作为对照基线。
 //
-// 注意：(1)刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store（C++ <atomic>
+// 注意：刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store（C++ <atomic>
 // 的 load/store 会撞 BPF 后端，见 BpfAtomicLowerPass 的 D1 注释），改用 mutex
-// 保护普通 int；(2)所有同步靠 barrier.arrive_and_wait / join 显式定序，不依赖时序，
+// 保护普通 int；所有同步靠 barrier.arrive_and_wait / join 显式定序，不依赖时序，
 // 保证 host 与 BPF（单核解释/JIT）行为一致。
 
 #include <barrier>
@@ -25,7 +25,7 @@
 int main() {
     int failures = 0;
 
-    // (1) 单阶段 barrier：N 个线程全部到达后一起放行，验证基本 arrive_and_wait 语义。
+    // 单阶段 barrier：N 个线程全部到达后一起放行，验证基本 arrive_and_wait 语义。
     //     每个线程在屏障前后分别 ++before / ++after（mutex 保护）。屏障保证全部"前半段"
     //     先完成，再开始"后半段"。
     {
@@ -49,7 +49,7 @@ int main() {
         }
     }
 
-    // (2) 多阶段复用：同一屏障复用 ROUNDS 轮，验证 phase 推进正确。
+    // 多阶段复用：同一屏障复用 ROUNDS 轮，验证 phase 推进正确。
     //     每轮每个线程 ++counter，ROUNDS 轮后 counter 应 == N*ROUNDS。
     {
         const int N = 4;
@@ -73,7 +73,7 @@ int main() {
         }
     }
 
-    // (3) arrive_and_drop：主线程参与第 1 轮后退出，后续轮次的 expected 自动减 1。
+    // arrive_and_drop：主线程参与第 1 轮后退出，后续轮次的 expected 自动减 1。
     //     验证 barrier 的动态参与人数调整。N-1 个 worker 跑 ROUNDS 轮，主线程跑 1 轮后 drop。
     {
         const int N = 4;
@@ -102,7 +102,7 @@ int main() {
         }
     }
 
-    // (4) completion function：屏障阶段切换时回调被调用恰好 ROUNDS 次（每阶段一次）。
+    // completion function：屏障阶段切换时回调被调用恰好 ROUNDS 次（每阶段一次）。
     //     completion 由最后到达的线程在阶段切换时同步调用，串行执行，普通 int ++ 在锁内安全。
     {
         const int N = 3;

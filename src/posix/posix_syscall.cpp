@@ -208,7 +208,7 @@ void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
     //   未被任何 session 绑为 ctty（owner_ == nullptr），或前台组无活进程，则不投递（不
     //   fallback）——Linux tty_vhangup 只影响把该 tty 作为控制终端的 session。
     // tty == nullptr（host_signal 无 ctty 路径）：退化为按调用者 session 选目标组，目标
-    //   为空时给当前 v 投信号（保留原 fallback 语义，让 pid 1 收到宿主信号）。
+    //   为空时给当前 v 投信号（让 pid 1 收到宿主信号）。
     if(sig <= 0) return;
 
     uint64_t target_pgid;

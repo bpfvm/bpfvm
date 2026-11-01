@@ -116,8 +116,6 @@ RANLIB="ranlib" \
 # 部分函数声明 ICE，expat 即触发），剥掉
 sed -i 's/\(OPT=\t*-DNDEBUG\) -g /\1 /' Makefile
 
-# _Py_tss_tstate 的定义独占 pystate.c:per-target 注入 emutls(thread_local ->
-# annotate)。其余 TU 无该宏,pyport.h 的 __BPF__ 分支走 PyThread_tss 回退
 echo "Python/pystate.o: PY_CORE_CFLAGS += -DBPFVM_EMUTLS_TSTATE -Dthread_local='__attribute__((annotate(\"emutls\")))'" >> Makefile
 
 echo "=== python: make ==="

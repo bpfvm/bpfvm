@@ -20,7 +20,7 @@
 #include <string.h>
 
 int main(void) {
-    /* --- 1) 正常退出 + P_PID --- */
+    /* --- 正常退出 + P_PID --- */
     pid_t child = fork();
     if (child < 0) {
         printf("fork failed\n");
@@ -55,8 +55,8 @@ int main(void) {
     }
     printf("waitid(P_PID, WEXITED) ok\n");
 
-    /* --- 2) SIGKILL + P_ALL --- */
-    /* 同步管道：子进程进入死循环后通知父进程，取代盲等 sleep(2) */
+    /* --- SIGKILL + P_ALL --- */
+    /* 同步管道：子进程进入死循环后通知父进程 */
     int syncfd[2];
     if (pipe(syncfd) < 0) {
         printf("sync pipe failed\n");
@@ -77,7 +77,7 @@ int main(void) {
         }
         _exit(0);
     }
-    /* 等子进程确认进入死循环（同步，不再依赖固定 sleep）*/
+    /* 等子进程确认进入死循环（同步）*/
     close(syncfd[1]);
     char ack;
     if (read(syncfd[0], &ack, 1) != 1) {

@@ -1,7 +1,3 @@
-//
-// Created by chouryzhou on 24-10-28.
-//
-
 #include "insn.h"
 #include "include/bpf_fp.h"
 #include <iostream>
@@ -67,16 +63,16 @@ void dump(uint64_t addr, const bpf_insn* insn) {
     case BPF_ALU: case BPF_ALU64: {
         printf("%s ", aluop[(insn->code & 0xf0) >> 4]);
         printf("r%d ", insn->dst_reg);
-        if ((insn->code & 0xf0) == BPF_END) { // Specific formatting for BPF_END
-            if ((insn->code & 0x08) == BPF_X) { // BPF_TO_BE (corresponds to BPF_X value 0x08)
+        if ((insn->code & 0xf0) == BPF_END) {
+            if ((insn->code & 0x08) == BPF_X) {
                 printf("be, %d\n", insn->imm); // imm is width
-            } else { // BPF_TO_LE (corresponds to BPF_K value 0x00)
+            } else {
                 printf("le, %d\n", insn->imm); // imm is width
             }
-        } else { // Formatting for other ALU operations
-            if((insn->code & 0x08) == BPF_X) { // Source is register
+        } else {
+            if((insn->code & 0x08) == BPF_X) {
                 printf("r%d\n", insn->src_reg);
-            } else { // Source is immediate
+            } else {
                 printf("%d\n", insn->imm);
             }
         }
@@ -290,7 +286,6 @@ bool vm::push_frame(uint64_t return_addr, uint64_t callee_entry, bool is_signal)
     }
     uint64_t sp = r(10) - caller_total_len;
     uint64_t frame_base_addr = sp - frame_size;
-    // 检查整段新帧 [frame_base_addr, sp)
     uint64_t* frame_base = (uint64_t*)mmu_w(frame_base_addr, sp - frame_base_addr);
     if(!frame_base) {
         log_mem_violation("stack access", frame_base_addr);
@@ -299,7 +294,6 @@ bool vm::push_frame(uint64_t return_addr, uint64_t callee_entry, bool is_signal)
 
     // 被调函数的编译期帧大小（帧槽精确值，缺失回退 -S）。
     uint64_t stack_limit = frame_size_of(callee_entry);
-    // frame[0] = stack_size(bit0..23) | alloca_len(bit24..47, 初始 0) | is_signal(bit48)。
     frame_base[0] = frame_flags_make(is_signal, stack_limit, 0);
     // 公共锚点：old_r10 / RA 固定在 [1] / [2]（与帧类型无关）。
     frame_base[1] = r(10);
@@ -456,7 +450,7 @@ int64_t vm::alloca(int64_t inc) {
 // call 即 imm 字段，本身就是 BPF_FP_* 编号（1..N，无 BASE 偏移），直接 switch。
 // ---------------------------------------------------------------------------
 bool vm::do_softfp(uint32_t call) {
-    const uint32_t op = call;   // FP 编号空间独立，imm 即 BPF_FP_* 值，无需 BPF_CALL_TO_ID
+    const uint32_t op = call;
 
     // 取出两个 i64 操作数（比较/算术用 r1,r2；一元只用 r1）。
     // 题外：glue 函数中所有位转换（double<->i64）已被 clang 优化为寄存器直传，
@@ -550,7 +544,7 @@ bool vm::do_softfp(uint32_t call) {
         r(0) = (a != a || b != b) ? 1ULL : 0ULL;
         return true;
     }
-    // fabs/copysign：musl 实现体是一条位运算，会被 instcombine 折叠回同名 intrinsic，
+    // fabs/copysign：musl 实现体是一条位运算，会被 instcombine 折叠回同名 intrinsic。
     case BPF_FP_FABS_D: r(0) = d_out(std::fabs(d_in(a_bits))); return true;
     case BPF_FP_FABS_F: r(0) = (uint64_t)f_out(std::fabs(f_in(a_bits))); return true;
     case BPF_FP_COPYSIGN_D: r(0) = d_out(std::copysign(d_in(a_bits), d_in(b_bits))); return true;
@@ -567,7 +561,7 @@ bool vm::do_softfp(uint32_t call) {
     case BPF_FP_SDIV128: case BPF_FP_SREM128: {
         uint64_t aLo = r(2), aHi = r(3), bLo = r(4), bHi = r(5);
         uint64_t resLo, resHi;
-        if (bLo == 0 && bHi == 0) {     // 除零：返回 0
+        if (bLo == 0 && bHi == 0) {
             resLo = 0; resHi = 0;
         } else if (op == BPF_FP_UDIV128 || op == BPF_FP_UREM128) {
             __uint128_t a = ((__uint128_t)aHi << 64) | aLo;
@@ -585,7 +579,6 @@ bool vm::do_softfp(uint32_t call) {
             resLo = (uint64_t)res;
             resHi = (uint64_t)((__uint128_t)res >> 64);
         }
-        // 高半写入 guest 内存（out_hi = r1），低半回 r0。
         if (uint64_t *out = (uint64_t*)mmu_w(r(1), 8)) {
             *out = resHi;
         } else {
@@ -776,8 +769,6 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
     std::cerr << std::endl;
 
     // 调用栈回溯：沿 frame 链向上遍历
-    // 正常帧: flags+alloca_len[0] r6..r9[1..4] old_r10[5] ret_addr[6]
-    // 信号帧: flags+alloca_len[0] r0..r9[1..10] old_r10[11] ret_addr[12]
     std::cerr << "Call stack:" << std::hex;
     uint64_t cur_sp = r(10);
     uint64_t cur_pc = pc_;
@@ -826,7 +817,6 @@ void vm::log_mem_violation(const char* type, uint64_t addr) {
 }
 
 int vm::wait_for(const struct timespec* timeout) {
-    // 阻塞在 wait_cv 上等待, timeout是相对时间 
     bool has_deadline = timeout != nullptr;
     struct timespec deadline{};
     if(has_deadline) {
@@ -1278,7 +1268,6 @@ bool vm::step() {
     }
     // 解释器执行一条指令
     interp_insns++;
-    // 指令计数递增 + 预算检查
     uint64_t cnt = ++insn_count;
     if(options.insn_limit != 0 && cnt >= options.insn_limit) {
         flags.fetch_or(VM_BUDGET_EXCEEDED, std::memory_order_release);
@@ -1361,7 +1350,7 @@ void vm::clear_jit_cache() {
 void* vm::mmu(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
-    // TLB fast path (1MB granularity)
+    // TLB fast path
     auto& entry = tlb[tlb_index(addr)];
     if(addr >= entry.guest_base && end <= entry.guest_end) {
         return entry.host_base + (addr - entry.guest_base);
@@ -1369,7 +1358,6 @@ void* vm::mmu(uint64_t addr, size_t size) {
     return mmu_slow(addr, size);
 }
 
-// 二分查找包含 [addr, addr+size) 的段。调用方须持 maps_mutex。maps 须按 paddr 升序。
 std::vector<memmap>::iterator vm::find_map_locked(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return maps->end(); // 回绕：mmu()/mmu_w() 已拦，JIT helper 直调 slow path 须经此处拦截
@@ -1397,7 +1385,7 @@ void* vm::mmu_slow(uint64_t addr, size_t size) {
 void* vm::mmu_w(uint64_t addr, size_t size) {
     uint64_t end = addr + size;
     if(end < addr) return nullptr; // overflow
-    // TLB fast path (1MB granularity, only when writable and no CoW pending)
+    // TLB fast path (only when writable and no CoW pending)
     auto& entry = tlb[tlb_index(addr)];
     if(addr >= entry.guest_base && end <= entry.guest_end
        && (entry.flags & PF_W) && !entry.cow) {
@@ -1413,7 +1401,7 @@ void* vm::mmu_w_slow(uint64_t addr, size_t size) {
     if(it == maps->end()) return nullptr;
     auto& map = *it;
     if(!(map.flags & PF_W)) return nullptr;
-    if(map.cow_data) { // CoW triggered: copy on write
+    if(map.cow_data) {
         if(map.cow_data.use_count() == 1) {
             // 唯一引用，直接偷：解除 cow_data 的所有权，unique_ptr 接管
             std::get_deleter<DataDeleter>(map.cow_data)->owned = false;
@@ -1500,7 +1488,6 @@ uint64_t vm::run(const vmOptions* options, const ElfLoadInfo& info) {
         printf("entry: 0x%lx\n", (unsigned long)entry);
     }
 
-    // setup_stack 接收 map（key->value），内部拼成 "KEY=VALUE" 写入栈。
     if(!setup_stack(options->argv, options->envp, info)) {
         return 0;
     }

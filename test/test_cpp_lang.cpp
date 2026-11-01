@@ -41,14 +41,14 @@ void *operator new(unsigned long n) { return malloc(n); }
 void operator delete(void *p) noexcept { free(p); }
 void operator delete(void *p, unsigned long) noexcept { free(p); }
 
-// (1) template
+// template
 template <typename T> struct Box {
     T v;
     T get() const { return v; }
     void set(T x) { v = x; }
 };
 
-// (2) class hierarchy with virtual dispatch
+// class hierarchy with virtual dispatch
 struct Base {
     int tag;
     explicit Base(int t) : tag(t) {}
@@ -62,7 +62,7 @@ struct Derived : Base {
     long id() const override { return tag * 100LL + extra; }
 };
 
-// (3) namespace + constexpr + overload
+// namespace + constexpr + overload
 namespace math {
 constexpr int factorial(int n) { return n <= 1 ? 1 : n * factorial(n - 1); }
 long abs_l(long x) { return x < 0 ? -x : x; }
@@ -77,7 +77,7 @@ static int inc_through_ref(int &r) {
 int main() {
     int failures = 0;
 
-    // (1) template
+    // template
     Box<int> b;
     b.set(7);
     if (b.get() != 7) {
@@ -85,7 +85,7 @@ int main() {
         ++failures;
     }
 
-    // (2) virtual dispatch through base pointer, plus heap via new/delete
+    // virtual dispatch through base pointer, plus heap via new/delete
     Base *p = new Derived(5);
     long vid = p->id(); // expect 7*100 + 5 = 705
     int tag = p->tag;   // expect 7
@@ -95,7 +95,7 @@ int main() {
         ++failures;
     }
 
-    // (3) constexpr + overload + namespace
+    // constexpr + overload + namespace
     constexpr int f5 = math::factorial(5); // 120
     long a = math::abs_l(-42LL);            // 42
     if (f5 != 120 || a != 42) {
@@ -103,7 +103,7 @@ int main() {
         ++failures;
     }
 
-    // (4) references
+    // references
     int counter = 100;
     int got = inc_through_ref(counter); // 101, counter also 101
     if (got != 101 || counter != 101) {
@@ -111,7 +111,7 @@ int main() {
         ++failures;
     }
 
-    // (5) auto + lambda with capture
+    // auto + lambda with capture
     int sum = 0;
     auto add = [&](int x) { sum += x; };
     for (int i = 1; i <= 5; ++i)

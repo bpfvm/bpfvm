@@ -38,9 +38,9 @@ static __int128 make_i128(uint64_t lo, uint64_t hi) {
 /* 多分支返回(提前 return):每个 ret i128 都要被改写。 */
 static __int128 select_i128(int which, uint64_t lo, uint64_t hi) {
     __int128 v = ((__int128)hi << 64) | lo;
-    if (which == 0) return 0;                 /* ret 0 */
-    if (which == 1) return v;                  /* ret v */
-    return v + 1;                              /* ret v+1 */
+    if (which == 0) return 0;
+    if (which == 1) return v;
+    return v + 1;
 }
 
 /* 接收 __int128 返回值作参数(链式:返回值传给另一个函数)。 */

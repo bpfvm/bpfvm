@@ -136,7 +136,7 @@ int main(void) {
      * sfd 原本监听 SIGUSR1；改成监听 SIGUSR2 后，SIGUSR1 不再被消费（走默认=无动作
      * 因无 handler 但 SIGUSR1 默认是 term——危险！为安全先恢复 SIGUSR1 的 handler
      * 或保持阻塞使其滞留队列）。
-     * 改为更安全的检验：把 mask 切到 SIGUSR2 后 kill SIGUSR2，read 到 SIGUSR2。*/
+     * 检验：把 mask 切到 SIGUSR2 后 kill SIGUSR2，read 到 SIGUSR2。*/
     sigset_t mask2;
     sigemptyset(&mask2);
     sigaddset(&mask2, SIGUSR2);

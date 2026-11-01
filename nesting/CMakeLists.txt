@@ -15,7 +15,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(bpfvm_bpf_proj CXX)
 
-# 把注入的相对路径源列表转成绝对路径（BPFVM_ROOT = 主项目根，由顶层注入）。
 foreach(_s IN LISTS BPFVM_LIB_SOURCES BPFVM_MAIN_SOURCE BPFVM_POSIX_SOURCES)
     list(APPEND _abs_sources ${BPFVM_ROOT}/${_s})
 endforeach()
@@ -29,6 +28,5 @@ target_include_directories(bpfvm_bpf_obj PRIVATE
     ${BPFVM_ROOT}/src/posix)
 
 # 最终 ELF：链接由 toolchain 的 CMAKE_CXX_LINK_EXECUTABLE 驱动 bpfvm-ld 完成。
-# 产物名 bpfvm.bpf；INSTALL_COMMAND 会把它拷到 ${CMAKE_BINARY_DIR}/bpfvm.bpf。
 add_executable(bpfvm_bpf $<TARGET_OBJECTS:bpfvm_bpf_obj>)
 set_target_properties(bpfvm_bpf PROPERTIES OUTPUT_NAME bpfvm.bpf)

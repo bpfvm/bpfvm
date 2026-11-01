@@ -5,8 +5,6 @@
 //
 // 搜索顺序：命令行 -L 目录 -> LD_LIBRARY_PATH -> 内置默认（lib, .；chroot --root 模式额外补搜 root/lib64, root/lib, root）
 //
-// load_elf 通过 std::function 回调把映射好的 memmap 交给调用方，
-//
 
 #ifndef ELF_LOADER_H
 #define ELF_LOADER_H
@@ -20,7 +18,6 @@
 #include <vector>
 
 // unique_ptr deleter：own=true 时 munmap；也用作 CoW 共享页的 deleter。
-// 单一 `owned` flag 控制是否 munmap，两种角色用同一路径。
 struct DataDeleter {
     size_t size = 0;
     bool owned = false;
@@ -55,7 +52,7 @@ struct memmap {
 std::string find_library(const std::vector<std::string>& extra_dirs, const std::string& name);
 
 // 从 envp（key->value）里解析 LD_LIBRARY_PATH，按 ':' 拆成目录列表。
-// elf_loader 不再读宿主 getenv；调用方（VM 运行时）传入 guest 的 envp（-e 注入或
+// elf_loader 不读宿主 getenv；调用方（VM 运行时）传入 guest 的 envp（-e 注入或
 // execve 的 envp），由本函数取出影响库搜索的变量。当前仅 LD_LIBRARY_PATH，便于
 // 将来扩展（LD_PRELOAD 等）。
 std::vector<std::string> lib_search_dirs_from_envp(const std::map<std::string, std::string>& envp);
@@ -73,7 +70,7 @@ std::string guest_view(const std::string& host_path);
 // 主程序加载结果：除入口地址外，还带 auxv 启动所需的信息（musl/glibc 的
 // __init_tls 靠 AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY 定位 program headers 与 TLS）。
 // entry 为 0 表示加载失败；此时 err 给出失败原因（正 errno 值，如 ENOENT/EACCES/ENOEXEC），
-// 供 do_execveat 等调用方映射为精确的 guest errno（替代历史上笼统的 ENOEXEC）。
+// 供 do_execveat 等调用方映射为精确的 guest errno。
 // err 为 0 表示未设置（成功，或极早期失败回退到 ENOEXEC）。phdr 为 0 表示主程序无 PT_PHDR。
 struct ElfLoadInfo {
     uint64_t entry = 0;
@@ -87,7 +84,7 @@ struct ElfLoadInfo {
                              // 下 == entry（主程序自带 _start）；ldso 模式下 entry 是 ldso 的
                              // _dlstart（VM 从那里开始执行动态链接流程），而 AT_ENTRY 必须是
                              // 主程序入口——ldso 的 CRTJMP(aux[AT_ENTRY]) 跳到它移交控制权。
-                             // 两者不同；0 表示回退用 entry（保持旧行为）。
+                             // 两者不同；0 表示回退用 entry。
     uint64_t app_load_base = 0;  // 主程序 PIE 加载基址（load_base[0]）。静态/ET_EXEC 为 0；
                                  // PIE（ET_DYN）下 = 运行时基址偏移，文件内地址 + 此值 = 运行时
                                  // 地址。GDB server 的 qOffsets 用它让 GDB 把符号/DWARF 文件内

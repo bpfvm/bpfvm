@@ -38,13 +38,10 @@ fi
 do_configure() {
     echo "=== busybox: defconfig + 裁剪 ==="
     cd "${BB_DIR}"
-    # 重新生成默认 config
     make HOSTCC=gcc defconfig >/dev/null 2>&1
 
     # 关掉不可用的 applet：网络栈、磁盘/文件系统管理、需要网络的服务端、
     # 需要 tty/getty 的 loginutils、需要浮点 long double 的（暂禁）。
-    # sed 把 "=y" 行改成 "# CONFIG_xxx is not set" 不行——olddefconfig 会用 # is not set 形式。
-    # 直接把值改 n，再跑 olddefconfig。
     local disable=(
         # 关掉编译失败的 applet（基于 defconfig -k 全量编译实测，非想当然）。
         # 分类：A=依赖内核UAPI头  B=VLA  C=浮点libcall  D=指针/int转换  E=synccall运行时nr
@@ -108,7 +105,6 @@ do_configure() {
 do_build() {
     echo "=== busybox: make ==="
     cd "${BB_DIR}"
-    # trylink 直接产出最终二进制（动态 PIE / 静态 ET_EXEC，见顶部说明）。
     local ldflags="-target bpf -nostdlib -L${ROOT_DIR}/root/lib"
     [ "${LINK_MODE}" = "static" ] && ldflags="${ldflags} -static"
     make -j"${JOBS}" \
@@ -136,7 +132,6 @@ fi
 
 do_build
 
-# trylink 产出即最终二进制，mv 为约定文件名（动态 busybox.linked / 静态 busybox.out）。
 cd "${BB_DIR}"
 OUT=$([ "${LINK_MODE}" = "static" ] && echo busybox.out || echo busybox.linked)
 mv busybox_unstripped "${OUT}"

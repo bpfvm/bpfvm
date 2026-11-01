@@ -72,7 +72,6 @@ int64_t PosixSyscall::do_mmap(vm* v) {
     int fd = arg_s32(v->r(5));
     off_t offset = (off_t)v->r(0);
 
-    // 长度向上页对齐（Linux mmap 要求，否则 EINVAL）。
     static constexpr size_t PAGE = 0x1000;
     len = (len + PAGE - 1) & ~(PAGE - 1);
     if (len == 0) {
@@ -191,7 +190,7 @@ int64_t PosixSyscall::do_mprotect(vm* v) {
         uint64_t sub_lo = std::max(range_lo, m.paddr);
         uint64_t sub_hi = std::min(range_hi, m.paddr + m.size);
         // 不允许去掉可执行（安全）：text 段不能改成非 X。但允许加 W（TEXTREL 需要
-        // 给 text 加 W 写 lddw imm）；原「PF_X 段一律拒绝」过严，会挡掉 TEXTREL。
+        // 给 text 加 W 写 lddw imm）。
         if ((m.flags & PF_X) && !(new_flags & PF_X)) {
             return -EACCES;
         }

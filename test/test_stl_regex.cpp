@@ -1,7 +1,7 @@
 // STL regex 测试：验证 <regex>（std::regex / std::wregex）在 bpfvm 上可用。
 //
 // 这是 port_cplusplus.md 里 regex 支持的端到端验证。机制（详见 md）：
-//   - lowerAggregateParams 路径 A（BpfWideArgs，原 stripByval）解锁按值传 std::string/
+//   - lowerAggregateParams 路径 A（BpfWideArgs）解锁按值传 std::string/
 //     sub_match 等结构体参数（regex 引擎内部大量 __add_range(basic_string, ...) 调用），
 //     前端编译通过。
 //   - libcxx.a 编入 regex.cpp + locale 子系统（locale.cpp/ios.cpp/ostream.cpp/
@@ -29,7 +29,7 @@ static int failures = 0;
     } while (0)
 
 int main() {
-    // (1) regex_match：基本完全匹配。
+    // regex_match：基本完全匹配。
     {
         std::string s = "abc123";
         std::regex re("[a-z]+[0-9]+");
@@ -37,7 +37,7 @@ int main() {
         CHECK(!std::regex_match(std::string("abcXYZ"), re), "match should fail on bad input");
     }
 
-    // (2) 捕获组：smatch[i] 取分组。
+    // 捕获组：smatch[i] 取分组。
     {
         std::string s = "2026-07-07";
         std::regex re("(\\d+)-(\\d+)-(\\d+)");
@@ -49,7 +49,7 @@ int main() {
         CHECK(m.size() == 4, "match size (full + 3 groups)");
     }
 
-    // (3) regex_search：在串中查找第一个匹配。
+    // regex_search：在串中查找第一个匹配。
     {
         std::string s = "hello 42 world 99 end";
         std::regex re("\\d+");
@@ -60,7 +60,7 @@ int main() {
         CHECK(m.length(0) == 2, "search length");
     }
 
-    // (4) sregex_iterator：遍历所有匹配。
+    // sregex_iterator：遍历所有匹配。
     {
         std::string s = "foo1 bar2 baz3";
         std::regex re("[a-z]+(\\d)");
@@ -76,7 +76,7 @@ int main() {
         CHECK(nums == "123", "iterator captured digits");
     }
 
-    // (5) regex_replace：替换。
+    // regex_replace：替换。
     {
         std::string s = "hello world";
         std::regex re("world");
@@ -90,7 +90,7 @@ int main() {
         CHECK(r2 == "aXbXcX", "replace all digits");
     }
 
-    // (6) sregex_token_iterator：按分隔符切分（-1 取未匹配部分）。
+    // sregex_token_iterator：按分隔符切分（-1 取未匹配部分）。
     {
         std::string s = "a,b,,c";
         std::regex re(",");
@@ -110,7 +110,7 @@ int main() {
         CHECK(joined == "a|b||c|", "token joined");
     }
 
-    // (7) icase 标志（大小写无关）。
+    // icase 标志（大小写无关）。
     {
         std::string s = "Hello";
         std::regex re("hello", std::regex_constants::icase);
@@ -119,7 +119,7 @@ int main() {
         CHECK(std::regex_match(s, re2), "icase match uppercase pattern");
     }
 
-    // (8) 字符类 \w \s \d 与量词组合。
+    // 字符类 \w \s \d 与量词组合。
     {
         std::string s = "Hello, World! 42";
         std::regex re("\\w+");
@@ -129,7 +129,7 @@ int main() {
         CHECK(count == 3, "\\w+ count=3 (Hello, World, 42)");
     }
 
-    // (9) 锚点 ^ 和 $。
+    // 锚点 ^ 和 $。
     {
         std::string s = "foobar";
         CHECK(std::regex_search(s, std::regex("^foo")), "^foo at start");
@@ -138,7 +138,7 @@ int main() {
         CHECK(!std::regex_search(s, std::regex("foo$")), "foo$ not at end");
     }
 
-    // (10) 量词 + * ? {n,m}。
+    // 量词 + * ? {n,m}。
     {
         CHECK(std::regex_match(std::string("aaa"), std::regex("a{2,3}")), "a{2,3}");
         CHECK(std::regex_match(std::string("ac"), std::regex("ab*c")), "ab*c (zero b)");
@@ -147,7 +147,7 @@ int main() {
         CHECK(std::regex_match(std::string("colour"), std::regex("colou?r")), "colou?r with u");
     }
 
-    // (11) 交替 (|)。
+    // 交替 (|)。
     {
         std::regex re("cat|dog|bird");
         CHECK(std::regex_match(std::string("cat"), re), "alternation cat");
@@ -156,7 +156,7 @@ int main() {
         CHECK(!std::regex_match(std::string("fish"), re), "alternation no fish");
     }
 
-    // (12) 字符范围 [a-z] [0-9] 与取反 [^]。
+    // 字符范围 [a-z] [0-9] 与取反 [^]。
     {
         CHECK(std::regex_match(std::string("5"), std::regex("[0-9]")), "[0-9]");
         CHECK(std::regex_match(std::string("m"), std::regex("[a-z]")), "[a-z]");
@@ -164,14 +164,14 @@ int main() {
         CHECK(std::regex_match(std::string("a"), std::regex("[^0-9]")), "[^0-9] accepts letter");
     }
 
-    // (13) 反向引用 (\1)。
+    // 反向引用 (\1)。
     {
         std::regex re("(ab)\\1");
         CHECK(std::regex_match(std::string("abab"), re), "backref (ab)\\1");
         CHECK(!std::regex_match(std::string("abcd"), re), "backref rejects non-repeat");
     }
 
-    // (14) C 字符串重载（const char* 直接匹配）。
+    // C 字符串重载（const char* 直接匹配）。
     {
         CHECK(std::regex_match("test", std::regex("test")), "cstr match");
         std::cmatch cm;
@@ -180,7 +180,7 @@ int main() {
         CHECK(std::string(cm[2]) == "123", "cstr group2");
     }
 
-    // (15) wregex 宽字符版（wchar_t 实例化路径）。
+    // wregex 宽字符版（wchar_t 实例化路径）。
     {
         std::wstring s = L"hello 42 world";
         std::wregex re(L"(\\d+)");
@@ -190,7 +190,7 @@ int main() {
         CHECK(std::regex_match(std::wstring(L"abc"), std::wregex(L"[a-z]+")), "wregex match class");
     }
 
-    // (16) empty match / zero-width（regex 引擎边界情况）。
+    // empty match / zero-width（regex 引擎边界情况）。
     {
         std::string s = "abc";
         std::regex re("a*");
@@ -199,7 +199,7 @@ int main() {
         CHECK(std::regex_search(s, m, re), "a* search");
     }
 
-    // (17) regex_error 异常构造（-fno-exceptions 下用 nothrow 路径）。
+    // regex_error 异常构造（-fno-exceptions 下用 nothrow 路径）。
     //      构造非法正则时，libc++ 在 EH 关闭下不抛异常，而是走 abort/mark 路径。
     //      这里只构造一个合法正则并查询 mark_count / flags，验证 basic_regex 元数据。
     {

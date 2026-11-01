@@ -104,7 +104,6 @@ echo "=== openssl: 合成 libcrypto.so / libssl.so ==="
 synth_so libcrypto
 synth_so libssl -l:libcrypto.so
 
-# CLI：make build_programs 让 OpenSSL 自链 apps/openssl（静态自包含 PIE）。
 echo "=== openssl: make CLI (apps/openssl via build_programs) ==="
 make -j"${JOBS}" build_programs
 [ -x "${BUILD_DIR}/apps/openssl" ] || {

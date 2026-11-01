@@ -19,7 +19,6 @@
 #define EM_BPF 247
 #endif
 
-// Helper function to print test results
 void print_test_result(const std::string& test_name, bool success) {
     std::cout << "Test: " << test_name << " - " << (success ? "PASSED" : "FAILED") << std::endl;
 }
@@ -42,10 +41,6 @@ struct vmOptions posix_option = {
     .root = {},
 };
 
-// Helper function to load BPF program code into the VM's memory
-// Allocates memory for the code, copies it, and adds it to the VM.
-// Sets PF_W flag in memmap to ensure free() is called by memmap's destructor,
-// as per current memmap destructor logic for malloc'd data.
 bool load_program_to_vm(std::shared_ptr<vm> ebpf_vm, const bpf_insn* instructions, size_t num_instructions, uint64_t paddr = 0x1000) {
     if (instructions == nullptr || num_instructions == 0) {
         std::cerr << "Error: No instructions provided to load_program_to_vm." << std::endl;
@@ -53,8 +48,6 @@ bool load_program_to_vm(std::shared_ptr<vm> ebpf_vm, const bpf_insn* instruction
     }
 
     size_t code_size = num_instructions * sizeof(bpf_insn);
-    // Align code_size to a reasonable boundary if necessary, e.g., page size for mmap later if used directly
-    // For now, simple malloc is used as in the original code.
 
     unsigned char* prog_data = (unsigned char*)mmap(nullptr, sysconf(_SC_PAGESIZE), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (!prog_data) {
@@ -113,7 +106,7 @@ void test_alu64_add_imm() {
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }             // exit
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
-    uint64_t ret = ebpf_vm->run(&option); // Program loaded at 0x1000
+    uint64_t ret = ebpf_vm->run(&option);
     bool success = (ebpf_vm->r(1) == 150 && ret == 150);
     print_test_result("test_alu64_add_imm", success);
     assert(success);
@@ -197,7 +190,7 @@ void test_alu64_mod_imm() {
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
     uint64_t ret = ebpf_vm->run(&option);
-    bool success = (ebpf_vm->r(1) == 2 && ret == 2); // 100 % 7 = 2
+    bool success = (ebpf_vm->r(1) == 2 && ret == 2);
     print_test_result("test_alu64_mod_imm", success);
     assert(success);
 }
@@ -687,7 +680,7 @@ void test_alu_end_be16() {
 // contain the swapped upper half instead of zero.
 // Input:  r1 = 0xAABBCCDD
 // BE16:   should produce 0x000000000000DDCC (byte-swap lower 16 bits, zero-extend)
-// Bug:    produces       0x00000000BB AADDCC (upper half also swapped, not cleared)
+// Bug:    produces       0x00000000BBAADDCC (upper half also swapped, not cleared)
 void test_alu_end_be16_upper_bits() {
     std::cout << "--- Running Test: test_alu_end_be16_upper_bits ---" << std::endl;
     auto ebpf_vm = vm::create();
@@ -797,7 +790,6 @@ void test_alu32_add_imm() {
     auto ebpf_vm = vm::create();
     ebpf_vm->r(2) = 0xFFFFFFFF000000AA; // Set r2 with high bits set
     bpf_insn instructions[] = {
-        // r2 is pre-set
         { BPF_ALU | BPF_ADD | BPF_K, 2, 0, 0, 0x55 },  // add r2, 0x55 (32-bit) ; r2 = 0xAA + 0x55 = 0xFF
                                                        // High bits of r2 should be cleared
         { BPF_ALU64 | BPF_MOV | BPF_X, 0, 2, 0, 0 },   // mov r0, r2
@@ -805,7 +797,7 @@ void test_alu32_add_imm() {
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
     uint64_t ret = ebpf_vm->run(&option);
-    bool success = (ebpf_vm->r(2) == 0xFF && ret == 0xFF); // High bits cleared
+    bool success = (ebpf_vm->r(2) == 0xFF && ret == 0xFF);
     print_test_result("test_alu32_add_imm", success);
     assert(success);
 }
@@ -929,7 +921,7 @@ void test_jmp_jeq_imm_true() {
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
     uint64_t ret = ebpf_vm->run(&option);
-    bool success = (ebpf_vm->r(1) == 60 && ret == 60); // 50 + 10
+    bool success = (ebpf_vm->r(1) == 60 && ret == 60);
     print_test_result("test_jmp_jeq_imm_true", success);
     assert(success);
 }
@@ -947,7 +939,7 @@ void test_jmp_jeq_imm_false() {
     };
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, instructions, sizeof(instructions) / sizeof(bpf_insn)); assert(ok); }
     uint64_t ret = ebpf_vm->run(&option);
-    bool success = (ebpf_vm->r(1) == 60 && ebpf_vm->r(2) == 100 && ret == 60); // 50+10
+    bool success = (ebpf_vm->r(1) == 60 && ebpf_vm->r(2) == 100 && ret == 60);
     print_test_result("test_jmp_jeq_imm_false", success);
     assert(success);
 }
@@ -1090,7 +1082,7 @@ void test_call_relative() {
     };
 
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn)); assert(ok); }
-    uint64_t ret = ebpf_vm->run(&option); // Main starts at 0x1000
+    uint64_t ret = ebpf_vm->run(&option);
 
     // Expected: r1 = 10 (initial) -> helper adds 5 (r1=15) -> returns -> main adds 100 (r1=115)
     bool success = (ebpf_vm->r(1) == 115 && ret == 115);
@@ -1125,10 +1117,10 @@ void test_call_pseudo_func() {
         { BPF_JMP | BPF_EXIT, 0, 0, 0, 0 }           // return from helper (effectively BPF_JA to caller's pc+1)
     };
 
-    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn)); assert(ok); } // Loads at 0x1000
+    { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, main_instructions, sizeof(main_instructions) / sizeof(bpf_insn)); assert(ok); }
     { [[maybe_unused]] bool ok = load_program_to_vm(ebpf_vm, helper_func_code, sizeof(helper_func_code) / sizeof(bpf_insn), helper_paddr); assert(ok); }
 
-    uint64_t ret = ebpf_vm->run(&option); // Main starts at 0x1000
+    uint64_t ret = ebpf_vm->run(&option);
 
     // Expected: r1 = 20 (initial) -> helper adds 5 (r1=25) -> returns -> main adds 200 (r1=225)
     bool success = (ebpf_vm->r(1) == 225 && ret == 225);
@@ -1147,7 +1139,6 @@ void test_call_indirect_r5() {
     auto ebpf_vm = vm::create();
     uint64_t helper_paddr = 0x2000;
 
-    // Main: set r1=100, r5=42, load helper addr into r5... wait—
     // We need r5 to hold both the call target AND a meaningful value
     // that the callee should NOT see. The bug is: when dst_reg != 5,
     // load_bpf(dst_reg, RDX) clobbers r5. So use a different register

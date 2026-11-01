@@ -17,7 +17,7 @@
 class PosixSyscall;
 class vm;
 
-// 信号事件 POD（完整定义见 posix_syscall.h，下移避免循环 include）。
+// 信号事件 POD（完整定义见 posix_syscall.h，避免循环 include）。
 // 此处前向声明让 SignalFd::deliver 的方法声明可用；实现在 signal.cpp（可见完整定义）。
 struct SigEvent;
 
@@ -82,8 +82,7 @@ struct Fd {
 
     // 销毁前副作用（所有 fd 关闭路径在 erase 前统一调）。默认 no-op。
     // DevFd override：pty master 末次关闭时向 ctty 前台组投 SIGHUP
-    // （对齐 Linux pty_close -> tty_vhangup）。其余子类（HostFd/SignalFd/ProcFile/VirtualDir）
-    // 用默认 no-op。
+    // （对齐 Linux pty_close -> tty_vhangup）。
     // 约束：不得在持有 fds 锁（fds_mutate 重试循环）时调用——SIGHUP 投递会重入 fd 表。
     // 调用方须先 find_fd 拿到 shared_ptr 快照、退出锁、再调本方法，最后才 erase。
     virtual void on_close(PosixSyscall* /*self*/, vm* /*v*/) {}
@@ -138,7 +137,6 @@ struct DevFd: HostFd {
           std::shared_ptr<PtySide> m = {})
         : HostFd(fd, std::move(path_)), tty_(std::move(t)), master_token_(std::move(m)) {}
     std::shared_ptr<Fd> clone() const override;        // 返回 DevFd，保留 tty_/master_token_
-    // fd 销毁前副作用：master 末次关闭发 SIGHUP（所有 fd 关闭路径在 erase 前统一调）。
     void on_close(PosixSyscall* self, vm* v) override;
     // 身份访问器：返回 tty_ 的 shared_ptr（供 do_ioctl/tty_bg_check/DevFd::open 找 ctty fd
     // 比对；TIOCSCTTY 的 session->ctty 绑定也用此 shared_ptr 直接赋值）。
@@ -256,7 +254,6 @@ struct Path {
 
 
 // 工厂：按 guest 前缀分类返回对应 Path 子类（/proc->ProcPath、/dev->DevPath、其它->HostPath）。
-// host 路径由 self->resolve_path(guest) 算好（含 chroot 前缀）传进 Path。
 std::shared_ptr<Path> ResolvePath(PosixSyscall* self, std::string guest);
 
 // 对裸 host fd 取属性（statx 的 fd 形态 = fstat；HostFd::fstatx 与 procfs 魔法链接

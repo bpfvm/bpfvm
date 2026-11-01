@@ -1,7 +1,3 @@
-//
-// Created by chouryzhou on 24-10-28.
-//
-
 #ifndef INSN_H
 #define INSN_H
 #include "elf_loader.h"
@@ -249,7 +245,7 @@ static_assert((TLB_SIZE & (TLB_SIZE - 1)) == 0, "TLB_SIZE must be power of 2");
 // 单纯 `(addr>>12) & (N-1)` 只用低 log2(N) 位，在 musl mallocng 这类同 1MB 页内
 // 产生大量 4KB 堆碎片的场景下区分度不够（高位相同的地址全落同一槽，互相驱逐）。
 // 折叠 ^ (addr>>20) 把高位差异混入低位，提高分散度。4KB 粒度让同 1MB 页内的
-// 相邻 4KB 碎片能落到不同槽（此前 1MB 粒度下它们必然冲突）。
+// 相邻 4KB 碎片能落到不同槽（1MB 粒度索引下它们必然冲突）。
 constexpr size_t tlb_index(uint64_t addr) {
     return ((addr >> 12) ^ (addr >> 20)) & (TLB_SIZE - 1);
 }
@@ -357,7 +353,7 @@ private:
     pthread_mutex_t wait_mutex;
     pthread_cond_t wait_cv;
     size_t signal_depth = 0;
-    uint64_t interp_insns = 0;            // 解释器执行的指令数
+    uint64_t interp_insns = 0;
     uint64_t tp_ = 0;                     // thread pointer（BPF_SYS_SET_TLS 设置；单线程 TLS 模拟）
 
     std::unique_ptr<JitCompilerBase> jit;
@@ -434,7 +430,7 @@ public:
     static std::shared_ptr<vm> create();
     void* mmu(uint64_t addr, size_t size = 1);
     void* mmu_w(uint64_t addr, size_t size = 1);
-    // Slow path: linear scan maps + fill TLB (no TLB lookup).  Called by JIT on miss.
+    // Slow path: binary-search maps + fill TLB (no TLB lookup).  Called by JIT on miss.
     void* mmu_slow(uint64_t addr, size_t size);
     void* mmu_w_slow(uint64_t addr, size_t size);
     // 二分查找包含 [addr, addr+size) 的段。maps 须按 paddr 升序（调用方持 maps_mutex）。

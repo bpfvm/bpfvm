@@ -61,7 +61,7 @@ static void *worker(void *p) {
 }
 
 int main() {
-    // (1) 单线程基本读写（含数组 + struct）
+    // 单线程基本读写（含数组 + struct）
     counter = 5;
     counter++;
     int c = counter;       // 6
@@ -76,7 +76,7 @@ int main() {
         return 1;
     }
 
-    // (1b) 聚合初始化非平凡类型：tracked.v 应为模板初值 7（首次访问 memcpy 模板）
+    // 聚合初始化非平凡类型：tracked.v 应为模板初值 7（首次访问 memcpy 模板）
     int tv = tracked.v;
     tracked.v = 100;
     int tv2 = tracked.v;
@@ -85,7 +85,7 @@ int main() {
         return 1;
     }
 
-    // (1c) 取地址 &var：
+    // 取地址 &var：
     //   get_counter_addr() 返回 counter 副本指针 -> 经它写入应改 counter
     //   via_call_arg() 把 &init_val 传入外部函数 -> 应读到模板初值 42
     counter = 11;
@@ -101,7 +101,7 @@ int main() {
         return 1;
     }
 
-    // (2) 多线程隔离
+    // 多线程隔离
     counter = -1;
     init_val = 999;
     struct Arg args[3] = {{1, 0}, {2, 0}, {3, 0}};
@@ -130,7 +130,7 @@ int main() {
         }
     }
 
-    // (3) fork 继承：子进程应继承父进程当前的 TLS 值（POSIX fork 语义）
+    // fork 继承：子进程应继承父进程当前的 TLS 值（POSIX fork 语义）
     counter = 555;
     init_val = 777;
     pid_t pid = fork();

@@ -415,7 +415,6 @@ static bool softenFunction(Function &F) {
                 }
 
                 if (Op == Instruction::FPTrunc) {
-                    // double -> float
                     if (!Src->isDoubleTy() || !Dst->isFloatTy()) continue;
                     Value *Call = emitDirectFpCall(B, Ctx, BPF_FP_TRUNC, {CI->getOperand(0)}, Dst);
                     CI->replaceAllUsesWith(Call);
@@ -425,7 +424,6 @@ static bool softenFunction(Function &F) {
                 }
 
                 if (Op == Instruction::FPExt) {
-                    // float -> double
                     if (!Src->isFloatTy() || !Dst->isDoubleTy()) continue;
                     Value *Call = emitDirectFpCall(B, Ctx, BPF_FP_EXTEND, {CI->getOperand(0)}, Dst);
                     CI->replaceAllUsesWith(Call);
@@ -623,7 +621,6 @@ static bool softenFunction(Function &F) {
                 continue;
             }
 
-            // ---- 其它 fp intrinsic（fabs/copysign/...）留待后续 ----
         }
     }
 

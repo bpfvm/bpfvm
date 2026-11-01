@@ -40,7 +40,7 @@ static void *worker(void *p) {
 }
 
 int main() {
-    // (1) 主线程首次访问（构造在 .init_array 已跑过，此处读副本）
+    // 主线程首次访问（构造在 .init_array 已跑过，此处读副本）
     int main_v = g_tls.v;
     if (main_v != 7) {
         printf("FAIL main init: g_tls.v=%d expected 7\n", main_v);
@@ -48,7 +48,7 @@ int main() {
     }
     g_tls.v = 100;   // 主线程副本改写，析构时 +100
 
-    // (2) 两个子线程：各自首次访问 -> 各自分配副本（v=7）-> 各自改 v=id -> 退出各自析构
+    // 两个子线程：各自首次访问 -> 各自分配副本（v=7）-> 各自改 v=id -> 退出各自析构
     struct Arg args[2] = {{1, 0}, {2, 0}};
     pthread_t threads[2];
     for (int i = 0; i < 2; i++)
@@ -57,7 +57,6 @@ int main() {
         pthread_join(threads[i], 0);
 
     // 子线程应都已析构：g_dtor_count==2（每个子线程副本一次），析构值之和=1+2=3。
-    // 修复前：子线程副本不析构，此处在 main 内检查时 g_dtor_count==0。
     if (g_dtor_count != 2) {
         printf("FAIL child dtor: g_dtor_count=%d expected 2\n", g_dtor_count);
         return 1;

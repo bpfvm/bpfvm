@@ -26,7 +26,7 @@ static int check(int cond, const char *what) {
 int main(int argc, char **argv) {
     int failures = 0;
 
-    // (1) getcwd 应为 "/"
+    // getcwd 应为 "/"
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
         printf("FAIL: getcwd returned NULL\n");
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     }
     failures += check(strcmp(cwd, "/") == 0, "getcwd should be '/' in chroot");
 
-    // (2) 写 /marker.txt 并读回校验
+    // 写 /marker.txt 并读回校验
     int fd = open("/marker.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     failures += check(fd >= 0, "open /marker.txt for write");
     if (fd >= 0) {
@@ -53,13 +53,13 @@ int main(int argc, char **argv) {
                           "marker content mismatch on readback");
     }
 
-    // (3) argv[0] 应是 guest 视角路径（/test_root.out），不是宿主路径
+    // argv[0] 应是 guest 视角路径（/test_root.out），不是宿主路径
     if (argc > 0) {
         failures += check(strncmp(argv[0], "/", 1) == 0,
                           "argv[0] should start with '/' (guest path)");
     }
 
-    // (4) 列出 / —— marker.txt 应可见
+    // 列出 / —— marker.txt 应可见
     DIR *d = opendir("/");
     int saw_marker = 0;
     if (d) {
@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
     }
     failures += check(saw_marker, "marker.txt should be visible in /");
 
-    // (5) 逃逸检测：/../../../etc/passwd 在真 chroot 下应 open 失败。
+    // 逃逸检测：/../../../etc/passwd 在真 chroot 下应 open 失败。
     fd = open("/../../../etc/passwd", O_RDONLY);
     if (fd >= 0) {
         printf("FAIL: escaped chroot via /../../../etc/passwd\n");

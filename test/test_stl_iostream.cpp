@@ -20,7 +20,7 @@
 int main() {
     int failures = 0;
 
-    // (1) cout 基本输出（验证 ios_base::Init 全局对象构造 + ostream << int/char*）。
+    // cout 基本输出（验证 ios_base::Init 全局对象构造 + ostream << int/char*）。
     //     这是 iostream 最核心路径：static guard（atomic 降级）+ locale::id 初始化 +
     //     num_put facet 格式化。仅验证不崩溃 + 流状态 good。
     std::cout << "hello iostream\n";
@@ -30,7 +30,7 @@ int main() {
     }
     std::cerr << "cerr ok\n";
 
-    // (2) stringstream 内存流：整数 -> 字符串，读回比对（真正验证 num_put 格式化正确）。
+    // stringstream 内存流：整数 -> 字符串，读回比对（真正验证 num_put 格式化正确）。
     {
         std::ostringstream oss;
         oss << 42 << " " << -7 << " " << 1234567;
@@ -41,7 +41,7 @@ int main() {
         }
     }
 
-    // (3) istringstream 字符串 -> 整数（验证 num_get 解析 + istream >>）。
+    // istringstream 字符串 -> 整数（验证 num_get 解析 + istream >>）。
     {
         std::istringstream iss("100 200 300");
         int a = 0, b = 0, c = 0;
@@ -52,7 +52,7 @@ int main() {
         }
     }
 
-    // (4) 浮点输出（验证 num_put 的 double 格式化 + BpfSoftFp 软化路径）。
+    // 浮点输出（验证 num_put 的 double 格式化 + BpfSoftFp 软化路径）。
     {
         std::ostringstream oss;
         oss << 3.14;
@@ -63,7 +63,7 @@ int main() {
         }
     }
 
-    // (5) endl + flush（验证操纵符 + ostream::flush）。
+    // endl + flush（验证操纵符 + ostream::flush）。
     {
         std::ostringstream oss;
         oss << "line1" << std::endl << "line2" << std::endl;
@@ -74,7 +74,7 @@ int main() {
         }
     }
 
-    // (6) hex/dec 操纵符（验证 ios_base::flags + num_put 按 base 格式化）。
+    // hex/dec 操纵符（验证 ios_base::flags + num_put 按 base 格式化）。
     {
         std::ostringstream oss;
         oss << std::hex << 255 << " " << std::dec << 255;
@@ -85,7 +85,7 @@ int main() {
         }
     }
 
-    // (7) setw 宽度（验证 ios_base::width + num_put 填充）。
+    // setw 宽度（验证 ios_base::width + num_put 填充）。
     {
         std::ostringstream oss;
         oss << std::setw(5) << 42;
@@ -96,7 +96,7 @@ int main() {
         }
     }
 
-    // (8) std::cin（读一个数）。仅验证流对象可用 + >> 操作符；测试框架需在 stdin 喂数据。
+    // std::cin（读一个数）。仅验证流对象可用 + >> 操作符；测试框架需在 stdin 喂数据。
     //     ctest 默认无 stdin，此处仅检查 cin 流对象构造不崩溃（goodbit）。
     if (!std::cin.good()) {
         // cin 在无输入时可能是 eof/good，不视为失败（取决于运行环境）。

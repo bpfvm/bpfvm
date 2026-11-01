@@ -1,7 +1,6 @@
 #include "posix_internal.h"
 
 // 从 guest 地址空间读出一个 NUL 结尾字符串（最多 max_len 字节）。
-// 与下面的 resolve_path 同属「guest 内存 <-> 字符串」工具，故放在本文件。
 bool PosixSyscall::read_c_string(vm* v, uint64_t addr, std::string& out, size_t max_len) {
     out.clear();
     if(addr == 0) {

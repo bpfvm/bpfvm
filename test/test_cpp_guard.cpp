@@ -57,7 +57,7 @@ int main() {
     const int N = 4;
     int failures = 0;
 
-    // (1) 多线程并发首次调用 func_a：static val 只构造一次（ctor_count 只 +1）
+    // 多线程并发首次调用 func_a：static val 只构造一次（ctor_count 只 +1）
     {
         ctor_count = 0;
         Arg args[N];
@@ -82,8 +82,8 @@ int main() {
         if (failures == 0) printf("[OK] concurrent func_a (single construction)\n");
     }
 
-    // (2) func_a + func_b 混合并发：两个 guard 独立。
-    // func_a 已在 (1) 构造过，此处不再构造；func_b 首次构造。ctor_count 增量应为 1。
+    // func_a + func_b 混合并发：两个 guard 独立。
+    // func_a 已在上一个用例构造过，此处不再构造；func_b 首次构造。ctor_count 增量应为 1。
     {
         ctor_count = 0;
         Arg args_a[N], args_b[N];
@@ -103,7 +103,7 @@ int main() {
         if (failures == 0) printf("[OK] mixed func_a + func_b (independent guards)\n");
     }
 
-    // (3) 单线程基本正确性（构造后多次调用值稳定）
+    // 单线程基本正确性（构造后多次调用值稳定）
     {
         int r1 = func_a(1);
         int r2 = func_a(2);

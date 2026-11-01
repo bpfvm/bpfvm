@@ -37,7 +37,6 @@ static ffi_closure *bpfffi_pool[BPFFFI_MAX_CLOSURES];
 static char bpfffi_used[BPFFFI_MAX_CLOSURES];
 static pthread_mutex_t bpfffi_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 
-/* 从 thunk 地址反查池下标;-1 表示不在池中。 */
 static int thunk_index(void *thunk)
 {
     int i;

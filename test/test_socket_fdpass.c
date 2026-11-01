@@ -1,7 +1,7 @@
 // test_socket_fdpass.c — 验证 bpfvm 的 sendmsg/recvmsg。
-// 用例 1：scatter-gather 数据收发（多个 iov），无 cmsg。覆盖 DNS 的 recvmsg 收 UDP 响应路径。
-// 用例 2：SCM_RIGHTS fd 传递——父把 pipe 写端经 AF_UNIX 传给子，子往收到的 fd 写、
-//         父从 pipe 读端读，验证 fd 跨进程传递 + 数据可达。这是 VM 边界 fd 翻译的核心风险点。
+// scatter-gather 数据收发（多个 iov），无 cmsg。覆盖 DNS 的 recvmsg 收 UDP 响应路径。
+// SCM_RIGHTS fd 传递——父把 pipe 写端经 AF_UNIX 传给子，子往收到的 fd 写、
+// 父从 pipe 读端读，验证 fd 跨进程传递 + 数据可达。这是 VM 边界 fd 翻译的核心风险点。
 // 覆盖：sendmsg/recvmsg（iov + SCM_RIGHTS）。
 
 #include <stdio.h>
@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
-/* 用例 1：sendmsg/recvmsg 的 scatter-gather 数据路径（iov 数组，无 cmsg）。 */
+/* sendmsg/recvmsg 的 scatter-gather 数据路径（iov 数组，无 cmsg）。 */
 static int test_scatter_gather(void)
 {
     int sv[2];
@@ -53,7 +53,7 @@ static int test_scatter_gather(void)
     return 0;
 }
 
-/* 用例 2：SCM_RIGHTS —— 父把 pipe 写端 pfd[1] 传给子，子写、父从 pfd[0] 读。 */
+/* SCM_RIGHTS —— 父把 pipe 写端 pfd[1] 传给子，子写、父从 pfd[0] 读。 */
 static int test_fd_pass(void)
 {
     int sv[2];

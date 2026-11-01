@@ -77,17 +77,14 @@ foreach(v ${variants})
     list(GET fields 4 threshold_env)
     list(GET fields 5 nest_flag)
 
-    # chroot 模式跳过 host 变体（chroot 无宿主对照意义）。
     if(DEFINED ROOT AND label STREQUAL "host")
         continue()
     endif()
 
-    # 嵌套变体跳过：bpfvm.bpf 不可用。
     if(nest_flag STREQUAL "1" AND NOT NEST_AVAILABLE)
         message("skip nest variant '${label}': bpfvm.bpf not available")
         continue()
     endif()
-    # 嵌套变体跳过：已知耗时过长的用例（BPF_NEST_SKIP，脚本内定义见上文）。
     if(nest_flag STREQUAL "1" AND NAME IN_LIST BPF_NEST_SKIP)
         continue()
     endif()
@@ -97,11 +94,11 @@ foreach(v ${variants})
     # 运行时库搜索路径（guest 用，经 -e 传给 bpfvm，再由 elf_loader 解析 LD_LIBRARY_PATH）：
     #   - root/lib：libc.so/libcxx.so（build_root.sh 复制到此，供 rootfs 与 ctest 共用）。
     #   - test：测试用 .so（如 GOT 的 libgot.so，构建产物落在 test/ 下）。
-    # 不再设宿主 ENV{LD_LIBRARY_PATH}：bpfvm 自身的 elf_loader 现在用 -e 的 guest envp 搜库，
+    # 不设宿主 ENV{LD_LIBRARY_PATH}：bpfvm 自身的 elf_loader 只用 -e 的 guest envp 搜库，
     # 宿主环境与 guest 库搜索彻底解耦。
     set(ldpath "${WORKDIR}/root/lib:${WORKDIR}/test")
 
-    # bpfvm 不再从宿主 environ 自动透传环境变量，所有 guest 可见变量经 -e 显式传入。
+    # bpfvm 不从宿主 environ 自动透传环境变量，所有 guest 可见变量经 -e 显式传入。
     # 收集成 cmake list（"-e;K=V;-e;K2=V2"），execute_process 展开为独立 argv。
     # host 变体例外：直接跑宿主二进制不经 bpfvm，-e 无效，改设宿主 ENV。
     #
@@ -116,8 +113,8 @@ foreach(v ${variants})
     set(inner_env_args)                                   # nest 内层：bpfvm.bpf 的 -e（见上注，默认空）
     # BPF_TEST_VARIANT 经 -e 注入给 guest（dynamic 系列变体需要它选 .linked）；
     # static 系列变体的 variant_env == "-"，清空宿主 ENV 避免残留。
-    # host 变体特殊：它不经 bpfvm（直接跑宿主 gcc 二进制），-e 对它无效，故必须走宿主 ENV。
-    # 其 variant_env == "host"（参见 variants 表），test 程序据此选 *.host 目标（如 test_arg.host）。
+    # host 变体的 variant_env == "host"（参见 variants 表），test 程序据此选 *.host 目标
+    # （如 test_arg.host）。
     if(label STREQUAL "host")
         set(ENV{BPF_TEST_VARIANT} "${variant_env}")
     elseif(variant_env STREQUAL "-")
@@ -159,9 +156,6 @@ foreach(v ${variants})
         file(COPY "${prog}" DESTINATION "${rootfs}")
         file(COPY "${ROOT_LIB}" DESTINATION "${rootfs}")
         if(nest_flag STREQUAL "1")
-            # 嵌套 chroot：outer_env_args 注入 bpfvm.bpf 进程 environ（供其 ldso 启动加载
-            # libcxx.so）；其后是 bpfvm.bpf 的 argv：--root chroot 到 rootfs，inner_env_args
-            # 是 bpfvm.bpf 的 -e（其 load_elf 搜库 + 注入给测试程序），最后是 guest 路径。
             set(cmd "${BPFVM}" ${outer_env_args} "${BPFVM_BPF}" "--root" "${rootfs}" ${inner_env_args} "/${NAME}.${suffix}")
         else()
             set(cmd "${BPFVM}" "--root" "${rootfs}" ${guest_env_args} "/${NAME}.${suffix}")
@@ -176,9 +170,6 @@ foreach(v ${variants})
         )
     else()
         if(nest_flag STREQUAL "1")
-            # 嵌套非 chroot：outer_env_args 注入 bpfvm.bpf 进程 environ（供其 ldso 启动加载
-            # libcxx.so）；其后是 bpfvm.bpf 的 argv：inner_env_args 是 bpfvm.bpf 的 -e
-            # （其 load_elf 搜库 + 注入给测试程序），最后是 guest 路径。
             set(cmd "${BPFVM}" ${outer_env_args} "${BPFVM_BPF}" ${inner_env_args} "${prog}")
         else()
             set(cmd "${BPFVM}" ${guest_env_args} "${prog}")
@@ -200,7 +191,6 @@ foreach(v ${variants})
         message(FATAL_ERROR "${NAME} variant '${label}' exited with ${result}, expected 0")
     endif()
 
-    # chroot 模式：清理临时 rootfs
     if(DEFINED ROOT)
         file(REMOVE_RECURSE "${rootfs}")
     endif()

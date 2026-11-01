@@ -113,7 +113,6 @@ std::string GdbServer::to_hex2(uint8_t v) {
 }
 
 std::string GdbServer::reg_to_hex(uint64_t v) {
-    // 小端：低字节在前
     std::string s;
     for(int i = 0; i < 8; i++) s += to_hex2((v >> (i * 8)) & 0xFF);
     return s;
@@ -172,7 +171,6 @@ bool GdbServer::recv_packet(std::string& out) {
     for(;;) {
         if(!recv_byte(c)) return false;
         if(c == '$') break;
-        // 其余（+, -, 0x03）忽略
     }
     std::string data;
     uint8_t cksum = 0;
@@ -319,7 +317,7 @@ void GdbServer::attach_on_connect() {
     if(main_vm->get_flags() & vm::VM_DEBUG_ATTACHED) return;
     register_task(main_vm);
     main_vm->set_flags(vm::VM_DEBUG_ATTACHED);
-    request_stop(main_vm.get());  // 停在当前 pc（set flag + wakeup + host_signal）
+    request_stop(main_vm.get());  // 停在当前 pc
 }
 
 void GdbServer::end_session() {
@@ -477,7 +475,6 @@ void GdbServer::resume(vm* v, bool single_step) {
 // 越过断点（若命中）后放行，不阻塞等下次停下（交给调用方的 wait_any_stopped）。
 void GdbServer::resume_continue(vm* v) {
     if(has_breakpoint(v, v->pc())) {
-        // step-over：清 STOP 放行 + 设 stepping，钩子消费 stepping 落实停。
         v->clear_flags(vm::VM_DEBUG_STOP);
         mark_stepping(v);
         v->wakeup(false);
@@ -499,7 +496,7 @@ void GdbServer::wait_stopped(vm* v) {
             ssize_t n = recv(client_fd_, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
             if(n == 1 && peek == '\x03') {
                 recv(client_fd_, &peek, 1, MSG_DONTWAIT);  // 消费 0x03
-                request_stop(v);  // set flag + wakeup + host_signal
+                request_stop(v);
                 continue;
             }
         }
@@ -824,7 +821,6 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         }
     });
     for(auto& v : need_step) {
-        // step-over：清 STOP 放行 + 设 stepping，钩子消费 stepping 落实停。
         v->clear_flags(vm::VM_DEBUG_STOP);
         mark_stepping(v.get());
         v->wakeup(false);
@@ -841,7 +837,7 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         auto it = action_of.find(e.vmp.get());
         if(it == action_of.end()) return;
         char act = it->second;
-        if(act == 't') return;  // 保持 stopped
+        if(act == 't') return;
         released.push_back(e.vmp.get());
         release_vms.push_back(e.vmp);
     });
@@ -849,7 +845,7 @@ std::string GdbServer::handle_vcont(const std::string& pkt) {
         char act = action_of[v.get()];
         v->clear_flags(vm::VM_DEBUG_STOP);  // 清上轮停止状态
         if(act == 's') {
-            mark_stepping(v.get());  // 单步：放行后跑一条，钩子消费 stepping 落实停
+            mark_stepping(v.get());
         }
         v->wakeup(false);
     }
@@ -1083,7 +1079,7 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
             } else {
                 return "E01";  // 格式错误（如 "1abc"）
             }
-            syscall_catch_.store(std::move(cfg));  // shared_ptr<T> -> shared_ptr<const T>
+            syscall_catch_.store(std::move(cfg));
             return "OK";
         }
         return "";
@@ -1204,9 +1200,9 @@ std::string GdbServer::handle_packet(const std::string& pkt) {
         }
         // all-stop：当前 vm 先越过断点并放行（resume_continue 读 v->pc()/设 flags，必须在
         // v 被放行前完成——否则 v 解释器线程并发写 pc_ 构成数据竞争），再放行其余 vm。
-        // continue 不能只等当前 vm（旧 resume 路径的 bug：若另一 vm 先命中断点而当前 vm
-        // 无断点长循环，wait_stopped(current) 永不返回 -> all-stop 失效）。改由 wait_any_stopped
-        // 统一协调：放行所有 vm 后等任一命中并传播 stop 到其余 vm。
+        // continue 不能只等当前 vm：若另一 vm 先命中断点而当前 vm 无断点长循环，
+        // wait_stopped(current) 永不返回 -> all-stop 失效。故由 wait_any_stopped 统一
+        // 协调：放行所有 vm 后等任一命中并传播 stop 到其余 vm。
         resume_continue(v.get());
         continue_all_vms();
         // 阻塞等待任一 vm 命中（断点/异常/fork），命中后 stop_all_vms 让其余 vm 也停

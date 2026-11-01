@@ -4,8 +4,8 @@
  *   后退出（last）。整组退出时由 last 线程（worker）的 fini 扫描 pid_map 把 ppid==C tgid
  *   的 G 重定向到 pid 1。G 轮询 getppid()==1 即成功。
  *
- * 这条路径验证 reparent 修复的关键点：reparent 不再挂在 leader、改由 last 线程按 tgid
- * 匹配执行——leader 先退出时也不能漏 reparent。
+ * 这条路径验证 reparent 的关键点：reparent 由 last 线程按 tgid 匹配执行——
+ * leader 先退出时也不能漏 reparent。
  *
  * 当前预期：撞预存的 CoW UAF（fork+跨进程并发写缺页，G 写 .data 段触发深拷贝时读到已
  * munmap 的页 -> 段错误）。该 bug 与 reparent 改动无关，待单独修复；修好后本测试应通过。

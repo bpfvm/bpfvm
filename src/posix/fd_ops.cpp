@@ -467,7 +467,7 @@ int64_t PosixSyscall::do_pselect6(vm* v) {
     int invalid_count = 0;
     // 虚拟 fd（/proc 等，host_fd()<0）算"就地就绪"，不进 host poll（无真实 fd 可等）。
     // 回写阶段会 FD_ZERO 清空全部位图后靠下面的列表回填，故虚拟 fd 的就绪位需单独记录，
-    // 否则会被清空（原实现只 continue 导致丢失）。与 do_poll 的就地就绪一致。
+    // 否则会被清空。与 do_poll 的就地就绪一致。
     std::vector<int> vfd_r, vfd_w;
     for(int fd = 0; fd < n; ++fd) {
         bool in_r = grfds && FD_ISSET(fd, grfds);

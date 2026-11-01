@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
-/* 测试1：经过 union 栈存取 */
+/* 经过 union 栈存取 */
 __attribute__((noinline))
 static uint64_t via_union(uint64_t v) {
     union { uint64_t i; } u;
@@ -10,7 +10,7 @@ static uint64_t via_union(uint64_t v) {
     return u.i;         /* 读栈返回 */
 }
 
-/* 测试2：不经过栈，纯寄存器 */
+/* 不经过栈，纯寄存器 */
 __attribute__((noinline))
 static uint64_t pure_reg(uint64_t v) {
     return v >> 4;

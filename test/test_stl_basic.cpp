@@ -21,7 +21,7 @@
 #include <numeric>
 #include <cstdio>
 
-// 按值传容器：验证 BpfWideArgs lowerAggregateParams 路径 A（原 stripByval；BPF
+// 按值传容器：验证 BpfWideArgs lowerAggregateParams 路径 A（BPF
 // 后端原本拒绝 byval 参数，"pass by value not supported"）。noinline 防 -O1 内联
 // 绕过 byval lowering；
 // caller 原对象必须不被 callee 修改（真正按值语义）。
@@ -35,7 +35,7 @@ __attribute__((noinline)) int byval_vec_sum(std::vector<int> v) {
 int main() {
     int failures = 0;
 
-    // (1) vector + algorithm::sort
+    // vector + algorithm::sort
     std::vector<int> v = {5, 3, 8, 1, 9, 2, 7, 4, 6};
     std::sort(v.begin(), v.end());
     bool sorted_ok = true;
@@ -47,7 +47,7 @@ int main() {
         ++failures;
     }
 
-    // (2) string 拼接 + 比较
+    // string 拼接 + 比较
     std::string s = "hello";
     s += " ";
     s += "world";
@@ -56,7 +56,7 @@ int main() {
         ++failures;
     }
 
-    // (3) map 插入 + 遍历（有序）
+    // map 插入 + 遍历（有序）
     std::map<std::string, int> m;
     m["one"] = 1;
     m["three"] = 3;
@@ -69,7 +69,7 @@ int main() {
         ++failures;
     }
 
-    // (4) unordered_map（验证 hash 容器 + ceilf 软化）
+    // unordered_map（验证 hash 容器 + ceilf 软化）
     std::unordered_map<int, int> um;
     for (int i = 0; i < 20; i++) um[i] = i * 2;
     if (um.size() != 20 || um[5] != 10) {
@@ -77,14 +77,14 @@ int main() {
         ++failures;
     }
 
-    // (5) unordered_set
+    // unordered_set
     std::unordered_set<int> us = {10, 20, 30, 40};
     if (us.size() != 4 || !us.count(20)) {
         printf("FAIL unordered_set: size=%zu\n", us.size());
         ++failures;
     }
 
-    // (6) deque（双向 push）
+    // deque（双向 push）
     std::deque<int> dq;
     for (int i = 1; i <= 5; i++) { dq.push_back(i); dq.push_front(-i); }
     if (dq.size() != 10 || dq.front() != -5 || dq.back() != 5) {
@@ -92,42 +92,42 @@ int main() {
         ++failures;
     }
 
-    // (7) set（有序）
+    // set（有序）
     std::set<int> st = {5, 3, 8, 1, 9};
     if (st.size() != 5 || *st.begin() != 1 || *st.rbegin() != 9) {
         printf("FAIL set: size=%zu\n", st.size());
         ++failures;
     }
 
-    // (8) unique_ptr + make_unique
+    // unique_ptr + make_unique
     auto p = std::make_unique<int>(42);
     if (!p || *p != 42) {
         printf("FAIL unique_ptr\n");
         ++failures;
     }
 
-    // (9) optional
+    // optional
     std::optional<int> opt = 100;
     if (!opt || *opt != 100) {
         printf("FAIL optional\n");
         ++failures;
     }
 
-    // (10) variant
+    // variant
     std::variant<int, double> var = 42;
     if (std::get<int>(var) != 42 || var.index() != 0) {
         printf("FAIL variant\n");
         ++failures;
     }
 
-    // (11) function + lambda
+    // function + lambda
     std::function<int(int)> sq = [](int x) { return x * x; };
     if (sq(7) != 49) {
         printf("FAIL function\n");
         ++failures;
     }
 
-    // (12) 按值传容器（BpfWideArgs lowerAggregateParams 路径 A）
+    // 按值传容器（BpfWideArgs lowerAggregateParams 路径 A）
     std::string bvs = "hello world";
     std::vector<int> bvv = {1, 2, 3, 4, 5};
     size_t bvsz = byval_str_size(bvs);    // 11

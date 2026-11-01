@@ -42,7 +42,7 @@ int main() {
         return 1;
     }
 
-    // ===== (1) path 构造/迭代/分解 =====
+    // ===== path 构造/迭代/分解 =====
     fs::path p = root / "sub" / "a.txt";
     if (p.filename() != "a.txt") {
         printf("FAIL path filename: '%s'\n", p.filename().c_str());
@@ -73,7 +73,7 @@ int main() {
         }
     }
 
-    // ===== (2) create_directories / exists / is_directory / is_regular_file =====
+    // ===== create_directories / exists / is_directory / is_regular_file =====
     fs::path subdir = root / "sub";
     if (!fs::create_directories(subdir, ec) || ec) {
         printf("FAIL create_directories: ec=%s\n", ec.message().c_str());
@@ -83,7 +83,7 @@ int main() {
     if (!fs::is_directory(subdir)) { printf("FAIL is_directory(subdir)\n"); ++failures; }
     if (fs::is_regular_file(subdir)) { printf("FAIL is_regular_file(subdir) should be false\n"); ++failures; }
 
-    // ===== (3) 写文件 + file_size / status =====
+    // ===== 写文件 + file_size / status =====
     fs::path fpath = subdir / "a.txt";
     {
         FILE* f = fopen(fpath.c_str(), "wb");
@@ -111,7 +111,7 @@ int main() {
         }
     }
 
-    // ===== (4) directory_iterator =====
+    // ===== directory_iterator =====
     {
         // root 下应至少有 "sub"。
         bool found_sub = false;
@@ -142,7 +142,7 @@ int main() {
         }
     }
 
-    // ===== (5) create_directories 多层 + recursive_directory_iterator =====
+    // ===== create_directories 多层 + recursive_directory_iterator =====
     fs::path deep = root / "d1" / "d2" / "d3";
     if (!fs::create_directories(deep, ec) || ec) {
         printf("FAIL create_directories(deep): ec=%s\n", ec.message().c_str());
@@ -169,7 +169,7 @@ int main() {
         }
     }
 
-    // ===== (6) symlink / read_symlink / is_symlink / symlink_status =====
+    // ===== symlink / read_symlink / is_symlink / symlink_status =====
     // symlink target 用相对路径 "a.txt"（相对 symlink 所在目录 sub，POSIX 语义）。
     // slink 放在 sub 下与 a.txt 同目录，这样跟随 target 能正确解析到 a.txt。
     fs::path slink = subdir / "a_link.txt";
@@ -198,7 +198,7 @@ int main() {
         }
     }
 
-    // ===== (7) create_hard_link / hard_link_count =====
+    // ===== create_hard_link / hard_link_count =====
 #if !defined(__ANDROID__)
     // Android 文件系统禁止 app 创建硬链接（EPERM），跳过本组验证。
     fs::path hlink = root / "a_hard.txt";
@@ -216,7 +216,7 @@ int main() {
     }
 #endif
 
-    // ===== (8) rename =====
+    // ===== rename =====
     fs::path rfrom = root / "rfrom.txt";
     fs::path rto = root / "rto.txt";
     {
@@ -230,7 +230,7 @@ int main() {
         ++failures;
     }
 
-    // ===== (9) copy（目录递归 copy，非 copy_file）=====
+    // ===== copy（目录递归 copy，非 copy_file）=====
     // 注意：copy 对每个文件内部调 copy_file，而 copy_file 在 VM 上依赖 sendfile
     // （未实现 -> ENOSYS 降级）。故 copy(recursive) 对含文件的目录会部分失败。
     // 这里只验证目录结构被创建（copy 对子目录的创建不依赖 copy_file），文件复制
@@ -245,7 +245,7 @@ int main() {
         ++failures;
     }
 
-    // ===== (10) permissions =====
+    // ===== permissions =====
     fs::permissions(fpath, fs::perms::owner_read | fs::perms::owner_write, ec);
     if (ec) {
         printf("FAIL permissions: ec=%s\n", ec.message().c_str());
@@ -260,7 +260,7 @@ int main() {
         }
     }
 
-    // ===== (11) last_write_time（读，不写——写需 utimensat 已实现，VM 有）=====
+    // ===== last_write_time（读，不写——写需 utimensat 已实现，VM 有）=====
     {
         fs::last_write_time(fpath, ec);
         if (ec) {
@@ -271,7 +271,7 @@ int main() {
         // （不与 host 精确比较，只验证可读且非零。）
     }
 
-    // ===== (12) current_path get / set =====
+    // ===== current_path get / set =====
     fs::path saved_cwd = fs::current_path(ec);
     if (ec) {
         printf("FAIL current_path(get): ec=%s\n", ec.message().c_str());
@@ -300,7 +300,7 @@ int main() {
         }
     }
 
-    // ===== (13) weakly_canonical / canonical =====
+    // ===== weakly_canonical / canonical =====
     // canonical 要求路径存在；fpath 存在。
     {
         fs::path can = fs::canonical(fpath, ec);
@@ -316,7 +316,7 @@ int main() {
         }
     }
 
-    // ===== (14) temp_directory_path =====
+    // ===== temp_directory_path =====
     // 只读不写；若 /tmp 不存在会报错，用 error_code 容错（不致命）。
     {
         fs::path tmp = fs::temp_directory_path(ec);
@@ -325,7 +325,7 @@ int main() {
         }
     }
 
-    // ===== (15) remove / remove_all =====
+    // ===== remove / remove_all =====
 #if !defined(__ANDROID__)
     if (!fs::remove(hlink, ec) || ec) {
         printf("FAIL remove(hlink): ec=%s\n", ec.message().c_str());

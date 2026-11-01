@@ -239,8 +239,8 @@ void JitCompiler<EmitterT>::discover_reachable(
 
     reachable.assign(seg_limit, false);
     back_edge_targets.assign(seg_limit, false);
-    // 回边稀疏记录：(target, src)。绝大多数 pc 不是回边 target
-    // 改为只在遇到回边时 push，遍历后聚合。
+    // 回边稀疏记录：(target, src)。绝大多数 pc 不是回边 target，
+    // 只在遇到回边时 push，遍历后聚合。
     std::vector<std::pair<int,int>> back_edges;
     int max_reached = -1;
 

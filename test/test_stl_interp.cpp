@@ -22,7 +22,7 @@
 //
 // 用 std::string/vector/unordered_map/unique_ptr + printf（musl）。不依赖未支持
 // 的头（regex/iostream/thread）。byval 传 unique_ptr/AST 节点已被 lowerAggregateParams
-// 路径 A（原 stripByval）解锁。
+// 路径 A 解锁。
 
 #include <string>
 #include <vector>

@@ -10,7 +10,6 @@
 //     SIG_IGN + 读 -> Linux 返回 -EIO（忽略读的 SIGTTIN 视作非法后台读）。
 //     SIG_DFL     -> 默认动作是停止作业（SIGTTIN/SIGTTOU 的 default action = stop）
 //     已 catch    -> handler 返回后被中断的系统调用返回 -1/EINTR
-// 返回 nullopt 表示放行真正 I/O；返回非空表示已拦截（已投信号），其值即 syscall 返回值。
 // 非 DevFd 第一行短路 -> 对它们永远放行（无后台门控）。
 std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<Fd>& fd, bool is_read) {
     auto dfd = std::dynamic_pointer_cast<DevFd>(fd).get();
@@ -31,8 +30,6 @@ std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<F
     const auto& act = ps->signal_actions[static_cast<size_t>(sig)];
     if(handler_is_ignored(act.handler)) {
         // SIG_IGN：信号被忽略。
-        //   写 -> I/O 照常完成（放行，do_write 真正 write）。
-        //   读 -> Linux 返回 -EIO（后台读被忽略视为非法）。
         if(is_read) {
             return -EIO;
         }
@@ -42,7 +39,7 @@ std::optional<int64_t> PosixSyscall::tty_bg_check(vm* v, const std::shared_ptr<F
     }
     queue_signal(v, {sig, 0, SI_KERNEL, 0});
     // SIG_DFL（停止作业，本次 I/O 不完成；已投递，handle_signals 会置 VM_STOPPED）或
-    // 已 catch（handler 返回后返回 -EINTR，job-control 信号默认不复重啜）。
+    // 已 catch（handler 返回后返回 -EINTR，job-control 信号默认不复重启）。
     return -EINTR;
 }
 

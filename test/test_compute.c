@@ -115,11 +115,9 @@ static uint64_t collatz_total_steps(uint64_t start, uint64_t count) {
  * =================================================================== */
 static uint64_t array_compute(void) {
     uint64_t buf[256];
-    /* 初始化 */
     for (int i = 0; i < 256; i++) {
         buf[i] = (uint64_t)(i * 7 + 3);
     }
-    /* 多轮迭代：读取-计算-写回 */
     for (int round = 0; round < 100000; round++) {
         for (int i = 0; i < 256; i++) {
             uint64_t v = buf[i];
@@ -130,7 +128,6 @@ static uint64_t array_compute(void) {
             buf[i] = v;
         }
     }
-    /* 求和 */
     uint64_t sum = 0;
     for (int i = 0; i < 256; i++) {
         sum += buf[i];
@@ -147,7 +144,6 @@ int main(void) {
     /* -  Fibonacci */
     {
         uint64_t r = fib(70);
-        /* fib(70) = 190392490709135 */
         printf("fib(70) = %lu\n", r);
         ok &= (r == 190392490709135ULL);
     }

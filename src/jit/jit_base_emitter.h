@@ -27,7 +27,7 @@ protected:
     bool budget_enabled_ = false;
 
     // Helper function pointers (set via set_helpers)：指向 JitCompiler 构造期生成的
-    // 同一份 HelperTable，emitter 不再各自拷贝。
+    // 同一份 HelperTable，各 emitter 共享。
     const HelperTable* helpers_ = nullptr;
 
     // vm_exit offset (set by emit_prologue, used by all emit_* methods)

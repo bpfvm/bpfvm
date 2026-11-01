@@ -6,8 +6,8 @@
 // Why this needs a dedicated test:
 //   The BPF backend rejects `byval` parameters ("pass by value not supported",
 //   BPFISelLowering). The BpfWideArgs pass strips the `byval` attribute in the
-//   IR (see src/passes/BpfWideArgs.cpp :: lowerAggregateParams, path A — the
-//   former stripByval), turning the parameter
+//   IR (see src/passes/BpfWideArgs.cpp :: lowerAggregateParams, path A),
+//   turning the parameter
 //   into a plain ptr — clang has already memcpys the argument into a stack
 //   temporary at every call site and passes that pointer. This test guards two
 //   invariants that would silently break if the lowering regressed:

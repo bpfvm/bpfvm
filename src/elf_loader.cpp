@@ -23,8 +23,6 @@
 #define EM_BPF 247
 #endif
 
-// ===== memmap =====
-
 memmap memmap::static_map(void* addr, size_t size, uint64_t paddr, std::string path_) {
     memmap map;
     map.size = size;
@@ -67,8 +65,6 @@ std::string guest_view(const std::string& host_path) {
 
 static std::vector<std::string> default_lib_search_dirs() {
     std::vector<std::string> dirs;
-    // 不再读宿主 getenv("LD_LIBRARY_PATH")：库搜索路径由调用方经 envp 显式传入
-    // （VM 运行时用 guest envp，ld_main 自己读 host getenv 后并入 opt.lib_dirs）。
     dirs.push_back("lib");
     dirs.push_back(".");
     // chroot 模式：在 rootfs 内补搜标准 lib 目录（优先于宿主，因 interp 在 rootfs 内）。
@@ -81,7 +77,6 @@ static std::vector<std::string> default_lib_search_dirs() {
 }
 
 // 从 envp（key->value）解析 LD_LIBRARY_PATH，按 ':' 拆成目录列表。
-// elf_loader 不再读宿主 getenv；VM 运行时把 guest 的 envp 传入，由本函数提取库搜索路径。
 std::vector<std::string> lib_search_dirs_from_envp(const std::map<std::string, std::string>& envp) {
     std::vector<std::string> dirs;
     auto it = envp.find("LD_LIBRARY_PATH");
@@ -119,8 +114,7 @@ private:
     std::function<void()> func;
 };
 
-// 构造一个「加载失败」结果：entry=0 + err=<errno>。供 load_elf 各失败点统一使用，
-// 让 do_execveat 能拿到精确 errno（ENOENT/EACCES/ENOEXEC...），替代历史上笼统的 ENOEXEC。
+// 构造一个「加载失败」结果：entry=0 + err=<errno>。供 load_elf 各失败点统一使用。
 static ElfLoadInfo fail(int err) {
     ElfLoadInfo info;
     info.err = err;
@@ -141,7 +135,7 @@ struct Seg {
 };
 
 // 读 + 校验 ELF64 header（64 字节）。BPF 固定 ELFCLASS64 + ELFDATA2LSB（小端 64 位），
-// 故魔数检查并入此函数（等价于原 elf_begin + elf_kind + gelf_getehdr 三步合一）。
+// 故魔数检查并入此函数。
 // 成功返回 true 并填 out；失败填具体原因到 err_reason（供调用方诊断输出）。
 static bool read_ehdr(int fd, Elf64_Ehdr& out, const char*& err_reason) {
     ssize_t n = pread(fd, &out, sizeof(out), 0);
@@ -152,7 +146,7 @@ static bool read_ehdr(int fd, Elf64_Ehdr& out, const char*& err_reason) {
     return true;
 }
 
-// 读第 i 个 program header（56 字节）。基于 ehdr 的 e_phoff/e_phentsize 定位。
+// 读第 i 个 program header（56 字节）。
 static bool read_phdr(int fd, const Elf64_Ehdr& eh, int i, Elf64_Phdr& out) {
     off_t off = eh.e_phoff + (off_t)i * eh.e_phentsize;
     ssize_t n = pread(fd, &out, sizeof(out), off);
@@ -205,8 +199,7 @@ void layout_module(const ElfFile& ef, size_t fi, bool is_dyn,
         }
     } else {
         // ET_EXEC：段 vaddr 已是绝对地址（bpfvm-ld 写死 guest_base_ 起），直接按 phdr 映射。
-        // 首段覆盖 ELF header + phdr table 的扩展由 bpfvm-ld 在产物里完成（PT_PHDR 配套），
-        // loader 不再需要特例处理。
+        // 首段覆盖 ELF header + phdr table 的扩展由 bpfvm-ld 在产物里完成（PT_PHDR 配套）。
         base_out = 0;
         for (size_t i = 0; i < eh.e_phnum; i++) {
             Elf64_Phdr ph;
@@ -243,7 +236,7 @@ bool map_segment(const Seg& s, const ElfFile& ef, memmap& m_out) {
     uint64_t page_start = s.vaddr & ~(PAGE - 1);
     uint64_t page_end = (s.vaddr + s.memsz + PAGE - 1) & ~(PAGE - 1);
     size_t map_size = page_end - page_start;
-    size_t head_off = s.vaddr - page_start;  // 段在页内的起始偏移
+    size_t head_off = s.vaddr - page_start;
 
     // p_filesz 由文件控制而映射大小由 p_memsz 决定，不钳制则 pread 越过宿主 mmap 边界
     if(s.filesz > s.memsz || head_off + s.filesz > map_size) {
@@ -298,7 +291,6 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
         // interp（动态链接器）找不到：对 guest 而言是程序所需的解释器不存在 -> ENOENT。
         return fail(ENOENT);
     }
-    // open ldso + 读 ehdr（手写解析，等价原 elf_begin + gelf_getehdr）。
     int ldso_fd = open(ldso_path.c_str(), O_RDONLY);
     if (ldso_fd < 0) {
         std::cerr << "[load_elf] failed to open ldso: " << guest_view(ldso_path) << ": " << strerror(errno) << "\n";
@@ -317,7 +309,6 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
     opened.push_back({ldso_fd, ldso_fd});
 
     // 地址分配 + 段布局：主程序（elves[0]）+ ldso（elves[1]），都按 ET_DYN PIE 分配。
-    //    不解析 DT_NEEDED、不收集依赖——那些由 guest ldso 在运行时自己 open/mmap。
     std::vector<ElfFile> elves = {{main_ef.path, main_ef.ehdr, main_ef.fd},
                                   {ldso_path, ldso_ehdr, ldso_fd}};
     uint64_t next_alloc = 0x40000000ULL;
@@ -366,7 +357,6 @@ ElfLoadInfo load_elf_ldso(ElfFile& main_ef, const char* interp_path,
 ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)> add,
                      const std::map<std::string, std::string>& envp) {
     // 加载 ET_EXEC（静态，固定地址）或 ET_DYN（PIE 主程序 / .so，运行时分配地址）。
-    // 运行时处理 .rela.dyn（数据/lddw 重定位）和 .rela.plt（GOT 槽）。
     Elf64_Ehdr ehdr;
     const char* err_reason = nullptr;
     if (!read_ehdr(main_fd, ehdr, err_reason)) {
@@ -374,7 +364,6 @@ ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)
                   << " (" << err_reason << ")" << std::endl;
         return fail(ENOEXEC);
     }
-    // opened：存本函数（含 ldso 路径）打开的待关闭 fd，Defer 统一关闭；main_fd 不在内。
     std::vector<std::pair<int, int>> opened;
     Defer defer_close([&]() {
         for (auto& [_, fd] : opened) { if (fd >= 0) close(fd); }
@@ -401,7 +390,7 @@ ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)
 
     // 静态路径（无 PT_INTERP）：bpfvm-ld -static 产物，自包含 ET_EXEC（固定地址），
     // 链接期已应用全部重定位，无 .dynamic/.rela.dyn/DT_NEEDED。loader 只需 mmap 段 +
-    // 算 entry/phdr。动态链接（有 PT_INTERP）走上面的 load_elf_ldso，依赖加载/重定位/
+    // 算 entry/phdr。
     std::vector<ElfFile> elves;
     elves.push_back({path, ehdr, main_fd});
 
@@ -425,7 +414,6 @@ ElfLoadInfo load_elf(int main_fd, const char* path, std::function<void(memmap&&)
         add(std::move(m));
     }
 
-    // 入口地址：ET_DYN（PIE）-> 主程序加载基址 + e_entry；ET_EXEC -> e_entry（绝对）
     const uint64_t entry = (ehdr.e_type == ET_DYN) ? (load_base[0] + ehdr.e_entry) : ehdr.e_entry;
 
     // program header table 的运行时地址（供 auxv AT_PHDR，musl __init_tls 用）：

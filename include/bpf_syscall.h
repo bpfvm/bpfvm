@@ -68,7 +68,7 @@
 #define BPF_SYS_SETPGID         55  /* setpgid(pid, pgrp) */
 #define BPF_SYS_GETPGID         56  /* getpgid(pid) */
 #define BPF_SYS_GETPGRP         57  /* getpgrp() == getpgid(0) */
-#define BPF_SYS_SETSID          58  /* setsid() */
+#define BPF_SYS_SETSID          58
 #define BPF_SYS_GETSID          59  /* getsid(pid) */
 #define BPF_SYS_FUTEX           60  /* futex(uaddr, op, val, timeout, uaddr2) — 第 6 参 val3 走 r0 */
 #define BPF_SYS_TKILL           61  /* tkill(tid, sig) */
@@ -97,9 +97,9 @@
 #define BPF_SYS_SIGNALFD4       84  /* signalfd4(fd, sigset*, sigsetsize, flags) — signalfd() 复用 */
 #define BPF_SYS_PSELECT6        85  /* pselect6(n, fd_set* r, w, e, timespec* ts, sigmask_data*) — select() 复用 */
 #define BPF_SYS_GETUID          86  /* getuid() — bpfvm 单用户 uid=0，供 OPENSSL_issetugid 等查询 */
-#define BPF_SYS_GETEUID         87  /* geteuid() */
-#define BPF_SYS_GETGID          88  /* getgid() */
-#define BPF_SYS_GETEGID         89  /* getegid() */
+#define BPF_SYS_GETEUID         87
+#define BPF_SYS_GETGID          88
+#define BPF_SYS_GETEGID         89
 #define BPF_SYS_GETGROUPS       90  /* getgroups(size, gid_t list[]) — bpfvm 无补充组，返回 0 */
 #define BPF_SYS_CLOCK_NANOSLEEP 91  /* clock_nanosleep(clk, flags, req, rem) — time.sleep 主路径 */
 #define BPF_SYS_FSYNC           92  /* fsync(fd) — os.fsync / sqlite */

@@ -1,7 +1,7 @@
 /*
  * /proc/[pid]/task 子目录 + thread-self 符号链接穿透测试。
  *
- * 覆盖点（本次 procfs 重构新增的能力）：
+ * 覆盖点：
  *   -  /proc/[pid]/task 目录可列举，单线程进程至少能看到 leader（自己的 tid）。
  *   -  多线程时 task 目录列出每个 tid，数量与创建的线程一致。
  *   -  /proc/thread-self 是相对符号链接（"<tgid>/task/<tid>"），readlink 返回原始相对

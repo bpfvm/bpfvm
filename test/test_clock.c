@@ -1,6 +1,6 @@
 // clock_nanosleep 验证：CPython time.sleep() 的主路径。
 //   相对睡眠（CLOCK_MONOTONIC, flags=0）与绝对睡眠（TIMER_ABSTIME）都必须成功
-//   （BPF_SYS_CLOCK_NANOSLEEP 之前未实现，musl 对 MONOTONIC/ABSTIME 直接拿 ENOSYS）。
+//   （BPF_SYS_CLOCK_NANOSLEEP 未实现时，musl 对 MONOTONIC/ABSTIME 直接拿 ENOSYS）。
 //   顺带验证非法 clockid 返回 EINVAL。
 #include <stdio.h>
 #include <stdint.h>

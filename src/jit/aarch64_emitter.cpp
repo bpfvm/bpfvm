@@ -482,7 +482,6 @@ void AArch64Emitter::reload_caller_saved() {
         ldr_imm(BPF_CALLER_SAVED_ARM[i], X28, (int32_t)(off_reg_ + i * 8), true);
 }
 void AArch64Emitter::spill_caller_saved() {
-    // SUB SP, #48; STP pairs
     add_imm(SP, SP, -48, true);
     stp(X9, X10, SP, 0, true);
     stp(X11, X12, SP, 16, true);
@@ -496,7 +495,7 @@ void AArch64Emitter::restore_caller_saved() {
 }
 
 // ---------------------------------------------------------------------------
-// Helper call: mov_imm X15, addr; BLR X15
+// Helper call
 // ---------------------------------------------------------------------------
 
 void AArch64Emitter::call_helper(void* addr) {
@@ -573,13 +572,13 @@ MemAccessContext AArch64Emitter::begin_mem_access(uint8_t base_reg, int16_t offs
     constexpr int32_t off_fl = (int32_t)offsetof(TlbEntry, flags);
     constexpr int32_t off_cw = (int32_t)offsetof(TlbEntry, cow);
 
-    // Bounds check 1: addr >= guest_base
+    // Bounds check: addr >= guest_base
     ldr_imm(X1, X15, off_gb, true);
     cmp_reg(X0, X1, true);
     ctx.miss_jumps.push_back(size());
     emit_insn(0x54000000u | ARMCond::CC); // B.cc (addr < base -> slow)
 
-    // Bounds check 2: addr + size <= guest_end
+    // Bounds check: addr + size <= guest_end
     add_imm(X2, X0, access_size, true);
     // 回绕检查：addr+size 溢出 2^64 时 X2 反而变小，仅凭范围比较会误判命中
     cmp_reg(X2, X0, true);
@@ -1314,17 +1313,16 @@ bool AArch64Emitter::emit_call_softfp(const bpf_insn* insn) {
 
 void AArch64Emitter::emit_call_syscall(const bpf_insn* insn, int cur, uint64_t entry_gpa) {
     flush_to_vm();
-    // Save pc (guest address)。用 X2 作写 pc 的临时，避免与 helper 第一参数 X0 复用
-    // （旧写法 mov_imm(X0) 后又 mov_reg(X0,X28) 覆盖，意图不清且 str_imm 的 fallback
-    //  会 clobber X1，隐式依赖 helper 不在 str 前设 X1）。X2 是参数寄存器，但这些 helper
-    //  最多 2 参（X0/X1），且写 pc 在设参数之前，无冲突。
+    // Save pc (guest address)。用 X2 作写 pc 的临时：X0 留作 helper 第一参数，且
+    // str_imm 的 fallback 会 clobber X1。X2 虽是参数寄存器，但这些 helper 最多
+    // 2 参（X0/X1），且写 pc 在设参数之前，无冲突。
     mov_imm(X2, entry_gpa + (uint64_t)cur * sizeof(bpf_insn), true);
     str_imm(X2, X28, (int32_t)off_pc_, true);
     // Call helper_do_syscall(vm*, call_id)
     mov_reg(X0, X28, true);
     mov_imm(X1, (uint64_t)(uint32_t)insn->imm, true);
     call_helper(helpers_->do_syscall);
-    // Check return (al != 0 means ok)
+    // Check return (w0 != 0 means ok)
     patch_branch_uncond(emit_far_czero(X0, false, /*taken_when_zero=*/true), vm_exit_offset);
     reload_from_vm();
 }
@@ -1372,7 +1370,7 @@ size_t AArch64Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_
                                               std::vector<AbortPatchInfo>& abort_patches,
                                               int bpf_index) {
     // 仅用 X0/X1/X2/X15 scratch，不碰 r1-r5(X9-X14)/r6-r9(X19-X22)/r10(X23)。
-    // 2a. 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
+    // 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
     auto rctx = begin_mem_access(X23, 0, 8, /*is_write=*/false);  // X0 = cur_frame host
     // and_imm 的内部 temp 是 X2（先 mov_imm X2 再 and）：X2 不得作源，也不得跨 and_imm 存活
     ldr_imm(X1, X0, 0, true);                     // X1 = cur_frame[0]
@@ -1389,7 +1387,7 @@ size_t AArch64Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_
     str_imm(X0, X28, (int32_t)off_scratch_, true);     // 暂存 frame_base（write-probe 会踩 scratch）
     finish_mem_access(rctx, abort_patches, bpf_index);
 
-    // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）。
+    // 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）。
     // frame[0] = callee_frame（编译期读帧槽的立即数；is_signal=0、alloca_len=0 时
     // frame_flags_make 的编码值 == stack_size 本身）；间接调用从 IC 槽取
     auto wctx = begin_mem_access(X0, 0, 64, /*is_write=*/true);  // X0 = 帧 host（base=X0=frame_base）
@@ -1770,9 +1768,9 @@ void AArch64Emitter::emit_safepoint(uint32_t loop_body_size, uint64_t insn_gpa) 
     patch_branch_cond(slow_patch, slow);
 
     flush_to_vm();
-    // 写当前 guest pc 到 vm->pc（同 x86 版本的注释：JIT 纯执行段不维护 vm->pc，
-    // 但 safepoint slow path 的 handle_signals 需要准确的 vm->pc 作信号返回地址）。
-    // 用 X2 作写 pc 的临时，X0 留给 helper 参数（见 emit_call_syscall 同款说明）。
+    // 写当前 guest pc 到 vm->pc：JIT 纯执行段不维护 vm->pc，但 safepoint slow path
+    // 的 handle_signals 需要准确的 vm->pc 作信号返回地址。用 X2 作写 pc 的临时，
+    // X0 留给 helper 参数（见 emit_call_syscall 的说明）。
     mov_imm(X2, insn_gpa, true);
     str_imm(X2, X28, (int32_t)off_pc_, true);
     mov_reg(X0, X28, true);

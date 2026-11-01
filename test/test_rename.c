@@ -11,7 +11,7 @@ int main() {
     unlink("test_rename_new");
     rmdir("test_rename_dir");
 
-    // Case 1: Simple rename with AT_FDCWD
+    // Simple rename with AT_FDCWD
     int fd = open("test_rename_old", O_CREAT | O_RDWR, 0644);
     if (fd < 0) {
         perror("open");
@@ -34,7 +34,7 @@ int main() {
         return 1;
     }
 
-    // Case 2: Rename using directory FDs
+    // Rename using directory FDs
     if (mkdir("test_rename_dir", 0755) < 0) {
         perror("mkdir");
         return 1;
@@ -70,7 +70,7 @@ int main() {
 
     close(dirfd);
     unlink("test_rename_new");
-    unlink("test_rename_dir/file_new"); // cleanup inside dir? or just rm -rf equivalent
+    unlink("test_rename_dir/file_new");
     // Since we don't have rm -rf easily, just unlink specific file
     int dirfd2 = open("test_rename_dir", O_RDONLY | O_DIRECTORY);
     unlinkat(dirfd2, "file_new", 0);

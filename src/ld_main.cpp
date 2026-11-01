@@ -33,7 +33,7 @@ enum class Mode { STATIC_EXE, DYNAMIC_EXE, SHARED_LIB, RELOCATABLE };
 
 struct Options {
     Mode mode = Mode::DYNAMIC_EXE;  // 默认动态链接（对齐标准 ld）
-    bool static_flag = false;       // -static
+    bool static_flag = false;
     bool strip_debug = false;       // --strip-debug：剥掉 DWARF 调试段（默认保留，对齐 ld）
     bool strip_all = false;         // -s/--strip-all：剥掉 DWARF + .symtab/.strtab（对齐 ld -s）
     std::vector<std::string> inputs;  // 输入 .o（可多个，gcc 经 bpf-gcc 链接时传多个）
@@ -91,10 +91,6 @@ int main(int argc, char** argv) {
     }
 
     // 手动扫描展开后的 args，兼容 clang/gcc 风格命令行（让 autoconf 项目的 $(CCLD) 可以直接调用）
-    // 已知 bpfvm-ld flags：-o, -e, -l, -l:, -L, -shared, -static, --soname, --entry
-    // 已知 clang/gcc 编译 flags（来自 CFLAGS，链接时传入，需忽略）：
-    //   -target, -nostdlib, -isystem, -I, -D, -O, -g, -std=, -m*, -f*, -W,
-    //   -bpf-stack-size=, -mllvm, ...
     auto ignore_flag = [&](const std::string& a) {
         std::cerr << "[bpfvm-ld] ignoring flag: " << a << "\n";
     };
@@ -173,7 +169,6 @@ int main(int argc, char** argv) {
         if (a.substr(0, 2) == "-L" && a.size() > 2) { opt.lib_dirs.push_back(a.substr(2)); continue; }
 
         // -l<name> / -l <name> / -l:<file>
-        // -static 模式只搜 lib<name>.a；否则搜 <name>.so（搜不到再搜 lib<name>.a，对齐标准 ld）
         if (a == "-l") {
             const char* v = next_arg(i, "-l");
             if (!v) return 1;
@@ -220,7 +215,6 @@ int main(int argc, char** argv) {
         }
 
         // 剩下的是位置参数：.o/.a/.so 都直接作为链接输入（可多个）；只有 -l/-l: 才走库搜索。
-        // （标准 ld 语义：位置参数=直接链接，-l=搜索库。gcc 经 bpf-gcc 链接时传多个 .o/.a。）
         if (a.ends_with(".c") || a.ends_with(".cc") || a.ends_with(".cpp")) {
             std::cerr << basename(argv[0]) << ": source file '" << a
                       << "' - bpfvm-ld only links, use clang to compile first\n";
@@ -260,7 +254,6 @@ int main(int argc, char** argv) {
             return s.size() >= suf.size() && s.substr(s.size() - suf.size()) == suf;
         };
         if (l.size() > 0 && l[0] == ':') {
-            // -l:<file>：去掉前导 ':'
             candidates.push_back(l.substr(1));
         } else if (ends_with(l, ".a") || ends_with(l, ".so")) {
             // 命令行直接传文件名（如 testgot_lib.a）：当文件路径搜索，不加 lib 前缀
@@ -269,7 +262,6 @@ int main(int argc, char** argv) {
             // -static 与 -r 都只搜 lib<name>.a：partial link 不接受共享库输入（标准 ld 同此）
             candidates.push_back("lib" + l + ".a");
         } else {
-            // 对齐标准 ld：-l <name> 搜 lib<name>.so，找不到再搜 lib<name>.a。
             candidates.push_back("lib" + l + ".so");
             candidates.push_back("lib" + l + ".a");
         }
@@ -291,7 +283,6 @@ int main(int argc, char** argv) {
     if (opt.mode == Mode::STATIC_EXE) {
         ok = link_bpf_object(opt.inputs, opt.output, resolved_libs, keep_debug, keep_symtab);
     } else if (opt.mode == Mode::RELOCATABLE) {
-        // partial link：合并输入 .o/.a 为单个 ET_REL（保留重定位，不解析符号）
         ok = link_bpf_relocatable(opt.inputs, opt.output, resolved_libs, keep_debug);
     } else if (opt.mode == Mode::DYNAMIC_EXE) {
         ok = link_bpf_exe(opt.inputs, opt.output, resolved_libs, opt.entry_name, keep_debug, keep_symtab);

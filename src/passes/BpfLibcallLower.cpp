@@ -158,8 +158,6 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
     return {LLVM_PLUGIN_API_VERSION, "BpfLibcallLower", LLVM_VERSION_STRING,
             [](PassBuilder &PB) {
-                // 晚跑（optimizer 末尾）：让优化器先消除可内联的小尺寸 intrinsic，
-                // 只改写剩下来的（动态长度/大尺寸/数学 intrinsic）。
                 auto addPass = [](ModulePassManager &MPM) {
                     FunctionPassManager FPM;
                     FPM.addPass(BpfLibcallLowerPass());
@@ -173,7 +171,6 @@ llvmGetPassPluginInfo() {
 #endif
                         addPass(MPM);
                     });
-                // -O0 兜底：直接在管道起始跑。
                 PB.registerPipelineStartEPCallback(
                     [addPass](ModulePassManager &MPM, OptimizationLevel OL) {
                         if (OL == OptimizationLevel::O0)

@@ -605,7 +605,6 @@ int64_t PosixSyscall::do_getpeername(vm* v) {
 // ===========================================================================
 // epoll
 // ===========================================================================
-//
 
 int64_t PosixSyscall::do_epoll_create1(vm* v) {
     int flags = arg_s32(v->r(1));
@@ -692,8 +691,7 @@ int64_t PosixSyscall::do_epoll_pwait(vm* v) {
     }
     for(int i = 0; i < n; ++i) {
         gev[i].events = hev[i].events;
-        // 同 do_epoll_ctl：data 按 u64 整体搬运（bpf::epoll_data_t 与 host epoll_data_t
-        // 是不同类型但同布局的 8B opaque union）。
+        // 同 do_epoll_ctl：data 按 u64 整体搬运。
         gev[i].data.u64 = hev[i].data.u64;
         // _pad 字段保持为 0（mmu_w 的内存不保证已清零；显式写更安全）
         gev[i]._pad   = 0;

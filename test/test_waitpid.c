@@ -4,7 +4,7 @@
 #include <sys/wait.h>
 
 int main(void) {
-    /* 同步管道：子进程进入死循环后通知父进程，取代盲等 sleep(2) */
+    /* 同步管道：子进程进入死循环后通知父进程 */
     int syncfd[2];
     if (pipe(syncfd) < 0) {
         printf("pipe failed\n");
@@ -29,7 +29,7 @@ int main(void) {
     }
 
     // Parent process
-    /* 等子进程确认进入死循环（同步，不再依赖固定 sleep）*/
+    /* 等子进程确认进入死循环（同步）*/
     close(syncfd[1]);
     char ack;
     if (read(syncfd[0], &ack, 1) != 1) {

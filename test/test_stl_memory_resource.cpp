@@ -22,7 +22,7 @@
 int main() {
     int failures = 0;
 
-    // (1) monotonic_buffer_resource：用栈缓冲区，分配不释放（仅析构时统一回收）
+    // monotonic_buffer_resource：用栈缓冲区，分配不释放（仅析构时统一回收）
     {
         unsigned char buf[256];
         std::pmr::monotonic_buffer_resource mbr(buf, sizeof(buf));
@@ -46,7 +46,7 @@ int main() {
         if (failures == 0) printf("[OK] monotonic_buffer_resource\n");
     }
 
-    // (2) unsynchronized_pool_resource：池分配 + do_deallocate 真正归还池
+    // unsynchronized_pool_resource：池分配 + do_deallocate 真正归还池
     {
         std::pmr::pool_options opts;
         opts.max_blocks_per_chunk = 4;
@@ -66,7 +66,7 @@ int main() {
         if (failures == 0) printf("[OK] unsynchronized_pool_resource\n");
     }
 
-    // (3) synchronized_pool_resource：线程安全池（单线程下行为同 unsynchronized）
+    // synchronized_pool_resource：线程安全池（单线程下行为同 unsynchronized）
     {
         std::pmr::synchronized_pool_resource pool;
         void *p = pool.allocate(64, alignof(double));
@@ -78,7 +78,7 @@ int main() {
         if (failures == 0) printf("[OK] synchronized_pool_resource\n");
     }
 
-    // (4) new_delete_resource / null_memory_resource / get/set_default_resource
+    // new_delete_resource / null_memory_resource / get/set_default_resource
     {
         auto *ndr = std::pmr::new_delete_resource();
         if (!ndr) { printf("FAIL new_delete_resource null\n"); failures++; }
@@ -103,7 +103,7 @@ int main() {
         if (failures == 0) printf("[OK] global resources + is_equal\n");
     }
 
-    // (5) polymorphic_allocator + pmr::vector：用 monotonic_buffer_resource 作分配器
+    // polymorphic_allocator + pmr::vector：用 monotonic_buffer_resource 作分配器
     {
         unsigned char buf[1024];
         std::pmr::monotonic_buffer_resource mbr(buf, sizeof(buf));

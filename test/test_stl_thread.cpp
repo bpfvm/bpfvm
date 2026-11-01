@@ -9,8 +9,8 @@
 //
 // host 变体用 g++ 编宿主 glibc，作为对照基线。
 //
-// 注意：(1)刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store，C++ <atomic> 的
-// load/store 会撞 BPF 后端，改用 mutex 保护普通 int；(2)所有同步靠 join/wait 显式定序，
+// 注意：刻意避免 std::atomic——eBPF ISA 无 plain atomic load/store，C++ <atomic> 的
+// load/store 会撞 BPF 后端，改用 mutex 保护普通 int；所有同步靠 join/wait 显式定序，
 // 不依赖时序，保证 host 与 BPF（单核解释/JIT）行为一致。
 
 #include <thread>
@@ -25,7 +25,7 @@
 int main() {
     int failures = 0;
 
-    // (1) std::thread + join：两个线程各自累加（mutex 保护），join 后验证。
+    // std::thread + join：两个线程各自累加（mutex 保护），join 后验证。
     {
         std::mutex m;
         int counter = 0;
@@ -44,7 +44,7 @@ int main() {
         }
     }
 
-    // (2) std::mutex + lock_guard：互斥保护的共享计数（4 线程 * 10000）。
+    // std::mutex + lock_guard：互斥保护的共享计数（4 线程 * 10000）。
     {
         std::mutex m;
         long x = 0;
@@ -62,7 +62,7 @@ int main() {
         }
     }
 
-    // (3) std::async(std::launch::async) + std::future::get：异步计算并取回结果。
+    // std::async(std::launch::async) + std::future::get：异步计算并取回结果。
     {
         auto f = std::async(std::launch::async, [](int a, int b) { return a + b; }, 40, 2);
         int r = f.get();
@@ -72,7 +72,7 @@ int main() {
         }
     }
 
-    // (4) std::promise / std::future：跨线程设值，主线程取值。
+    // std::promise / std::future：跨线程设值，主线程取值。
     {
         std::promise<int> p;
         std::future<int> ff = p.get_future();
@@ -85,7 +85,7 @@ int main() {
         }
     }
 
-    // (5) std::condition_variable：生产者置标志并 notify，消费者 wait(谓词) 直到就绪。
+    // std::condition_variable：生产者置标志并 notify，消费者 wait(谓词) 直到就绪。
     {
         std::mutex m;
         std::condition_variable cv;
@@ -106,7 +106,7 @@ int main() {
         }
     }
 
-    // (6) std::condition_variable + 多个消费者：notify_all 唤醒所有等待者。
+    // std::condition_variable + 多个消费者：notify_all 唤醒所有等待者。
     {
         std::mutex m;
         std::condition_variable cv;
@@ -135,7 +135,7 @@ int main() {
         }
     }
 
-    // (7) std::this_thread::get_id / thread::get_id：同一线程内 get_id 一致，不同线程不同。
+    // std::this_thread::get_id / thread::get_id：同一线程内 get_id 一致，不同线程不同。
     {
         auto self = std::this_thread::get_id();
         std::thread::id other;
@@ -147,7 +147,7 @@ int main() {
         }
     }
 
-    // (8) thread::hardware_concurrency()：返回值应 >=1（不强求具体值，宿主/BPF 都可能返回 1）。
+    // thread::hardware_concurrency()：返回值应 >=1（不强求具体值，宿主/BPF 都可能返回 1）。
     {
         unsigned hc = std::thread::hardware_concurrency();
         if (hc < 1) {
@@ -156,7 +156,7 @@ int main() {
         }
     }
 
-    // (9) std::call_once：多线程并发调用，仅执行一次。
+    // std::call_once：多线程并发调用，仅执行一次。
     //     calls 在 std::call_once 内部回调里 ++（串行化），读取在 join 后，普通 int 安全。
     {
         std::once_flag flag;
@@ -172,7 +172,7 @@ int main() {
         }
     }
 
-    // (10) std::async 返回多个 future 并行求和。
+    // std::async 返回多个 future 并行求和。
     {
         auto sq = [](int x) { return (long)x * x; };
         auto f1 = std::async(std::launch::async, sq, 10);

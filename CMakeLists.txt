@@ -15,10 +15,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBELF REQUIRED libelf)
 
-#SET(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-#SET(BUILD_SHARED_LIBRARIES OFF)
-#SET(CMAKE_EXE_LINKER_FLAGS "-static")
-
 add_compile_options(-Wall -Wextra -Werror -fPIC -fno-omit-frame-pointer)
 
 include_directories(${LIBELF_INCLUDE_DIRS})
@@ -104,10 +100,6 @@ if(BPFVM_BUILD_BPF)
                 -DBPFVM_PASS_SOFTFP=$<TARGET_FILE:BpfSoftFp>
                 -DBPFVM_PASS_LIBCALLLOWER=$<TARGET_FILE:BpfLibcallLower>
                 -DBPFVM_PASS_EMUTLS=$<TARGET_FILE:BpfEmutls>
-                # 源文件列表由 src/CMakeLists.txt 与 src/posix/CMakeLists.txt 导出
-                # （相对 ${CMAKE_SOURCE_DIR} 的相对路径，子项目里拼上 ${BPFVM_ROOT}/ 前缀）。
-                # 走 ExternalProject 的 LIST_SEPARATOR：值里 ";" 换成 "|" 传入，子项目
-                # 收到的变量里 "|" 会被还原回 ";"，可直接当 CMake list 用。
                 -DBPFVM_LIB_SOURCES=${_lib_sources_arg}
                 -DBPFVM_MAIN_SOURCE=${_main_source_arg}
                 -DBPFVM_POSIX_SOURCES=${_posix_sources_arg}
@@ -119,7 +111,6 @@ if(BPFVM_BUILD_BPF)
             BUILD_ALWAYS     1
             # 先编 host 工具链（bpfvm-ld + 4 个 pass .so）再 configure 子项目。
             DEPENDS          bpfvm-ld BpfWideArgs BpfSoftFp BpfLibcallLower BpfEmutls
-            # 子项目产物拷到顶层 build/bpfvm.bpf。
             INSTALL_COMMAND  ${CMAKE_COMMAND} -E copy
                              ${CMAKE_BINARY_DIR}/bpfvm_bpf/bpfvm.bpf
                              ${CMAKE_BINARY_DIR}/bpfvm.bpf)

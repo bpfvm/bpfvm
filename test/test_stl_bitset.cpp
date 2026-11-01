@@ -15,7 +15,7 @@
 int main() {
     int failures = 0;
 
-    // (1) 构造 + count：8 位 bitset，3 个置位。
+    // 构造 + count：8 位 bitset，3 个置位。
     {
         std::bitset<8> b(0b00010101);  // 3 bits set
         if (b.count() != 3) {
@@ -24,7 +24,7 @@ int main() {
         }
     }
 
-    // (2) set/reset/test/flip。
+    // set/reset/test/flip。
     {
         std::bitset<8> b;
         b.set(1);
@@ -41,7 +41,7 @@ int main() {
         }
     }
 
-    // (3) 运算符 & | ^ ~。
+    // 运算符 & | ^ ~。
     {
         std::bitset<8> a(0b11001010), b(0b10110110);
         auto and_ = (a & b).to_ulong();
@@ -53,7 +53,7 @@ int main() {
         }
     }
 
-    // (4) 移位 << >>。
+    // 移位 << >>。
     {
         std::bitset<8> b(0b00000011);
         b <<= 4;
@@ -68,7 +68,7 @@ int main() {
         }
     }
 
-    // (5) 字符串转换 to_string / 构造自字符串。
+    // 字符串转换 to_string / 构造自字符串。
     {
         std::bitset<8> b(std::string("10101010"));
         if (b.to_string() != "10101010" || b.count() != 4) {
@@ -77,7 +77,7 @@ int main() {
         }
     }
 
-    // (6) 大 bitset（跨多个 word）：64 位，count（走 __bit_iterator 的 __count
+    // 大 bitset（跨多个 word）：64 位，count（走 __bit_iterator 的 __count
     //     特化路径——本测试 lowerAggregateParams 验证的核心点）。
     {
         std::bitset<64> b;
@@ -94,7 +94,7 @@ int main() {
         }
     }
 
-    // (7) all/any/none（全 1 时 all）。
+    // all/any/none（全 1 时 all）。
     {
         std::bitset<4> b(0b1111);
         std::bitset<4> e;

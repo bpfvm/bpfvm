@@ -13,7 +13,8 @@
  *      状态（仍被 block）。
  *   -  setjmp/longjmp 基本回跳仍正确（防止改动引入回归）。
  *
- * BPF 上 setjmp == sigsetjmp(env, 1)（总是保存掩码），故 case 3 等价于 case 1。
+ * BPF 上 setjmp == sigsetjmp(env, 1)（总是保存掩码），故 case_basic_setjmp 等价于
+ * case_savemask。
  * 掩码查询用 sigprocmask(SIG_BLOCK, NULL, &set) 读当前掩码，检查目标位是否置位。
  */
 
@@ -24,7 +25,7 @@ static int mask_has(int sig) {
     return sigismember(&set, sig) ? 1 : 0;
 }
 
-/* case 1：sigsetjmp(env, 1) 保存掩码，siglongjmp 后恢复 */
+/* sigsetjmp(env, 1) 保存掩码，siglongjmp 后恢复 */
 static sigjmp_buf buf1;
 static int case_savemask(void) {
     /* 起点：确保 SIGUSR1 未被 block */
@@ -60,7 +61,7 @@ static int case_savemask(void) {
     return 0;
 }
 
-/* case 2：sigsetjmp(env, 0) 不保存掩码，siglongjmp 后掩码保持调用时状态 */
+/* sigsetjmp(env, 0) 不保存掩码，siglongjmp 后掩码保持调用时状态 */
 static sigjmp_buf buf2;
 static int case_nosavemask(void) {
     sigset_t set;
@@ -97,7 +98,7 @@ static int case_nosavemask(void) {
     return 0;
 }
 
-/* case 3：setjmp/longjmp 基本回跳（setjmp 在 BPF 上 == sigsetjmp(env,1)） */
+/* setjmp/longjmp 基本回跳（setjmp 在 BPF 上 == sigsetjmp(env,1)） */
 static jmp_buf buf3;
 static int case_basic_setjmp(void) {
     int r = setjmp(buf3);

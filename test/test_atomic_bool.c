@@ -21,7 +21,7 @@ struct Padded {
 int main(void) {
     int ok = 1;
 
-    // —— 1. compare_exchange 成功路径（_Bool，即 i8）——
+    // —— compare_exchange 成功路径（_Bool，即 i8）——
     {
         _Bool b = 0;
         _Bool expected = 0;
@@ -31,7 +31,7 @@ int main(void) {
         ok &= success && b == 1 && expected == 0;
     }
 
-    // —— 2. compare_exchange 失败路径（期望值不匹配）——
+    // —— compare_exchange 失败路径（期望值不匹配）——
     {
         _Bool b = 1;
         _Bool expected = 0;
@@ -42,7 +42,7 @@ int main(void) {
         ok &= !success && b == 1 && expected == 1;
     }
 
-    // —— 3. fetch_add（atomic_char，i8）——
+    // —— fetch_add（atomic_char，i8）——
     {
         uint8_t c = 100;
         uint8_t old = __atomic_fetch_add(&c, 5, __ATOMIC_SEQ_CST);
@@ -50,7 +50,7 @@ int main(void) {
         ok &= old == 100 && c == 105;
     }
 
-    // —— 4. 相邻字节完整性（子字节 CAS 越界检测）——
+    // —— 相邻字节完整性（子字节 CAS 越界检测）——
     // 关键测试：原子字段只有 1 字节，展开成 i32 CAS 会读写包含它的 4 字节槽。
     // 如果 mask/shift 算错，会写脏 before/after。
     {
@@ -71,7 +71,7 @@ int main(void) {
         ok &= !success && p.before == 0xAB && p.val == 0x42 && p.after == 0xCD;
     }
 
-    // —— 5. fetch_or on char（位运算 widen 分支）——
+    // —— fetch_or on char（位运算 widen 分支）——
     {
         uint8_t c = 0x0F;
         uint8_t old = __atomic_fetch_or(&c, 0x30, __ATOMIC_SEQ_CST);
@@ -79,7 +79,7 @@ int main(void) {
         ok &= old == 0x0F && c == 0x3F;
     }
 
-    // —— 6. short (i16) fetch_add ——
+    // —— short (i16) fetch_add ——
     {
         uint16_t s = 1000;
         uint16_t old = __atomic_fetch_add(&s, 23, __ATOMIC_SEQ_CST);

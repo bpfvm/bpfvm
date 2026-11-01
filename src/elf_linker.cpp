@@ -54,7 +54,6 @@ constexpr size_t kPltStubSize = 40;
 // （运行期 push_frame 读 桩入口-8）。
 constexpr size_t kPltEntrySize = 8 + kPltStubSize;
 
-// 单个加载后的 section
 struct LoadedSection {
     std::string name;
     uint64_t guest_addr = 0;   // 加载到 VM 内的地址（layout_segments 后按所在段计算）
@@ -75,7 +74,6 @@ struct LoadedSection {
     bool slotted = false;
 };
 
-// 符号
 struct LoadedSym {
     std::string name;
     size_t sec_idx = SIZE_MAX;  // 所属 section 在 LoadedObject::sections 的下标；UND -> SIZE_MAX
@@ -87,7 +85,6 @@ struct LoadedSym {
     bool defined = false;       // sec_idx != SIZE_MAX
 };
 
-// 重定位
 struct LoadedReloc {
     size_t target_sec;          // 要 patch 的 section 下标
     uint64_t offset;            // 在该 section 内的偏移
@@ -115,7 +112,6 @@ struct DebugSec {
     size_t contrib_off = 0;
 };
 
-// 加载后的 .o
 struct LoadedObject {
     std::string source;         // 路径或 "archive:member"
     std::vector<LoadedSection> sections;
@@ -345,7 +341,6 @@ bool parse_archive(const uint8_t* data, size_t size, std::vector<ArMember>& out)
         std::string size_str((const char*)p + 48, 10);
         if (memcmp(p + 58, "`\n", 2) != 0) break;
 
-        // 去掉 size_str 尾部空格
         while (!size_str.empty() && isspace(size_str.back())) size_str.pop_back();
         size_t member_size = 0;
         try {
@@ -378,7 +373,6 @@ bool parse_archive(const uint8_t* data, size_t size, std::vector<ArMember>& out)
             // 普通名字，以 '/' 结尾（System V 风格）
             size_t slash = raw_name.find('/');
             name = (slash == std::string::npos) ? raw_name : raw_name.substr(0, slash);
-            // 去尾部空格
             while (!name.empty() && isspace(name.back())) name.pop_back();
             if (!name.empty()) {
                 out.push_back({name, member_data, member_size});
@@ -463,7 +457,7 @@ private:
     std::unordered_map<uint64_t, uint64_t> loclist_ss_;
 
     // loclists_base 旧值 -> 新值（fix_loclists_breg10 重建 .debug_loclists 后填）。
-    // 贡献区按真实长度重建（不再 padding），后续贡献区起点会位移 -> 其 loclists_base 改变，
+    // 贡献区按真实长度重建（不 padding），后续贡献区起点会位移 -> 其 loclists_base 改变，
     // remap_loclists_base 据此定长改写 .debug_info 里的 DW_AT_loclists_base(sec_offset)。
     std::unordered_map<uint64_t, uint64_t> loclists_base_remap_;
 
@@ -579,7 +573,6 @@ public:
         return false;
     }
 
-    // 执行链接
     bool run(const std::vector<std::string>& inputs) {
         if (!pool_) return false;
 
@@ -594,7 +587,6 @@ public:
         }
 
         if (mode_ == Mode::STATIC_EXE) {
-            // 静态：加载所有输入（.o/.a，按类型分流）
             for (const auto& in : inputs) {
                 if (!load_input(in)) {
                     std::cerr << "[elf_linker] failed to load: " << in << "\n";
@@ -614,7 +606,6 @@ public:
                     return false;
                 }
             }
-            // 库：加载所有输入（.a/.o/.so，按类型分流）
             for (const auto& in : inputs) {
                 if (!load_input(in)) {
                     std::cerr << "[elf_linker] failed to load: " << in << "\n";
@@ -648,7 +639,6 @@ public:
                         break;
                 }
             }
-            // 加载所有输入（.o/.a/.so，按类型分流）
             for (const auto& in : inputs) {
                 if (!load_input(in)) {
                     std::cerr << "[elf_linker] failed to load: " << in << "\n";
@@ -692,7 +682,6 @@ public:
         // layout 后 .got/.plt 的 guest_addr 已定：回填 PLT 桩字节码（lddw imm = GOT 槽地址）
         if (got_enabled_ && !finalize_plt_stubs()) return false;
 
-        // 应用重定位
         for (size_t i = 0; i < objects_.size(); i++) {
             if (!apply_relocations(i)) {
                 std::cerr << "[elf_linker] relocations failed for " << objects_[i].source << "\n";
@@ -998,7 +987,6 @@ public:
                 } else {
                     auto& [idx, acc] = it->second;
                     auto& out = extras[idx];
-                    // 对齐填充到 align 倍数
                     if (align > 1 && (acc % align) != 0) {
                         size_t pad = align - (acc % align);
                         if (out.type != SHT_NOBITS) {
@@ -1006,7 +994,6 @@ public:
                         }
                         acc += pad;
                     }
-                    // 取最大对齐
                     if (align > out.addralign) out.addralign = align;
                     rel_contrib_off_[{oi, si}] = acc;
                     rel_sec_out_index_[{oi, si}] = idx;
@@ -1109,7 +1096,6 @@ public:
             if (cit == rel_contrib_off_.end()) return s.value;
             return cit->second + s.value;
         };
-        // 计算某输入符号的输出 shndx
         auto sym_shndx = [&](size_t oi, const LoadedSym& s) -> Elf64_Half {
             if (s.sec_idx == SIZE_MAX) {
                 return (s.type == STT_FILE) ? SHN_ABS : SHN_UNDEF;
@@ -1123,7 +1109,7 @@ public:
             Elf64_Sym es = {};
             es.st_name = add_name(s.name);
             es.st_info = GELF_ST_INFO(s.binding, s.type);
-            es.st_other = GELF_ST_VISIBILITY(s.visibility);  // 保留原可见性
+            es.st_other = GELF_ST_VISIBILITY(s.visibility);
             es.st_shndx = sym_shndx(oi, s);
             es.st_value = sym_value(oi, s);
             es.st_size = s.size;
@@ -1159,7 +1145,7 @@ public:
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (size_t si = 1; si < objects_[oi].symbols.size(); si++) {  // 跳过 NULL 符号
                 const auto& s = objects_[oi].symbols[si];
-                if (s.defined) continue;              // 已处理
+                if (s.defined) continue;
                 if (s.binding == STB_LOCAL) continue; // local UND 不输出
                 // 已有定义的符号名不输出 UND 条目（定义在 globals_ 里，已输出）
                 if (globals_.count(s.name)) continue;
@@ -1167,7 +1153,7 @@ public:
                 Elf64_Sym es = {};
                 es.st_name = add_name(s.name);
                 es.st_info = GELF_ST_INFO(s.binding, s.type);
-                es.st_other = GELF_ST_VISIBILITY(s.visibility);  // 保留原可见性
+                es.st_other = GELF_ST_VISIBILITY(s.visibility);
                 es.st_shndx = SHN_UNDEF;
                 es.st_value = 0;
                 es.st_size = 0;
@@ -1190,7 +1176,7 @@ public:
     // .rela.text（目标段 index 相同）。r_offset 重定位到合并段内（contrib_off + r.offset），
     // r_info 重索引到输出 symtab，addend 原样保留。不跳过任何重定位类型（含 call type 10）。
     void build_rel_relocations(std::vector<SecBuf>& extras, size_t symtab_idx) {
-        // 输出目标段 index -> (extras 下标, 段名)
+        // 输出目标段 index -> .rela 段在 extras 的下标
         std::map<size_t, size_t> outsec_to_rela;
         for (size_t oi = 0; oi < objects_.size(); oi++) {
             for (const auto& r : objects_[oi].relocations) {
@@ -1391,9 +1377,8 @@ private:
     // 依赖 .so 以非 weak UND 引用、期望从外部获得的符号名。DYNAMIC_EXE 若只在
     // 本链接单元有 hidden 定义,导出闸门会跳过 -> 运行期 ldso 解析失败。结构性
     // 案例:main —— 本平台 crt(_start)住在共享 ldso 里,对 main 的跨模块引用是
-    // 平台契约,不应转嫁给应用程序(此前 cpython 因此打 visibility patch)。
+    // 平台契约,不应转嫁给应用程序。
     std::unordered_set<std::string> bpfso_und_strong_;
-    // 从文件加载一个 ET_REL .o
     size_t load_rel_file(const std::string& path) {
         std::vector<uint8_t> data;
         if (!read_file(path, data)) return SIZE_MAX;
@@ -1466,7 +1451,7 @@ private:
         }
 
         // 计算 total_size（所有 loadable section 进 pool，.so 的 _start 也在 .so 内部，
-        // 主程序通过 PLT/GOT 调用，不再需要把 _start 代码单独移出）
+        // 主程序通过 PLT/GOT 调用）
         size_t total_size = 0;
         for (size_t i = 1; i < obj.sections.size(); i++) {
             LoadedSection& ls = obj.sections[i];
@@ -1715,7 +1700,6 @@ private:
         }
     }
 
-    // 把 obj 的所有 GLOBAL 符号注册到 globals_
     // hidden 符号的强制导出判定:标准 ld 的按需导出只覆盖默认可见符号;这里把
     // 被依赖 .so 强(非 weak)引用的 exe 定义符号越过 hidden 边界提升导出。
     bool forced_export(const std::string& name) const {
@@ -1739,7 +1723,7 @@ private:
                 // 和 mallocng/malloc.o（strong __libc_malloc_impl）。archive 拉入顺序不定，
                 // 若 weak 先注册而 strong 不覆盖，malloc 会错误地链到 lite_malloc（brk 分配
                 // 器），与 mallocng 的 free 配对立刻崩溃。weak 不覆盖 strong；两个 strong
-                // 保留先到的（与原行为一致，不新增报错）。
+                // 保留先到的（不新增报错）。
                 const auto& existing = objects_[it->second.obj_idx].symbols[it->second.sym_idx];
                 if (existing.binding == STB_WEAK && sym.binding == STB_GLOBAL) {
                     globals_[sym.name] = {obj_idx, i};
@@ -1760,7 +1744,6 @@ private:
     // src_reg=2 + imm=<ID>。
     static constexpr const char* kFpKsymPrefix = "__bpf_fp_";
 
-    // 是否 FP ksym 符号。
     static bool is_fp_ksym(const std::string& name) {
         return name.rfind(kFpKsymPrefix, 0) == 0;  // 以 prefix 开头
     }
@@ -1810,7 +1793,6 @@ private:
     std::optional<uint64_t> resolve_symbol(size_t obj_idx, size_t sym_idx) const {
         const auto& sym = objects_[obj_idx].symbols[sym_idx];
 
-        // STB_LOCAL：本 obj 私有，直接用本 obj 定义
         if (sym.binding == STB_LOCAL) {
             const auto& sec = objects_[obj_idx].sections[sym.sec_idx];
             return sec.guest_addr + sym.value;
@@ -1884,7 +1866,7 @@ private:
         return sec.guest_addr + def_sym.value;
     }
 
-    // 加载 .so 文件，提取其 symtab 中所有 GLOBAL 符号 -> 地址映射
+    // 加载 .so 文件，提取其 .dynsym 中所有 GLOBAL 符号 -> 地址映射
     // 不加载内容到 pool_，只读符号信息
     bool load_bpfso_symbols(const std::string& path) {
         std::vector<uint8_t> data;
@@ -2005,7 +1987,7 @@ private:
 
         // -  构建 extras（按 mode_ 条件追加）
         std::vector<SecBuf> extras;
-        // 2a. DWARF 调试段（最先 push：在 extras 区前部，便于 shstrtab 自动注册名字）。
+        // DWARF 调试段（最先 push：在 extras 区前部，便于 shstrtab 自动注册名字）。
         //     .debug_addr/.debug_ranges 等含运行时地址的重定位走 debug->loadable 分支，
         //     返回 guest_addr。STATIC_EXE 下 guest_addr 即最终地址；PIE 模式下 guest_addr
         //     是文件内偏移（基址 0），运行时由 VM 加载基址后，GDB 经 qOffsets/RSP 获得真实
@@ -2021,7 +2003,7 @@ private:
             // 在 collect_debug_sections 之后：它已跳过输入的空 .debug_frame，这里补合成版。
             synthesize_debug_frame(extras);
         }
-        // 2b. 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
+        // 静态符号表（三种模式都输出，含本地 FUNC/OBJECT，供反汇编/调试）。
         //     -s/--strip-all 时跳过（对齐标准 ld；运行时符号解析仍走 .dynsym）。
         if (keep_symtab_) {
             build_static_symtab(extras, extras_base, bss_shndx, seg_shndx);
@@ -2037,7 +2019,7 @@ private:
         }
         ShstrtabOut names = build_shstrtab(extras, has_plt, has_gotplt, has_bss);
 
-        // 2c. DWARF 重定位 patch + 偏移修正：必须在 compute_file_layout 之前完成，
+        // DWARF 重定位 patch + 偏移修正：必须在 compute_file_layout 之前完成，
         //     因为 fix_fbreg_offsets / fix_loclists_breg10 可能改变 .debug_info /
         //     .debug_loclists 长度（SLEB128 变长重写），若在布局后才改，后续段的文件偏移
         //     会与变化后的尺寸不一致 -> 段重叠/破坏。resolve_debug_value 用的是 guest 地址
@@ -2109,7 +2091,6 @@ private:
                 } else {
                     auto& [idx, acc] = it->second;
                     auto& out = extras[idx];
-                    // 对齐填充到 align 的倍数
                     if (align > 1 && (acc % align) != 0) {
                         size_t pad = align - (acc % align);
                         out.data.insert(out.data.end(), pad, 0);
@@ -2743,7 +2724,7 @@ private:
     //   offset_table[i] = 第 i 条 loclist 起点相对 loclists_base 的偏移（loclistx 索引经此定位）；
     //   loclists_base = 贡献区起点 + 12（offset_table 起点）。
     //
-    // 三阶段完整重写（不再 padding 到原长，故 stacksize>64 的 SLEB128 变长 loclist 也能修）：
+    // 三阶段完整重写（贡献区不 padding 到原长，stacksize>64 的 SLEB128 变长 loclist 也能修）：
     //   A. 每条 loclist 按修正后 SLEB128 的【真实长度】重建。
     //   B. offset_table[i] 用新 loclist 起点相对新 loclists_base 的偏移重算（条数/定长 4B 不变，只值变）。
     //   C. 贡献区按真实新长度拼接 -> 后续贡献区起点位移 -> 其 loclists_base 改变；
@@ -3194,7 +3175,7 @@ private:
             Elf64_Sym s = {};
             s.st_name = add_name(sym.name);
             s.st_info = GELF_ST_INFO(bind, sym.type == 0 ? STT_FUNC : sym.type);
-            s.st_other = GELF_ST_VISIBILITY(sym.visibility);  // 保留原可见性
+            s.st_other = GELF_ST_VISIBILITY(sym.visibility);
             s.st_shndx = sym_to_shndx(obj, sym.sec_idx, bss_shndx, seg_shndx);
             s.st_value = sec_guest_addr_of(obj, sym.sec_idx) + sym.value;
             s.st_size = sym.size;
@@ -3733,7 +3714,6 @@ private:
             memcpy(dynsym_data.data() + dyn_idx.dynamic_sym_off + 8, &dyn_vaddr, 8);
         }
 
-        // 回填 .dynamic 的 DT_* 指针
         auto& dyn_data = extras[dyn_idx.dynamic_idx].data;
         for (size_t off = 0; off + sizeof(Elf64_Dyn) <= dyn_data.size(); off += sizeof(Elf64_Dyn)) {
             Elf64_Dyn d;
@@ -3920,7 +3900,6 @@ private:
                 if (fwrite(pad.data(), 1, pad.size(), f) != pad.size()) return false;
             }
         }
-        // extras
         for (size_t i = 0; i < extras.size(); i++) {
             long now = ftell(f);
             uint64_t target = L.extra_offs[i];
@@ -4008,7 +3987,6 @@ private:
         return obj.sections[sec_idx].guest_addr;
     }
 
-    // 应用一个 .o 的所有重定位
     bool apply_relocations(size_t obj_idx) {
         auto& obj = objects_[obj_idx];
         // PIC 模式：绝对引用（lddw/数据指针）不构建期 patch，留占位给 VM 运行时填

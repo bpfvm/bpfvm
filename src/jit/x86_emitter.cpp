@@ -64,7 +64,7 @@ void X86Emitter::mov_rip_literal(uint8_t dst, size_t data_off) {
 
 // ---------------------------------------------------------------------------
 // SIB-addressed operations: [RBP + R11 + disp32]
-// R11 用作 TLB 索引寄存器（scratch 寄存器，替代旧方案中的 RDI）
+// R11 用作 TLB 索引寄存器（scratch 寄存器）
 //
 // SIB 编码：
 //   ModRM = mod:10 reg:xxx rm:100 (SIB follows)
@@ -103,7 +103,7 @@ void X86Emitter::sib_cmp_byte(int32_t disp, uint8_t imm) {
 }
 
 // ---------------------------------------------------------------------------
-// BPF register access — 全部 BPF 寄存器都在 x86 物理寄存器中
+// BPF register access
 // ---------------------------------------------------------------------------
 
 void X86Emitter::load_bpf(uint8_t bpf_reg, uint8_t x86_dst) {
@@ -127,35 +127,30 @@ void X86Emitter::store_bpf(uint8_t bpf_reg, uint8_t x86_src) {
 // ---------------------------------------------------------------------------
 
 void X86Emitter::flush_to_vm() {
-    // 写回全部 10 个可写 BPF 寄存器到 vm->reg[]（r10 只读，不写回）
     for (int i = 0; i < 10; i++) {
         store_r64((int32_t)(off_reg_ + i * 8), BPF_REG_MAP[i]);
     }
 }
 
 void X86Emitter::reload_from_vm() {
-    // 从 vm->reg[] 加载全部 10 个可写 BPF 寄存器
     for (int i = 0; i < 10; i++) {
         load_r64(BPF_REG_MAP[i], (int32_t)(off_reg_ + i * 8));
     }
 }
 
 void X86Emitter::reload_caller_saved() {
-    // 只加载 r0-r5（callee-saved 的 r6-r9 在 CALL 后自动存活）
     for (int i = 0; i < BPF_CALLER_SAVED_COUNT; i++) {
         load_r64(BPF_CALLER_SAVED_X86[i], (int32_t)(off_reg_ + i * 8));
     }
 }
 
 void X86Emitter::spill_caller_saved() {
-    // push r0-r5 的 x86 寄存器到栈（TLB miss 慢速路径用）
     for (int i = 0; i < BPF_CALLER_SAVED_COUNT; i++) {
         push_reg(BPF_CALLER_SAVED_X86[i]);
     }
 }
 
 void X86Emitter::restore_caller_saved() {
-    // pop 恢复 r0-r5（反向顺序）
     for (int i = BPF_CALLER_SAVED_COUNT - 1; i >= 0; i--) {
         pop_reg(BPF_CALLER_SAVED_X86[i]);
     }
@@ -611,7 +606,6 @@ void X86Emitter::emit_inline_div(bool is_64, bool is_unsigned, bool is_mod) {
 //
 // 快速路径：查 TLB，命中则直接得到 host 指针
 // 慢速路径：push/pop caller-saved 寄存器，调用 helper_mmu
-// R11 用作 TLB 索引寄存器（替代旧方案中的 RDI）
 // ---------------------------------------------------------------------------
 
 MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
@@ -619,7 +613,6 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
     MemAccessContext ctx{};
     int32_t tlb_off = (int32_t)off_tlb_;
 
-    // Load guest address into RAX from the mapped x86 register, then apply BPF offset
     if (base_x86_reg != X86::RAX) {
         mov_r64(X86::RAX, base_x86_reg);
     }
@@ -702,14 +695,13 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
     spill_caller_saved();
 
     // 设置 System V ABI 参数：RDI=vm*, RSI=guest_addr, EDX=size
-    mov_r64(X86::RDI, X86::RBP);                             // mov rdi, rbp
+    mov_r64(X86::RDI, X86::RBP);
     // RAX 里的 guest addr 已经被 spill_caller_saved 的 push 指令破坏了？
     // 不会：RAX 是 scratch，不在 caller-saved 列表中，push 不影响它
-    mov_r64(X86::RSI, X86::RAX);                             // mov rsi, rax
+    mov_r64(X86::RSI, X86::RAX);
     emit8(0xBA); emit32((uint32_t)access_size);              // mov edx, size
     call_helper(is_write ? helpers_->mmu_w : helpers_->mmu);
 
-    // 恢复 caller-saved 的 BPF 寄存器
     restore_caller_saved();
 
     // Test for null (memory violation)
@@ -724,11 +716,9 @@ MemAccessContext X86Emitter::begin_mem_access(uint8_t base_x86_reg,
 
 void X86Emitter::finish_mem_access(MemAccessContext& ctx,
                                      std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
-    // Patch miss jumps -> .slow
     for (size_t off : ctx.miss_jumps) {
         patch_branch_cond(off, ctx.slow_start);
     }
-    // Patch fast-path JMP -> .done
     patch_branch_uncond(ctx.done_jmp, ctx.done_offset);
     // Record abort jumps for later patching to .vm_exit
     for (size_t off : ctx.abort_jumps) {
@@ -740,8 +730,6 @@ void X86Emitter::finish_mem_access(MemAccessContext& ctx,
 // ALU (unified for ALU64 and ALU32)
 //
 // 操作流程：load_bpf(dst->RAX), load_bpf(src->RCX), ALU, store_bpf(dst<-RAX)
-// 由于所有 BPF 寄存器都在 x86 物理寄存器中，load_bpf/store_bpf
-// 只是 reg-to-reg mov（或 nop）。
 // ---------------------------------------------------------------------------
 
 bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
@@ -764,7 +752,6 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
             if (is_x && insn->dst_reg == insn->src_reg) return true;
         }
         if (is_x) {
-            // 直接从源 BPF 寄存器 mov 到目标 BPF 寄存器
             uint8_t src_x86 = BPF_REG_MAP[insn->src_reg];
             uint8_t dst_x86 = BPF_REG_MAP[insn->dst_reg];
             if (!is_64) {
@@ -774,8 +761,6 @@ bool X86Emitter::emit_alu(const bpf_insn* insn, bool is_64) {
                 mov_r64(dst_x86, src_x86);
             }
         } else {
-            // MOV immediate: 需要先写到内存再加载到映射寄存器
-            // 或者直接 mov imm 到映射寄存器
             uint8_t dst_x86 = BPF_REG_MAP[insn->dst_reg];
             if (is_64) {
                 // mov rax, sign-extended imm32; mov dst, rax
@@ -1020,7 +1005,6 @@ bool X86Emitter::emit_ldx(const bpf_insn* insn,
         }
     }
 
-    // 将结果从 RAX 移到目标 BPF 寄存器的映射
     mov_r64(BPF_REG_MAP[insn->dst_reg], X86::RAX);
     finish_mem_access(ctx, abort_patches, bpf_index);
     return true;
@@ -1083,7 +1067,6 @@ bool X86Emitter::emit_stx(const bpf_insn* insn,
     // BPF 寄存器映射不使用这三个，所以源值寄存器安全
     auto ctx = begin_mem_access(BPF_REG_MAP[insn->dst_reg], insn->off, access_size, /*is_write=*/true);
 
-    // 将源值从映射寄存器加载到 RCX
     load_bpf(insn->src_reg, X86::RCX);
 
     // [RAX] = RCX (source value)
@@ -1207,7 +1190,6 @@ bool X86Emitter::emit_stx_atomic(const bpf_insn* insn,
             // 成功路径 RAX 不被写，需按 RFC 9669 零扩展（失败路径 eax<-mem 硬件已清零，幂等）
             emit8(0x89); emit8(0xC0);  // mov eax, eax
         }
-        // 结果回写 r0
         store_bpf(0, X86::RAX);
         break;
 
@@ -1291,7 +1273,7 @@ bool X86Emitter::emit_jmp(const bpf_insn* insn, int current_index, bool is_64,
 
 // deopt 前置:vm->pc_ = imm64。配合越界跳转桩(emit 后紧跟跳 flush_and_exit 的 ja)
 void X86Emitter::emit_set_pc_imm(uint64_t gpa) {
-    mov_rax_imm64(gpa);                             // mov rax, imm64
+    mov_rax_imm64(gpa);
     store_r64((int32_t)off_pc_, X86::RAX);          // vm->pc_ = rax
 }
 
@@ -1340,7 +1322,6 @@ void X86Emitter::emit_ja32(const bpf_insn* insn, int current_index,
 
 void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
                                       uint64_t entry_gpa) {
-    // 完整 flush 所有 BPF 寄存器到 vm->reg[]
     flush_to_vm();
 
     // 保存当前 pc（guest 地址）到 vm->pc
@@ -1349,7 +1330,7 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
     emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
 
     // 调用 helper_do_syscall(vm*, call_id)
-    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
+    mov_r64(X86::RDI, X86::RBP);
     emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
     call_helper(helpers_->do_syscall);
 
@@ -1359,7 +1340,6 @@ void X86Emitter::emit_call_syscall(const bpf_insn* insn, int current_index,
     emit8(0x0F); emit8(0x84); emit32(0);  // JZ .vm_exit
     patch_branch_cond(jz_off, vm_exit_offset);
 
-    // 完整 reload 所有 BPF 寄存器（syscall 可能改了任意寄存器）
     reload_from_vm();
 }
 
@@ -1382,7 +1362,7 @@ void X86Emitter::emit_call_softfp_slow(const bpf_insn* insn, int current_index,
     emit8(0x48); emit8(0x89); emit8(0x85); emit32((uint32_t)off_pc_);  // mov [rbp+off_pc], rax
 
     // 调用 helper_do_softfp(vm*, call_id)
-    mov_r64(X86::RDI, X86::RBP);                              // mov rdi, rbp
+    mov_r64(X86::RDI, X86::RBP);
     emit8(0xBE); emit32((uint32_t)insn->imm);                 // mov esi, call_id
     call_helper(helpers_->do_softfp);
 
@@ -1698,7 +1678,7 @@ size_t X86Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
                                           std::vector<AbortPatchInfo>& abort_patches,
                                           int bpf_index) {
     // 仅用 RAX/RCX/R11 scratch，不碰 r1-r5 参数与 r6-r9/r10。
-    // 2a. 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
+    // - 读 cur_frame[0]，解码 caller 总长 = stack_size(bit0..23) + alloca_len(bit24..47)
     auto rctx = begin_mem_access(X86::R15, 0, 8, /*is_write=*/false);  // RAX = cur_frame host
     emit8(0x48); emit8(0x8B); emit8(0x08);  // mov rcx, [rax]  (cur_frame[0])
     emit8(0x49); emit8(0x89); emit8(0xCB);  // mov r11, rcx
@@ -1709,13 +1689,13 @@ size_t X86Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
     mov_r64(X86::RAX, X86::R15);             // mov rax, r15    (rax = r10 = old sp)
     sub64();                                 // sub rax, rcx    (rax = r10 - caller_total_len)
     sub64_imm(64);                           // sub rax, 64     (rax = frame_base)
-    cmp64_imm((int32_t)STACK_BASE);          // cmp rax, STACK_BASE
+    cmp64_imm((int32_t)STACK_BASE);
     size_t overflow_jb = size();
     emit8(0x0F); emit8(0x82); emit32(0);     // JB .overflow (frame_base < STACK_BASE)
     store_r64((int32_t)off_scratch_, X86::RAX);  // 暂存 frame_base（write-probe 会踩 scratch）
     finish_mem_access(rctx, abort_patches, bpf_index);
 
-    // 2b. 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
+    // - 写新帧 [frame_base, 64)（含 !cow 检查，覆盖 fork 后栈 CoW）
     auto wctx = begin_mem_access(X86::RAX, 0, 64, /*is_write=*/true);  // RAX = 帧 host
     //   [rax+0] = callee_frame（编译期读帧槽的立即数；is_signal=0、alloca_len=0
     //             时 frame_flags_make 的编码值 == stack_size 本身）；间接调用从 IC 槽取
@@ -1738,14 +1718,13 @@ size_t X86Emitter::emit_push_frame_inline(const FrameSrc& src, uint64_t ret_gpa,
     emit8(0x4C); emit8(0x89); emit8(0x70); emit8(0x30);   // mov [rax+0x30], r14
     //   r10 = frame_base（从暂存读回）。同步 vm->reg[10]：entry_fast 不 load r10，
     //   R15 即真理源；且 .not_compiled 时 step 经正常入口也从 vm->reg[10] 读。
-    load_r64(X86::R15, (int32_t)off_scratch_);            // mov r15, [rbp+off_scratch]
-    store_r64((int32_t)(off_reg_ + 10 * 8), X86::R15);     // mov [rbp+reg+10*8], r15
+    load_r64(X86::R15, (int32_t)off_scratch_);
+    store_r64((int32_t)(off_reg_ + 10 * 8), X86::R15);
     finish_mem_access(wctx, abort_patches, bpf_index);
     return overflow_jb;
 }
 
 void X86Emitter::emit_call_overflow_stub(size_t overflow_jb) {
-    // .overflow：栈溢出 -> VM_KILLED -> vm_exit
     size_t overflow = size();
     patch_branch_cond(overflow_jb, overflow);
     emit8(0xF0); emit8(0x83); emit8(modrm(2, 1, X86::RBP));  // lock or [rbp+off_flags], VM_KILLED
@@ -1766,9 +1745,9 @@ void X86Emitter::emit_call_cont_tail(uint64_t ret_gpa, std::initializer_list<siz
     emit8(0x00);                            // cmp dword [rbp+off_flags], 0
     size_t cont_jnz = size();
     emit8(0x0F); emit8(0x85); emit32(0);    // JNZ vm_exit
-    load_r64(X86::RAX, (int32_t)off_pc_);            // mov rax, [rbp+off_pc]
+    load_r64(X86::RAX, (int32_t)off_pc_);
     emit8(0x48); emit8(0xB9); emit64(ret_gpa);       // mov rcx, ret_gpa
-    cmp64();                                          // cmp rax, rcx
+    cmp64();
     size_t cont_jne = size();
     emit8(0x0F); emit8(0x85); emit32(0);    // JNE vm_exit
     patch_branch_cond(cont_jnz, vm_exit_offset);
@@ -1993,20 +1972,18 @@ void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_i
 // ---------------------------------------------------------------------------
 
 size_t X86Emitter::emit_prologue() {
-    // 保存 callee-saved 寄存器
-    push_rbp();                               // push rbp
-    push_reg(X86::RBX);                       // push rbx
-    push_reg(X86::R12);                       // push r12
-    push_reg(X86::R13);                       // push r13
-    push_reg(X86::R14);                       // push r14
-    push_reg(X86::R15);                       // push r15
+    push_rbp();
+    push_reg(X86::RBX);
+    push_reg(X86::R12);
+    push_reg(X86::R13);
+    push_reg(X86::R14);
+    push_reg(X86::R15);
     // 对齐栈到 16 字节（6 pushes + return addr = 56 bytes, +8 = 64）
     emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);  // sub rsp, 8
 
     // RBP = vm* 指针
-    mov_r64(X86::RBP, X86::RDI);             // mov rbp, rdi
+    mov_r64(X86::RBP, X86::RDI);
 
-    // 从 vm->reg[] 加载全部 11 个 BPF 寄存器
     for (int i = 0; i < 11; i++) {
         load_r64(BPF_REG_MAP[i], (int32_t)(off_reg_ + i * 8));
     }
@@ -2018,12 +1995,12 @@ size_t X86Emitter::emit_prologue() {
     // .vm_exit: 恢复 callee-saved 并返回
     vm_exit_offset = size();
     emit8(0x48); emit8(0x83); emit8(0xC4); emit8(0x08);  // add rsp, 8
-    pop_reg(X86::R15);                        // pop r15
-    pop_reg(X86::R14);                        // pop r14
-    pop_reg(X86::R13);                        // pop r13
-    pop_reg(X86::R12);                        // pop r12
-    pop_reg(X86::RBX);                        // pop rbx
-    pop_rbp();                                // pop rbp
+    pop_reg(X86::R15);
+    pop_reg(X86::R14);
+    pop_reg(X86::R13);
+    pop_reg(X86::R12);
+    pop_reg(X86::RBX);
+    pop_rbp();
     emit8(0xC3);                              // ret
 
     // .flush_and_exit: 将全部 BPF 寄存器写回 vm->reg[]，然后跳到 .vm_exit
@@ -2052,7 +2029,6 @@ size_t X86Emitter::emit_prologue() {
     push_reg(X86::R14);
     push_reg(X86::R15);
     emit8(0x48); emit8(0x83); emit8(0xEC); emit8(0x08);  // sub rsp, 8
-    // RBP 已是 vm*（跨 call 保留），无 mov rbp,rdi、无 vm->reg[] load（见上注释）。
     jmp_rel32();
     size_t fast_jmp_offset = size() - 5;
 
@@ -2062,7 +2038,7 @@ size_t X86Emitter::emit_prologue() {
 
     // Safepoint at entry: 必须先 flush 所有寄存器（信号处理器可能读取）
     flush_to_vm();
-    mov_r64(X86::RDI, X86::RBP);             // mov rdi, rbp
+    mov_r64(X86::RDI, X86::RBP);
     call_helper(helpers_->safepoint);
     test_eax_eax();
     // Safepoint 失败 -> 直接跳 vm_exit（不走 flush_and_exit，因为 flush 已做过，

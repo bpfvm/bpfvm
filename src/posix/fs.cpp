@@ -5,8 +5,6 @@
 //    - HostFd / DevFd 的 I/O 虚方法 + DevFd::open 工厂：
 //      把"host fd 直通"的 I/O 动作封装——HostFd 调 host libc
 //      同名函数（EINTR 时返回 -EINTR，syscall 层转 SYSCALL_RESTART）。
-//      syscall 入口（do_read 等）只做指针翻译和 EINTR
-//      处理，通过虚分派选择实现，不再判 is_proc()。
 //      （/proc 虚拟文件 ProcFile 实现在 procfs.cpp；虚拟目录 VirtualDir 在本文件，/proc|/dev 共用。）
 //    - Path 多态层次：ResolvePath 工厂 + HostPath/DevPath（按 guest 路径前缀 /proc|/dev|其它
 //      分类）。调用方（do_openat/do_statx/...）统一模式：
@@ -102,7 +100,6 @@ static int statx_raw(int dirfd, const char* path, int flags, unsigned int mask,
     return rc == -1 ? -errno : 0;
 }
 
-// statx 的 fd 形态（= fstat）：dirfd=fd + 空 path + AT_EMPTY_PATH。
 int statx_fd(int fd, struct statx* stx, unsigned int mask) {
     return statx_raw(fd, "", AT_EMPTY_PATH, mask, stx);
 }
@@ -137,8 +134,7 @@ std::shared_ptr<Fd> HostFd::clone() const {
     return std::make_shared<HostFd>(new_fd, path);
 }
 
-// host 透传工厂：openat(AT_FDCWD, host_path)。host_path 由调用方拼好（AT_FDCWD 时含 chroot
-// 前缀；DevFd::open 委托开标准设备时直接用 /dev/null 等绝对路径，不经 chroot）。
+// host_path 由调用方拼好；DevFd::open 委托开标准设备时直接用 /dev/null 等绝对路径，不经 chroot。
 std::shared_ptr<HostFd> HostFd::open(const std::string& host_path, int flags, mode_t mode,
                                      std::string guest_abs) {
     int fd = ::openat(AT_FDCWD, host_path.c_str(), guest_open_flags((unsigned)flags), mode);
@@ -243,7 +239,6 @@ std::shared_ptr<Fd> VirtualDir::clone() const {
 
 std::shared_ptr<Fd> DevFd::clone() const {
     // host dup 得独立 host fd；GuestTty / master_token 共享（pty 语义保持）。
-    // cloexec 不复制（由调用方按需设置，与 dup 语义一致）。
     int new_fd = ::dup(fd_);
     if(new_fd < 0) return nullptr;
     return std::make_shared<DevFd>(new_fd, path, tty_, master_token_);
@@ -275,7 +270,6 @@ int SignalFd::fstatx(struct statx* stx, unsigned int mask, int flags) {
 // fork 复制：为子新建独立 pipe（写端 O_NONBLOCK），mask 复制自父。子读端不能
 // 指向父同一 pipe——否则父子读到对方 pending 的信号，破坏 Linux task-pending 语义。
 std::shared_ptr<Fd> SignalFd::clone() const {
-    // cloexec 不复制（由调用方按需设置，与 dup 语义一致）。
     int p[2];
     if(pipe2(p, 0) < 0) {
         return nullptr;
@@ -325,8 +319,7 @@ static const std::map<std::string, DevInfo> dev_nodes = {
     {"/dev/stderr",  DevInfo{DevInfo::Symlink, "/proc/self/fd/2"}},
 };
 
-// Kind -> 目录列举的 d_type（与节点类型一一对应：HostChr=DT_CHR、Dir=DT_DIR、
-// Symlink=DT_LNK；同 procfs 的 gen_dtype 从节点描述现算 d_type）。
+// Kind -> 目录列举的 d_type；同 procfs 的 gen_dtype 从节点描述现算 d_type。
 static unsigned char kind_dtype(DevInfo::Kind k) {
     switch(k) {
     case DevInfo::HostChr: return DT_CHR;
@@ -444,12 +437,10 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
         }
         auto tty = std::make_shared<GuestTty>();
         dev_ptmx_register(ptn, tty);
-        // master token：仅由 master fd 持有（use_count = master fd 数），最后一个关闭触发 SIGHUP。
         return std::make_shared<DevFd>(master, guest_abs, tty, std::make_shared<PtySide>());
     }
     // rfind(...,0) == 0 即 starts_with：前缀匹配 "/dev/pts/"（9 字符）。
     if(guest_abs.rfind("/dev/pts/", 0) == 0) {
-        // /dev/pts/N：查 registry 取该编号的 GuestTty，打开对应 host slave，包成 DevFd。
         int ptn = parse_dev_suffix(guest_abs.c_str() + 9);  // 数字从 index 9 起
         std::shared_ptr<GuestTty> tty;
         {
@@ -458,7 +449,7 @@ std::shared_ptr<Fd> DevFd::open(const std::string& guest_abs, int flags, mode_t 
             if(it2 != ptmx_registry.end()) tty = it2->second;
         }
         if(!tty) { errno = ENOENT; return nullptr; }
-        // 打开 host slave，包成 DevFd，携带同一 GuestTty（与 master 共享）。
+        // 携带同一 GuestTty（与 master 共享）。
         char slave_name[64];
         snprintf(slave_name, sizeof(slave_name), "/dev/pts/%d", ptn);
         // guest -> 宿主位重排（见 guest_abi.h），另剥 O_CREAT
@@ -489,8 +480,7 @@ inline bool is_proc(const std::string& p) { return p == "/proc" || p.rfind("/pro
 inline bool is_dev(const std::string& p) { return p == "/dev" || p.rfind("/dev/", 0) == 0; }
 
 // =====================================================================
-// ResolvePath —— 按 guest 前缀分类构造子类（替代 PathStub 的 open/readlink/statx 路由）。
-// host 路径由 self->resolve_path(guest) 算好（含 chroot 前缀）传进 Path。
+// ResolvePath —— 按 guest 前缀分类构造子类。
 // =====================================================================
 std::shared_ptr<Path> ResolvePath(PosixSyscall* self, std::string guest) {
     // /proc、/dev 统一去尾斜杠：虚拟层内部按精确/组件匹配，而 Linux path resolution
@@ -524,13 +514,10 @@ Path::Path(PosixSyscall* s, std::string g)
 }
 
 std::shared_ptr<Fd> HostPath::open(int flags, mode_t mode) {
-    // host 已含 chroot 前缀；guest 存进 Fd::path（供 fchdir/readlinkat 用）。
     return HostFd::open(host, flags, mode, guest);
 }
 
 ssize_t HostPath::readlink(char* buf, size_t bufsiz) {
-    // host /dev/普通文件：直接 ::readlink 写入 buf（host 已含 chroot 前缀）。
-    // 返回值天然按 bufsiz 截断、不含 NUL，与 readlink(2) 语义一致。
     ssize_t rc = ::readlink(host.c_str(), buf, bufsiz);
     return rc < 0 ? -errno : rc;
 }
@@ -552,7 +539,7 @@ int HostPath::mkdir(mode_t mode) {
 }
 
 int HostPath::symlink(const std::string& target) {
-    // 本 path=linkpath（host 已含 chroot 前缀），target 原样。
+    // 本 path=linkpath，target 原样。
     return ::symlinkat(target.c_str(), AT_FDCWD, host.c_str()) == -1 ? -errno : 0;
 }
 
@@ -624,7 +611,6 @@ ssize_t DevPath::readlink(char* buf, size_t bufsiz) {
         return ResolvePath(self, escape)->readlink(buf, bufsiz);
     }
     if(!info) return -ENOENT;
-    // Symlink：返回符号链接 target（按 bufsiz 截断，不含 NUL，与 readlink(2) 一致）。
     if(info->kind == DevInfo::Symlink) {
         size_t n = info->link.size() < bufsiz ? info->link.size() : bufsiz;
         memcpy(buf, info->link.data(), n);

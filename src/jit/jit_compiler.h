@@ -85,10 +85,10 @@ public:
     // Compile or find a JIT function starting at pc.
     // Returns nullptr if the instruction cannot be JIT-compiled.
     JitEntry* compile(vm* v, uint64_t gpa) override;
-    // execve 后失效所有旧 JIT 缓存。注意：与原实现一致，这里只丢弃映射、不 munmap
-    // code 页——execve 的 syscall 仍在某段 JIT 代码的调用链中（helper_do_syscall
-    // 返回后 JIT .cont 续段还要跑 flag check），此刻 munmap 正在执行的 code 页会
-    // segfault。code 页随 JitCompiler 析构（VM 销毁）时统一释放。
+    // execve 后失效所有旧 JIT 缓存。只丢弃映射、不 munmap code 页——execve 的
+    // syscall 仍在某段 JIT 代码的调用链中（helper_do_syscall 返回后 JIT .cont 续段
+    // 还要跑 flag check），此刻 munmap 正在执行的 code 页会 segfault。code 页随
+    // JitCompiler 析构（VM 销毁）时统一释放。
     void clear() override {
         entries_.clear();
         std::memset(pc_cache_, 0, sizeof(pc_cache_));

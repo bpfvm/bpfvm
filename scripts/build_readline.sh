@@ -50,7 +50,6 @@ AR="ar" RANLIB="ranlib" \
 echo "=== readline: make ==="
 make -j"${JOBS}"
 
-# termcap shim + history 并入 libreadline.a
 "${CLANG_WRAPPER}" ${CFLAGS_NOG} -c "${ROOT_DIR}/scripts/termcap_shim.c" \
     -o "${BUILD_DIR}/termcap_shim.o"
 cp -f libreadline.a libreadline-merge.a

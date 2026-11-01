@@ -58,8 +58,7 @@
 #define BPF_FP_COPYSIGN_F  37   // float  copysign（二元）
 #define BPF_FP_COPYSIGN_D  38   // double copysign
 // int128 运算
-// 整数宽乘取高半
-// r0 = (a*b) >> 64。低半由调用方用原生 mul i64 另算。
+// 低半由调用方用原生 mul i64 另算。
 #define BPF_FP_UMULH       39   // (i64 a, i64 b) -> r0 = (a*b) >> 64
 // 低半经 r0 返回，高半经 sret 指针：i64 __bpf_fp_<ID>(ptr out_hi, i64 aLo, i64 aHi,
 // i64 bLo, i64 bHi)。除法频率极低（libc++ filesystem 时间

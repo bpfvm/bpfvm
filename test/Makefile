@@ -118,12 +118,12 @@ HOST_TARGETS := $(SOURCES:.c=.host)
 HOST_CXX      := clang++
 HOST_CXXFLAGS := -std=c++23 -O1 -D_GNU_SOURCE -g -Wall -fno-exceptions -frtti
 
-# 通用规则：单文件直接编译链接。host 用 gcc/g++，target=宿主。
+# 通用规则：单文件直接编译链接。host 用 clang/clang++，target=宿主。
 %.host: %.c
 	$(HOST_CC) $(HOST_CFLAGS) $< -o $@ $(HOST_LDFLAGS)
 %.host: %.cpp
 	$(HOST_CXX) $(HOST_CXXFLAGS) $< -o $@ $(HOST_LDFLAGS)
-# test_stl_expected 的 host 对照改用 clang++/libc++：Debian 12 的 gcc 12 自带 libstdc++
+# test_stl_expected 的 host 对照用 clang++/libc++：Debian 12 的 gcc 12 自带 libstdc++
 # 还没有 expected::transform/or_else/and_then（C++23 后期才加），而 clang 19 自带 libc++
 # 有完整 expected 支持——与 BPF 端同源，作对照基线更一致。HOST_CXXFLAGS 已是 c++23。
 test_stl_expected.host: test_stl_expected.cpp

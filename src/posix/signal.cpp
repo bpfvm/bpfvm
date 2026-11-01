@@ -120,8 +120,8 @@ void PosixSyscall::queue_signal(vm* v, const SigEvent& ev) {
     int sig = ev.sig;
     bool stop_dfl = is_default_stop(sig) &&
                     handler_is_default(ps->signal_actions[static_cast<size_t>(sig)].handler);
-    // 是否需要入队 pending_signals。SIGKILL 直接置 VM_KILLED 不入队；SIGSTOP/SIGCONT/
-    // 未阻塞 ignorable 自己 return；普通信号 + 被阻塞 ignorable 需要入队。
+    // 是否需要入队 pending_signals。SIGKILL 直接置 VM_KILLED 不入队；普通信号 +
+    // 被阻塞 ignorable 需要入队。
     bool enqueue = true;
 
     if(sig == SIGKILL) {

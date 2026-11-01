@@ -12,9 +12,6 @@
 // root 前缀。[pid] 用 guest 的 pid/tgid，完全按 guest 语义生成 —— 这是"模拟"而非
 // "直通 host /proc"的核心。
 //
-// 内容策略：快照式。open 时调一次 generate 生成全量内容存进 ProcFile::data，
-// read 按 pos 切片。与 Linux 一致（进程改 argv 后 /proc 仍反映旧值）。
-//
 
 #define _GNU_SOURCE 1   // struct utsname 的 domainname 字段（glibc 下需 GNU 扩展；musl 恒有）
 #include "posix_internal.h"
@@ -58,7 +55,6 @@ struct Gen {
 
     mode_t mode() const { return ptr->mode(); }
 
-    // 辅助方法：取出底层具体的指针以便调用 operator()
     template<typename T>
     T* as() const { return dynamic_cast<T*>(ptr.get()); }
 };
@@ -80,7 +76,6 @@ struct LinkGen: IGen {
 };
 
 struct DirGen: IGen {
-    // DirGen 内部返回的是包装类 Gen 的 Map
     std::function<std::map<std::string, Gen>()> func;
     DirGen(std::function<std::map<std::string, Gen>()> f) : func(std::move(f)) {}
 
@@ -548,7 +543,7 @@ static Gen lookup(PosixSyscall* self, const std::string& guest_abs, std::string&
             }
             auto tsegs = to_segs(rs);
             // 用 target 的段替换当前符号链接段 segs[i]（符号链接段已消费，不能残留，
-            // 否则会被当普通段重复匹配）。erase segs[i] 后插入 tsegs，i 指向 tsegs 首段。
+            // 否则会被当普通段重复匹配）。
             segs.erase(segs.begin() + i);
             segs.insert(segs.begin() + i, tsegs.begin(), tsegs.end());
             current = proc_root(self);
@@ -585,7 +580,7 @@ static std::string resolve_symlink(const std::string& link_path, const std::stri
     return resolved.lexically_normal().string();
 }
 
-// open：命中 lookup 即构造 ProcFile/VirtualDir（快照式）。/proc 下查不到节点 -> ENOENT（设备封闭）。
+// open：/proc 下查不到节点 -> ENOENT（设备封闭）。
 std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     std::string escape;
     auto node = lookup(self, guest, escape);
@@ -671,7 +666,7 @@ std::shared_ptr<Fd> ProcPath::open(int flags, mode_t mode) {
     }
     // 末段符号链接 follow：O_NOFOLLOW 自查判 ELOOP（do_openat 不看此 flag，虚拟符号链接
     // 须自查；仅末段，escape 的中间段链接不受影响）。target 经 resolve_symlink 规范成
-    // 绝对 guest 路径后经 ResolvePath 重解析（套 chroot + 按前缀分发），返回真实 fd。
+    // 绝对 guest 路径后经 ResolvePath 重解析，返回真实 fd。
     if(auto link = node.as<LinkGen>()) {
         if(flags & BPF_O_NOFOLLOW) { errno = ELOOP; return nullptr; }
         std::string target = resolve_symlink(guest, (*link)());
@@ -696,7 +691,7 @@ ssize_t ProcPath::readlink(char* buf, size_t bufsiz) {
     std::string escape;
     auto node = lookup(self, guest, escape);
     // 中间段符号链接跳出 /proc（如 /proc/self/root/lib：root->/，再读 /lib 链接）-> escape 是
-    // 完整 host 路径，交给 ResolvePath 的 readlink 读真实符号链接（套 chroot + 按前缀分发）。
+    // 完整 host 路径，交给 ResolvePath 的 readlink 读真实符号链接。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->readlink(buf, bufsiz);
     }
@@ -718,7 +713,7 @@ int ProcPath::statx(struct statx* stx, unsigned int mask, int flags) {
     std::string escape;
     auto node = lookup(self, guest, escape);
     // 中间段符号链接跳出 /proc（如 /proc/1/root/bin）：escape 是完整 host 路径，交给
-    // ResolvePath 的 statx（套 chroot + 按前缀分发）走完剩余部分。
+    // ResolvePath 的 statx 走完剩余部分。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->statx(stx, STATX_BASIC_STATS, flags);
     }
@@ -768,7 +763,7 @@ int ProcPath::access(int mode, int flags) {
     std::string escape;
     auto node = lookup(self, guest, escape);
     // 中间段符号链接跳出 /proc -> escape 是完整 host 路径，交给 ResolvePath 的 access
-    // （套 chroot + 按前缀分发）测真实文件可访问性。
+    // 测真实文件可访问性。
     if(!escape.empty()) {
         return ResolvePath(self, escape)->access(mode, flags);
     }
