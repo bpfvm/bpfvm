@@ -1,0 +1,63 @@
+# CI:构建 host 工具链(bpfvm/bpfvm-ld/passes)+ rootfs base(musl libc + libcxx)
+# + bpfvm.bpf(BPF-on-BPF 自举),然后跑全量 ctest。
+#
+# 顺序约束(CMakeLists 的 bpfvm_bpf 在 configure 期检测 root/,缺失则跳过):
+#   先 cmake+build 产出工具链 -> build_root.sh 装 root/lib -> 重新 configure+build
+#   触发 bpfvm.bpf 构建 -> ctest(nest 变体依赖 bpfvm.bpf,chroot 变体依赖 root/lib)。
+#
+# 编译器固定 clang 19:仓库工作流基于 clang(AGENTS.md),且 test/pass/musl/libcxx
+# 的 BPF 目标要求 clang>=19;gcc 12 编 host 侧会因 -Werror=restrict 误报失败。
+# PATH 前置 /usr/lib/llvm-19/bin,使无版本号的 `clang` 解析到 19(脚本和
+# test/Makefile 都按裸名调用)。
+name: ctest
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  ctest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install clang 19 + LLVM/libelf/libc++ dev
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          # llvm-19-dev: pass 插件构建硬依赖 llvm-config(src/CMakeLists.txt),
+          # 不装会命中 runner 预装的旧版,头文件/链接库与 clang 19 不匹配
+          # libc++-19-dev: test_stl_expected 的 host 对照按 Makefile 固定用
+          # clang++ -stdlib=libc++,runner 需装 libc++ 头/库才能编
+          sudo apt-get -y install libelf-dev pkg-config llvm-19-dev libc++-19-dev libc++abi-19-dev
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+
+      # LLVM 源码(build_libcxx.sh 浅克隆 llvmorg-19.1.7,~1GB)只与锁定的 tag 相关,
+      # 可安全缓存;musl/libcxx 的构建产物不缓存——它们经 pass 插件编译,pass 变更后
+      # 不重编会得到陈旧产物(见 AGENTS.md 的 pass rebuild 说明)。
+      - name: Cache LLVM sources
+        uses: actions/cache@v4
+        with:
+          path: thirdparty/llvm
+          key: llvm-src-llvmorg-19.1.7
+
+      - name: Build host toolchain (bpfvm, bpfvm-ld, passes)
+        run: |
+          cmake -S . -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build -j"$(nproc)"
+
+      - name: Build rootfs base (musl libc + libcxx)
+        run: ./scripts/build_root.sh
+
+      - name: Rebuild with bpfvm.bpf (BPF-on-BPF)
+        run: |
+          cmake -S . -B build -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build -j"$(nproc)"
+
+      - name: ctest
+        run: ctest --test-dir build -j"$(nproc)" --output-on-failure
