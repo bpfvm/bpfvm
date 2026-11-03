@@ -1815,13 +1815,12 @@ private:
         }
 
         // 查不到（仅 UND 符号会走到这里；defined 的 non-local 符号必然在 globals_ 中）：
-        //   - weak UND + 链接可执行（STATIC_EXE/DYNAMIC_EXE）：按标准 ld 解析为 0
-        //     （musl/glibc 用 weak 引用 __init_array_start/_DYNAMIC 等「可能不存在」的
-        //      边界符号，空范围 start==end==0 的遍历是安全的 no-op）。
-        //   - SHARED_LIB：保持 UND 返回 nullopt，留给运行期经 PLT/GOT 解析（如 PDCLib
-        //      的 main 是 weak UND，.so 里 _start 调它必须走 PLT 桩，由消费者在链接期
-        //      填入 main 地址）。
-        if (sym.binding == STB_WEAK && mode_ != Mode::SHARED_LIB)
+        //   - weak UND + STATIC_EXE：无运行时重定位机制，构建期烧 0（musl/glibc 用 weak
+        //     引用 __init_array_start/_DYNAMIC 等「可能不存在」的边界符号，空范围
+        //     start==end==0 的遍历是安全的 no-op）。
+        //   - DYNAMIC_EXE/SHARED_LIB：返回 nullopt，留给运行期 PLT/GOT/.rela.dyn 解析
+        //     （weak 符号解析失败时 ldso 填 0，判空惯用法由此保证）。
+        if (sym.binding == STB_WEAK && mode_ == Mode::STATIC_EXE)
             return 0;
         return std::nullopt;
     }
