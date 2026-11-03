@@ -10,7 +10,7 @@
  *     SIGKILL 绕过 handle_signals：queue_signal 直接置 VM_KILLED，停止态也能被杀，
  *     不依赖 SIGCONT 唤醒。
  *
- *   case 2  stop=SIGTSTP  kill=SIGTERM + SIGCONT
+ *   case 2  stop=SIGSTOP  kill=SIGTERM + SIGCONT
  *     回归「停止态下信号挂起 + SIGCONT 唤醒后投递」的内核语义（kernel/signal.c:
  *     do_signal_stop / get_signal）。bash 对 `kill %1` 实际发的是一对系统调用
  *       kill(-pgid, SIGTERM);   // 停止态收 SIGTERM：不终结，挂入 pending 队列
@@ -46,7 +46,7 @@ static int test_kill_stopped_sigkill(int stop_sig) {
         return 1;
     }
     if (child == 0) {
-        /* 子进程：停止自己（SIGSTOP 不可捕获；SIGTSTP 默认动作停止，模拟 Ctrl+Z）。 */
+        /* 子进程：停止自己。 */
         raise(stop_sig);
         _exit(0);  /* 不应到达：被 SIGKILL 终止 */
     }
@@ -80,7 +80,7 @@ static int test_kill_stopped_sigterm_cont(int stop_sig) {
         return 1;
     }
     if (child == 0) {
-        /* 子进程：停止自己（SIGTSTP 默认动作停止，模拟 Ctrl+Z）。 */
+        /* 子进程：停止自己。 */
         raise(stop_sig);
         _exit(0);  /* 不应到达：被 SIGTERM 终止 */
     }
@@ -138,10 +138,12 @@ static int reap_expect_signaled(pid_t child, int *status_out, int expected_sig) 
 }
 
 int main(void) {
+    /* 两组都用 SIGSTOP 停止：SIGTSTP 是 tty 停止信号，无控制终端的孤儿进程组
+     * （CI runner 的 job 进程）里被内核丢弃，host 对照无法停止。 */
     printf("[case] stop=SIGSTOP kill=SIGKILL\n");
     if (test_kill_stopped_sigkill(SIGSTOP)) return 1;
-    printf("[case] stop=SIGTSTP kill=SIGTERM+SIGCONT\n");
-    if (test_kill_stopped_sigterm_cont(SIGTSTP)) return 1;
+    printf("[case] stop=SIGSTOP kill=SIGTERM+SIGCONT\n");
+    if (test_kill_stopped_sigterm_cont(SIGSTOP)) return 1;
 
     printf("waitpid_kill_stopped ok\n");
     return 0;
