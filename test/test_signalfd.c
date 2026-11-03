@@ -262,14 +262,17 @@ int main(void) {
     pid_t ca = fork();
     if (ca < 0) return fail("case9 forkA", "fork");
     if (ca == 0) _exit(42);
-    n = read(sfd_chld, &s9, sizeof(s9));
-    if (n != sizeof(s9) || s9.ssi_signo != SIGCHLD || s9.ssi_code != CLD_EXITED || s9.ssi_status != 42) {
-        fprintf(stderr, "FAIL case9 readA: n=%zd signo=%u code=%d status=%d "
-                        "(want CLD_EXITED/42)\n", n, s9.ssi_signo, s9.ssi_code, s9.ssi_status);
-        return 1;
+    /* 更早 fork 的子进程（用例 1/6）的 SIGCHLD 可能恰在本用例 sigprocmask(BLOCK)
+     * 之后才投递入队，排在 A 的事件前面（负载相关）。signalfd 是事件流，按
+     * ssi_pid 鉴别丢弃非 A 的事件，直到读到 A 的。 */
+    for (;;) {
+        n = read(sfd_chld, &s9, sizeof(s9));
+        if (n != sizeof(s9)) return fail("case9 readA", "read");
+        if (s9.ssi_signo == SIGCHLD && s9.ssi_pid == (uint32_t)ca) break;
     }
-    if (s9.ssi_pid != (uint32_t)ca) {
-        fprintf(stderr, "FAIL case9 readA: ssi_pid=%u expected=%d\n", s9.ssi_pid, ca);
+    if (s9.ssi_code != CLD_EXITED || s9.ssi_status != 42) {
+        fprintf(stderr, "FAIL case9 readA: pid=%u code=%d status=%d "
+                        "(want CLD_EXITED/42)\n", s9.ssi_pid, s9.ssi_code, s9.ssi_status);
         return 1;
     }
     /* A 已 zombie（read 拿到 CLD_EXITED 即证明），阻塞 waitpid 立即回收，不与 signalfd 争抢。*/
@@ -285,14 +288,14 @@ int main(void) {
         raise(SIGKILL);
         _exit(99);   /* 不会到达 */
     }
-    n = read(sfd_chld, &s9, sizeof(s9));
-    if (n != sizeof(s9) || s9.ssi_signo != SIGCHLD || s9.ssi_code != CLD_KILLED || s9.ssi_status != SIGKILL) {
-        fprintf(stderr, "FAIL case9 readB: n=%zd signo=%u code=%d status=%d "
-                        "(want CLD_KILLED/9)\n", n, s9.ssi_signo, s9.ssi_code, s9.ssi_status);
-        return 1;
+    for (;;) {
+        n = read(sfd_chld, &s9, sizeof(s9));
+        if (n != sizeof(s9)) return fail("case9 readB", "read");
+        if (s9.ssi_signo == SIGCHLD && s9.ssi_pid == (uint32_t)cb) break;
     }
-    if (s9.ssi_pid != (uint32_t)cb) {
-        fprintf(stderr, "FAIL case9 readB: ssi_pid=%u expected=%d\n", s9.ssi_pid, cb);
+    if (s9.ssi_code != CLD_KILLED || s9.ssi_status != SIGKILL) {
+        fprintf(stderr, "FAIL case9 readB: pid=%u code=%d status=%d "
+                        "(want CLD_KILLED/9)\n", s9.ssi_pid, s9.ssi_code, s9.ssi_status);
         return 1;
     }
     int sb;

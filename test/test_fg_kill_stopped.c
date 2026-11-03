@@ -14,8 +14,10 @@
  * 注：这是 dash `fg` 不生效的次要因素；主因（SIGTTOU+SIG_IGN 死循环）见
  * test_bg_write_tty.c。本用例独立验证信号投递时序。
  *
- * 流程：子进程 raise(SIGTSTP) 停 -> 父 SIGTERM(挂起)+SIGCONT(唤醒) -> 轮询 waitpid，
+ * 流程：子进程 raise(SIGSTOP) 停 -> 父 SIGTERM(挂起)+SIGCONT(唤醒) -> 轮询 waitpid，
  * 期望 5 秒内被 SIGTERM 杀；回归（JIT 模式）时子进程卡在 nanosleep，5 秒超时。
+ * 停止用 SIGSTOP 而非 SIGTSTP：后者是 tty 停止信号，无控制终端的孤儿进程组
+ * （CI runner 的 job 进程）里被内核丢弃，host 对照无法停止。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +34,7 @@ int main(void) {
         return 1;
     }
     if(child == 0) {
-        raise(SIGTSTP);
+        raise(SIGSTOP);
         /* 被 SIGCONT 恢复后立即长 sleep —— 等同 dash 场景的 `sleep 30`。
          * 正确：SIGCONT 后 SIGTERM 在此前投递，本行不到达；
          * 回归（JIT）：SIGTERM 迟到，进入 nanosleep 被丢弃。 */
@@ -43,8 +45,8 @@ int main(void) {
 
     int status = 0;
     pid_t r = waitpid(child, &status, WUNTRACED);
-    if(r != child || !WIFSTOPPED(status) || WSTOPSIG(status) != SIGTSTP) {
-        printf("expected WIFSTOPPED/SIGTSTP, r=%d status=0x%x errno=%d\n",
+    if(r != child || !WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
+        printf("expected WIFSTOPPED/SIGSTOP, r=%d status=0x%x errno=%d\n",
                r, status, errno);
         return 1;
     }

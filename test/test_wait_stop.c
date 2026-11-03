@@ -1,12 +1,13 @@
 /* job-control 停止/恢复 + waitpid(WUNTRACED) 回归测试。
  *
- * 覆盖 SIGTSTP -> 子进程停止 -> 父进程经 SIGCHLD 唤醒 -> waitpid(WUNTRACED) 报告
- * WIFSTOPPED / WSTOPSIG==SIGTSTP -> kill(SIGCONT) 恢复 -> 再 waitpid 报告退出 的完整链路。
+ * 覆盖停止信号 -> 子进程停止 -> 父进程经 SIGCHLD 唤醒 -> waitpid(WUNTRACED) 报告
+ * WIFSTOPPED -> kill(SIGCONT) 恢复 -> 再 waitpid 报告退出 的完整链路。
  * 这是 dash 等交互式 shell 实现 CTRL+Z / fg 的核心机制。
  *
- * 关键点：子进程的 SIGTSTP 是它自己 raise 的（模拟收到 tty 信号停止），父进程靠
- * waitpid(WUNTRACED) 拿到停止状态，而非阻塞轮询。验证 bpfvm 的 stop_process +
- * notify_parent_sigchld + do_waitpid 的 WUNTRACED 支持。
+ * 关键点：子进程用 SIGSTOP 停止自己。SIGTSTP 是 tty 停止信号，在无控制终端的
+ * 孤儿进程组（CI runner 的 job 进程）中被内核按默认处置丢弃，进程不会被停止；
+ * SIGSTOP 不可捕获也不受该规则约束，host 对照在任何环境下都成立。
+ * 验证 bpfvm 的 stop_process + notify_parent_sigchld + do_waitpid 的 WUNTRACED 支持。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,9 +23,9 @@ int main(void) {
         return 1;
     }
     if (child == 0) {
-        /* 子进程：raise SIGTSTP 停止自己。bpfvm 的 stop_process 会设 tg 停止状态 +
+        /* 子进程：raise SIGSTOP 停止自己。bpfvm 的 stop_process 会设 tg 停止状态 +
          * 给父投 SIGCHLD。被 SIGCONT 恢复后继续往下走 exit(0)。 */
-        raise(SIGTSTP);
+        raise(SIGSTOP);
         _exit(0);
     }
 
@@ -39,8 +40,8 @@ int main(void) {
         printf("expected WIFSTOPPED, got status=0x%x\n", status);
         return 1;
     }
-    if (WSTOPSIG(status) != SIGTSTP) {
-        printf("WSTOPSIG=%d expected %d\n", WSTOPSIG(status), SIGTSTP);
+    if (WSTOPSIG(status) != SIGSTOP) {
+        printf("WSTOPSIG=%d expected %d\n", WSTOPSIG(status), SIGSTOP);
         return 1;
     }
 
