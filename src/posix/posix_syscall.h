@@ -94,14 +94,16 @@ struct ThreadGroup {
 //   sig     —— 信号号
 //   sender  —— 发送方 pid（0 = kernel/host，对齐 Linux si_pid 语义）。pid 在
 //              PosixSyscall 是 uint64_t，故此处用 uint64_t，免得调用方到处 cast。
-//   code    —— si_code：SI_USER（kill/raise）、SI_KERNEL（kernel/tty）、CLD_*（SIGCHLD）
+//   code    —— si_code：SI_USER（kill/raise）、SI_QUEUE（sigqueue）、SI_KERNEL（kernel/tty）、CLD_*（SIGCHLD）
 //   status  —— si_status：SIGCHLD 事件有效（CLD_EXITED=退出码、CLD_KILLED=信号号、
 //              CLD_STOPPED=停止信号号），其余场景为 0
+//   value   —— si_value：sigqueue 携带的 union sigval，其余来源为 0
 struct SigEvent {
     int sig;
     uint64_t sender;
     int32_t code;
     int32_t status;
+    uint64_t value;
 };
 
 // 信号队列：deque + 互斥锁。
@@ -232,6 +234,9 @@ class PosixSyscall: public SyscallHandler{
     // 给父进程（ppid 指向的 vm）投 SIGCHLD。find_task(ppid) 取父 vm -> sys()->queue_signal。
     // 父进程可能是 EmptySyscall（测试）或已退出，此时降级为 no-op。
     void notify_parent_sigchld();
+    // kill/sigqueueinfo 共用的发送核心：目标收集 + 存在性检查（空 = -ESRCH）+
+    // sig==0 短路 + 扇出投递（SIGKILL 对整个线程组）。
+    int64_t send_sig_info(int target_pid, int sig, int32_t code, uint64_t value);
 
     // do_execveat 与 shebang 递归共用的 exec 主体。depth 是 shebang 递归深度，
     // 上限 4（Linux BINPRM_MAX_RECURSION）。
@@ -257,6 +262,9 @@ public:
     virtual void init(const std::shared_ptr<vm>& v) override;
     virtual void fini(const std::shared_ptr<vm>& v) override;
     virtual bool handle_signals(vm* v, sig_info* info) override;
+    virtual void build_siginfo(vm* v, uint64_t frame_base, const sig_info& info,
+                               uint64_t resumed_pc, uint64_t interrupted_sp) override;
+    virtual uint64_t sigreturn(vm* v, uint64_t frame_base, uint64_t fallback_pc) override;
     virtual int64_t (syscall)(vm* v, uint32_t call) override;
     virtual int id() override {
         return (int)pid;
@@ -358,6 +366,7 @@ public:
     int64_t do_utimensat(vm* v);
     int64_t do_faccessat(vm* v);
     int64_t do_kill(vm* v);
+    int64_t do_sigqueueinfo(vm* v);
     int64_t do_tkill(vm* v);
     int64_t do_tgkill(vm* v);
     int64_t do_sigaction(vm* v);

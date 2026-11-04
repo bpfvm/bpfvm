@@ -21,6 +21,47 @@ struct sigaction {
     uint64_t mask;
 };
 
+// guest siginfo_t 镜像（musl include/signal.h，LP64 无 __SI_SWAP_ERRNO_CODE 布局，
+// 共 128B）。只列出 VM 写入的成员，union 其余成员以 __reserved 占位锁总大小；
+// si_value 与 SIGCHLD 的 si_status 在 @24 同偏移复用（musl __si_common.__second）。
+struct guest_siginfo {
+    int32_t si_signo;   // @0
+    int32_t si_errno;   // @4
+    int32_t si_code;    // @8
+    int32_t __pad;      // @12：union 成员 8B 对齐的空隙
+    int32_t si_pid;     // @16
+    int32_t si_uid;     // @20
+    union {
+        uint64_t si_value;         // @24：kill 来源为 0
+        struct {
+            int32_t si_status;     // @24：SIGCHLD 有效
+            int32_t __pad2;
+            uint64_t si_utime;     // @32
+            uint64_t si_stime;     // @40
+        } sigchld;
+    };
+    uint8_t __reserved[128 - 48];
+};
+
+// guest ucontext_t 镜像（musl arch/bpf/bits/signal.h 自有形状，共 264B）。
+// gregs[12] = r0..r10 + pc（REG_SP=10、REG_PC=11），无 FPU 上下文；uc_sigmask 是
+// musl sigset_t（128B，低 8B 按 bit(sig-1) 编码，高 120B 恒 0）。SA_SIGINFO 投递
+// 时 build_siginfo 在信号帧上构造本结构，sigreturn 按（可能被 handler 改写过的）
+// gregs/uc_sigmask 恢复现场。与 musl 侧（arch/bpf/bits/signal.h 的注释约定）
+// 由下方 static_assert 双向锁死，勿单边改动。
+struct guest_ucontext {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    struct {
+        void* ss_sp;
+        int32_t ss_flags;
+        int32_t __pad;
+        uint64_t ss_size;
+    } uc_stack;
+    uint64_t gregs[12];
+    uint8_t uc_sigmask[128];
+};
+
 typedef union epoll_data {
     void *ptr;
     int fd;
@@ -40,6 +81,7 @@ struct epoll_event {
 
 #include <errno.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -65,6 +107,25 @@ struct epoll_event {
 
 #undef sa_handler
 #undef sa_sigaction
+// musl（嵌套构建 bpfvm-on-bpfvm 的宿主 libc）把 siginfo_t 的 union 成员定义为
+// 宏，展开会破坏下方镜像结构体的 offsetof；下方 static_assert 需先剥掉。
+#undef si_pid
+#undef si_uid
+#undef si_value
+#undef si_status
+
+// —— guest siginfo_t/ucontext_t 镜像布局锁（勿单边改动，见 struct 注释）——
+static_assert(sizeof(bpf::guest_siginfo) == 128);
+static_assert(sizeof(bpf::guest_ucontext) == 264);
+static_assert(offsetof(bpf::guest_siginfo, si_pid) == 16);
+static_assert(offsetof(bpf::guest_siginfo, si_value) == 24);
+static_assert(offsetof(bpf::guest_siginfo, sigchld) == 24);
+static_assert(offsetof(bpf::guest_ucontext, uc_stack) == 16);
+static_assert(offsetof(bpf::guest_ucontext, gregs) == 40);
+static_assert(offsetof(bpf::guest_ucontext, uc_sigmask) == 136);
+// 与 insn.h 的 SA_SIGINFO 信号帧布局互锁：帧偏移增量须等于镜像结构大小。
+static_assert(SIGINFO_FRAME_UC_OFF - SIGINFO_FRAME_SI_OFF == sizeof(bpf::guest_siginfo));
+static_assert(SIGNAL_FRAME_SIGINFO_SIZE - SIGINFO_FRAME_UC_OFF == sizeof(bpf::guest_ucontext));
 
 // —— futex 子系统对外封装（实现在 futex.cpp）——
 // g_futex_mutex / g_futex_table 是 futex.cpp 内部 file-static，不暴露；

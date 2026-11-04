@@ -22,7 +22,7 @@ int64_t PosixSyscall::do_exit_group(vm* v) {
         for(auto& weak_vm : tg->threads) {
             auto tvm = weak_vm.lock();
             if(tvm && tvm.get() != v) {
-                if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0});
+                if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0, 0});
             }
         }
     }
@@ -188,7 +188,7 @@ int64_t PosixSyscall::exec_common(vm* v, int dirfd, const std::string& path,
             if(!tvm || tvm.get() == v) {
                 continue;
             }
-            if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0});
+            if(auto s = sys(tvm.get())) s->queue_signal(tvm.get(), {SIGKILL, pid, SI_USER, 0, 0});
         }
     }
     // 等待同组其它线程退出（live_threads 降到 1）。阻塞在自身 wait_for 上，sibling

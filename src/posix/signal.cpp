@@ -43,7 +43,7 @@ void PosixSyscall::notify_parent_sigchld() {
     }
     // sender = 本子进程的 pid（wait4 的 siginfo.si_pid 据此报告是谁退出/停止）。
     if(auto ps = sys(parent_vm.get())) {
-        ps->queue_signal(parent_vm.get(), {SIGCHLD, pid, code, status});
+        ps->queue_signal(parent_vm.get(), {SIGCHLD, pid, code, status, 0});
     }
 }
 
@@ -268,10 +268,7 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
             sig_action_flags = act.flags;
         }
     }
-    // 当前 handler 只传 sig（r1），未走 SA_SIGINFO，故 chosen.code/status/sender 未使用；
-    // 保留在 chosen 里供未来 SA_SIGINFO 投递填 siginfo.si_code/si_status/si_pid 用。
     int sig = chosen.sig;
-    (void)chosen.sender; (void)chosen.code; (void)chosen.status;
     if(sig <= 0 || sig >= NSIG) {
         return true;
     }
@@ -305,24 +302,75 @@ bool PosixSyscall::handle_signals(vm* v, sig_info* info) {
     }
 
     // 已 catch：带回 sig 与 handler 地址，由 vm::deliver_signal 压栈跳转。
-    // 同时带回 sa_flags：投递信号的 SA_RESTART 位用于 ERESTARTSYS 重启判定。
+    // 同时带回 sa_flags（SA_RESTART 供 ERESTARTSYS 重启判定、SA_SIGINFO 决定
+    // r2/r3 传 siginfo/ucontext）与 SigEvent 载荷（build_siginfo 构造 siginfo_t 用）。
     info->sig = sig;
     info->handler = handler;
     info->sa_flags = static_cast<uint64_t>(sig_action_flags);
+    info->si_pid = chosen.sender;
+    info->si_code = chosen.code;
+    info->si_status = chosen.status;
+    info->si_value = chosen.value;
     return true;
 }
 
-int64_t PosixSyscall::do_kill(vm* v) {
-    int target_pid = arg_s32(v->r(1));
-    int sig = arg_s32(v->r(2));
-    if(sig < 0 || sig >= NSIG) {
-        return -EINVAL;
+void PosixSyscall::build_siginfo(vm* v, uint64_t frame_base, const sig_info& info,
+                                 uint64_t resumed_pc, uint64_t interrupted_sp) {
+    // SA_SIGINFO 投递的数据构造。调用时机 = push_frame 之后、r1/r2/r3 被投递参数
+    // 覆盖之前，故 gregs 捕获的是被中断处的原始寄存器现场（r10 例外：push_frame
+    // 已改成帧基址，取调用方传入的投递前 sp）。帧区域刚被 push_frame 以 mmu_w
+    // 覆盖过，mmu_w 不会失败。
+    auto* si = static_cast<bpf::guest_siginfo*>(
+        v->mmu_w(frame_base + SIGINFO_FRAME_SI_OFF, sizeof(bpf::guest_siginfo)));
+    auto* uc = static_cast<bpf::guest_ucontext*>(
+        v->mmu_w(frame_base + SIGINFO_FRAME_UC_OFF, sizeof(bpf::guest_ucontext)));
+    memset(si, 0, sizeof(*si));
+    si->si_signo = info.sig;
+    si->si_code = info.si_code;
+    si->si_pid = static_cast<int32_t>(info.si_pid);
+    // si_value 与 si_status 在 musl siginfo_t 里同偏移复用（@24 union），按信号类型写其一
+    if(info.sig == SIGCHLD) {
+        si->sigchld.si_status = info.si_status;
+    } else {
+        si->si_value = info.si_value;
     }
+    memset(uc, 0, sizeof(*uc));
+    for(int i = 0; i <= 9; i++) {
+        uc->gregs[i] = v->r(i);
+    }
+    uc->gregs[10] = interrupted_sp;   // REG_SP
+    uc->gregs[11] = resumed_pc;       // REG_PC
+    uint64_t mask = sigmask.load(std::memory_order_relaxed);
+    memcpy(uc->uc_sigmask, &mask, sizeof(mask));   // 高 120B 恒 0
+}
 
-    // 收集目标 task 列表。Linux 语义：
+uint64_t PosixSyscall::sigreturn(vm* v, uint64_t frame_base, uint64_t fallback_pc) {
+    // rt_sigreturn 语义：gregs/uc_sigmask 可能被 handler 改写，一切以帧上 ucontext
+    // 为准（含恢复 pc = gregs[REG_PC]，实现 handler 改执行流）。
+    auto* uc = static_cast<const bpf::guest_ucontext*>(
+        v->mmu(frame_base + SIGINFO_FRAME_UC_OFF, sizeof(bpf::guest_ucontext)));
+    if(uc == nullptr) {
+        // 帧上 ucontext 不可读（handler 期间被 unmap，guest bug）：沿用帧内恢复的现场
+        return fallback_pc;
+    }
+    for(int i = 0; i <= 10; i++) {
+        v->r(i) = uc->gregs[i];
+    }
+    // 掩码恢复与 do_sigprocmask 同规则：按 NSIG 截断、KILL/STOP 不可阻塞。
+    uint64_t bits;
+    memcpy(&bits, uc->uc_sigmask, sizeof(bits));
+    constexpr uint64_t valid = (NSIG < 64) ? ((1ULL << (NSIG - 1)) - 1) : ~0ULL;
+    bits &= valid;
+    bits &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sigmask.store(bits, std::memory_order_release);
+    return uc->gregs[11];
+}
+
+int64_t PosixSyscall::send_sig_info(int target_pid, int sig, int32_t code, uint64_t value) {
+    // 目标收集，Linux 语义：
     //   pid > 0  -> 指定 task
     //   pid == 0 -> 调用者进程组所有 task（含自身）
-    //   pid == -1-> 除 pid 1 外所有 task（含自身）
+    //   pid == -1-> 除 pid 1 与自身外所有 task
     //   pid < -1 -> 进程组 -pid 所有 task
     std::vector<std::shared_ptr<vm>> targets;
     auto pick = [&](const std::shared_ptr<vm>& task_vm) {
@@ -360,36 +408,59 @@ int64_t PosixSyscall::do_kill(vm* v) {
             }
         }
     }
-
     if(targets.empty()) {
         return -ESRCH;
     }
-
     // sig == 0：仅存在性检查，不发信号。
     if(sig == 0) {
         return 0;
     }
-
     for(auto& t : targets) {
-        // kill/tgkill 来源：SI_USER（用户态发起），si_status=0。
         auto s = sys(t.get());
         if(!s) continue;
-        // SIGKILL 终止整个线程组，普通信号 Linux 投递给任一线程即可，
-        // 这里仍只给 leader（简化）
+        // SIGKILL 终止整个线程组，对组内全线程扇出；普通信号 Linux 投递给任一
+        // 线程即可，仍只给 leader（简化）。
         if(sig == SIGKILL) {
             std::lock_guard<std::mutex> lock(s->tg->mtx);
             for(auto& weak_vm : s->tg->threads) {
                 if(auto tvm = weak_vm.lock()) {
                     if(auto ts = sys(tvm.get())) {
-                        ts->queue_signal(tvm.get(), {sig, pid, SI_USER, 0});
+                        ts->queue_signal(tvm.get(), {sig, pid, code, 0, value});
                     }
                 }
             }
         } else {
-            s->queue_signal(t.get(), {sig, pid, SI_USER, 0});
+            s->queue_signal(t.get(), {sig, pid, code, 0, value});
         }
     }
     return 0;
+}
+
+int64_t PosixSyscall::do_kill(vm* v) {
+    int target_pid = arg_s32(v->r(1));
+    int sig = arg_s32(v->r(2));
+    if(sig < 0 || sig >= NSIG) {
+        return -EINVAL;
+    }
+    return send_sig_info(target_pid, sig, SI_USER, 0);
+}
+
+int64_t PosixSyscall::do_sigqueueinfo(vm* v) {
+    // rt_sigqueueinfo(pid, sig, siginfo*)：musl sigqueue() 构造 si_code=SI_QUEUE 的
+    // siginfo 调此。只透传 si_value——si_code 恒按 SI_QUEUE（Linux 不允许用户态经
+    // 本 syscall 伪造 si_code，musl 也只发 SI_QUEUE）。
+    int target_pid = arg_s32(v->r(1));
+    int sig = arg_s32(v->r(2));
+    uint64_t uinfo_addr = v->r(3);
+    if(sig < 0 || sig >= NSIG) {
+        return -EINVAL;
+    }
+    auto* si = static_cast<const bpf::guest_siginfo*>(
+        v->mmu(uinfo_addr, sizeof(bpf::guest_siginfo)));
+    if(si == nullptr) {
+        return -EFAULT;
+    }
+    return send_sig_info(target_pid, sig, SI_QUEUE, si->si_value);
 }
 
 int64_t PosixSyscall::do_tkill(vm* v) {
@@ -405,7 +476,7 @@ int64_t PosixSyscall::do_tkill(vm* v) {
     if(sig == 0) {
         return 0;
     }
-    if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0});
+    if(auto s = sys(target_vm.get())) s->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0, 0});
     return 0;
 }
 
@@ -427,7 +498,7 @@ int64_t PosixSyscall::do_tgkill(vm* v) {
     if(sig == 0) {
         return 0;
     }
-    target->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0});
+    target->queue_signal(target_vm.get(), {sig, pid, SI_USER, 0, 0});
     return 0;
 }
 
@@ -699,9 +770,10 @@ int64_t PosixSyscall::do_sigsuspend(vm* v) {
     if(!parse_guest_sigset(v, v->r(1), new_mask)) {
         return -EFAULT;
     }
-    // 不恢复调用前掩码：VM 的信号帧机制无 sigreturn 钩子，POSIX 要求的"handler 返回后
-    // 恢复"没有落点。调用方按惯例随后自行设置掩码（dash waitproc 循环出口的
-    // sigclearmask、sigsetjmp/siglongjmp 的 env 掩码恢复）。
+    // 不恢复调用前掩码：SA_SIGINFO 帧的 sigreturn 恢复的是投递时刻掩码（即本函数刚设
+    // 的临时掩码），普通信号帧则完全不恢复，POSIX 要求的"handler 返回后恢复挂起前掩码"
+    // 均无落点。调用方按惯例随后自行设置掩码（dash waitproc 循环出口的 sigclearmask、
+    // sigsetjmp/siglongjmp 的 env 掩码恢复）。
     sigmask.store(new_mask, std::memory_order_release);
     while(true) {
         if(v->get_flags() & (vm::VM_KILLED | vm::VM_STOPPED | vm::VM_DEBUG_STOP)) {
@@ -750,6 +822,8 @@ bool SignalFd::deliver(const SigEvent& ev) {
     si.ssi_status = ev.status;      // SIGCHLD 有效：CLD_EXITED=退出码、CLD_KILLED=信号号、CLD_STOPPED=停止信号号；其余 0
     si.ssi_pid    = static_cast<uint32_t>(ev.sender);   // 发送方 pid（0 = kernel/host，对齐 Linux si_pid 语义）
     si.ssi_uid    = 0;
+    si.ssi_int    = static_cast<int32_t>(ev.value);     // sigqueue 载荷：同一 sigval 填 int/ptr 两个字段（对齐 Linux SIL_RT）
+    si.ssi_ptr    = ev.value;
     ssize_t n = ::write(write_fd, &si, sizeof(si));
     (void)n;  // EAGAIN（pipe 满）/ EBADF（已关闭，理论不会）均静默忽略，与 Linux 一致。
     return true;

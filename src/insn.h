@@ -34,12 +34,21 @@ static_assert(STACK_BASE + STACK_SIZE <= 0x40000000ULL, "guest stack overlaps mo
 // 不冗余存储）：
 //   bit  0..23 : stack_size —— 本函数编译期帧大小（帧槽精确值或 -S 回退）
 //   bit 24..47 : alloca_len —— 本函数已 alloca 的字节数
-//   bit     48 : is_signal（1=信号帧 128B / 0=普通帧 64B）
-//   bit 49..63 : 保留
+//   bit     48 : is_signal（1=信号帧 / 0=普通帧 64B）
+//   bit     49 : SA_SIGINFO（信号帧 520B：槽区上方挂 siginfo_t + ucontext_t，
+//                供 handler 的 r2/r3 与返回时的 sigreturn 恢复）
+//   bit 50..63 : 保留
 // 两字段均按字节精确编码，同受栈界约束（total <= STACK_SIZE），见下方 static_assert。
 // 帧布局详见 insn.cpp 的 Stack Frame Layout。
 constexpr uint32_t NORMAL_FRAME_SIZE = 64;
 constexpr uint32_t SIGNAL_FRAME_SIZE = 128;
+// SA_SIGINFO 信号帧：[frame_base+0,+128) 槽区；[+128,+256) siginfo_t(128B)；
+// [+256,+520) ucontext_t(264B)。128/264 是 musl ABI 布局大小，与
+// posix_internal.h 的 guest_siginfo/guest_ucontext 镜像互锁（static_assert）。
+// 数据位于信号帧槽区上方，handler 的帧自 frame_base 向下增长，不会触碰。
+constexpr uint32_t SIGINFO_FRAME_SI_OFF = SIGNAL_FRAME_SIZE;
+constexpr uint32_t SIGINFO_FRAME_UC_OFF = SIGINFO_FRAME_SI_OFF + 128;
+constexpr uint32_t SIGNAL_FRAME_SIGINFO_SIZE = SIGINFO_FRAME_UC_OFF + 264;
 // frame[0] 24 位字段的上限须覆盖栈上界（帧的 total 及各分量都 < STACK_SIZE）。
 static_assert(STACK_SIZE <= (1ull << 24), "frame[0] 24-bit fields cannot hold stack bound");
 #define FRAME_FLAG_SIGNAL  (1ull << 48)
@@ -52,6 +61,8 @@ static_assert(STACK_SIZE <= (1ull << 24), "frame[0] 24-bit fields cannot hold st
         & ((uint64_t)FRAME_ALLOCA_MASK << FRAME_ALLOCA_SHIFT)) \
      | ((is_sig) ? FRAME_FLAG_SIGNAL : 0))
 #define frame_is_signal(flags0)  (((flags0) & FRAME_FLAG_SIGNAL) != 0)
+#define FRAME_FLAG_SIGINFO (1ull << 49)
+#define frame_has_siginfo(flags0) (((flags0) & FRAME_FLAG_SIGINFO) != 0)
 #define frame_stack_size(flags0) ((uint64_t)((flags0) & FRAME_SIZE_MASK))
 #define frame_alloca_len(flags0)  ((uint64_t)(((flags0) >> FRAME_ALLOCA_SHIFT) & FRAME_ALLOCA_MASK))
 #define frame_total_len(flags0)   (frame_stack_size(flags0) + frame_alloca_len(flags0))
@@ -167,7 +178,12 @@ template<typename T> class JitCompiler;
 struct sig_info {
     int sig = 0;
     uint64_t handler = 0;   // guest handler 地址
-    uint64_t sa_flags = 0;  // 投递信号的 sa_flags（含 SA_RESTART），供重启判定
+    uint64_t sa_flags = 0;  // 投递信号的 sa_flags（含 SA_RESTART/SA_SIGINFO），供重启判定
+    // SA_SIGINFO 投递载荷（handle_signals 填），build_siginfo 据此构造 guest siginfo_t。
+    uint64_t si_pid = 0;    // 发送方 pid
+    uint64_t si_value = 0;  // sigqueue 携带的 union sigval
+    int32_t si_code = 0;    // SI_USER/SI_QUEUE/SI_KERNEL/CLD_*
+    int32_t si_status = 0;  // SIGCHLD：CLD_* 对应状态（退出码/信号号），其余 0
 };
 
 inline constexpr int64_t SYSCALL_RESTART = -512;
@@ -195,6 +211,22 @@ public:
     // 调用方（如 main.cpp 的信号 handler）不再关心"PTY 模式"等 host 侧接入细节。
     virtual void host_signal(vm* v, int sig) { (void)v; (void)sig; }
     virtual bool handle_signals(vm* v, sig_info* info) = 0;
+    // SA_SIGINFO 投递：push_frame 压好 siginfo 信号帧后，在帧上方构造 guest
+    // siginfo_t/ucontext_t（deliver_signal 随后以 r2/r3 指向二者传给 handler）。
+    // resumed_pc = 投递时定下的恢复点，写入 gregs[REG_PC]；interrupted_sp = 投递前
+    // 的 r10（push_frame 已把 r10 改成帧基址，gregs[REG_SP] 不能从当前寄存器取）。
+    // 帧区域刚被 push_frame 以 mmu_w 覆盖过，构造不会失败。
+    virtual void build_siginfo(vm* v, uint64_t frame_base, const sig_info& info,
+                               uint64_t resumed_pc, uint64_t interrupted_sp) {
+        (void)v; (void)frame_base; (void)info; (void)resumed_pc; (void)interrupted_sp;
+    }
+    // SA_SIGINFO 信号帧返回（rt_sigreturn 语义）：按 handler 可能改写过的帧上
+    // ucontext 恢复 r0..r10 与信号掩码，返回恢复后的 pc。fallback_pc = ucontext
+    // 不可读时的兜底（沿用帧内恢复的现场）。
+    virtual uint64_t sigreturn(vm* v, uint64_t frame_base, uint64_t fallback_pc) {
+        (void)v; (void)frame_base;
+        return fallback_pc;
+    }
     virtual int id() = 0;
 };
 
@@ -447,7 +479,8 @@ public:
     bool setup_stack(const std::vector<std::string>& argv,
                      const std::map<std::string, std::string>& envp,
                      const ElfLoadInfo& info);
-    bool push_frame(uint64_t return_addr, uint64_t callee_entry = 0, bool is_signal = false);
+    bool push_frame(uint64_t return_addr, uint64_t callee_entry = 0, bool is_signal = false,
+                    bool sa_siginfo = false);
     // 读 callee 入口前 8 字节帧槽（frame_slot.h），返回该函数编译期帧大小；
     uint64_t frame_size_of(uint64_t callee_entry);
     // 调用 handle_signals 决策并通过 push_frame 投递信号 handler（压信号帧、r(1)=sig、pc=handler）。

@@ -113,6 +113,7 @@
 #define BPF_SYS_SIGALTSTACK     100 /* sigaltstack(ss*, old*) — stub，查询恒报未启用，见 do_sigaltstack */
 #define BPF_SYS_SIGSUSPEND      101 /* rt_sigsuspend(sigset*) — 换掩码后睡到信号投递（dash wait 内建依赖）*/
 #define BPF_SYS_PRCTL           102 /* prctl(option, ...) — PR_SET_NAME/PR_GET_NAME（comm 读写）*/
+#define BPF_SYS_SIGQUEUEINFO    103 /* rt_sigqueueinfo(pid, sig, siginfo*) — sigqueue() 复用，携带 si_value */
 
 #define BPF_CALL_BASE 0x10000u
 #define BPF_CALL_ID(id) (BPF_CALL_BASE + (uint32_t)(id))
@@ -224,5 +225,6 @@
 #define BPF_CALL_PSELECT6         BPF_CALL_ID(BPF_SYS_PSELECT6)
 #define BPF_CALL_SIGSUSPEND       BPF_CALL_ID(BPF_SYS_SIGSUSPEND)
 #define BPF_CALL_PRCTL            BPF_CALL_ID(BPF_SYS_PRCTL)
+#define BPF_CALL_SIGQUEUEINFO     BPF_CALL_ID(BPF_SYS_SIGQUEUEINFO)
 
 #endif //BPF_SYSCALL_H

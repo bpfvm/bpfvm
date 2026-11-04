@@ -268,8 +268,10 @@ uint64_t vm::frame_size_of(uint64_t callee_entry) {
     return v & FRAME_SLOT_SIZE_MASK;
 }
 
-bool vm::push_frame(uint64_t return_addr, uint64_t callee_entry, bool is_signal) {
-    uint32_t frame_size = is_signal ? SIGNAL_FRAME_SIZE : NORMAL_FRAME_SIZE;
+bool vm::push_frame(uint64_t return_addr, uint64_t callee_entry, bool is_signal, bool sa_siginfo) {
+    uint32_t frame_size = is_signal
+        ? (sa_siginfo ? SIGNAL_FRAME_SIGINFO_SIZE : SIGNAL_FRAME_SIZE)
+        : NORMAL_FRAME_SIZE;
     // 调用者（被中断函数）栈帧的总长度 = 帧大小 + alloca_len，即"当前 r10
     //   处那个帧"frame_base[0] 两字段之和。调用者的局部变量区是
     //   [r10 - 帧大小, r10]，alloca 区在其下 [r10 - total_len, r10 - 帧大小]。
@@ -294,7 +296,8 @@ bool vm::push_frame(uint64_t return_addr, uint64_t callee_entry, bool is_signal)
 
     // 被调函数的编译期帧大小（帧槽精确值，缺失回退 -S）。
     uint64_t stack_limit = frame_size_of(callee_entry);
-    frame_base[0] = frame_flags_make(is_signal, stack_limit, 0);
+    frame_base[0] = frame_flags_make(is_signal, stack_limit, 0)
+                    | (sa_siginfo ? FRAME_FLAG_SIGINFO : 0);
     // 公共锚点：old_r10 / RA 固定在 [1] / [2]（与帧类型无关）。
     frame_base[1] = r(10);
     frame_base[2] = return_addr;
@@ -352,8 +355,18 @@ bool vm::deliver_signal() {
         restart_syscall_pc_ = 0;
         restart_nohand_ = false;
     }
-    if(!push_frame(ret_addr, info.handler, true)) {
+    // SA_SIGINFO 投递：压 520B 信号帧，帧上方由 handler 侧构造 siginfo_t/ucontext_t，
+    // r2/r3 指向二者（r1=sig 不变）。非 SA_SIGINFO 只传 r1=sig。
+    bool want_siginfo = (info.sa_flags & SA_SIGINFO) != 0;
+    uint64_t interrupted_sp = r(10);   // push_frame 会改写 r10，先留投递前值
+    if(!push_frame(ret_addr, info.handler, true, want_siginfo)) {
         return false;
+    }
+    if(want_siginfo) {
+        // gregs 须捕获投递前寄存器现场（r1/r2/r3 在此后才被投递参数覆盖）。
+        options.sys->build_siginfo(this, r(10), info, ret_addr, interrupted_sp);
+        r(2) = r(10) + SIGINFO_FRAME_SI_OFF;
+        r(3) = r(10) + SIGINFO_FRAME_UC_OFF;
     }
     r(1) = static_cast<uint64_t>(info.sig);
     pc_ = info.handler;
@@ -362,13 +375,14 @@ bool vm::deliver_signal() {
 
 uint64_t vm::pop_frame() {
     uint64_t sp = r(10);
-    // 帧头 [0..6] + 信号帧扩展 [7..12]，与 JIT emit_exit 的 104B 读取等宽
+    // 帧头 [0..6] 普通帧即够；[7..12] 是信号帧的 r0..r5 槽（JIT 信号帧也走本函数）
     uint64_t* frame_base = (uint64_t*)mmu(sp, 13 * sizeof(uint64_t));
     if(!frame_base) return 0;
 
     uint64_t old_sp;
     uint64_t ret_addr;
     bool is_signal = frame_is_signal(frame_base[0]);
+    bool has_siginfo = frame_has_siginfo(frame_base[0]);
     // 公共锚点：old_r10 / RA 固定在 [1] / [2]。
     old_sp = frame_base[1];
     ret_addr = frame_base[2];
@@ -393,6 +407,12 @@ uint64_t vm::pop_frame() {
             options.sys->id(), sp, old_sp, ret_addr, is_signal);
     }
     r(10) = old_sp;
+    // SA_SIGINFO 帧：rt_sigreturn 语义——按 handler 可能改写过的帧上 ucontext
+    // 重恢复 r0..r10/sigmask，返回 pc 改取 gregs[REG_PC]（覆盖上面的帧内恢复；
+    // r10 已先行按帧内 old_sp 恢复，ucontext 可读时会被 gregs[REG_SP] 覆写）。
+    if (is_signal && has_siginfo) {
+        return options.sys->sigreturn(this, sp, ret_addr);
+    }
     return ret_addr;
 }
 

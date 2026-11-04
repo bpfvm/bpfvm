@@ -12,7 +12,7 @@
 *   **浮点支持**: 通过 `BpfSoftFp` LLVM pass 提供 `float`/`double` 支持（算术、类型转换、比较）。
 *   **系统调用模拟**: 通过可插拔的 `SyscallHandler` 接口实现了 `open`, `read`, `write`, `fork`, `execve` 等核心 POSIX 系统调用，支持文件系统操作和进程控制。
 *   **标准库支持**: 深度集成了 musl（默认）作为 C 库，并提供 libc++ 支持 C++ STL。
-*   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用。
+*   **信号支持**: 支持信号处理（`SIGKILL`/`SIGSTOP`/`SIGCONT` 等），使用无锁队列实现信号传递，支持信号打断系统调用；`SA_SIGINFO` 投递在信号帧上构造 `siginfo_t`/`ucontext_t`（handler 可改写 gregs/uc_sigmask，返回时按 rt_sigreturn 语义恢复），并支持 `sigqueue` 的 `si_value` 传递。
 *   **内存安全**: 提供内存越界检查机制。
 *   **实际应用支持**: 能够运行 `dash` (Debian Almquist Shell) 和 `busybox` (coreutils) 等复杂程序。
 *   **Demo Rootfs**: 提供脚本一键构建 `dash + busybox` 的最小 rootfs，并安装到 `root/`。

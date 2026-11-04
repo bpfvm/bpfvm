@@ -239,12 +239,12 @@ void PosixSyscall::deliver_to_ctty_fg(vm* v, GuestTty* tty, int sig) {
     if(targets.empty()) {
         if(tty) return;  // tty 路径不 fallback
         // 无 ctty fallback：投给当前 v（pid 1）。host/kernel 发起：sender=0、code=SI_KERNEL。
-        queue_signal(v, {sig, 0, SI_KERNEL, 0});
+        queue_signal(v, {sig, 0, SI_KERNEL, 0, 0});
         return;
     }
     for(auto& t : targets) {
         // 目标是另一个 PosixSyscall：经 sys() downcast 后调内部 queue_signal。
-        if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, 0, SI_KERNEL, 0});
+        if(auto s = sys(t.get())) s->queue_signal(t.get(), {sig, 0, SI_KERNEL, 0, 0});
     }
 }
 
@@ -442,6 +442,7 @@ int64_t (PosixSyscall::syscall)(vm* v, uint32_t call) {
     case BPF_SYS_UMASK:      return do_umask(v);
     // —— 信号 ——
     case BPF_SYS_KILL:       return do_kill(v);
+    case BPF_SYS_SIGQUEUEINFO: return do_sigqueueinfo(v);
     case BPF_SYS_TKILL:      return do_tkill(v);
     case BPF_SYS_TGKILL:     return do_tgkill(v);
     case BPF_SYS_SIGACTION:  return do_sigaction(v);

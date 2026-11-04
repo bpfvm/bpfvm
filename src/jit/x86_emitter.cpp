@@ -1891,12 +1891,13 @@ void X86Emitter::emit_call_indirect(const bpf_insn* insn, uint64_t ret_gpa,
 //   从帧取 r6..r9 写 vm->reg[6..9]（BPF 后端对未用 r6..r9 的函数不 spill/reload，x86 值
 //   不可信，必从帧取）；写 vm->reg[0]=r0(R8)、vm->reg[10]=old_sp、vm->pc_=ret_addr。
 //   r0 留 R8：fast path 经 vm_exit ret 回 .cont，.cont 用 R8 取返回值，不 reload。
-//   信号帧在 frame[7..12] 存被中断处 caller-saved r0..r5，须一并恢复。
+//   信号帧不内联：frame[0] bit48 置位即转 helper_pop_frame（见下方 .signal_pop）。
 // ---------------------------------------------------------------------------
 
 void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_index) {
-    // -  内联 pop_frame：读 frame[0..12]（104B，覆盖普通 64B + 信号 128B 的 r0..r5）。
-    auto ctx = begin_mem_access(X86::R15, 0, 104, /*is_write=*/false);  // RAX = frame host
+    // -  内联 pop_frame：读 frame[0..6]（56B = 普通帧头 flags/old_sp/RA + r6..r9 槽；
+    //    信号帧分流到 helper_pop_frame，frame[7..12] 不再内联读取）。
+    auto ctx = begin_mem_access(X86::R15, 0, 56, /*is_write=*/false);  // RAX = frame host
     emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x10);   // mov rcx, [rax+0x10]  (ret_addr = frame[2])
     emit8(0x4C); emit8(0x8B); emit8(0x18);               // mov r11, [rax]      (frame[0] flags，检测 is_signal)
     store_r64((int32_t)off_scratch_, X86::RAX);           // 暂存 frame host（正常返回路径复用）
@@ -1908,11 +1909,34 @@ void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_i
     size_t stack_bottom_jz = size();
     emit8(0x0F); emit8(0x84); emit32(0);                  // JZ .stack_bottom
 
-    // -  vm->pc_ = ret_addr；vm->reg[0..5]=物理寄存器终值（r1-r5 是 caller-saved，
-    //    调用者可见被调函数的写入——与解释器的全局寄存器语义一致，慢速调用路径
-    //    经 vm_exit 重载后才能看到）；r6..r9/10 从帧取写 vm->reg[]（callee-saved 恢复）。
+    // -  信号帧（bit48；SA_SIGINFO 帧 bit49 必伴随置位）不走内联恢复：r0..r5 槽恢复、
+    //    signal_depth 维护、SA_SIGINFO 的 ucontext 恢复（rt_sigreturn 语义）统一由
+    //    helper_pop_frame（C++ pop_frame 单一来源）完成，避免两条路径行为分叉。
+    //    判定先于普通帧写回，信号路径不产生任何被覆盖的 store。信号返回非热路径，
+    //    C 调用代价可忽略。普通帧（bit48=0）跳到 .no_signal。
+    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(48);     // shr r11, 48
+    emit8(0x45); emit8(0x85); emit8(0xDB);                 // test r11d, r11d
+    size_t sig_je = size();
+    emit8(0x0F); emit8(0x84); emit32(0);                   // JE .no_signal
+    // -  .signal_pop：helper_pop_frame 重读帧恢复现场，返回恢复后 pc（普通信号帧 =
+    //    RA，SA_SIGINFO 帧 = gregs[REG_PC]）。pop_frame 用 vm->reg[10] 定位帧，
+    //    从 R15（BPF r10 = 帧基址）写入。
+    store_r64((int32_t)(off_reg_ + 10 * 8), X86::R15);
+    mov_r64(X86::RDI, X86::RBP);
+    call_helper(helpers_->pop_frame);
+    store_r64((int32_t)off_pc_, X86::RAX);                 // vm->pc_ = resumed pc
+    size_t sig_jmp = size();
+    emit8(0xE9); emit32(0);
+    patch_branch_uncond(sig_jmp, vm_exit_offset);
+
+    // -  .no_signal：普通帧内联恢复。vm->pc_ = ret_addr；vm->reg[0..5]=物理寄存器
+    //    终值（r1-r5 是 caller-saved，调用者可见被调函数的写入——与解释器的全局
+    //    寄存器语义一致，慢速调用路径经 vm_exit 重载后才能看到）；r6..r9/10 从帧
+    //    取写 vm->reg[]（callee-saved 恢复）。
+    size_t no_signal = size();
+    patch_branch_cond(sig_je, no_signal);
     store_r64((int32_t)off_pc_, X86::RCX);                 // vm->pc_ = ret_addr
-    store_r64((int32_t)(off_reg_ + 0 * 8), X86::R8);       // vm->reg[0] = r0（信号帧下方覆盖）
+    store_r64((int32_t)(off_reg_ + 0 * 8), X86::R8);       // vm->reg[0] = r0
     for (int i = 1; i <= 5; i++) {
         store_r64((int32_t)(off_reg_ + i * 8), BPF_REG_MAP[i]);
     }
@@ -1926,27 +1950,6 @@ void X86Emitter::emit_exit(std::vector<AbortPatchInfo>& abort_patches, int bpf_i
     store_r64((int32_t)(off_reg_ + 8 * 8), X86::RCX);
     emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x30);   // mov rcx, [rax+0x30]  (r9)
     store_r64((int32_t)(off_reg_ + 9 * 8), X86::RCX);
-
-    // -  信号帧：r0..r5 从 frame[7..12](@+0x38..0x60) 覆盖写 vm->reg[0..5]。
-    //    is_signal = frame[0] bit48。普通帧（bit48=0）跳过。
-    emit8(0x49); emit8(0xC1); emit8(0xEB); emit8(48);     // shr r11, 48
-    emit8(0x45); emit8(0x85); emit8(0xDB);                 // test r11d, r11d
-    size_t sig_je = size();
-    emit8(0x0F); emit8(0x84); emit32(0);                   // JE .no_signal
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x38);   // mov rcx, [rax+0x38]  (r0)
-    store_r64((int32_t)(off_reg_ + 0 * 8), X86::RCX);
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x40);   // mov rcx, [rax+0x40]  (r1)
-    store_r64((int32_t)(off_reg_ + 1 * 8), X86::RCX);
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x48);   // mov rcx, [rax+0x48]  (r2)
-    store_r64((int32_t)(off_reg_ + 2 * 8), X86::RCX);
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x50);   // mov rcx, [rax+0x50]  (r3)
-    store_r64((int32_t)(off_reg_ + 3 * 8), X86::RCX);
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x58);   // mov rcx, [rax+0x58]  (r4)
-    store_r64((int32_t)(off_reg_ + 4 * 8), X86::RCX);
-    emit8(0x48); emit8(0x8B); emit8(0x48); emit8(0x60);   // mov rcx, [rax+0x60]  (r5)
-    store_r64((int32_t)(off_reg_ + 5 * 8), X86::RCX);
-    size_t no_signal = size();
-    patch_branch_cond(sig_je, no_signal);
 
     size_t exit_jmp = size();
     emit8(0xE9); emit32(0);
